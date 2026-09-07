@@ -6,3 +6,7 @@ add_test(NAME test_version COMMAND test_version)
 add_executable(test_random test_random.c)
 target_link_libraries(test_random PRIVATE cloak-common)
 add_test(NAME test_random COMMAND test_random)
+
+add_executable(test_aead test_aead.c)
+target_link_libraries(test_aead PRIVATE cloak-common)
+add_test(NAME test_aead COMMAND test_aead)
