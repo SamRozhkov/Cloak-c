@@ -18,3 +18,7 @@ add_test(NAME test_salsa20 COMMAND test_salsa20)
 add_executable(test_x25519 test_x25519.c)
 target_link_libraries(test_x25519 PRIVATE cloak-common)
 add_test(NAME test_x25519 COMMAND test_x25519)
+
+add_executable(test_reactor test_reactor.c)
+target_link_libraries(test_reactor PRIVATE cloak-common)
+add_test(NAME test_reactor COMMAND test_reactor)
