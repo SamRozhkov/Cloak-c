@@ -45,4 +45,16 @@ void cloak_salsa20_xor(uint8_t *dst, const uint8_t *src, size_t len,
                         const uint8_t nonce[CLOAK_SALSA20_NONCE_LEN],
                         const uint8_t key[CLOAK_SALSA20_KEY_LEN]);
 
+#define CLOAK_X25519_KEY_LEN 32
+
+/* Generates a fresh X25519 keypair. Returns 0 on success, -1 on failure. */
+int cloak_x25519_generate_keypair(uint8_t priv[CLOAK_X25519_KEY_LEN],
+                                   uint8_t pub[CLOAK_X25519_KEY_LEN]);
+
+/* Computes the ECDH shared secret between priv and peer_pub. Returns 0 on
+ * success, -1 on failure. */
+int cloak_x25519_shared_secret(const uint8_t priv[CLOAK_X25519_KEY_LEN],
+                                const uint8_t peer_pub[CLOAK_X25519_KEY_LEN],
+                                uint8_t out_secret[CLOAK_X25519_KEY_LEN]);
+
 #endif
