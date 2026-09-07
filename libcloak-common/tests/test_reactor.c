@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 struct read_ctx {
@@ -178,10 +179,134 @@ static void test_remove_fd_stops_dispatch_in_same_batch(void) {
     close(fds_b[1]);
 }
 
+#include <time.h>
+
+static uint64_t test_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+struct timer_fire_ctx {
+    int fired;
+};
+
+static void on_timer_fire_and_stop(cloak_reactor_t *r, void *userdata) {
+    struct timer_fire_ctx *ctx = (struct timer_fire_ctx *)userdata;
+    ctx->fired = 1;
+    cloak_reactor_stop(r);
+}
+
+static void test_timer_fires_after_delay(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    struct timer_fire_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    uint64_t start = test_now_ms();
+    cloak_timer_id_t id = cloak_reactor_add_timer(r, 20, on_timer_fire_and_stop, &ctx);
+    ASSERT_TRUE(id != CLOAK_TIMER_INVALID);
+
+    cloak_reactor_run(r);
+    uint64_t elapsed = test_now_ms() - start;
+
+    ASSERT_TRUE(ctx.fired);
+    ASSERT_TRUE(elapsed >= 15); /* small slack below the 20ms target */
+    ASSERT_TRUE(elapsed < 2000); /* generous upper bound: catches a broken timeout computation that blocks forever */
+
+    cloak_reactor_destroy(r);
+}
+
+struct cancel_ctx {
+    int should_not_fire_flag;
+    int stopper_flag;
+};
+
+static void on_should_not_fire(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    struct cancel_ctx *ctx = (struct cancel_ctx *)userdata;
+    ctx->should_not_fire_flag = 1;
+}
+
+static void on_stopper(cloak_reactor_t *r, void *userdata) {
+    struct cancel_ctx *ctx = (struct cancel_ctx *)userdata;
+    ctx->stopper_flag = 1;
+    cloak_reactor_stop(r);
+}
+
+static void test_cancel_timer_prevents_firing(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    struct cancel_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    cloak_timer_id_t id = cloak_reactor_add_timer(r, 10, on_should_not_fire, &ctx);
+    ASSERT_TRUE(id != CLOAK_TIMER_INVALID);
+    cloak_reactor_cancel_timer(r, id);
+
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 20, on_stopper, &ctx) != CLOAK_TIMER_INVALID);
+
+    cloak_reactor_run(r);
+
+    ASSERT_TRUE(ctx.stopper_flag);
+    ASSERT_TRUE(!ctx.should_not_fire_flag);
+
+    cloak_reactor_destroy(r);
+}
+
+struct order_ctx {
+    int log[3];
+    int log_len;
+};
+
+static void on_order_20ms(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    struct order_ctx *ctx = (struct order_ctx *)userdata;
+    ctx->log[ctx->log_len++] = 20;
+}
+static void on_order_60ms(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    struct order_ctx *ctx = (struct order_ctx *)userdata;
+    ctx->log[ctx->log_len++] = 60;
+}
+static void on_order_120ms(cloak_reactor_t *r, void *userdata) {
+    struct order_ctx *ctx = (struct order_ctx *)userdata;
+    ctx->log[ctx->log_len++] = 120;
+    cloak_reactor_stop(r);
+}
+
+static void test_multiple_timers_fire_in_order(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    struct order_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    /* Added out of chronological order on purpose, to prove the heap
+     * orders by deadline, not insertion order. */
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 120, on_order_120ms, &ctx) != CLOAK_TIMER_INVALID);
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 20, on_order_20ms, &ctx) != CLOAK_TIMER_INVALID);
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 60, on_order_60ms, &ctx) != CLOAK_TIMER_INVALID);
+
+    cloak_reactor_run(r);
+
+    ASSERT_EQ_INT(ctx.log_len, 3);
+    ASSERT_EQ_INT(ctx.log[0], 20);
+    ASSERT_EQ_INT(ctx.log[1], 60);
+    ASSERT_EQ_INT(ctx.log[2], 120);
+
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_add_and_dispatch_readable();
     test_dispatch_writable();
     test_add_fd_rejects_duplicate();
     test_mod_fd_changes_interest();
     test_remove_fd_stops_dispatch_in_same_batch();
+    test_timer_fires_after_delay();
+    test_cancel_timer_prevents_firing();
+    test_multiple_timers_fire_in_order();
 TEST_MAIN_END()

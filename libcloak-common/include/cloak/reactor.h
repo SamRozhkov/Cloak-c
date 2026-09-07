@@ -55,4 +55,20 @@ void cloak_reactor_run(cloak_reactor_t *r);
  * callback running on the reactor's own thread during cloak_reactor_run. */
 void cloak_reactor_stop(cloak_reactor_t *r);
 
+typedef uint64_t cloak_timer_id_t;
+#define CLOAK_TIMER_INVALID ((cloak_timer_id_t)0)
+
+typedef void (*cloak_reactor_timer_cb)(cloak_reactor_t *r, void *userdata);
+
+/* Schedules cb to run once, delay_ms from now (CLOCK_MONOTONIC). Returns a
+ * timer id usable with cloak_reactor_cancel_timer, or CLOAK_TIMER_INVALID
+ * on failure (cb is NULL, or an allocation failure growing the timer
+ * heap). */
+cloak_timer_id_t cloak_reactor_add_timer(cloak_reactor_t *r, uint64_t delay_ms,
+                                          cloak_reactor_timer_cb cb, void *userdata);
+
+/* Cancels a pending timer. A no-op if id is CLOAK_TIMER_INVALID, already
+ * fired, or already cancelled. */
+void cloak_reactor_cancel_timer(cloak_reactor_t *r, cloak_timer_id_t id);
+
 #endif

@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
+#include <time.h>
 #include <unistd.h>
 
 struct watcher {
@@ -12,11 +13,24 @@ struct watcher {
     void *userdata;
 };
 
+struct timer_entry {
+    uint64_t deadline_ms;
+    uint64_t id;
+    cloak_reactor_timer_cb cb;
+    void *userdata;
+    int cancelled;
+};
+
 struct cloak_reactor {
     int epoll_fd;
     struct watcher **watchers;
     size_t watchers_cap;
     int stopped;
+
+    struct timer_entry *timers;
+    size_t timer_count;
+    size_t timer_cap;
+    uint64_t next_timer_id;
 };
 
 static uint32_t to_epoll_events(uint32_t events) {
@@ -50,6 +64,105 @@ static int ensure_capacity(cloak_reactor_t *r, int fd) {
     return 0;
 }
 
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+static void timer_swap(struct timer_entry *a, struct timer_entry *b) {
+    struct timer_entry tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+static void heap_sift_up(cloak_reactor_t *r, size_t i) {
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (r->timers[parent].deadline_ms <= r->timers[i].deadline_ms) {
+            break;
+        }
+        timer_swap(&r->timers[parent], &r->timers[i]);
+        i = parent;
+    }
+}
+
+static void heap_sift_down(cloak_reactor_t *r, size_t i) {
+    for (;;) {
+        size_t left = 2 * i + 1;
+        size_t right = 2 * i + 2;
+        size_t smallest = i;
+        if (left < r->timer_count && r->timers[left].deadline_ms < r->timers[smallest].deadline_ms) {
+            smallest = left;
+        }
+        if (right < r->timer_count && r->timers[right].deadline_ms < r->timers[smallest].deadline_ms) {
+            smallest = right;
+        }
+        if (smallest == i) {
+            break;
+        }
+        timer_swap(&r->timers[i], &r->timers[smallest]);
+        i = smallest;
+    }
+}
+
+static int timer_heap_ensure_capacity(cloak_reactor_t *r) {
+    if (r->timer_count < r->timer_cap) {
+        return 0;
+    }
+    size_t new_cap = r->timer_cap == 0 ? 8 : r->timer_cap * 2;
+    struct timer_entry *grown = realloc(r->timers, new_cap * sizeof(*grown));
+    if (grown == NULL) {
+        return -1;
+    }
+    r->timers = grown;
+    r->timer_cap = new_cap;
+    return 0;
+}
+
+static void heap_pop(cloak_reactor_t *r) {
+    r->timer_count--;
+    r->timers[0] = r->timers[r->timer_count];
+    if (r->timer_count > 0) {
+        heap_sift_down(r, 0);
+    }
+}
+
+/* Fires all expired (non-cancelled) timers whose deadline has passed,
+ * discarding cancelled ones encountered along the way. */
+static void process_expired_timers(cloak_reactor_t *r) {
+    uint64_t now = now_ms();
+    while (r->timer_count > 0) {
+        struct timer_entry top = r->timers[0];
+        if (top.cancelled) {
+            heap_pop(r);
+            continue;
+        }
+        if (top.deadline_ms > now) {
+            break;
+        }
+        heap_pop(r);
+        top.cb(r, top.userdata);
+    }
+}
+
+/* Returns the epoll_wait timeout in ms: -1 if there are no live timers,
+ * otherwise the ms remaining until the earliest one (>= 0). */
+static int compute_timeout_ms(cloak_reactor_t *r) {
+    while (r->timer_count > 0 && r->timers[0].cancelled) {
+        heap_pop(r);
+    }
+    if (r->timer_count == 0) {
+        return -1;
+    }
+    uint64_t now = now_ms();
+    if (r->timers[0].deadline_ms <= now) {
+        return 0;
+    }
+    uint64_t diff = r->timers[0].deadline_ms - now;
+    return diff > (uint64_t)2147483647 ? 2147483647 : (int)diff;
+}
+
 cloak_reactor_t *cloak_reactor_create(void) {
     cloak_reactor_t *r = calloc(1, sizeof(*r));
     if (r == NULL) {
@@ -71,6 +184,7 @@ void cloak_reactor_destroy(cloak_reactor_t *r) {
         free(r->watchers[i]);
     }
     free(r->watchers);
+    free(r->timers);
     close(r->epoll_fd);
     free(r);
 }
@@ -137,11 +251,44 @@ void cloak_reactor_stop(cloak_reactor_t *r) {
     r->stopped = 1;
 }
 
+cloak_timer_id_t cloak_reactor_add_timer(cloak_reactor_t *r, uint64_t delay_ms,
+                                          cloak_reactor_timer_cb cb, void *userdata) {
+    if (cb == NULL) {
+        return CLOAK_TIMER_INVALID;
+    }
+    if (timer_heap_ensure_capacity(r) != 0) {
+        return CLOAK_TIMER_INVALID;
+    }
+    size_t idx = r->timer_count;
+    struct timer_entry *e = &r->timers[idx];
+    e->deadline_ms = now_ms() + delay_ms;
+    e->id = ++r->next_timer_id;
+    e->cb = cb;
+    e->userdata = userdata;
+    e->cancelled = 0;
+    r->timer_count++;
+    heap_sift_up(r, idx);
+    return e->id;
+}
+
+void cloak_reactor_cancel_timer(cloak_reactor_t *r, cloak_timer_id_t id) {
+    if (id == CLOAK_TIMER_INVALID) {
+        return;
+    }
+    for (size_t i = 0; i < r->timer_count; i++) {
+        if (r->timers[i].id == id) {
+            r->timers[i].cancelled = 1;
+            return;
+        }
+    }
+}
+
 void cloak_reactor_run(cloak_reactor_t *r) {
     struct epoll_event events[64];
 
     while (!r->stopped) {
-        int n = epoll_wait(r->epoll_fd, events, 64, -1);
+        int timeout_ms = compute_timeout_ms(r);
+        int n = epoll_wait(r->epoll_fd, events, 64, timeout_ms);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -165,6 +312,9 @@ void cloak_reactor_run(cloak_reactor_t *r) {
             if (fired != 0) {
                 w->cb(r, fd, fired, w->userdata);
             }
+        }
+        if (!r->stopped) {
+            process_expired_timers(r);
         }
     }
 }
