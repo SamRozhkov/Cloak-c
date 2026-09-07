@@ -2,6 +2,7 @@ find_package(OpenSSL REQUIRED)
 
 add_library(cloak-common STATIC
     src/version.c
+    src/random.c
 )
 
 target_include_directories(cloak-common PUBLIC include)
