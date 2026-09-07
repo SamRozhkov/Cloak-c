@@ -23,6 +23,31 @@ size_t cloak_aead_overhead(cloak_aead_method_t method) {
     return CLOAK_AEAD_TAG_LEN;
 }
 
+size_t cloak_aead_key_len(cloak_aead_method_t method) {
+    switch (method) {
+        case CLOAK_AEAD_AES_128_GCM:
+            return 16;
+        case CLOAK_AEAD_NONE:
+            return 0;
+        case CLOAK_AEAD_AES_256_GCM:
+        case CLOAK_AEAD_CHACHA20_POLY1305:
+        default:
+            return CLOAK_AEAD_KEY_LEN;
+    }
+}
+
+int cloak_aead_method_is_valid(cloak_aead_method_t method) {
+    switch (method) {
+        case CLOAK_AEAD_NONE:
+        case CLOAK_AEAD_AES_256_GCM:
+        case CLOAK_AEAD_CHACHA20_POLY1305:
+        case CLOAK_AEAD_AES_128_GCM:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 int cloak_aead_seal(cloak_aead_method_t method,
                      const uint8_t key[CLOAK_AEAD_KEY_LEN],
                      const uint8_t nonce[CLOAK_AEAD_NONCE_LEN],

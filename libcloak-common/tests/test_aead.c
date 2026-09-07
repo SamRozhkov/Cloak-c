@@ -128,6 +128,48 @@ static void test_unknown_method_fails(void) {
     ASSERT_EQ_INT(rc, -1);
 }
 
+static void test_key_len_matches_effective_key_size(void) {
+    ASSERT_EQ_INT(cloak_aead_key_len(CLOAK_AEAD_AES_128_GCM), 16);
+    ASSERT_EQ_INT(cloak_aead_key_len(CLOAK_AEAD_AES_256_GCM), CLOAK_AEAD_KEY_LEN);
+    ASSERT_EQ_INT(cloak_aead_key_len(CLOAK_AEAD_CHACHA20_POLY1305), CLOAK_AEAD_KEY_LEN);
+    ASSERT_EQ_INT(cloak_aead_key_len(CLOAK_AEAD_NONE), 0);
+}
+
+static void test_aes128gcm_ignores_key_bytes_16_31(void) {
+    uint8_t key_a[CLOAK_AEAD_KEY_LEN];
+    uint8_t key_b[CLOAK_AEAD_KEY_LEN];
+    uint8_t nonce[CLOAK_AEAD_NONCE_LEN];
+    cloak_random_bytes(key_a, sizeof(key_a));
+    cloak_random_bytes(nonce, sizeof(nonce));
+
+    memcpy(key_b, key_a, sizeof(key_a));
+    cloak_random_bytes(key_b + 16, 16); /* bytes 0-15 identical, 16-31 differ */
+
+    const uint8_t plaintext[] = "same first 16 key bytes, different tail";
+    uint8_t ciphertext_a[sizeof(plaintext) + CLOAK_AEAD_TAG_LEN];
+    uint8_t ciphertext_b[sizeof(plaintext) + CLOAK_AEAD_TAG_LEN];
+    size_t ciphertext_a_len = 0;
+    size_t ciphertext_b_len = 0;
+
+    int rc = cloak_aead_seal(CLOAK_AEAD_AES_128_GCM, key_a, nonce, plaintext, sizeof(plaintext),
+                              ciphertext_a, &ciphertext_a_len);
+    ASSERT_EQ_INT(rc, 0);
+    rc = cloak_aead_seal(CLOAK_AEAD_AES_128_GCM, key_b, nonce, plaintext, sizeof(plaintext),
+                          ciphertext_b, &ciphertext_b_len);
+    ASSERT_EQ_INT(rc, 0);
+
+    ASSERT_EQ_INT(ciphertext_a_len, ciphertext_b_len);
+    ASSERT_MEM_EQ(ciphertext_a, ciphertext_b, ciphertext_a_len);
+}
+
+static void test_method_is_valid(void) {
+    ASSERT_EQ_INT(cloak_aead_method_is_valid(CLOAK_AEAD_NONE), 1);
+    ASSERT_EQ_INT(cloak_aead_method_is_valid(CLOAK_AEAD_AES_256_GCM), 1);
+    ASSERT_EQ_INT(cloak_aead_method_is_valid(CLOAK_AEAD_CHACHA20_POLY1305), 1);
+    ASSERT_EQ_INT(cloak_aead_method_is_valid(CLOAK_AEAD_AES_128_GCM), 1);
+    ASSERT_EQ_INT(cloak_aead_method_is_valid((cloak_aead_method_t)99), 0);
+}
+
 TEST_MAIN_BEGIN()
     test_overhead();
     test_none_is_passthrough();
@@ -137,4 +179,7 @@ TEST_MAIN_BEGIN()
     test_aes128gcm_round_trip();
     test_chacha20poly1305_round_trip();
     test_unknown_method_fails();
+    test_key_len_matches_effective_key_size();
+    test_aes128gcm_ignores_key_bytes_16_31();
+    test_method_is_valid();
 TEST_MAIN_END()
