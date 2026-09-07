@@ -7,6 +7,10 @@ static const EVP_CIPHER *pick_cipher(cloak_aead_method_t method) {
     switch (method) {
         case CLOAK_AEAD_AES_256_GCM:
             return EVP_aes_256_gcm();
+        case CLOAK_AEAD_AES_128_GCM:
+            return EVP_aes_128_gcm();
+        case CLOAK_AEAD_CHACHA20_POLY1305:
+            return EVP_chacha20_poly1305();
         default:
             return NULL;
     }
