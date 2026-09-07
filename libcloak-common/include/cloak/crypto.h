@@ -36,4 +36,13 @@ int cloak_aead_open(cloak_aead_method_t method,
 
 size_t cloak_aead_overhead(cloak_aead_method_t method);
 
+#define CLOAK_SALSA20_KEY_LEN 32
+#define CLOAK_SALSA20_NONCE_LEN 8
+
+/* XORs len bytes of src with the Salsa20 keystream (starting at block
+ * counter 0) into dst. dst and src may alias (in-place XOR). */
+void cloak_salsa20_xor(uint8_t *dst, const uint8_t *src, size_t len,
+                        const uint8_t nonce[CLOAK_SALSA20_NONCE_LEN],
+                        const uint8_t key[CLOAK_SALSA20_KEY_LEN]);
+
 #endif

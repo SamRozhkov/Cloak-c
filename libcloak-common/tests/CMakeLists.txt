@@ -10,3 +10,7 @@ add_test(NAME test_random COMMAND test_random)
 add_executable(test_aead test_aead.c)
 target_link_libraries(test_aead PRIVATE cloak-common)
 add_test(NAME test_aead COMMAND test_aead)
+
+add_executable(test_salsa20 test_salsa20.c)
+target_link_libraries(test_salsa20 PRIVATE cloak-common)
+add_test(NAME test_salsa20 COMMAND test_salsa20)
