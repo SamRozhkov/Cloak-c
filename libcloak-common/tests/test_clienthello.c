@@ -3,6 +3,8 @@
 #include "test_framework.h"
 
 #include <string.h>
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
 
 /* Minimal from-scratch structural walk of a built ClientHello, independent
  * of clienthello.c's own logic, used only to verify structural integrity
@@ -91,6 +93,27 @@ static void fill_marker(uint8_t *buf, uint8_t seed) {
     for (int i = 0; i < 32; i++) {
         buf[i] = (uint8_t)(seed + i);
     }
+}
+
+static int is_valid_secp256r1_point(const uint8_t point[65]) {
+    int ok = 0;
+    EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    if (group == NULL) {
+        return 0;
+    }
+    EC_POINT *pt = EC_POINT_new(group);
+    if (pt == NULL) {
+        EC_GROUP_free(group);
+        return 0;
+    }
+    if (EC_POINT_oct2point(group, pt, point, 65, NULL) == 1) {
+        if (EC_POINT_is_on_curve(group, pt, NULL) == 1) {
+            ok = 1;
+        }
+    }
+    EC_POINT_free(pt);
+    EC_GROUP_free(group);
+    return ok;
 }
 
 static void test_build_chrome_round_trip_and_structural_integrity(void) {
@@ -272,8 +295,147 @@ static void test_safari_round_trip_and_structural_integrity(void) {
     round_trip_and_structural_integrity_for(&cloak_clienthello_safari);
 }
 
-static void test_safari_shorter_sni_shifts_keyshare(void) {
-    shorter_sni_shifts_keyshare_for(&cloak_clienthello_safari);
+/* NOTE: unlike Chrome and Firefox, Safari's padding extension is recomputed
+ * on every build (see test_safari_padding_recomputed_for_various_sni_lengths
+ * below), so shorter_sni_shifts_keyshare_for's exact-delta-length assertion
+ * (n == tmpl->len + expected_delta) does NOT hold for Safari: shrinking the
+ * SNI by 11 bytes ("a.co") grows the padding by 11 bytes to compensate, so
+ * the total length stays at 512 instead of shrinking. Deliberately not
+ * calling shorter_sni_shifts_keyshare_for(&cloak_clienthello_safari) here --
+ * Safari's shorter-SNI behavior is covered correctly by
+ * test_safari_padding_recomputed_for_various_sni_lengths instead. */
+
+static void test_chrome_random_regions_differ_between_builds(void) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    uint8_t out1[2048];
+    long n1 = cloak_clienthello_build(&cloak_clienthello_chrome, random, session_id, key_share,
+                                       "www.example.com", out1, sizeof(out1));
+    ASSERT_TRUE(n1 > 0);
+
+    uint8_t out2[2048];
+    long n2 = cloak_clienthello_build(&cloak_clienthello_chrome, random, session_id, key_share,
+                                       "www.example.com", out2, sizeof(out2));
+    ASSERT_TRUE(n2 > 0);
+    ASSERT_EQ_INT(n1, n2);
+
+    for (size_t i = 0; i < cloak_clienthello_chrome.random_region_count; i++) {
+        size_t off = cloak_clienthello_chrome.random_regions[i].off; /* SNI unchanged, delta=0, no shift needed */
+        size_t len = cloak_clienthello_chrome.random_regions[i].len;
+        ASSERT_MEM_NE(out1 + off, out2 + off, len);
+    }
+}
+
+static void test_firefox_random_regions_differ_between_builds(void) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    uint8_t out1[2048];
+    long n1 = cloak_clienthello_build(&cloak_clienthello_firefox, random, session_id, key_share,
+                                       "www.example.com", out1, sizeof(out1));
+    ASSERT_TRUE(n1 > 0);
+
+    uint8_t out2[2048];
+    long n2 = cloak_clienthello_build(&cloak_clienthello_firefox, random, session_id, key_share,
+                                       "www.example.com", out2, sizeof(out2));
+    ASSERT_TRUE(n2 > 0);
+    ASSERT_EQ_INT(n1, n2);
+
+    for (size_t i = 0; i < cloak_clienthello_firefox.random_region_count; i++) {
+        size_t off = cloak_clienthello_firefox.random_regions[i].off;
+        size_t len = cloak_clienthello_firefox.random_regions[i].len;
+        ASSERT_MEM_NE(out1 + off, out2 + off, len);
+    }
+}
+
+static void test_firefox_secp256r1_keyshare_is_valid_and_fresh(void) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    uint8_t out1[2048];
+    long n1 = cloak_clienthello_build(&cloak_clienthello_firefox, random, session_id, key_share,
+                                       "www.example.com", out1, sizeof(out1));
+    ASSERT_TRUE(n1 > 0);
+
+    uint8_t out2[2048];
+    long n2 = cloak_clienthello_build(&cloak_clienthello_firefox, random, session_id, key_share,
+                                       "www.example.com", out2, sizeof(out2));
+    ASSERT_TRUE(n2 > 0);
+    ASSERT_EQ_INT(n1, n2);
+
+    /* server_name unchanged (delta=0), so secp256r1_keyshare_off needs no shift. */
+    const uint8_t *point1 = out1 + cloak_clienthello_firefox.secp256r1_keyshare_off;
+    const uint8_t *point2 = out2 + cloak_clienthello_firefox.secp256r1_keyshare_off;
+
+    ASSERT_TRUE(is_valid_secp256r1_point(point1));
+    ASSERT_TRUE(is_valid_secp256r1_point(point2));
+    ASSERT_MEM_NE(point1, point2, 65);
+}
+
+static void test_safari_padding_recomputed_for_various_sni_lengths(void) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    /* {sni_len, expected_total_len, expect_padding_present, expected_pad_data_len} --
+     * independently verified against github.com/refraction-networking/utls
+     * v1.8.0's HelloSafari_Auto padding behavior across all SNI lengths
+     * 1..253 (these 5 are representative boundary/interior cases). */
+    struct {
+        int sni_len;
+        long expected_total;
+        int expect_padding;
+        int expected_pad_data_len;
+    } cases[5] = {
+        {1, 512, 1, 205},
+        {205, 512, 1, 1},
+        {206, 513, 1, 1},
+        {210, 512, 0, 0},
+        {253, 555, 0, 0},
+    };
+
+    for (size_t c = 0; c < 5; c++) {
+        char sni[254];
+        for (int i = 0; i < cases[c].sni_len; i++) {
+            sni[i] = (char)('a' + (i % 26));
+        }
+        sni[cases[c].sni_len] = '\0';
+
+        uint8_t out[2048];
+        long n = cloak_clienthello_build(&cloak_clienthello_safari, random, session_id, key_share,
+                                          sni, out, sizeof(out));
+        ASSERT_TRUE(n > 0);
+        ASSERT_EQ_INT(n, cases[c].expected_total);
+
+        walk_result_t w = walk_and_verify(out, (size_t)n);
+        ASSERT_TRUE(w.ok);
+        ASSERT_EQ_INT(w.sni_host_len, cases[c].sni_len);
+
+        if (cases[c].expect_padding) {
+            long shifted_padding_off = (long)cloak_clienthello_safari.padding_ext_off
+                + ((long)cases[c].sni_len - (long)cloak_clienthello_safari.sni_host_len);
+            uint16_t pad_type = (uint16_t)((out[shifted_padding_off] << 8) | out[shifted_padding_off + 1]);
+            uint16_t pad_len = (uint16_t)((out[shifted_padding_off + 2] << 8) | out[shifted_padding_off + 3]);
+            ASSERT_EQ_INT(pad_type, 0x0015);
+            ASSERT_EQ_INT(pad_len, cases[c].expected_pad_data_len);
+        }
+    }
 }
 
 TEST_MAIN_BEGIN()
@@ -286,5 +448,8 @@ TEST_MAIN_BEGIN()
     test_firefox_round_trip_and_structural_integrity();
     test_firefox_shorter_sni_shifts_keyshare();
     test_safari_round_trip_and_structural_integrity();
-    test_safari_shorter_sni_shifts_keyshare();
+    test_chrome_random_regions_differ_between_builds();
+    test_firefox_random_regions_differ_between_builds();
+    test_firefox_secp256r1_keyshare_is_valid_and_fresh();
+    test_safari_padding_recomputed_for_various_sni_lengths();
 TEST_MAIN_END()

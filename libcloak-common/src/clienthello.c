@@ -1,6 +1,8 @@
 #include "cloak/clienthello.h"
+#include "cloak/common.h"
 
 #include <string.h>
+#include <openssl/evp.h>
 
 /* Captured via github.com/refraction-networking/utls v1.8.0's
  * utls.HelloChrome_Auto -- see the plan's Provenance section for exactly
@@ -166,6 +168,15 @@ const cloak_clienthello_template_t cloak_clienthello_chrome = {
     .sni_host_length_off = 120,
     .sni_host_off = 122,
     .sni_host_len = 15,
+    .random_regions = {
+        { .off = 204, .len = 1216 },  /* X25519Kyber768Draft00 hybrid PQ share */
+        { .off = 1533, .len = 32 },   /* ECH enc (ephemeral HPKE public key) */
+        { .off = 1567, .len = 144 },  /* ECH payload (HPKE ciphertext) */
+    },
+    .random_region_count = 3,
+    .secp256r1_keyshare_off = 0,
+    .padding_ext_off = 0,
+    .padding_data_len = 0,
 };
 
 /* Captured via github.com/refraction-networking/utls v1.8.0's
@@ -241,6 +252,15 @@ const cloak_clienthello_template_t cloak_clienthello_firefox = {
     .sni_host_length_off = 118,
     .sni_host_off = 120,
     .sni_host_len = 15,
+    .random_regions = {
+        { .off = 385, .len = 32 },   /* ECH enc */
+        { .off = 419, .len = 239 },  /* ECH payload */
+        { .off = 0, .len = 0 },
+    },
+    .random_region_count = 2,
+    .secp256r1_keyshare_off = 259,
+    .padding_ext_off = 0,
+    .padding_data_len = 0,
 };
 
 /* Captured via github.com/refraction-networking/utls v1.8.0's
@@ -304,6 +324,15 @@ const cloak_clienthello_template_t cloak_clienthello_safari = {
     .sni_host_length_off = 130,
     .sni_host_off = 132,
     .sni_host_len = 15,
+    .random_regions = {
+        { .off = 0, .len = 0 },
+        { .off = 0, .len = 0 },
+        { .off = 0, .len = 0 },
+    },
+    .random_region_count = 0,
+    .secp256r1_keyshare_off = 0,
+    .padding_ext_off = 317,
+    .padding_data_len = 191,
 };
 
 static void patch_be16_delta(uint8_t *p, long delta) {
@@ -318,6 +347,59 @@ static void store_be16(uint8_t *p, uint16_t v) {
     p[1] = (uint8_t)v;
 }
 
+static void patch_be24_delta(uint8_t *p, long delta) {
+    long v = ((long)p[0] << 16) | ((long)p[1] << 8) | (long)p[2];
+    v += delta;
+    p[0] = (uint8_t)(v >> 16);
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)v;
+}
+
+/* Generates a fresh, genuinely on-curve uncompressed secp256r1 public key
+ * point (0x04 || X(32) || Y(32), 65 bytes) into out. Returns 0 on success,
+ * -1 on failure. Only the Firefox template uses this. */
+static int generate_secp256r1_point(uint8_t out[65]) {
+    int ok = -1;
+    EVP_PKEY_CTX *pctx = NULL;
+    EVP_PKEY *pkey = NULL;
+    unsigned char *pub = NULL;
+
+    pctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+    if (pctx == NULL) {
+        goto done;
+    }
+    if (EVP_PKEY_keygen_init(pctx) <= 0) {
+        goto done;
+    }
+    if (EVP_PKEY_CTX_set_group_name(pctx, "prime256v1") <= 0) {
+        goto done;
+    }
+    if (EVP_PKEY_keygen(pctx, &pkey) <= 0) {
+        goto done;
+    }
+
+    {
+        size_t pub_len = EVP_PKEY_get1_encoded_public_key(pkey, &pub);
+        if (pub_len != 65) {
+            goto done;
+        }
+        memcpy(out, pub, 65);
+    }
+    ok = 0;
+
+done:
+    if (pub != NULL) {
+        OPENSSL_free(pub);
+    }
+    if (pkey != NULL) {
+        EVP_PKEY_free(pkey);
+    }
+    if (pctx != NULL) {
+        EVP_PKEY_CTX_free(pctx);
+    }
+    return ok;
+}
+
 long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
                               const uint8_t random[32],
                               const uint8_t session_id[32],
@@ -329,44 +411,106 @@ long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
         return -1;
     }
 
-    long delta = (long)host_len - (long)tmpl->sni_host_len;
-    long new_len = (long)tmpl->len + delta;
-    if (new_len < 0 || out_cap < (size_t)new_len) {
+    long sni_delta = (long)host_len - (long)tmpl->sni_host_len;
+    long len_after_sni_shift = (long)tmpl->len + sni_delta;
+    if (len_after_sni_shift < 0) {
         return -1;
     }
 
-    /* Unchanged prefix: everything up to (not including) the old hostname. */
+    /* Precompute the padding adjustment (if this template has a dynamic
+     * padding extension) BEFORE touching out, so out_cap can be validated
+     * against the true final size upfront -- same fail-fast discipline as
+     * the rest of this function. */
+    long pad_delta = 0;
+    long new_pad_len = 0;
+    int has_padding = (tmpl->padding_ext_off != 0);
+    if (has_padding) {
+        long old_ext_total = 4 + (long)tmpl->padding_data_len;
+        long unpadded_len = len_after_sni_shift - old_ext_total;
+        if (unpadded_len < 512) {
+            long needed = 512 - unpadded_len - 4;
+            new_pad_len = needed > 1 ? needed : 1;
+        } else {
+            new_pad_len = 0;
+        }
+        long new_ext_total = (new_pad_len == 0) ? 0 : (4 + new_pad_len);
+        pad_delta = new_ext_total - old_ext_total;
+    }
+
+    long new_len = len_after_sni_shift + pad_delta;
+    /* out_cap must cover not just the final length, but the largest extent
+     * this function ever writes to. Phase 1 always writes len_after_sni_shift
+     * bytes (it copies the template's suffix -- including its old, not-yet-
+     * shrunk padding extension -- verbatim); when the padding extension then
+     * shrinks in phase 4 (pad_delta < 0), new_len ends up smaller than that.
+     * Checking out_cap against new_len alone would let phase 1 overrun a
+     * buffer sized exactly to new_len. */
+    long max_write_len = len_after_sni_shift > new_len ? len_after_sni_shift : new_len;
+    if (new_len < 0 || out_cap < (size_t)max_write_len) {
+        return -1;
+    }
+
+    /* Phase 1: SNI splice. */
     memcpy(out, tmpl->bytes, tmpl->sni_host_off);
-    /* The new hostname. */
     memcpy(out + tmpl->sni_host_off, server_name, host_len);
-    /* Unchanged suffix: everything after the old hostname, shifted by delta. */
     size_t old_suffix_off = tmpl->sni_host_off + tmpl->sni_host_len;
     size_t suffix_len = tmpl->len - old_suffix_off;
     memcpy(out + tmpl->sni_host_off + host_len, tmpl->bytes + old_suffix_off, suffix_len);
 
-    /* Patch the length fields the SNI change affects. All of these sit
-     * strictly before sni_host_off in every supported template, so their
-     * own byte positions are unaffected by the shift -- only the values
-     * they hold change. */
-    long hs_len = ((long)out[1] << 16) | ((long)out[2] << 8) | out[3];
-    hs_len += delta;
-    out[1] = (uint8_t)(hs_len >> 16);
-    out[2] = (uint8_t)(hs_len >> 8);
-    out[3] = (uint8_t)hs_len;
-
-    patch_be16_delta(out + tmpl->extensions_length_off, delta);
-    patch_be16_delta(out + tmpl->sni_ext_length_off, delta);
-    patch_be16_delta(out + tmpl->sni_list_length_off, delta);
+    patch_be24_delta(out + 1, sni_delta);
+    patch_be16_delta(out + tmpl->extensions_length_off, sni_delta);
+    patch_be16_delta(out + tmpl->sni_ext_length_off, sni_delta);
+    patch_be16_delta(out + tmpl->sni_list_length_off, sni_delta);
     store_be16(out + tmpl->sni_host_length_off, (uint16_t)host_len);
 
-    /* Splice in Cloak's own protocol data. random_off/session_id_off are
-     * always before sni_host_off (fixed ClientHello prefix layout shared
-     * by every template), so their positions are unaffected by the shift.
-     * keyshare_off is after sni_host_off in every supported template, so
-     * it must be adjusted by delta. */
     memcpy(out + tmpl->random_off, random, 32);
     memcpy(out + tmpl->session_id_off, session_id, 32);
-    memcpy(out + (size_t)((long)tmpl->keyshare_off + delta), x25519_key_share, 32);
+    memcpy(out + (size_t)((long)tmpl->keyshare_off + sni_delta), x25519_key_share, 32);
+
+    /* Phase 2: refill regions the real browser regenerates every
+     * handshake, which this static template would otherwise freeze
+     * identically across every connection. */
+    for (size_t i = 0; i < tmpl->random_region_count; i++) {
+        size_t region_off = tmpl->random_regions[i].off;
+        if (region_off > tmpl->sni_host_off) {
+            region_off = (size_t)((long)region_off + sni_delta);
+        }
+        cloak_random_bytes(out + region_off, tmpl->random_regions[i].len);
+    }
+
+    /* Phase 3: a genuine on-curve secp256r1 point where the template calls
+     * for one (Firefox) -- plain random bytes would not be a valid point. */
+    if (tmpl->secp256r1_keyshare_off != 0) {
+        size_t region_off = tmpl->secp256r1_keyshare_off;
+        if (region_off > tmpl->sni_host_off) {
+            region_off = (size_t)((long)region_off + sni_delta);
+        }
+        uint8_t point[65];
+        if (generate_secp256r1_point(point) != 0) {
+            return -1;
+        }
+        memcpy(out + region_off, point, sizeof(point));
+    }
+
+    /* Phase 4: recompute the padding extension (Safari) now that the SNI
+     * shift is fully applied. The padding extension is always the LAST
+     * extension in every template that has one (BoringSSL computes its
+     * size from everything else, so it must be written last) -- so
+     * resizing it never requires moving any other bytes, only writing (or
+     * omitting) it and re-patching the two length fields it affects. */
+    if (has_padding) {
+        size_t padding_off = tmpl->padding_ext_off;
+        if (padding_off > tmpl->sni_host_off) {
+            padding_off = (size_t)((long)padding_off + sni_delta);
+        }
+        patch_be24_delta(out + 1, pad_delta);
+        patch_be16_delta(out + tmpl->extensions_length_off, pad_delta);
+        if (new_pad_len > 0) {
+            store_be16(out + padding_off, 0x0015);
+            store_be16(out + padding_off + 2, (uint16_t)new_pad_len);
+            memset(out + padding_off + 4, 0, (size_t)new_pad_len);
+        }
+    }
 
     return new_len;
 }
