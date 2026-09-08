@@ -13,3 +13,4 @@ add_compile_options(-Wall -Wextra)
 enable_testing()
 
 add_subdirectory(libcloak-common)
+add_subdirectory(libcloak-mux)
