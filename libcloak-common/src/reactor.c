@@ -1,6 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
 #include "cloak/reactor.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
 #include <time.h>
@@ -11,6 +13,8 @@ struct watcher {
     uint32_t events;
     cloak_reactor_fd_cb cb;
     void *userdata;
+    int dead;
+    struct watcher *dead_next;
 };
 
 struct timer_entry {
@@ -25,6 +29,7 @@ struct cloak_reactor {
     int epoll_fd;
     struct watcher **watchers;
     size_t watchers_cap;
+    struct watcher *dead_list;
     int stopped;
 
     struct timer_entry *timers;
@@ -184,6 +189,11 @@ void cloak_reactor_destroy(cloak_reactor_t *r) {
         free(r->watchers[i]);
     }
     free(r->watchers);
+    while (r->dead_list != NULL) {
+        struct watcher *dead = r->dead_list;
+        r->dead_list = dead->dead_next;
+        free(dead);
+    }
     free(r->timers);
     close(r->epoll_fd);
     free(r);
@@ -192,6 +202,10 @@ void cloak_reactor_destroy(cloak_reactor_t *r) {
 int cloak_reactor_add_fd(cloak_reactor_t *r, int fd, uint32_t events,
                           cloak_reactor_fd_cb cb, void *userdata) {
     if (fd < 0 || cb == NULL) {
+        return -1;
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
         return -1;
     }
     if (ensure_capacity(r, fd) != 0) {
@@ -209,6 +223,8 @@ int cloak_reactor_add_fd(cloak_reactor_t *r, int fd, uint32_t events,
     w->events = events;
     w->cb = cb;
     w->userdata = userdata;
+    w->dead = 0;
+    w->dead_next = NULL;
 
     struct epoll_event ev;
     ev.events = to_epoll_events(events);
@@ -241,9 +257,12 @@ int cloak_reactor_remove_fd(cloak_reactor_t *r, int fd) {
     if (fd < 0 || (size_t)fd >= r->watchers_cap || r->watchers[fd] == NULL) {
         return -1;
     }
+    struct watcher *w = r->watchers[fd];
     epoll_ctl(r->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
-    free(r->watchers[fd]);
     r->watchers[fd] = NULL;
+    w->dead = 1;
+    w->dead_next = r->dead_list;
+    r->dead_list = w;
     return 0;
 }
 
@@ -286,6 +305,7 @@ void cloak_reactor_cancel_timer(cloak_reactor_t *r, cloak_timer_id_t id) {
 
 void cloak_reactor_run(cloak_reactor_t *r) {
     struct epoll_event events[64];
+    r->stopped = 0;
 
     while (!r->stopped) {
         int timeout_ms = compute_timeout_ms(r);
@@ -298,10 +318,13 @@ void cloak_reactor_run(cloak_reactor_t *r) {
         }
         for (int i = 0; i < n && !r->stopped; i++) {
             struct watcher *w = (struct watcher *)events[i].data.ptr;
-            int fd = w->fd;
-            if ((size_t)fd >= r->watchers_cap || r->watchers[fd] != w) {
-                continue; /* removed (or replaced) earlier in this same batch */
+            if (w->dead) {
+                continue; /* removed earlier in this same batch; the watcher's
+                           * memory is kept alive via deferred free below, so
+                           * this read is safe -- unlike checking watchers[fd]
+                           * against a pointer that may already be freed. */
             }
+            int fd = w->fd;
 
             uint32_t fired = 0;
             if (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
@@ -313,6 +336,11 @@ void cloak_reactor_run(cloak_reactor_t *r) {
             if (fired != 0) {
                 w->cb(r, fd, fired, w->userdata);
             }
+        }
+        while (r->dead_list != NULL) {
+            struct watcher *dead = r->dead_list;
+            r->dead_list = dead->dead_next;
+            free(dead);
         }
         if (!r->stopped) {
             process_expired_timers(r);

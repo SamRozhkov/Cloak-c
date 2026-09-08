@@ -1,6 +1,7 @@
 #include "cloak/reactor.h"
 #include "test_framework.h"
 
+#include <fcntl.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -167,6 +168,62 @@ static void test_remove_fd_stops_dispatch_in_same_batch(void) {
      * deterministic regardless of epoll's (unspecified) ready-list order. */
     ASSERT_EQ_INT(cloak_reactor_add_fd(r, fds_a[0], CLOAK_REACTOR_WRITABLE, on_either_removes_other, &ctx), 0);
     ASSERT_EQ_INT(cloak_reactor_add_fd(r, fds_b[0], CLOAK_REACTOR_WRITABLE, on_either_removes_other, &ctx), 0);
+
+    cloak_reactor_run(r);
+
+    ASSERT_EQ_INT(ctx.fire_count, 1);
+
+    cloak_reactor_destroy(r);
+    close(fds_a[0]);
+    close(fds_a[1]);
+    close(fds_b[0]);
+    close(fds_b[1]);
+}
+
+struct remove_no_stop_ctx {
+    int fire_count;
+    int fds[2];
+};
+
+static void on_either_removes_other_no_stop(cloak_reactor_t *r, int fd, uint32_t events, void *userdata) {
+    (void)events;
+    struct remove_no_stop_ctx *ctx = (struct remove_no_stop_ctx *)userdata;
+    ctx->fire_count++;
+    int other = (fd == ctx->fds[0]) ? ctx->fds[1] : ctx->fds[0];
+    cloak_reactor_remove_fd(r, other);
+    /* Deliberately do NOT call cloak_reactor_stop() here, unlike
+     * test_remove_fd_stops_dispatch_in_same_batch. Letting the for-loop
+     * actually continue past this point is what exercises the
+     * tombstone/deferred-free guard against the OTHER fd's stale entry
+     * later in the SAME already-fetched events[] array -- a test that
+     * stops immediately never reaches that code path. */
+}
+
+static void on_order_stop_timeout(cloak_reactor_t *r, void *userdata) {
+    (void)userdata;
+    cloak_reactor_stop(r);
+}
+
+static void test_remove_fd_without_stop_does_not_dispatch_survivor(void) {
+    int fds_a[2];
+    int fds_b[2];
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_a) == 0);
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds_b) == 0);
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    struct remove_no_stop_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fds[0] = fds_a[0];
+    ctx.fds[1] = fds_b[0];
+
+    ASSERT_EQ_INT(cloak_reactor_add_fd(r, fds_a[0], CLOAK_REACTOR_WRITABLE, on_either_removes_other_no_stop, &ctx), 0);
+    ASSERT_EQ_INT(cloak_reactor_add_fd(r, fds_b[0], CLOAK_REACTOR_WRITABLE, on_either_removes_other_no_stop, &ctx), 0);
+
+    /* Nothing calls stop() directly in this test, so bound the loop with a
+     * short timer (the reactor already supports timers from Task 2). */
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 30, on_order_stop_timeout, NULL) != CLOAK_TIMER_INVALID);
 
     cloak_reactor_run(r);
 
@@ -356,15 +413,89 @@ static void test_process_expired_timers_stops_dispatch_in_same_batch(void) {
     cloak_reactor_destroy(r);
 }
 
+struct restart_ctx {
+    int first_fired;
+    int second_fired;
+};
+
+static void on_restart_first(cloak_reactor_t *r, void *userdata) {
+    struct restart_ctx *ctx = (struct restart_ctx *)userdata;
+    ctx->first_fired = 1;
+    cloak_reactor_stop(r);
+}
+
+static void on_restart_second(cloak_reactor_t *r, void *userdata) {
+    struct restart_ctx *ctx = (struct restart_ctx *)userdata;
+    ctx->second_fired = 1;
+    cloak_reactor_stop(r);
+}
+
+static void test_run_can_be_called_again_after_stop(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    struct restart_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 10, on_restart_first, &ctx) != CLOAK_TIMER_INVALID);
+    cloak_reactor_run(r);
+    ASSERT_TRUE(ctx.first_fired);
+
+    /* If stopped were stuck at 1 from the first run(), this second call
+     * would return immediately without ever dispatching the new timer. */
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 10, on_restart_second, &ctx) != CLOAK_TIMER_INVALID);
+    cloak_reactor_run(r);
+    ASSERT_TRUE(ctx.second_fired);
+
+    cloak_reactor_destroy(r);
+}
+
+static void test_add_fd_forces_nonblocking(void) {
+    int fds[2];
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    ASSERT_EQ_INT(cloak_reactor_add_fd(r, fds[0], CLOAK_REACTOR_READABLE, on_writable_stop, NULL), 0);
+
+    int flags = fcntl(fds[0], F_GETFL, 0);
+    ASSERT_TRUE(flags >= 0);
+    ASSERT_TRUE((flags & O_NONBLOCK) != 0);
+
+    cloak_reactor_destroy(r);
+    close(fds[0]);
+    close(fds[1]);
+}
+
+static void test_add_fd_rejects_invalid_arguments(void) {
+    int fds[2];
+    ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    ASSERT_EQ_INT(cloak_reactor_add_fd(r, -1, CLOAK_REACTOR_READABLE, on_writable_stop, NULL), -1);
+    ASSERT_EQ_INT(cloak_reactor_add_fd(r, fds[0], CLOAK_REACTOR_READABLE, NULL, NULL), -1);
+
+    cloak_reactor_destroy(r);
+    close(fds[0]);
+    close(fds[1]);
+}
+
 TEST_MAIN_BEGIN()
     test_add_and_dispatch_readable();
     test_dispatch_writable();
     test_add_fd_rejects_duplicate();
     test_mod_fd_changes_interest();
     test_remove_fd_stops_dispatch_in_same_batch();
+    test_remove_fd_without_stop_does_not_dispatch_survivor();
     test_timer_fires_after_delay();
     test_cancel_timer_prevents_firing();
     test_multiple_timers_fire_in_order();
     test_add_timer_returns_correct_id_after_sift_up();
     test_process_expired_timers_stops_dispatch_in_same_batch();
+    test_run_can_be_called_again_after_stop();
+    test_add_fd_forces_nonblocking();
+    test_add_fd_rejects_invalid_arguments();
 TEST_MAIN_END()
