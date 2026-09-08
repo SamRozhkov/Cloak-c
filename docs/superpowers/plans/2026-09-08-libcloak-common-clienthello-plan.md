@@ -262,7 +262,7 @@ static void test_build_chrome_round_trip_and_structural_integrity(void) {
     walk_result_t w = walk_and_verify(out, (size_t)n);
     ASSERT_TRUE(w.ok);
     ASSERT_EQ_INT(w.sni_host_off, cloak_clienthello_chrome.sni_host_off);
-    ASSERT_EQ_INT(w.sni_host_len, 16); /* strlen("www.example.com") */
+    ASSERT_EQ_INT(w.sni_host_len, 15); /* strlen("www.example.com") */
 }
 
 static void test_build_shorter_sni_shrinks_and_shifts_keyshare(void) {
@@ -303,8 +303,8 @@ static void test_build_longer_sni_grows_and_shifts_keyshare(void) {
     fill_marker(session_id, 0x30);
     fill_marker(key_share, 0x50);
 
-    const char *long_name = "a-considerably-longer-hostname.example.com"; /* 43 bytes */
-    long expected_delta = (long)43 - (long)cloak_clienthello_chrome.sni_host_len;
+    const char *long_name = "a-considerably-longer-hostname.example.com"; /* 42 bytes */
+    long expected_delta = (long)42 - (long)cloak_clienthello_chrome.sni_host_len;
 
     uint8_t out[2048];
     long n = cloak_clienthello_build(&cloak_clienthello_chrome, random, session_id, key_share,
@@ -317,8 +317,8 @@ static void test_build_longer_sni_grows_and_shifts_keyshare(void) {
 
     walk_result_t w = walk_and_verify(out, (size_t)n);
     ASSERT_TRUE(w.ok);
-    ASSERT_EQ_INT(w.sni_host_len, 43);
-    ASSERT_MEM_EQ(out + w.sni_host_off, long_name, 43);
+    ASSERT_EQ_INT(w.sni_host_len, 42);
+    ASSERT_MEM_EQ(out + w.sni_host_off, long_name, 42);
 }
 
 static void test_build_rejects_empty_server_name(void) {
@@ -691,7 +691,7 @@ static void round_trip_and_structural_integrity_for(const cloak_clienthello_temp
     walk_result_t w = walk_and_verify(out, (size_t)n);
     ASSERT_TRUE(w.ok);
     ASSERT_EQ_INT(w.sni_host_off, tmpl->sni_host_off);
-    ASSERT_EQ_INT(w.sni_host_len, 16); /* strlen("www.example.com") */
+    ASSERT_EQ_INT(w.sni_host_len, 15); /* strlen("www.example.com") */
 }
 
 static void shorter_sni_shifts_keyshare_for(const cloak_clienthello_template_t *tmpl) {
