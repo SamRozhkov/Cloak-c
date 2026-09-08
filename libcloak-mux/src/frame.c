@@ -51,6 +51,9 @@ long cloak_frame_obfuscate(const cloak_obfuscator_t *o, const cloak_frame_t *fra
     if (frame->payload_len == 0) {
         return -1;
     }
+    if (frame->payload_len > buf_cap) {
+        return -1;
+    }
 
     size_t tag_len = tag_len_for_method(o->method);
 
@@ -84,6 +87,7 @@ long cloak_frame_obfuscate(const cloak_obfuscator_t *o, const cloak_frame_t *fra
         memcpy(nonce, buf, CLOAK_AEAD_NONCE_LEN); /* plaintext stream_id+seq, before header encryption */
         size_t sealed_len = 0;
         int rc = cloak_aead_seal(o->method, o->session_key, nonce,
+                                  buf + 12, 2,
                                   payload_region, frame->payload_len + pad_len,
                                   payload_region, &sealed_len);
         if (rc != 0) {
@@ -114,6 +118,10 @@ int cloak_frame_deobfuscate(const cloak_obfuscator_t *o, cloak_frame_t *out_fram
     uint8_t *pld_with_overhead = buf + CLOAK_FRAME_HEADER_LEN;
     size_t pld_with_overhead_len = buf_len - CLOAK_FRAME_HEADER_LEN;
 
+    size_t min_extra_len = tag_len_for_method(o->method);
+    if ((size_t)extra_len < min_extra_len) {
+        return -1;
+    }
     if ((size_t)extra_len > pld_with_overhead_len) {
         return -1;
     }
@@ -124,6 +132,7 @@ int cloak_frame_deobfuscate(const cloak_obfuscator_t *o, cloak_frame_t *out_fram
         memcpy(nonce, buf, CLOAK_AEAD_NONCE_LEN); /* now-decrypted plaintext stream_id+seq */
         size_t opened_len = 0;
         int rc = cloak_aead_open(o->method, o->session_key, nonce,
+                                  buf + 12, 2,
                                   pld_with_overhead, pld_with_overhead_len,
                                   pld_with_overhead, &opened_len);
         if (rc != 0) {

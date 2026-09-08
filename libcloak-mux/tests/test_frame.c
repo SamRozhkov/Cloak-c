@@ -282,6 +282,84 @@ static void test_wrong_key_rejected(void) {
     ASSERT_EQ_INT(rc, -1);
 }
 
+static void test_closing_byte_tamper_detected_with_aead(void) {
+    cloak_obfuscator_t o;
+    o.method = CLOAK_AEAD_AES_256_GCM;
+    cloak_random_bytes(o.session_key, sizeof(o.session_key));
+
+    const uint8_t payload[] = "authenticated header test";
+    cloak_frame_t frame;
+    frame.stream_id = 1;
+    frame.seq = 1000;
+    frame.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[256];
+    long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+    ASSERT_TRUE(n > 0);
+
+    /* Flip the closing byte in the wire-format header (Salsa20-obfuscated,
+     * so this simulates an on-path attacker who does NOT know the session
+     * key -- Salsa20-XOR is malleable, no key needed to flip a bit). Before
+     * this fix, this byte was unauthenticated and deobfuscate would
+     * "successfully" report a corrupted closing value; after this fix, it
+     * must be caught as an authentication failure since closing/extra_len
+     * are now part of the AEAD-authenticated additional data. */
+    buf[12] ^= 0x02;
+
+    cloak_frame_t out;
+    int rc = cloak_frame_deobfuscate(&o, &out, buf, (size_t)n);
+    ASSERT_EQ_INT(rc, -1);
+}
+
+static void test_obfuscate_rejects_payload_larger_than_buf_cap(void) {
+    cloak_obfuscator_t o;
+    o.method = CLOAK_AEAD_NONE;
+    cloak_random_bytes(o.session_key, sizeof(o.session_key));
+
+    uint8_t payload[1000] = {0};
+    cloak_frame_t frame;
+    frame.stream_id = 1;
+    frame.seq = 100;
+    frame.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[10]; /* far smaller than payload_len -- must be rejected immediately */
+    long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+    ASSERT_EQ_INT(n, -1);
+}
+
+static void test_deobfuscate_rejects_extra_len_below_minimum(void) {
+    cloak_obfuscator_t o;
+    make_plain_obfuscator(&o);
+
+    const uint8_t payload[] = "short";
+    cloak_frame_t frame;
+    frame.stream_id = 1;
+    frame.seq = 100;
+    frame.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[128];
+    long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+    ASSERT_TRUE(n > 0);
+
+    /* Corrupt extra_len to a value below CLOAK_SALSA20_NONCE_LEN (8) -- the
+     * minimum for plain mode -- using the same decrypt/corrupt/re-encrypt
+     * technique as test_deobfuscate_rejects_corrupt_extra_len. */
+    const uint8_t *header_nonce = buf + n - CLOAK_SALSA20_NONCE_LEN;
+    cloak_salsa20_xor(buf, buf, CLOAK_FRAME_HEADER_LEN, header_nonce, o.session_key);
+    buf[13] = 3; /* below the minimum of 8 for plain mode */
+    cloak_salsa20_xor(buf, buf, CLOAK_FRAME_HEADER_LEN, header_nonce, o.session_key);
+
+    cloak_frame_t out;
+    int rc = cloak_frame_deobfuscate(&o, &out, buf, (size_t)n);
+    ASSERT_EQ_INT(rc, -1);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_plain();
     test_padding_varies_for_first_n_frames_only();
@@ -295,4 +373,7 @@ TEST_MAIN_BEGIN()
     test_chacha20poly1305_round_trip();
     test_tamper_detected_after_obfuscate();
     test_wrong_key_rejected();
+    test_closing_byte_tamper_detected_with_aead();
+    test_obfuscate_rejects_payload_larger_than_buf_cap();
+    test_deobfuscate_rejects_extra_len_below_minimum();
 TEST_MAIN_END()

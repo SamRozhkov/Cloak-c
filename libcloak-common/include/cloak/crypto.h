@@ -24,10 +24,16 @@ typedef enum {
  *
  * On success returns 0 and writes plaintext_len + cloak_aead_overhead(method)
  * bytes to out, setting *out_len. Returns -1 on an unknown method or an
- * OpenSSL-level failure. */
+ * OpenSSL-level failure.
+ *
+ * aad (additional authenticated data) is authenticated but not encrypted --
+ * it is not written to out and is not part of the returned length. Pass
+ * aad_len == 0 (aad may then be NULL) if there is no associated data. aad
+ * is ignored entirely for CLOAK_AEAD_NONE, which authenticates nothing. */
 int cloak_aead_seal(cloak_aead_method_t method,
                      const uint8_t key[CLOAK_AEAD_KEY_LEN],
                      const uint8_t nonce[CLOAK_AEAD_NONCE_LEN],
+                     const uint8_t *aad, size_t aad_len,
                      const uint8_t *plaintext, size_t plaintext_len,
                      uint8_t *out, size_t *out_len);
 
@@ -41,10 +47,16 @@ int cloak_aead_seal(cloak_aead_method_t method,
  * in is ciphertext||tag for non-NONE methods (in_len includes the tag).
  * On success returns 0 and writes in_len - cloak_aead_overhead(method) bytes
  * to out, setting *out_len. Returns -1 on authentication failure, an unknown
- * method, or in_len too short to contain a tag. */
+ * method, or in_len too short to contain a tag.
+ *
+ * aad must be the exact same bytes (and length) passed to the seal call
+ * that produced in, or authentication fails. Pass aad_len == 0 (aad may
+ * then be NULL) if none was used. aad is ignored entirely for
+ * CLOAK_AEAD_NONE. */
 int cloak_aead_open(cloak_aead_method_t method,
                      const uint8_t key[CLOAK_AEAD_KEY_LEN],
                      const uint8_t nonce[CLOAK_AEAD_NONCE_LEN],
+                     const uint8_t *aad, size_t aad_len,
                      const uint8_t *in, size_t in_len,
                      uint8_t *out, size_t *out_len);
 

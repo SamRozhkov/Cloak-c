@@ -51,6 +51,7 @@ int cloak_aead_method_is_valid(cloak_aead_method_t method) {
 int cloak_aead_seal(cloak_aead_method_t method,
                      const uint8_t key[CLOAK_AEAD_KEY_LEN],
                      const uint8_t nonce[CLOAK_AEAD_NONCE_LEN],
+                     const uint8_t *aad, size_t aad_len,
                      const uint8_t *plaintext, size_t plaintext_len,
                      uint8_t *out, size_t *out_len) {
     if (method == CLOAK_AEAD_NONE) {
@@ -78,6 +79,10 @@ int cloak_aead_seal(cloak_aead_method_t method,
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, CLOAK_AEAD_NONCE_LEN, NULL) != 1) goto done;
     if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto done;
 
+    if (aad_len > 0) {
+        if (EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) goto done;
+    }
+
     if (plaintext_len > 0) {
         if (EVP_EncryptUpdate(ctx, out, &len, plaintext, (int)plaintext_len) != 1) goto done;
         ciphertext_len = len;
@@ -99,6 +104,7 @@ done:
 int cloak_aead_open(cloak_aead_method_t method,
                      const uint8_t key[CLOAK_AEAD_KEY_LEN],
                      const uint8_t nonce[CLOAK_AEAD_NONCE_LEN],
+                     const uint8_t *aad, size_t aad_len,
                      const uint8_t *in, size_t in_len,
                      uint8_t *out, size_t *out_len) {
     if (method == CLOAK_AEAD_NONE) {
@@ -129,6 +135,10 @@ int cloak_aead_open(cloak_aead_method_t method,
     if (EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1) goto done;
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, CLOAK_AEAD_NONCE_LEN, NULL) != 1) goto done;
     if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto done;
+
+    if (aad_len > 0) {
+        if (EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) goto done;
+    }
 
     if (ciphertext_len > 0) {
         if (EVP_DecryptUpdate(ctx, out, &len, in, (int)ciphertext_len) != 1) goto done;
