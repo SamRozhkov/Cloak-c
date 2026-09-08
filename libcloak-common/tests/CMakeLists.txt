@@ -22,3 +22,7 @@ add_test(NAME test_x25519 COMMAND test_x25519)
 add_executable(test_reactor test_reactor.c)
 target_link_libraries(test_reactor PRIVATE cloak-common)
 add_test(NAME test_reactor COMMAND test_reactor)
+
+add_executable(test_clienthello test_clienthello.c)
+target_link_libraries(test_clienthello PRIVATE cloak-common)
+add_test(NAME test_clienthello COMMAND test_clienthello)

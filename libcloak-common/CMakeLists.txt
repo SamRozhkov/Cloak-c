@@ -7,6 +7,7 @@ add_library(cloak-common STATIC
     src/salsa20.c
     src/x25519.c
     src/reactor.c
+    src/clienthello.c
 )
 
 target_include_directories(cloak-common PUBLIC include)
