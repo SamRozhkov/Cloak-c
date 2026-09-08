@@ -1,3 +1,5 @@
 .worktrees/
 build/
+build-*/
+build2/
 .DS_Store
