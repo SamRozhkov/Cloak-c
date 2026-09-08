@@ -190,6 +190,98 @@ static void test_deobfuscate_rejects_corrupt_extra_len(void) {
     ASSERT_EQ_INT(rc, -1);
 }
 
+static void round_trip_for_method(cloak_aead_method_t method) {
+    cloak_obfuscator_t o;
+    o.method = method;
+    cloak_random_bytes(o.session_key, sizeof(o.session_key));
+
+    const uint8_t payload[] = "round trip across every AEAD method the frame codec supports";
+    cloak_frame_t frame;
+    frame.stream_id = 42;
+    frame.seq = 1000; /* no padding, deterministic layout */
+    frame.closing = CLOAK_FRAME_CLOSING_STREAM;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[256];
+    long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ_INT(n, CLOAK_FRAME_HEADER_LEN + (long)frame.payload_len + CLOAK_AEAD_TAG_LEN);
+
+    cloak_frame_t out;
+    int rc = cloak_frame_deobfuscate(&o, &out, buf, (size_t)n);
+    ASSERT_EQ_INT(rc, 0);
+    ASSERT_EQ_INT(out.stream_id, frame.stream_id);
+    ASSERT_EQ_INT(out.seq, frame.seq);
+    ASSERT_EQ_INT(out.closing, frame.closing);
+    ASSERT_EQ_INT(out.payload_len, frame.payload_len);
+    ASSERT_MEM_EQ(out.payload, payload, frame.payload_len);
+}
+
+static void test_aes256gcm_round_trip(void) {
+    round_trip_for_method(CLOAK_AEAD_AES_256_GCM);
+}
+
+static void test_aes128gcm_round_trip(void) {
+    round_trip_for_method(CLOAK_AEAD_AES_128_GCM);
+}
+
+static void test_chacha20poly1305_round_trip(void) {
+    round_trip_for_method(CLOAK_AEAD_CHACHA20_POLY1305);
+}
+
+static void test_tamper_detected_after_obfuscate(void) {
+    cloak_obfuscator_t o;
+    o.method = CLOAK_AEAD_AES_256_GCM;
+    cloak_random_bytes(o.session_key, sizeof(o.session_key));
+
+    const uint8_t payload[] = "tamper with me if you can";
+    cloak_frame_t frame;
+    frame.stream_id = 1;
+    frame.seq = 1000;
+    frame.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[256];
+    long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+    ASSERT_TRUE(n > 0);
+
+    /* Flip a bit inside the encrypted payload region (well after the
+     * header, well before the very end) -- must break AEAD authentication. */
+    buf[CLOAK_FRAME_HEADER_LEN] ^= 0x01;
+
+    cloak_frame_t out;
+    int rc = cloak_frame_deobfuscate(&o, &out, buf, (size_t)n);
+    ASSERT_EQ_INT(rc, -1);
+}
+
+static void test_wrong_key_rejected(void) {
+    cloak_obfuscator_t sender;
+    sender.method = CLOAK_AEAD_CHACHA20_POLY1305;
+    cloak_random_bytes(sender.session_key, sizeof(sender.session_key));
+
+    cloak_obfuscator_t wrong_receiver;
+    wrong_receiver.method = CLOAK_AEAD_CHACHA20_POLY1305;
+    cloak_random_bytes(wrong_receiver.session_key, sizeof(wrong_receiver.session_key));
+
+    const uint8_t payload[] = "secret";
+    cloak_frame_t frame;
+    frame.stream_id = 1;
+    frame.seq = 1000;
+    frame.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[256];
+    long n = cloak_frame_obfuscate(&sender, &frame, buf, sizeof(buf), 0);
+    ASSERT_TRUE(n > 0);
+
+    cloak_frame_t out;
+    int rc = cloak_frame_deobfuscate(&wrong_receiver, &out, buf, (size_t)n);
+    ASSERT_EQ_INT(rc, -1);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_plain();
     test_padding_varies_for_first_n_frames_only();
@@ -198,4 +290,9 @@ TEST_MAIN_BEGIN()
     test_obfuscate_rejects_buffer_too_small();
     test_deobfuscate_rejects_short_buffer();
     test_deobfuscate_rejects_corrupt_extra_len();
+    test_aes256gcm_round_trip();
+    test_aes128gcm_round_trip();
+    test_chacha20poly1305_round_trip();
+    test_tamper_detected_after_obfuscate();
+    test_wrong_key_rejected();
 TEST_MAIN_END()
