@@ -26,6 +26,8 @@ typedef struct {
 } cloak_clienthello_template_t;
 
 extern const cloak_clienthello_template_t cloak_clienthello_chrome;
+extern const cloak_clienthello_template_t cloak_clienthello_firefox;
+extern const cloak_clienthello_template_t cloak_clienthello_safari;
 
 /* Builds a ClientHello handshake message (no TLS record layer) from tmpl:
  * splices random/session_id/x25519_key_share (each exactly 32 bytes) into

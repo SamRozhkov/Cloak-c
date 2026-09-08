@@ -211,6 +211,71 @@ static void test_build_rejects_buffer_too_small(void) {
     ASSERT_EQ_INT(n, -1);
 }
 
+static void round_trip_and_structural_integrity_for(const cloak_clienthello_template_t *tmpl) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    uint8_t out[2048];
+    long n = cloak_clienthello_build(tmpl, random, session_id, key_share,
+                                      "www.example.com", out, sizeof(out));
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ_INT(n, (long)tmpl->len);
+
+    ASSERT_MEM_EQ(out + tmpl->random_off, random, 32);
+    ASSERT_MEM_EQ(out + tmpl->session_id_off, session_id, 32);
+    ASSERT_MEM_EQ(out + tmpl->keyshare_off, key_share, 32);
+
+    walk_result_t w = walk_and_verify(out, (size_t)n);
+    ASSERT_TRUE(w.ok);
+    ASSERT_EQ_INT(w.sni_host_off, tmpl->sni_host_off);
+    ASSERT_EQ_INT(w.sni_host_len, 15); /* strlen("www.example.com") */
+}
+
+static void shorter_sni_shifts_keyshare_for(const cloak_clienthello_template_t *tmpl) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    const char *short_name = "a.co";
+    long expected_delta = (long)4 - (long)tmpl->sni_host_len;
+
+    uint8_t out[2048];
+    long n = cloak_clienthello_build(tmpl, random, session_id, key_share,
+                                      short_name, out, sizeof(out));
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ_INT(n, (long)tmpl->len + expected_delta);
+
+    long shifted_keyshare_off = (long)tmpl->keyshare_off + expected_delta;
+    ASSERT_MEM_EQ(out + shifted_keyshare_off, key_share, 32);
+
+    walk_result_t w = walk_and_verify(out, (size_t)n);
+    ASSERT_TRUE(w.ok);
+    ASSERT_EQ_INT(w.sni_host_len, 4);
+}
+
+static void test_firefox_round_trip_and_structural_integrity(void) {
+    round_trip_and_structural_integrity_for(&cloak_clienthello_firefox);
+}
+
+static void test_firefox_shorter_sni_shifts_keyshare(void) {
+    shorter_sni_shifts_keyshare_for(&cloak_clienthello_firefox);
+}
+
+static void test_safari_round_trip_and_structural_integrity(void) {
+    round_trip_and_structural_integrity_for(&cloak_clienthello_safari);
+}
+
+static void test_safari_shorter_sni_shifts_keyshare(void) {
+    shorter_sni_shifts_keyshare_for(&cloak_clienthello_safari);
+}
+
 TEST_MAIN_BEGIN()
     test_build_chrome_round_trip_and_structural_integrity();
     test_build_shorter_sni_shrinks_and_shifts_keyshare();
@@ -218,4 +283,8 @@ TEST_MAIN_BEGIN()
     test_build_rejects_empty_server_name();
     test_build_rejects_server_name_too_long();
     test_build_rejects_buffer_too_small();
+    test_firefox_round_trip_and_structural_integrity();
+    test_firefox_shorter_sni_shifts_keyshare();
+    test_safari_round_trip_and_structural_integrity();
+    test_safari_shorter_sni_shifts_keyshare();
 TEST_MAIN_END()
