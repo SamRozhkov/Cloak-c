@@ -179,8 +179,6 @@ static void test_remove_fd_stops_dispatch_in_same_batch(void) {
     close(fds_b[1]);
 }
 
-#include <time.h>
-
 static uint64_t test_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -300,6 +298,64 @@ static void test_multiple_timers_fire_in_order(void) {
     cloak_reactor_destroy(r);
 }
 
+static void test_add_timer_returns_correct_id_after_sift_up(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    struct cancel_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    /* A long-delay timer first, so it starts at the heap root... */
+    cloak_timer_id_t id_a = cloak_reactor_add_timer(r, 100000, on_should_not_fire, &ctx);
+    /* ...then a short-delay timer, whose insertion must sift up PAST timer A. */
+    cloak_timer_id_t id_b = cloak_reactor_add_timer(r, 1, on_should_not_fire, &ctx);
+
+    ASSERT_TRUE(id_a != CLOAK_TIMER_INVALID);
+    ASSERT_TRUE(id_b != CLOAK_TIMER_INVALID);
+    ASSERT_TRUE(id_a != id_b);
+    ASSERT_EQ_INT(id_a, 1);
+    ASSERT_EQ_INT(id_b, 2);
+
+    /* Cancelling B by its returned id must not silently cancel A instead. */
+    cloak_reactor_cancel_timer(r, id_b);
+
+    cloak_reactor_destroy(r);
+}
+
+struct timer_stop_ctx {
+    int fire_count;
+};
+
+static void on_timer_stop_and_count(cloak_reactor_t *r, void *userdata) {
+    struct timer_stop_ctx *ctx = (struct timer_stop_ctx *)userdata;
+    ctx->fire_count++;
+    cloak_reactor_stop(r);
+}
+
+static void test_process_expired_timers_stops_dispatch_in_same_batch(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    struct timer_stop_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    /* Both timers share the same short delay, so both are already expired
+     * by the time process_expired_timers runs. Whichever fires first calls
+     * cloak_reactor_stop(); if the timer-dispatch loop didn't honor
+     * r->stopped mid-batch, the second (already-expired) timer would also
+     * fire before run() returns, making fire_count 2 instead of 1 -- this
+     * doesn't depend on which of the two fires first, so it's deterministic
+     * regardless of heap tie-break order. */
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 5, on_timer_stop_and_count, &ctx) != CLOAK_TIMER_INVALID);
+    ASSERT_TRUE(cloak_reactor_add_timer(r, 5, on_timer_stop_and_count, &ctx) != CLOAK_TIMER_INVALID);
+
+    cloak_reactor_run(r);
+
+    ASSERT_EQ_INT(ctx.fire_count, 1);
+
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_add_and_dispatch_readable();
     test_dispatch_writable();
@@ -309,4 +365,6 @@ TEST_MAIN_BEGIN()
     test_timer_fires_after_delay();
     test_cancel_timer_prevents_firing();
     test_multiple_timers_fire_in_order();
+    test_add_timer_returns_correct_id_after_sift_up();
+    test_process_expired_timers_stops_dispatch_in_same_batch();
 TEST_MAIN_END()

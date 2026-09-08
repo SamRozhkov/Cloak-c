@@ -132,7 +132,7 @@ static void heap_pop(cloak_reactor_t *r) {
  * discarding cancelled ones encountered along the way. */
 static void process_expired_timers(cloak_reactor_t *r) {
     uint64_t now = now_ms();
-    while (r->timer_count > 0) {
+    while (r->timer_count > 0 && !r->stopped) {
         struct timer_entry top = r->timers[0];
         if (top.cancelled) {
             heap_pop(r);
@@ -262,13 +262,14 @@ cloak_timer_id_t cloak_reactor_add_timer(cloak_reactor_t *r, uint64_t delay_ms,
     size_t idx = r->timer_count;
     struct timer_entry *e = &r->timers[idx];
     e->deadline_ms = now_ms() + delay_ms;
-    e->id = ++r->next_timer_id;
+    cloak_timer_id_t new_id = ++r->next_timer_id;
+    e->id = new_id;
     e->cb = cb;
     e->userdata = userdata;
     e->cancelled = 0;
     r->timer_count++;
     heap_sift_up(r, idx);
-    return e->id;
+    return new_id;
 }
 
 void cloak_reactor_cancel_timer(cloak_reactor_t *r, cloak_timer_id_t id) {
