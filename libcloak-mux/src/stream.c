@@ -6,6 +6,9 @@
 
 static int heap_grow(cloak_stream_t *s) {
     size_t new_cap = s->heap_cap == 0 ? 8 : s->heap_cap * 2;
+    if (new_cap > s->max_pending_frames) {
+        new_cap = s->max_pending_frames;
+    }
     cloak_pending_frame_t *new_heap =
         (cloak_pending_frame_t *)realloc(s->heap, new_cap * sizeof(cloak_pending_frame_t));
     if (new_heap == NULL) {
@@ -91,6 +94,7 @@ static int try_drain(cloak_stream_t *s) {
             cloak_pending_frame_t pf = heap_pop(s);
             free(pf.payload);
             s->recv_closing_seen = 1;
+            cloak_bytequeue_close(&s->recv_bytes);
             return 1;
         }
         size_t payload_len = s->heap[0].payload_len;
@@ -110,11 +114,12 @@ static int try_drain(cloak_stream_t *s) {
 int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *obfuscator,
                        size_t max_on_wire_size, size_t recv_capacity, size_t max_pending_frames,
                        cloak_stream_frame_sink_t sink, void *sink_userdata) {
+    memset(s, 0, sizeof(*s));
     if (max_on_wire_size <= CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN ||
-        recv_capacity == 0 || sink == NULL) {
+        recv_capacity == 0 || recv_capacity < max_on_wire_size - CLOAK_FRAME_HEADER_LEN ||
+        sink == NULL) {
         return -1;
     }
-    memset(s, 0, sizeof(*s));
     s->id = id;
     s->obfuscator = obfuscator;
     s->sink = sink;
@@ -164,10 +169,12 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
 
         long written = cloak_frame_obfuscate(s->obfuscator, &frame, s->write_buf, s->write_buf_cap, 0);
         if (written < 0) {
+            s->write_closed = 1;
             return -1;
         }
         s->next_write_seq++;
         if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
+            s->write_closed = 1;
             return -1;
         }
         n += chunk;
@@ -225,6 +232,11 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
         return -1;
     }
 
+    size_t recv_total_capacity = cloak_bytequeue_len(&s->recv_bytes) + cloak_bytequeue_free_space(&s->recv_bytes);
+    if (frame->payload_len > recv_total_capacity) {
+        return -1;
+    }
+
     uint8_t *payload_copy = NULL;
     if (frame->payload_len > 0) {
         payload_copy = (uint8_t *)malloc(frame->payload_len);
@@ -254,7 +266,7 @@ long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
         try_drain(s);
         return (long)n;
     }
-    if (s->recv_closing_seen) {
+    if (cloak_bytequeue_is_eof(&s->recv_bytes)) {
         return -1;
     }
     return 0;

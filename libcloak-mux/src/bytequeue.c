@@ -24,9 +24,13 @@ void cloak_bytequeue_destroy(cloak_bytequeue_t *q) {
     q->cap = 0;
     q->head = 0;
     q->len = 0;
+    q->closed = 0;
 }
 
 size_t cloak_bytequeue_write(cloak_bytequeue_t *q, const uint8_t *data, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
     if (q->closed || len > q->cap - q->len) {
         return 0;
     }

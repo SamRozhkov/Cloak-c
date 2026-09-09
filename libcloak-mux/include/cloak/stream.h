@@ -10,7 +10,13 @@
 /* Returns 0 on success (bytes accepted for transmission -- the connection
  * layer may still buffer them internally), or -1 on a hard failure (the
  * underlying connection is broken), mirroring Go Cloak's
- * switchboard.send()'s error contract. Must not block. */
+ * switchboard.send()'s error contract. Must not block.
+ *
+ * bytes is valid only for the duration of this call -- cloak_stream_write
+ * reuses the same internal scratch buffer for every frame it obfuscates,
+ * so the sink must fully copy or fully consume bytes before returning;
+ * retaining the pointer past this call (e.g. for a later batched write)
+ * will read overwritten/corrupted data. */
 typedef int (*cloak_stream_frame_sink_t)(void *userdata, const uint8_t *bytes, size_t len);
 
 typedef struct {
@@ -67,7 +73,15 @@ typedef struct {
  * max_pending_frames bounds how many out-of-order frames may be buffered
  * awaiting a gap-filling frame, as a defensive measure against unbounded
  * memory growth from adversarial frame reordering (Go's implementation has
- * no such cap).
+ * no such cap). max_pending_frames also bounds the CPU cost of feeding each
+ * frame (the duplicate-detection scan is O(max_pending_frames)) -- an
+ * attacker who can arrange deep reordering pays for it linearly in this
+ * cap, not unboundedly, but this is a real per-frame cost to weigh when
+ * choosing the value, not just a memory bound.
+ *
+ * sink must be non-NULL (rejected with -1 otherwise). max_pending_frames
+ * == 0 is silently treated as 1 (a minimum of one out-of-order frame can
+ * always be buffered) rather than rejected.
  *
  * Returns 0 on success, -1 on allocation failure or invalid parameters
  * (max_on_wire_size too small to fit a header, recv_capacity == 0). */
@@ -118,7 +132,15 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type);
  * closing frame was drained into order -- the caller should tear this
  * stream down after this call), or -1 (protocol violation: frame->seq is
  * a duplicate/already-delivered sequence number, the out-of-order buffer's
- * max_pending_frames cap was exceeded, or an allocation failure). */
+ * max_pending_frames cap was exceeded, or an allocation failure).
+ *
+ * Note: a closing frame that arrives out of order may not drain
+ * immediately -- if it's buffered because earlier frames are still
+ * missing, or if draining is backpressured, the close is only detected
+ * later, when cloak_stream_read internally re-attempts the drain. A
+ * caller must therefore also treat cloak_stream_read's own -1
+ * (end-of-stream) return as a close signal, not rely solely on this
+ * function ever returning 1. */
 int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame);
 
 /* Copies up to out_cap reassembled bytes into out. Returns bytes copied

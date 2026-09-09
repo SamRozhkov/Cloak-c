@@ -390,36 +390,48 @@ static void test_backpressure_and_resume(void) {
     wire_t w;
     wire_init(&w);
 
-    /* 4-byte frames, tiny 10-byte recv capacity: only 2.5 frames worth of
-     * payload fit at once. */
+    /* 4-byte frames. recv_capacity must now (post final-review Fix 1 Part A)
+     * be at least max_on_wire_size - CLOAK_FRAME_HEADER_LEN, so with
+     * CLOAK_FRAME_MAX_EXTRA_LEN's fixed padding budget folded into
+     * max_on_wire_size, the smallest legal recv_capacity here is 259 --
+     * pick 260 (still small relative to the total message) so most, but
+     * not all, of the message fits at once. */
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 4;
+    size_t recv_cap = 260; /* == 65 four-byte frames' worth */
     cloak_stream_t tx;
     cloak_stream_init(&tx, 6, &o, max_on_wire, 1 << 20, MAX_PENDING, wire_sink, &w);
-    const char *msg = "0123456789ABCDEFGHIJ"; /* 20 bytes -> 5 frames of 4 bytes */
-    cloak_stream_write(&tx, (const uint8_t *)msg, strlen(msg));
-    ASSERT_EQ_INT(w.frame_count, 5);
+
+    /* 400 bytes -> 100 frames of 4 bytes; recv_cap only holds the first 65
+     * frames' payload (260 bytes), so the remaining 35 must back up on the
+     * heap and only drain as cloak_stream_read frees space. */
+    uint8_t msg[400];
+    for (size_t i = 0; i < sizeof(msg); i++) msg[i] = (uint8_t)('0' + (i % 10));
+    cloak_stream_write(&tx, msg, sizeof(msg));
+    ASSERT_EQ_INT(w.frame_count, 100);
 
     cloak_stream_t rx;
-    ASSERT_EQ_INT(cloak_stream_init(&rx, 6, &o, max_on_wire, 10, MAX_PENDING, wire_sink, &w), 0);
+    ASSERT_EQ_INT(cloak_stream_init(&rx, 6, &o, max_on_wire, recv_cap, MAX_PENDING, wire_sink, &w), 0);
 
-    size_t order[5] = {0, 1, 2, 3, 4};
-    /* Deliver all 5 in order; backpressure should stall draining partway
-     * through since the queue can only hold 10 of the 20 payload bytes. */
-    deliver_frames(&w, &o, &rx, order, 5);
-    ASSERT_TRUE(cloak_stream_recv_available(&rx) <= 10);
+    size_t order[100];
+    for (size_t i = 0; i < 100; i++) order[i] = i;
+    /* Deliver all 100 in order; backpressure should stall draining partway
+     * through since the queue can only hold recv_cap of the 400 payload
+     * bytes. */
+    deliver_frames(&w, &o, &rx, order, 100);
+    ASSERT_TRUE(cloak_stream_recv_available(&rx) <= recv_cap);
     ASSERT_TRUE(cloak_stream_recv_available(&rx) > 0);
 
-    uint8_t out[64];
+    uint8_t out[400];
     long total = 0;
     /* Drain in small chunks, exactly like a real consumer, and confirm
      * try_drain resumes delivering the backpressured frames as space frees. */
-    for (int iter = 0; iter < 20 && total < (long)strlen(msg); iter++) {
+    for (int iter = 0; iter < 300 && total < (long)sizeof(msg); iter++) {
         long got = cloak_stream_read(&rx, out + total, 3);
         if (got > 0) {
             total += got;
         }
     }
-    ASSERT_EQ_INT(total, (long)strlen(msg));
+    ASSERT_EQ_INT(total, (long)sizeof(msg));
     ASSERT_MEM_EQ(out, msg, (size_t)total);
 
     cloak_stream_destroy(&tx);
@@ -486,6 +498,71 @@ static void test_sink_failure_propagates(void) {
     wire_free(&w);
 }
 
+static void test_undersized_recv_capacity_rejected(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+    cloak_stream_t s;
+    /* recv_capacity smaller than what this max_on_wire_size could ever
+     * deliver in one frame must be rejected at init, not accepted and
+     * silently wedged later. */
+    ASSERT_EQ_INT(cloak_stream_init(&s, 1, &o, MAX_ON_WIRE, 4, MAX_PENDING, wire_sink, &w), -1);
+    wire_free(&w);
+}
+
+static void test_write_failure_closes_write_side(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+    w.fail_after_n = 0; /* sink fails on the very first frame */
+
+    cloak_stream_t tx;
+    cloak_stream_init(&tx, 12, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    ASSERT_EQ_INT(cloak_stream_write(&tx, (const uint8_t *)"x", 1), -1);
+    /* A retry must also fail -- the stream must be closed, not silently
+     * skip the sequence number that never actually reached the sink. */
+    ASSERT_EQ_INT(cloak_stream_write(&tx, (const uint8_t *)"y", 1), -1);
+
+    cloak_stream_destroy(&tx);
+    wire_free(&w);
+}
+
+static void test_read_with_zero_capacity_is_not_spurious_eof(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+
+    cloak_stream_t tx;
+    cloak_stream_init(&tx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    const char *msg = "still here";
+    cloak_stream_write(&tx, (const uint8_t *)msg, strlen(msg));
+    cloak_stream_send_closing(&tx, CLOAK_FRAME_CLOSING_STREAM);
+
+    cloak_stream_t rx;
+    cloak_stream_init(&rx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    size_t order[2] = {0, 1};
+    deliver_frames(&w, &o, &rx, order, 2);
+
+    uint8_t out[1];
+    /* out_cap == 0, with real buffered data and a closing frame already
+     * seen -- must NOT report EOF (there's still data to deliver). */
+    long got_zero = cloak_stream_read(&rx, out, 0);
+    ASSERT_EQ_INT(got_zero, 0);
+
+    uint8_t real_out[64];
+    long got = cloak_stream_read(&rx, real_out, sizeof(real_out));
+    ASSERT_EQ_INT(got, (long)strlen(msg));
+    ASSERT_MEM_EQ(real_out, msg, (size_t)got);
+    ASSERT_EQ_INT(cloak_stream_read(&rx, real_out, sizeof(real_out)), -1);
+
+    cloak_stream_destroy(&tx);
+    cloak_stream_destroy(&rx);
+    wire_free(&w);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_in_order();
     test_multi_frame_chunking_and_reassembly();
@@ -498,4 +575,7 @@ TEST_MAIN_BEGIN()
     test_backpressure_and_resume();
     test_max_pending_frames_cap();
     test_sink_failure_propagates();
+    test_undersized_recv_capacity_rejected();
+    test_write_failure_closes_write_side();
+    test_read_with_zero_capacity_is_not_spurious_eof();
 TEST_MAIN_END()
