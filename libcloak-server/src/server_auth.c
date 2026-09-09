@@ -70,9 +70,13 @@ int cloak_server_auth_decrypt(const uint8_t random[32], const uint8_t session_id
     }
 
     int64_t timestamp = load_be64(plaintext + 29);
-    int64_t delta = timestamp - now_unix;
-    if (delta <= -CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS ||
-        delta >= CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS) {
+    int64_t lower = (now_unix > INT64_MIN + CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS)
+                         ? now_unix - CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS
+                         : INT64_MIN;
+    int64_t upper = (now_unix < INT64_MAX - CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS)
+                         ? now_unix + CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS
+                         : INT64_MAX;
+    if (timestamp <= lower || timestamp >= upper) {
         return -1;
     }
 

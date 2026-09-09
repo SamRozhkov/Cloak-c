@@ -193,6 +193,22 @@ static void test_compose_reply_all_cert_lens_succeed(void) {
     }
 }
 
+static void test_timestamp_extreme_now_unix_no_ub(void) {
+    load_shared_vectors();
+    cloak_server_clientinfo_t info;
+    uint8_t shared_secret[32];
+
+    /* now_unix near INT64_MIN/INT64_MAX must not crash or hang -- both must
+     * cleanly reject (the fixed vector's timestamp, 1799999999, is nowhere
+     * near either extreme, so both should be well outside the window). */
+    int rc_min = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+                                            g_server_priv, INT64_MIN, &info, shared_secret);
+    ASSERT_EQ_INT(rc_min, -1);
+    int rc_max = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+                                            g_server_priv, INT64_MAX, &info, shared_secret);
+    ASSERT_EQ_INT(rc_max, -1);
+}
+
 TEST_MAIN_BEGIN()
     test_decrypt_matches_real_go_vector();
     test_timestamp_window_is_strict();
@@ -203,4 +219,5 @@ TEST_MAIN_BEGIN()
     test_compose_reply_rejects_invalid_cert_len();
     test_compose_reply_rejects_undersized_buffer();
     test_compose_reply_all_cert_lens_succeed();
+    test_timestamp_extreme_now_unix_no_ub();
 TEST_MAIN_END()
