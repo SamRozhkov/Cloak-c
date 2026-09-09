@@ -68,6 +68,15 @@ static cloak_pending_frame_t heap_pop(cloak_stream_t *s) {
     return top;
 }
 
+static int heap_contains_seq(const cloak_stream_t *s, uint64_t seq) {
+    for (size_t i = 0; i < s->heap_len; i++) {
+        if (s->heap[i].seq == seq) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Drains heap-buffered frames that are now next-in-order into recv_bytes,
  * stopping early (leaving the rest buffered) if recv_bytes lacks room for
  * the next one -- this is what lets a previously-backpressured reassembly
@@ -212,7 +221,7 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
     if (s->recv_closing_seen) {
         return -1;
     }
-    if (frame->seq < s->next_recv_seq) {
+    if (frame->seq < s->next_recv_seq || heap_contains_seq(s, frame->seq)) {
         return -1;
     }
 

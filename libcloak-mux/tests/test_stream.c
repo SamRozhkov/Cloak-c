@@ -329,6 +329,61 @@ static void test_duplicate_seq_rejected(void) {
     wire_free(&w);
 }
 
+static void test_duplicate_pending_frame_rejected_not_wedged(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+
+    size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 2;
+    cloak_stream_t tx;
+    cloak_stream_init(&tx, 11, &o, max_on_wire, 1 << 20, MAX_PENDING, wire_sink, &w);
+    uint8_t msg[16];
+    for (size_t i = 0; i < sizeof(msg); i++) msg[i] = (uint8_t)('A' + i);
+    cloak_stream_write(&tx, msg, sizeof(msg)); /* 8 frames of 2 bytes, seq 0..7 */
+    ASSERT_EQ_INT(w.frame_count, 8);
+
+    cloak_stream_t rx;
+    cloak_stream_init(&rx, 11, &o, max_on_wire, 1 << 20, MAX_PENDING, wire_sink, &w);
+
+    size_t *offsets = (size_t *)malloc(w.frame_count * sizeof(size_t));
+    size_t off = 0;
+    for (size_t i = 0; i < w.frame_count; i++) { offsets[i] = off; off += w.frame_lens[i]; }
+
+    /* Feed seq 5 twice while frames 0-4 are still missing (an open gap) --
+     * the first copy should be accepted (buffered out of order), the
+     * second copy of the SAME still-pending seq must be rejected, not
+     * silently accepted as a second heap entry. */
+    uint8_t *copy_a = (uint8_t *)malloc(w.frame_lens[5]);
+    memcpy(copy_a, w.frames_data + offsets[5], w.frame_lens[5]);
+    cloak_frame_t frame_a;
+    cloak_frame_deobfuscate(&o, &frame_a, copy_a, w.frame_lens[5]);
+    ASSERT_EQ_INT(cloak_stream_feed_frame(&rx, &frame_a), 0);
+    free(copy_a);
+
+    uint8_t *copy_b = (uint8_t *)malloc(w.frame_lens[5]);
+    memcpy(copy_b, w.frames_data + offsets[5], w.frame_lens[5]);
+    cloak_frame_t frame_b;
+    cloak_frame_deobfuscate(&o, &frame_b, copy_b, w.frame_lens[5]);
+    ASSERT_EQ_INT(cloak_stream_feed_frame(&rx, &frame_b), -1);
+    free(copy_b);
+
+    /* Now fill the gap (seq 0..4) and deliver the rest (6,7) -- everything
+     * must still drain correctly, with no permanent freeze. */
+    size_t order[] = {0, 1, 2, 3, 4, 6, 7};
+    deliver_frames(&w, &o, &rx, order, 7);
+    free(offsets);
+
+    uint8_t out[32];
+    long got = cloak_stream_read(&rx, out, sizeof(out));
+    ASSERT_EQ_INT(got, (long)sizeof(msg));
+    ASSERT_MEM_EQ(out, msg, (size_t)got);
+
+    cloak_stream_destroy(&tx);
+    cloak_stream_destroy(&rx);
+    wire_free(&w);
+}
+
 static void test_backpressure_and_resume(void) {
     cloak_obfuscator_t o;
     make_obfuscator(&o);
@@ -439,6 +494,7 @@ TEST_MAIN_BEGIN()
     test_closing_frame_signals_eof();
     test_closing_frame_out_of_order_stops_drain();
     test_duplicate_seq_rejected();
+    test_duplicate_pending_frame_rejected_not_wedged();
     test_backpressure_and_resume();
     test_max_pending_frames_cap();
     test_sink_failure_propagates();
