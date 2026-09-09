@@ -7,3 +7,8 @@ add_executable(test_bytequeue test_bytequeue.c)
 target_include_directories(test_bytequeue PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_bytequeue PRIVATE cloak-mux)
 add_test(NAME test_bytequeue COMMAND test_bytequeue)
+
+add_executable(test_stream test_stream.c)
+target_include_directories(test_stream PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_stream PRIVATE cloak-mux)
+add_test(NAME test_stream COMMAND test_stream)
