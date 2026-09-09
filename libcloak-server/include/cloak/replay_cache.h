@@ -37,8 +37,12 @@ typedef struct {
  * Returns 0 on success, -1 on allocation failure. */
 int cloak_replay_cache_init(cloak_replay_cache_t *cache, size_t capacity);
 
-/* Frees the table. Safe to call on an already-destroyed (or never
- * successfully initialized) cache. */
+/* Frees the table. Safe to call after cloak_replay_cache_init returned 0
+ * (normal use) OR -1 (a failed init leaves the cache in a safe, zeroed
+ * state). NOT safe to call on a cloak_replay_cache_t that
+ * cloak_replay_cache_init was never called on at all -- zero-initialize it
+ * yourself first (e.g. cloak_replay_cache_t cache = {0};) if you need
+ * that. */
 void cloak_replay_cache_destroy(cloak_replay_cache_t *cache);
 
 /* Looks up key's slot (hash(key) % capacity). If that slot currently holds
@@ -55,7 +59,14 @@ void cloak_replay_cache_destroy(cloak_replay_cache_t *cache);
  * now_unix going backwards between calls (a clock adjustment) is handled
  * safely: age is computed as now_unix - inserted_at and treated as
  * expired (not a replay) whenever it falls outside [0, age_limit_seconds),
- * which includes negative values from a clock that moved backwards. */
+ * which includes negative values from a clock that moved backwards.
+ *
+ * For use alongside cloak_server_auth_decrypt's timestamp check,
+ * age_limit_seconds must exceed twice that check's tolerance window, or a
+ * replayed ciphertext can succeed after the cache entry ages out but
+ * before the timestamp window closes -- see
+ * CLOAK_SERVER_AUTH_REPLAY_CACHE_AGE_LIMIT_SECONDS in
+ * cloak/server_auth.h. */
 int cloak_replay_cache_check_and_insert(cloak_replay_cache_t *cache, const uint8_t key[32],
                                          int64_t now_unix, int64_t age_limit_seconds);
 

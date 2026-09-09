@@ -11,33 +11,74 @@
 #define CLOAK_SERVER_AUTH_UNORDERED_FLAG 0x01
 #define CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS 180
 
+/* The replay cache's age_limit_seconds (see cloak/replay_cache.h) MUST
+ * exceed 2 * CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS: a client's
+ * clock may legitimately run up to the tolerance ahead of the server's, so
+ * a captured ciphertext can remain within the timestamp window for up to
+ * twice the tolerance -- not just the tolerance itself -- and the replay
+ * cache must stay populated for at least that long to catch a resend
+ * within that window. Go Cloak's own replay cache uses a 12-hour age
+ * limit for exactly this reason; this constant matches it. */
+#define CLOAK_SERVER_AUTH_REPLAY_CACHE_AGE_LIMIT_SECONDS (12 * 60 * 60)
+
 typedef struct {
     uint8_t uid[CLOAK_SERVER_AUTH_UID_LEN];
     /* NUL-terminated. The wire field is a fixed 12-byte, NUL-padded ASCII
      * string; leading and trailing NUL padding is stripped (matching Go's
      * bytes.Trim(s, "\x00") exactly), so this is always
-     * <= CLOAK_SERVER_AUTH_PROXY_METHOD_LEN bytes plus the terminator. */
+     * <= CLOAK_SERVER_AUTH_PROXY_METHOD_LEN bytes plus the terminator.
+     * Unlike Go's string(bytes.Trim(...)), a NUL byte anywhere before the
+     * end of the field's meaningful content (not just as trailing padding)
+     * truncates this C string early -- callers needing exact byte-for-byte
+     * parity with Go's semantics for a proxy method containing embedded
+     * NULs (not a realistic scenario for any real proxy method name) should
+     * be aware of this divergence. */
     char proxy_method[CLOAK_SERVER_AUTH_PROXY_METHOD_LEN + 1];
     uint8_t encryption_method;
     uint32_t session_id;
     int unordered; /* 0 or 1 */
 } cloak_server_clientinfo_t;
 
-/* Authenticates one Cloak client connection attempt: derives the ECDH
- * shared secret (server_priv x the client's ephemeral public key, carried
- * in the ClientHello's `random` field), uses it to AES-256-GCM-decrypt the
- * 64-byte ciphertext (session_id_field || key_share_field -- exactly the
- * `session_id` and X25519 `key_share` fields cloak_clienthello_parse
- * extracts) into the 48-byte ClientInfo payload, and validates both AEAD
- * authentication and that the embedded timestamp is within
- * +/- CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS of now_unix.
+/* Validates that data was encrypted by someone who knows the server's
+ * public key, with a fresh timestamp -- it does NOT authorize the UID
+ * inside the decrypted payload. `uid`, `proxy_method`, `encryption_method`,
+ * `session_id`, and `unordered` in `*out` are all attacker-chosen values on
+ * success; the caller (a future dispatcher/user-management module) is
+ * responsible for validating and authorizing `uid` before trusting anything
+ * else in `*out`.
+ *
+ * Derives the ECDH shared secret (server_priv x the client's ephemeral
+ * public key, carried in the ClientHello's `random` field), uses it to
+ * AES-256-GCM-decrypt the 64-byte ciphertext (session_id_field ||
+ * key_share_field -- exactly the `session_id` and X25519 `key_share` fields
+ * cloak_clienthello_parse extracts) into the 48-byte ClientInfo payload, and
+ * validates both AEAD authentication and that the embedded timestamp is
+ * within +/- CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS of now_unix.
+ *
+ * session_id_field/session_id_field_len and key_share_field mirror how
+ * cloak_clienthello_parse exposes those fields: session_id_field may be
+ * NULL (pass NULL with session_id_field_len == 0 when cloak_clienthello_parse
+ * returned a NULL session_id); key_share_field may be NULL. This function
+ * returns -1 immediately if session_id_field == NULL,
+ * session_id_field_len != 32, or key_share_field == NULL -- mirroring Go
+ * Cloak's combined `len(ctxTag) != 64` check (internal/server/TLS.go),
+ * split across the two constituent 32-byte fields (Go's keyShare is always
+ * exactly 32 bytes by the time it reaches that check -- parseKeyShare
+ * itself enforces that -- so the only real variable in Go's check is the
+ * session_id half, making this split check exactly equivalent to Go's
+ * combined one).
  *
  * Wire layout of the 48-byte decrypted payload (matches Go Cloak's
  * authenticationPayload exactly, byte for byte):
  *   [0:16)  UID
  *   [16:28) proxy method (NUL-padded ASCII)
  *   [28]    encryption method (see cloak_aead_method_t -- the wire byte
- *           values are numerically identical to that enum)
+ *           values are numerically identical to that enum, but this
+ *           function does NOT validate that the byte is a legal member of
+ *           it -- the caller MUST call
+ *           cloak_aead_method_is_valid(info.encryption_method) before using
+ *           it, the same requirement crypto.h already documents for any
+ *           wire-sourced method byte)
  *   [29:37) Unix timestamp, big-endian int64
  *   [37:41) session ID, big-endian uint32
  *   [41]    flags (bit 0 = CLOAK_SERVER_AUTH_UNORDERED_FLAG)
@@ -47,16 +88,18 @@ typedef struct {
  * secret to out_shared_secret (needed later by
  * cloak_server_auth_compose_reply to encrypt the session key -- the same
  * shared secret authenticates both directions of this handshake). On
- * failure (AEAD authentication failure, or timestamp outside the tolerance
- * window) returns -1 and leaves both outputs unspecified.
+ * failure (NULL/wrong-length session_id_field or key_share_field, AEAD
+ * authentication failure, or timestamp outside the tolerance window)
+ * returns -1 and leaves both outputs unspecified.
  *
  * This function does NOT check for replayed `random` values -- call
  * cloak_replay_cache_check_and_insert (cloak/replay_cache.h) on `random`
  * separately, BEFORE calling this function, mirroring Go Cloak's own
  * AuthFirstPacket (which checks replay first, against the raw
  * not-yet-authenticated random, then decrypts). */
-int cloak_server_auth_decrypt(const uint8_t random[32], const uint8_t session_id_field[32],
-                               const uint8_t key_share_field[32],
+int cloak_server_auth_decrypt(const uint8_t random[32],
+                               const uint8_t *session_id_field, size_t session_id_field_len,
+                               const uint8_t *key_share_field,
                                const uint8_t server_priv[CLOAK_X25519_KEY_LEN],
                                int64_t now_unix,
                                cloak_server_clientinfo_t *out,

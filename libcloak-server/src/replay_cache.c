@@ -39,10 +39,24 @@ static uint64_t fnv1a(const uint8_t *data, size_t len) {
 
 int cloak_replay_cache_check_and_insert(cloak_replay_cache_t *cache, const uint8_t key[32],
                                          int64_t now_unix, int64_t age_limit_seconds) {
+    if (cache->capacity == 0) {
+        return 0; /* uninitialized or destroyed cache: nothing to check against, fail open on
+                    the "is this a duplicate" question rather than crash. Calling this function
+                    with such a cache is a caller bug -- see cloak_replay_cache_init's contract --
+                    but a SIGFPE is a worse failure mode than silently treating everything as
+                    novel, especially since insert-side state is unusable anyway if capacity is
+                    0 (there's nowhere to store the entry). */
+    }
+
     size_t slot_idx = (size_t)(fnv1a(key, 32) % cache->capacity);
     cloak_replay_slot_t *slot = &cache->slots[slot_idx];
 
     if (slot->inserted_at != 0 && memcmp(slot->key, key, 32) == 0) {
+        /* Unlike server_auth.c's timestamp check, both operands here come
+         * from this process's own clock (never directly from
+         * attacker-controlled wire bytes), so this subtraction cannot be
+         * driven to the extremes that made a bound-comparison rewrite
+         * necessary there. */
         int64_t age = now_unix - slot->inserted_at;
         if (age >= 0 && age < age_limit_seconds) {
             return 1; /* replay -- do not refresh */

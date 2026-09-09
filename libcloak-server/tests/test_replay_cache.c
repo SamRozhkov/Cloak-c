@@ -99,6 +99,16 @@ static void test_destroy_after_failed_init_is_safe(void) {
     cloak_replay_cache_destroy(&cache); /* must not crash -- this is the documented contract */
 }
 
+static void test_check_and_insert_on_capacity_zero_cache_is_safe(void) {
+    cloak_replay_cache_t cache;
+    ASSERT_EQ_INT(cloak_replay_cache_init(&cache, 0), -1); /* leaves capacity == 0 */
+    uint8_t key[32];
+    fill_key(key, 5);
+    /* Must not SIGFPE (division by zero in the old slot_idx computation) --
+     * returns 0 (not a replay) cleanly instead. */
+    ASSERT_EQ_INT(cloak_replay_cache_check_and_insert(&cache, key, 1000, 180), 0);
+}
+
 TEST_MAIN_BEGIN()
     test_insert_then_replay_then_ages_out();
     test_distinct_keys_dont_interfere();
@@ -107,4 +117,5 @@ TEST_MAIN_BEGIN()
     test_stress_low_collision_rate();
     test_init_rejects_zero_capacity();
     test_destroy_after_failed_init_is_safe();
+    test_check_and_insert_on_capacity_zero_cache_is_safe();
 TEST_MAIN_END()

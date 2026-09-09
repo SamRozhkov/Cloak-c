@@ -44,12 +44,17 @@ static void trim_nul_copy(const uint8_t *in, size_t in_len, char *out, size_t ou
     out[n] = '\0';
 }
 
-int cloak_server_auth_decrypt(const uint8_t random[32], const uint8_t session_id_field[32],
-                               const uint8_t key_share_field[32],
+int cloak_server_auth_decrypt(const uint8_t random[32],
+                               const uint8_t *session_id_field, size_t session_id_field_len,
+                               const uint8_t *key_share_field,
                                const uint8_t server_priv[CLOAK_X25519_KEY_LEN],
                                int64_t now_unix,
                                cloak_server_clientinfo_t *out,
                                uint8_t out_shared_secret[CLOAK_AEAD_KEY_LEN]) {
+    if (session_id_field == NULL || session_id_field_len != 32 || key_share_field == NULL) {
+        return -1;
+    }
+
     uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
     if (cloak_x25519_shared_secret(server_priv, random, shared_secret) != 0) {
         return -1;

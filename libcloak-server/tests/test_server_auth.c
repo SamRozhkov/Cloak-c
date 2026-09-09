@@ -59,7 +59,7 @@ static void test_decrypt_matches_real_go_vector(void) {
     load_shared_vectors();
     cloak_server_clientinfo_t info;
     uint8_t shared_secret[32];
-    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                         g_server_priv, NOW_EXACT, &info, shared_secret);
     ASSERT_EQ_INT(rc, 0);
     ASSERT_MEM_EQ(shared_secret, g_expected_shared_secret, 32);
@@ -78,13 +78,13 @@ static void test_timestamp_window_is_strict(void) {
     cloak_server_clientinfo_t info;
     uint8_t shared_secret[32];
 
-    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                              g_server_priv, NOW_EXACT - 179, &info, shared_secret), 0);
-    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                              g_server_priv, NOW_EXACT - 180, &info, shared_secret), -1);
-    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                              g_server_priv, NOW_EXACT + 179, &info, shared_secret), 0);
-    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    ASSERT_EQ_INT(cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                              g_server_priv, NOW_EXACT + 180, &info, shared_secret), -1);
 }
 
@@ -96,7 +96,7 @@ static void test_tampered_key_share_rejected(void) {
 
     cloak_server_clientinfo_t info;
     uint8_t shared_secret[32];
-    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, tampered,
+    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, tampered,
                                         g_server_priv, NOW_EXACT, &info, shared_secret);
     ASSERT_EQ_INT(rc, -1);
 }
@@ -109,7 +109,7 @@ static void test_tampered_session_id_rejected(void) {
 
     cloak_server_clientinfo_t info;
     uint8_t shared_secret[32];
-    int rc = cloak_server_auth_decrypt(g_client_pub_random, tampered, g_key_share_field,
+    int rc = cloak_server_auth_decrypt(g_client_pub_random, tampered, 32, g_key_share_field,
                                         g_server_priv, NOW_EXACT, &info, shared_secret);
     ASSERT_EQ_INT(rc, -1);
 }
@@ -121,7 +121,7 @@ static void test_wrong_server_key_rejected(void) {
 
     cloak_server_clientinfo_t info;
     uint8_t shared_secret[32];
-    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                         wrong_priv, NOW_EXACT, &info, shared_secret);
     ASSERT_EQ_INT(rc, -1);
 }
@@ -201,12 +201,39 @@ static void test_timestamp_extreme_now_unix_no_ub(void) {
     /* now_unix near INT64_MIN/INT64_MAX must not crash or hang -- both must
      * cleanly reject (the fixed vector's timestamp, 1799999999, is nowhere
      * near either extreme, so both should be well outside the window). */
-    int rc_min = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    int rc_min = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                             g_server_priv, INT64_MIN, &info, shared_secret);
     ASSERT_EQ_INT(rc_min, -1);
-    int rc_max = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, g_key_share_field,
+    int rc_max = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, g_key_share_field,
                                             g_server_priv, INT64_MAX, &info, shared_secret);
     ASSERT_EQ_INT(rc_max, -1);
+}
+
+static void test_null_session_id_rejected(void) {
+    load_shared_vectors();
+    cloak_server_clientinfo_t info;
+    uint8_t shared_secret[32];
+    int rc = cloak_server_auth_decrypt(g_client_pub_random, NULL, 0, g_key_share_field,
+                                        g_server_priv, NOW_EXACT, &info, shared_secret);
+    ASSERT_EQ_INT(rc, -1);
+}
+
+static void test_wrong_length_session_id_rejected(void) {
+    load_shared_vectors();
+    cloak_server_clientinfo_t info;
+    uint8_t shared_secret[32];
+    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 31, g_key_share_field,
+                                        g_server_priv, NOW_EXACT, &info, shared_secret);
+    ASSERT_EQ_INT(rc, -1);
+}
+
+static void test_null_key_share_rejected(void) {
+    load_shared_vectors();
+    cloak_server_clientinfo_t info;
+    uint8_t shared_secret[32];
+    int rc = cloak_server_auth_decrypt(g_client_pub_random, g_session_id_field, 32, NULL,
+                                        g_server_priv, NOW_EXACT, &info, shared_secret);
+    ASSERT_EQ_INT(rc, -1);
 }
 
 TEST_MAIN_BEGIN()
@@ -220,4 +247,7 @@ TEST_MAIN_BEGIN()
     test_compose_reply_rejects_undersized_buffer();
     test_compose_reply_all_cert_lens_succeed();
     test_timestamp_extreme_now_unix_no_ub();
+    test_null_session_id_rejected();
+    test_wrong_length_session_id_rejected();
+    test_null_key_share_rejected();
 TEST_MAIN_END()
