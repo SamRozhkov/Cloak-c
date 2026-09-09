@@ -93,6 +93,12 @@ static void test_init_rejects_zero_capacity(void) {
     ASSERT_EQ_INT(cloak_replay_cache_init(&cache, 0), -1);
 }
 
+static void test_destroy_after_failed_init_is_safe(void) {
+    cloak_replay_cache_t cache;
+    ASSERT_EQ_INT(cloak_replay_cache_init(&cache, 0), -1);
+    cloak_replay_cache_destroy(&cache); /* must not crash -- this is the documented contract */
+}
+
 TEST_MAIN_BEGIN()
     test_insert_then_replay_then_ages_out();
     test_distinct_keys_dont_interfere();
@@ -100,4 +106,5 @@ TEST_MAIN_BEGIN()
     test_backwards_clock_not_a_replay();
     test_stress_low_collision_rate();
     test_init_rejects_zero_capacity();
+    test_destroy_after_failed_init_is_safe();
 TEST_MAIN_END()

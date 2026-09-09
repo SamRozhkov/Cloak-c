@@ -4,6 +4,8 @@
 #include <string.h>
 
 int cloak_replay_cache_init(cloak_replay_cache_t *cache, size_t capacity) {
+    cache->slots = NULL;
+    cache->capacity = 0;
     if (capacity == 0) {
         return -1;
     }
