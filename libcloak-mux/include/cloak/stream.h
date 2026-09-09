@@ -84,7 +84,11 @@ typedef struct {
  * always be buffered) rather than rejected.
  *
  * Returns 0 on success, -1 on allocation failure or invalid parameters
- * (max_on_wire_size too small to fit a header, recv_capacity == 0). */
+ * (max_on_wire_size too small to fit a header, recv_capacity == 0, or
+ * recv_capacity smaller than max_on_wire_size - CLOAK_FRAME_HEADER_LEN --
+ * too small to ever hold this stream's own largest possible frame
+ * payload, which would otherwise let a single oversized frame wedge the
+ * stream permanently). */
 int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *obfuscator,
                        size_t max_on_wire_size, size_t recv_capacity, size_t max_pending_frames,
                        cloak_stream_frame_sink_t sink, void *sink_userdata);
@@ -131,8 +135,10 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type);
  * Returns 0 (accepted, delivered and/or buffered for reassembly), 1 (a
  * closing frame was drained into order -- the caller should tear this
  * stream down after this call), or -1 (protocol violation: frame->seq is
- * a duplicate/already-delivered sequence number, the out-of-order buffer's
- * max_pending_frames cap was exceeded, or an allocation failure).
+ * a duplicate/already-delivered sequence number, frame->payload_len
+ * exceeds the receive queue's total capacity (can never fit, regardless
+ * of current free space), the out-of-order buffer's max_pending_frames
+ * cap was exceeded, or an allocation failure).
  *
  * Note: a closing frame that arrives out of order may not drain
  * immediately -- if it's buffered because earlier frames are still
