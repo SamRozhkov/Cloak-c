@@ -1,6 +1,7 @@
 add_library(cloak-server STATIC
     src/clienthello_parse.c
     src/server_auth.c
+    src/replay_cache.c
 )
 
 target_include_directories(cloak-server PUBLIC include)
