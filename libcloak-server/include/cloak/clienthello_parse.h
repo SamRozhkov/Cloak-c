@@ -12,13 +12,18 @@ typedef struct {
     const uint8_t *session_id; /* points into data; NULL if session_id_len == 0 */
     size_t session_id_len;     /* 0-255 (whatever the wire said; no TLS-legal-range enforcement here) */
     const uint8_t *x25519_key_share; /* points into data, always exactly CLOAK_CLIENTHELLO_PARSE_X25519_LEN bytes; NULL if no group 0x001d key_share entry was present */
-    const uint8_t *sni;   /* points into data; NULL if no server_name/host_name extension was present */
+    const uint8_t *sni;   /* points into data; NULL if no server_name/host_name extension was present.
+                           * Note: a server_name extension whose host_name entry has name_len == 0
+                           * produces sni != NULL with sni_len == 0 -- callers checking "is SNI
+                           * present" should test sni != NULL, not assume a non-NULL sni implies
+                           * sni_len > 0. */
     size_t sni_len;
 } cloak_clienthello_parsed_t;
 
 /* Parses a single TLS record (5-byte record header + one ClientHello
  * handshake message) out of data[0,len). Populates *out with pointers INTO
- * data -- no copying, no allocation; data must outlive out.
+ * data -- no copying, no allocation; data must outlive out. out must be
+ * non-NULL; this function does not check.
  *
  * Returns 0 on success, -1 if data is not a structurally valid ClientHello
  * this function can parse (wrong record type, wrong record-layer version,
@@ -39,7 +44,12 @@ typedef struct {
  * record layer's own declared length field against len; it assumes the
  * caller has already delivered exactly one un-fragmented ClientHello
  * record (matching Go Cloak's own parser, which makes the same
- * assumption). */
+ * assumption).
+ *
+ * The extensions block is parsed strictly within its declared
+ * extensions_len -- a deliberate, stricter divergence from Go Cloak's
+ * reference parser, which never checks that extensions actually stop at
+ * the declared boundary (see clienthello_parse.c for details). */
 int cloak_clienthello_parse(const uint8_t *data, size_t len, cloak_clienthello_parsed_t *out);
 
 #endif

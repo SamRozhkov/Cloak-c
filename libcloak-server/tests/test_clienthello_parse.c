@@ -3,6 +3,7 @@
 #include "cloak/common.h"
 #include "test_framework.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,7 +12,15 @@ static size_t hex_decode(const char *hex, uint8_t *out) {
     size_t hlen = strlen(hex);
     for (size_t i = 0; i + 1 < hlen; i += 2) {
         unsigned int byte;
-        sscanf(hex + i, "%2x", &byte);
+        int matched = sscanf(hex + i, "%2x", &byte);
+        if (matched != 1) {
+            /* Malformed hex literal in test-vector-decoding code -- fail
+             * loudly during development rather than silently produce
+             * garbage bytes. Not reachable via attacker input; these are
+             * fixed, in-source test vectors. */
+            fprintf(stderr, "hex_decode: malformed hex literal at offset %zu\n", i);
+            abort();
+        }
         out[n++] = (uint8_t)byte;
     }
     return n;
@@ -101,18 +110,28 @@ static void test_empty(void) {
  * possible length from 0 to full, and confirm the parser never crashes and
  * never reads outside the buffer (this whole test binary is also run under
  * ASan+UBSan in Step 6 below). Every truncation must return -1 except the
- * one at full length. */
+ * one at full length.
+ *
+ * Each iteration's prefix is copied into a freshly `malloc`'d buffer sized
+ * to *exactly* n bytes (not a fixed oversized stack array) so that ASan's
+ * redzone sits immediately past the last valid byte -- an overread of even
+ * one byte past the intended prefix is then a `heap-buffer-overflow`,
+ * where the same overread landing inside a 4096-byte stack array would be
+ * invisible to ASan. */
 static void test_truncation_sweep(void) {
     uint8_t full[4096];
     size_t full_len = hex_decode(GOOD_HEX, full);
     for (size_t n = 0; n <= full_len; n++) {
+        uint8_t *buf = (uint8_t *)malloc(n > 0 ? n : 1);
+        memcpy(buf, full, n);
         cloak_clienthello_parsed_t out;
-        int rc = cloak_clienthello_parse(full, n, &out);
+        int rc = cloak_clienthello_parse(buf, n, &out);
         if (n < full_len) {
             ASSERT_TRUE(rc == -1);
         } else {
             ASSERT_EQ_INT(rc, 0);
         }
+        free(buf);
     }
 }
 
@@ -123,20 +142,143 @@ static void test_truncation_sweep(void) {
  * untouched). Not a correctness check (many single-bit mutations of a
  * valid ClientHello are still structurally well-formed, e.g. mutating a
  * byte inside `random` or the SNI hostname), so this only needs to run to
- * completion without ASan/UBSan reporting anything. */
+ * completion without ASan/UBSan reporting anything.
+ *
+ * Parses out of a `malloc`'d buffer that stays exactly full_len bytes for
+ * the same ASan-redzone reason as test_truncation_sweep above. When a
+ * mutation happens to still parse successfully, the output fields are
+ * actually read (XORed into a volatile sink) so that a parser bug
+ * returning an out-of-bounds pointer would be dereferenced -- and caught
+ * by ASan -- rather than silently ignored. */
 static void test_byte_flip_sweep(void) {
     uint8_t full[4096];
     size_t full_len = hex_decode(GOOD_HEX, full);
+    uint8_t *buf = (uint8_t *)malloc(full_len);
+    memcpy(buf, full, full_len);
+    volatile uint8_t sink = 0;
     for (size_t i = 0; i < full_len; i++) {
-        uint8_t saved = full[i];
+        uint8_t saved = buf[i];
         for (int bit = 0; bit < 8; bit++) {
-            full[i] = (uint8_t)(saved ^ (1u << bit));
+            buf[i] = (uint8_t)(saved ^ (1u << bit));
             cloak_clienthello_parsed_t out;
-            cloak_clienthello_parse(full, full_len, &out); /* must not crash */
+            int rc = cloak_clienthello_parse(buf, full_len, &out); /* must not crash */
+            if (rc == 0) {
+                sink ^= out.random[0];
+                sink ^= out.random[CLOAK_CLIENTHELLO_PARSE_RANDOM_LEN - 1];
+                if (out.session_id_len > 0) {
+                    sink ^= out.session_id[0];
+                    sink ^= out.session_id[out.session_id_len - 1];
+                }
+                if (out.sni != NULL && out.sni_len > 0) {
+                    sink ^= out.sni[0];
+                    sink ^= out.sni[out.sni_len - 1];
+                }
+                if (out.x25519_key_share != NULL) {
+                    sink ^= out.x25519_key_share[0];
+                    sink ^= out.x25519_key_share[CLOAK_CLIENTHELLO_PARSE_X25519_LEN - 1];
+                }
+            }
         }
-        full[i] = saved;
+        buf[i] = saved;
     }
+    free(buf);
     ASSERT_TRUE(1); /* reaching here without an ASan/UBSan abort is the test */
+}
+
+/* Locks in the header's documented contract: a missing server_name
+ * extension is NOT a parse failure, only structural malformation is. This
+ * rewrites the SNI extension's 2-byte type field (server_name == 0x0000,
+ * matched via its exact ext_type/ext_len byte sequence for this fixed
+ * vector) to an unused value so the parser's extension walk skips over it
+ * without recognizing it as server_name -- everything else, including the
+ * key_share extension, stays intact and should still be found. */
+static void test_missing_sni_is_not_a_failure(void) {
+    uint8_t buf[4096];
+    size_t n = hex_decode(GOOD_HEX, buf);
+    /* server_name extension type is 0x0000 at some offset within the
+     * extensions block; rewrite its 2-byte type field to an unused value
+     * (0xfff0) so the parser's extension walk skips over it without
+     * recognizing it as server_name. Locate it by scanning for the exact
+     * 4-byte sequence {0x00, 0x00, 0x00, 0x11} (ext_type=0x0000,
+     * ext_len=0x0011=17, matching this vector's SNI extension) since this
+     * is a fixed, known-good test vector, not attacker input. */
+    int found = 0;
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (buf[i] == 0x00 && buf[i + 1] == 0x00 && buf[i + 2] == 0x00 && buf[i + 3] == 0x11) {
+            buf[i] = 0xff;
+            buf[i + 1] = 0xf0;
+            found = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+    cloak_clienthello_parsed_t out;
+    int rc = cloak_clienthello_parse(buf, n, &out);
+    ASSERT_EQ_INT(rc, 0);
+    ASSERT_TRUE(out.sni == NULL);
+    ASSERT_TRUE(out.x25519_key_share != NULL); /* untouched, should still be found */
+}
+
+/* Same contract, for the key_share extension: rewrite its 2-byte type
+ * field (0x0033) to an unused value so the parser doesn't recognize it,
+ * leaving the SNI extension untouched. */
+static void test_missing_key_share_is_not_a_failure(void) {
+    uint8_t buf[4096];
+    size_t n = hex_decode(GOOD_HEX, buf);
+    /* key_share extension type is 0x0033; rewrite it the same way. Note
+     * 0x0033 also appears earlier in this vector as a plain cipher-suite
+     * value (TLS_DHE_RSA_WITH_AES_128_CBC_SHA in the cipher_suites list),
+     * so anchor on the 4-byte {ext_type=0x0033, ext_len=0x006b} sequence
+     * that is unique to this vector's actual key_share extension header,
+     * rather than the bare 2-byte type alone. */
+    int found = 0;
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (buf[i] == 0x00 && buf[i + 1] == 0x33 && buf[i + 2] == 0x00 && buf[i + 3] == 0x6b) {
+            buf[i] = 0xff;
+            buf[i + 1] = 0xf1;
+            found = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+    cloak_clienthello_parsed_t out;
+    int rc = cloak_clienthello_parse(buf, n, &out);
+    ASSERT_EQ_INT(rc, 0);
+    ASSERT_TRUE(out.x25519_key_share == NULL);
+    ASSERT_TRUE(out.sni != NULL); /* untouched, should still be found */
+}
+
+/* Same contract, one level deeper: the key_share extension itself is
+ * present and well-formed, it just doesn't contain an X25519 (group
+ * 0x001d) entry -- rewrite that one group id to 0x0017 (secp256r1) so no
+ * group-0x001d entry exists. */
+static void test_key_share_without_x25519_group_is_not_a_failure(void) {
+    uint8_t buf[4096];
+    size_t n = hex_decode(GOOD_HEX, buf);
+    /* Within the key_share extension's entry list, this vector's X25519
+     * entry has group 0x001d. Rewrite that one group id to 0x0017
+     * (secp256r1) so no group-0x001d entry exists -- the key_share
+     * extension itself is still present and well-formed, it just doesn't
+     * contain an X25519 entry. Note 0x001d also appears earlier in this
+     * vector inside the supported_groups extension's list of *advertised*
+     * groups (which this parser doesn't even inspect), so anchor on the
+     * 6-byte {client_shares list_len=0x0069, group=0x001d, key_len=0x0020}
+     * sequence that is unique to this vector's actual key_share entry,
+     * rather than the bare 2-byte group id alone. */
+    int found = 0;
+    for (size_t i = 0; i + 6 <= n; i++) {
+        if (buf[i] == 0x00 && buf[i + 1] == 0x69 && buf[i + 2] == 0x00 && buf[i + 3] == 0x1d &&
+            buf[i + 4] == 0x00 && buf[i + 5] == 0x20) {
+            buf[i + 3] = 0x17;
+            found = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+    cloak_clienthello_parsed_t out;
+    int rc = cloak_clienthello_parse(buf, n, &out);
+    ASSERT_EQ_INT(rc, 0);
+    ASSERT_TRUE(out.x25519_key_share == NULL);
 }
 
 static void store_be16(uint8_t *p, uint16_t v) {
@@ -214,5 +356,8 @@ TEST_MAIN_BEGIN()
     test_empty();
     test_truncation_sweep();
     test_byte_flip_sweep();
+    test_missing_sni_is_not_a_failure();
+    test_missing_key_share_is_not_a_failure();
+    test_key_share_without_x25519_group_is_not_a_failure();
     test_round_trip_against_client_builder();
 TEST_MAIN_END()

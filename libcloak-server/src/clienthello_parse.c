@@ -65,6 +65,14 @@ static int cursor_take_scoped(cursor_t *c, size_t n, cursor_t *scoped) {
     return 1;
 }
 
+/* Validates that n bytes remain and advances c past them, without
+ * exposing them to the caller -- used for fields this parser must skip
+ * over (with bounds checking) but never needs to read. */
+static int cursor_skip(cursor_t *c, size_t n) {
+    const uint8_t *unused;
+    return cursor_take(c, n, &unused);
+}
+
 /* Walks a key_share extension's data looking for a group == 0x001d entry
  * with a 32-byte key_exchange. The data starts with its own 2-byte
  * "client_shares list length" prefix before the list of
@@ -73,7 +81,13 @@ static int cursor_take_scoped(cursor_t *c, size_t n, cursor_t *scoped) {
  * int(u16(input[0:2])); pointer := 2` before its loop. Returns 0 on
  * structural malformation (a length that overruns ext_cursor); "not found"
  * is reported via *out_key_share staying NULL, which is not itself a
- * failure return. */
+ * failure return.
+ *
+ * If a ClientHello contains more than one server_name/key_share extension
+ * (or, within key_share, more than one X25519 entry), the FIRST one found
+ * wins. This differs from Go Cloak's reference parser, which uses a map and
+ * so takes the LAST one -- not a bug, just a documented, deliberate choice
+ * for this port. */
 static int parse_key_share_ext(cursor_t ext_cursor, const uint8_t **out_key_share) {
     uint16_t list_len;
     cursor_t list;
@@ -106,7 +120,11 @@ static int parse_key_share_ext(cursor_t ext_cursor, const uint8_t **out_key_shar
 
 /* Walks a server_name extension's data looking for the first
  * name_type == 0 (host_name) entry. Same not-found-is-not-failure contract
- * as parse_key_share_ext. */
+ * as parse_key_share_ext.
+ *
+ * If a ClientHello contains more than one server_name extension, the FIRST
+ * one found wins -- see the note on parse_key_share_ext for how this
+ * differs from Go Cloak's reference (map-based, last-wins) parser. */
 static int parse_server_name_ext(cursor_t ext_cursor, const uint8_t **out_sni, size_t *out_sni_len) {
     uint16_t list_len;
     cursor_t list;
@@ -225,23 +243,31 @@ int cloak_clienthello_parse(const uint8_t *data, size_t len, cloak_clienthello_p
     }
 
     uint16_t cipher_suites_len;
-    cursor_t cipher_suites;
     if (!cursor_take_u16(&c, &cipher_suites_len)) {
         return -1;
     }
-    if (!cursor_take_scoped(&c, cipher_suites_len, &cipher_suites)) {
+    if (!cursor_skip(&c, cipher_suites_len)) {
         return -1;
     }
 
     uint8_t compression_methods_len;
-    cursor_t compression_methods;
     if (!cursor_take_u8(&c, &compression_methods_len)) {
         return -1;
     }
-    if (!cursor_take_scoped(&c, compression_methods_len, &compression_methods)) {
+    if (!cursor_skip(&c, compression_methods_len)) {
         return -1;
     }
 
+    /* extensions is scoped to exactly extensions_len bytes via
+     * cursor_take_scoped, so parse_extensions can never walk past the
+     * declared end of the extensions block. This is a deliberate, stricter
+     * divergence from Go Cloak's parseClientHello, which passes
+     * peeled[pointer:] -- every remaining byte in the message -- to
+     * parseExtensions and never checks that extensions actually stop at the
+     * declared extensionsLen boundary. A ClientHello with an X25519
+     * key_share placed after the declared end of the extensions block will
+     * not have that key_share found by this parser, where Go's would find
+     * it. Not an oversight -- see the header's top-level doc comment. */
     uint16_t extensions_len;
     cursor_t extensions;
     if (!cursor_take_u16(&c, &extensions_len)) {
