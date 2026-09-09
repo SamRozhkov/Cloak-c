@@ -1,0 +1,4 @@
+add_executable(test_clienthello_parse test_clienthello_parse.c)
+target_include_directories(test_clienthello_parse PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_clienthello_parse PRIVATE cloak-server cloak-common)
+add_test(NAME test_clienthello_parse COMMAND test_clienthello_parse)

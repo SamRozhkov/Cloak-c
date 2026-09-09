@@ -14,3 +14,4 @@ enable_testing()
 
 add_subdirectory(libcloak-common)
 add_subdirectory(libcloak-mux)
+add_subdirectory(libcloak-server)
