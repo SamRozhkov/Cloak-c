@@ -1,5 +1,6 @@
 #include "cloak/clienthello.h"
 #include "cloak/common.h"
+#include "cloak/crypto.h"
 
 #include <string.h>
 #include <openssl/evp.h>
@@ -169,7 +170,7 @@ const cloak_clienthello_template_t cloak_clienthello_chrome = {
     .sni_host_off = 122,
     .sni_host_len = 15,
     .random_regions = {
-        /* The rest of the X25519Kyber768Draft00 hybrid share ([204,1388),
+        /* The rest of the X25519MLKEM768 hybrid share ([204,1388),
          * the ML-KEM-768 encapsulation key) is format-constrained and
          * handled by mlkem_ek_off below, not here. */
         { .off = 1388, .len = 32, .kind = CLOAK_CH_REGION_X25519 },  /* hybrid share's X25519 half */
@@ -461,14 +462,23 @@ static void fill_mlkem768_ek(uint8_t *out) {
     cloak_random_bytes(out + CLOAK_MLKEM768_EK_PACKED_LEN, CLOAK_MLKEM768_EK_SEED_LEN);
 }
 
-/* X25519 encodes a u-coordinate < 2^255 - 19; the wire format's top bit
- * (byte 31, bit 7) must be clear on any output a real client sends.
- * Verified against real uTLS builds: 300/300 Chrome and 200/200 Firefox
- * X25519-typed fields (hybrid key share's X25519 half, ECH `enc`) had
- * this bit clear; plain cloak_random_bytes sets it ~50% of the time. */
-static void fill_x25519_canonical(uint8_t *out) {
-    cloak_random_bytes(out, 32);
-    out[31] &= 0x7f;
+/* X25519 encodes the u-coordinate of a point in the prime-order subgroup
+ * of Curve25519 -- not just any 255-bit value with the top bit clear. A
+ * uniform random field element lands on the curve only ~50% of the time
+ * (curve vs. twist) and in the correct subgroup only ~1/8 of that (cofactor
+ * 8), so masking alone leaves a cheap, ~99.6%-accurate distinguisher for a
+ * censor doing offline flow analysis (two Legendre symbol checks). Use a
+ * genuine, freshly generated X25519 public key instead -- the same
+ * category of fix already applied to the Firefox secp256r1 field below.
+ * Real clients' values pass both checks 100% of the time, and so do these.
+ *
+ * The private half is deliberately discarded: these are decoy fields
+ * (the hybrid key share's X25519 half, ECH's ephemeral `enc`) that nothing
+ * downstream ever completes a key agreement against. Returns 0 on success,
+ * -1 on keygen failure. */
+static int fill_x25519_canonical(uint8_t *out) {
+    uint8_t priv[CLOAK_X25519_KEY_LEN];
+    return cloak_x25519_generate_keypair(priv, out);
 }
 
 /* Real Chrome/Firefox pick ECH's AEAD uniformly between AES-128-GCM
@@ -585,7 +595,9 @@ long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
     for (size_t i = 0; i < tmpl->random_region_count; i++) {
         size_t region_off = shift_off(tmpl->random_regions[i].off, tmpl->sni_host_off, sni_delta);
         if (tmpl->random_regions[i].kind == CLOAK_CH_REGION_X25519) {
-            fill_x25519_canonical(out + region_off);
+            if (fill_x25519_canonical(out + region_off) != 0) {
+                return -1;
+            }
         } else {
             cloak_random_bytes(out + region_off, tmpl->random_regions[i].len);
         }
@@ -645,7 +657,13 @@ long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
      * tail rather than just overwrite in place. Moving the tail first is
      * what makes it safe to then write up to chosen_ech_payload_len bytes
      * (which can exceed the template's baked-in payload length) into the
-     * payload region. */
+     * payload region.
+     *
+     * Invariant: every shipped template has at most one of
+     * padding_ext_off / ech_payload_candidate_count nonzero. Phase 4 and
+     * phase 5 each patch handshake_length and extensions_length by their
+     * own delta independently and are not designed to compose; a template
+     * setting both would need this code reworked, not just re-run. */
     if (has_ech_payload_resize) {
         size_t payload_off = shift_off(tmpl->ech_payload_off, tmpl->sni_host_off, sni_delta);
         size_t payload_len_off = shift_off(tmpl->ech_payload_len_off, tmpl->sni_host_off, sni_delta);
@@ -653,6 +671,13 @@ long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
 
         size_t base_payload_len = tmpl->ech_payload_candidate_lens[0];
         size_t tail_start = payload_off + base_payload_len;
+        /* Guards against a misconfigured template (a bad ech_payload_off or
+         * ech_payload_candidate_lens[0]) silently wrapping tail_len to a
+         * huge size_t and turning the memmove below into memory corruption
+         * instead of a caught error. Both shipped templates satisfy this. */
+        if (tail_start > (size_t)len_after_sni_shift) {
+            return -1;
+        }
         size_t tail_len = (size_t)len_after_sni_shift - tail_start;
 
         memmove(out + (size_t)((long)tail_start + ech_payload_delta), out + tail_start, tail_len);

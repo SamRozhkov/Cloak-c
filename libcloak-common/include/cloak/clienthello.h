@@ -24,7 +24,7 @@
  * would itself be a DPI distinguisher. */
 typedef enum {
     CLOAK_CH_REGION_RANDOM = 0,  /* plain cloak_random_bytes, no constraint */
-    CLOAK_CH_REGION_X25519 = 1,  /* cloak_random_bytes then clear the top bit of the last byte */
+    CLOAK_CH_REGION_X25519 = 1,  /* a genuine, freshly generated X25519 public key (the private half is discarded) */
 } cloak_clienthello_region_kind_t;
 
 /* A byte range within a template (and, after cloak_clienthello_build's SNI
@@ -86,7 +86,7 @@ typedef struct {
 
     /* If nonzero, the offset (in the template) of an ML-KEM-768
      * encapsulation key inside a hybrid post-quantum key share (Chrome's
-     * X25519Kyber768Draft00 group, 0x11ec). The first 1152 bytes are 768
+     * X25519MLKEM768 group, 0x11ec). The first 1152 bytes are 768
      * 12-bit coefficients packed per FIPS 203's ByteEncode_12, every one of
      * which is < q = 3329 in any genuine key; the trailing 32 bytes are an
      * unconstrained seed. Plain random bytes would leave ~145 of the 768
@@ -175,9 +175,9 @@ extern const cloak_clienthello_template_t cloak_clienthello_safari;
  *
  * Returns the number of bytes written to out (> 0) on success, or -1 on
  * failure (server_name empty or too long, out_cap too small for the
- * result, or a secp256r1 keygen failure). out_cap should be at least
- * CLOAK_CLIENTHELLO_MAX_BYTES to always succeed for any supported
- * template and any valid server_name. */
+ * result, or an X25519 or secp256r1 keygen failure). out_cap should be
+ * at least CLOAK_CLIENTHELLO_MAX_BYTES to always succeed for any
+ * supported template and any valid server_name. */
 long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
                               const uint8_t random[32],
                               const uint8_t session_id[32],

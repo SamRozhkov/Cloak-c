@@ -1,9 +1,11 @@
 #include "cloak/clienthello.h"
 #include "cloak/common.h"
+#include "cloak/crypto.h"
 #include "test_framework.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/obj_mac.h>
 
@@ -206,6 +208,84 @@ static int is_valid_secp256r1_point(const uint8_t point[65]) {
     }
     EC_POINT_free(pt);
     EC_GROUP_free(group);
+    return ok;
+}
+
+/* Returns 1 if u_le (a 32-byte little-endian X25519 wire encoding) is the
+ * u-coordinate of a point on Curve25519 -- i.e. u^3 + 486662*u^2 + u is a
+ * quadratic residue mod p = 2^255-19, checked by Legendre symbol -- and 0
+ * if it lies on the quadratic twist or is not a canonically reduced field
+ * element.
+ *
+ * A genuine X25519 public key is a multiple of the base point, so it is on
+ * the curve 100% of the time. A uniform random 255-bit value only is ~50%
+ * of the time; this is the distinguisher this check exists to catch. (The
+ * stronger prime-order-subgroup property -- a further ~1/8 filter on random
+ * values -- would need scalar multiplication, so it is not reimplemented
+ * here; it was verified out-of-tree against an RFC 7748 implementation
+ * during review, and the on-curve check alone already rejects a
+ * masked-random fill within a couple of loop iterations.) */
+static int is_on_curve25519(const uint8_t u_le[32]) {
+    int ok = 0;
+    uint8_t be[32];
+    BN_CTX *ctx = NULL;
+    BIGNUM *p = NULL, *u = NULL, *t = NULL, *a = NULL, *rhs = NULL, *e = NULL;
+
+    /* RFC 7748 masks the top bit before use; mirror that, then require what
+     * remains to be a canonically reduced field element. */
+    for (size_t i = 0; i < 32; i++) {
+        be[i] = u_le[31 - i];
+    }
+    be[0] &= 0x7f;
+
+    ctx = BN_CTX_new();
+    p = BN_new();
+    t = BN_new();
+    a = BN_new();
+    rhs = BN_new();
+    e = BN_new();
+    u = BN_bin2bn(be, 32, NULL);
+    if (ctx == NULL || p == NULL || t == NULL || a == NULL || rhs == NULL ||
+        e == NULL || u == NULL) {
+        goto done;
+    }
+
+    /* p = 2^255 - 19 */
+    if (!BN_lshift(p, BN_value_one(), 255) || !BN_set_word(t, 19) ||
+        !BN_sub(p, p, t)) {
+        goto done;
+    }
+    if (BN_cmp(u, p) >= 0) {
+        goto done; /* not a canonical field element */
+    }
+
+    /* rhs = u * (u^2 + 486662*u + 1) mod p */
+    if (!BN_mod_sqr(t, u, p, ctx) || !BN_set_word(a, 486662) ||
+        !BN_mod_mul(a, a, u, p, ctx) || !BN_mod_add(t, t, a, p, ctx) ||
+        !BN_mod_add(t, t, BN_value_one(), p, ctx) ||
+        !BN_mod_mul(rhs, t, u, p, ctx)) {
+        goto done;
+    }
+    if (BN_is_zero(rhs)) {
+        ok = 1; /* v == 0: a point of order 2, still on the curve */
+        goto done;
+    }
+
+    /* Legendre symbol: rhs^((p-1)/2) mod p == 1 iff rhs is a square. */
+    if (!BN_sub(e, p, BN_value_one()) || !BN_rshift1(e, e) ||
+        !BN_mod_exp(t, rhs, e, p, ctx)) {
+        goto done;
+    }
+    ok = BN_is_one(t);
+
+done:
+    BN_free(u);
+    BN_free(e);
+    BN_free(rhs);
+    BN_free(a);
+    BN_free(t);
+    BN_free(p);
+    BN_CTX_free(ctx);
     return ok;
 }
 
@@ -576,10 +656,13 @@ static void test_chrome_mlkem_key_is_structurally_valid_and_fresh(void) {
     ASSERT_TRUE(saw_difference); /* fresh key material every build, not frozen */
 }
 
-/* Every X25519-kind region must decode as a u-coordinate < 2^255-19, i.e.
- * the top bit of its last byte must be clear -- unlike plain random bytes,
- * which set it half the time. */
-static void x25519_regions_are_canonical_for(const cloak_clienthello_template_t *tmpl) {
+/* Every X25519-kind region must hold a value a real client could actually
+ * have sent: a genuine X25519 public key. That means both the cheap
+ * encoding property (top bit of the last byte clear, which plain random
+ * bytes get wrong half the time) and, more importantly, the structural one
+ * -- an actual point on Curve25519, which even top-bit-masked random bytes
+ * only manage ~52% of the time. */
+static void x25519_regions_are_valid_public_keys_for(const cloak_clienthello_template_t *tmpl) {
     uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
     uint8_t prev[32];
     int have_prev = 0;
@@ -603,6 +686,7 @@ static void x25519_regions_are_canonical_for(const cloak_clienthello_template_t 
                 off = (size_t)((long)off + sni_delta);
             }
             ASSERT_EQ_INT(out[off + 31] & 0x80, 0);
+            ASSERT_TRUE(is_on_curve25519(out + off));
 
             if (i == 0) {
                 if (have_prev && memcmp(prev, out + off, 32) != 0) {
@@ -617,12 +701,35 @@ static void x25519_regions_are_canonical_for(const cloak_clienthello_template_t 
     ASSERT_TRUE(saw_difference);
 }
 
-static void test_chrome_x25519_regions_are_canonical(void) {
-    x25519_regions_are_canonical_for(&cloak_clienthello_chrome);
+static void test_chrome_x25519_regions_are_valid_public_keys(void) {
+    x25519_regions_are_valid_public_keys_for(&cloak_clienthello_chrome);
 }
 
-static void test_firefox_x25519_regions_are_canonical(void) {
-    x25519_regions_are_canonical_for(&cloak_clienthello_firefox);
+static void test_firefox_x25519_regions_are_valid_public_keys(void) {
+    x25519_regions_are_valid_public_keys_for(&cloak_clienthello_firefox);
+}
+
+/* Guards the check above against silently passing on a broken
+ * is_on_curve25519: the old masked-random construction this fix replaced
+ * must be rejected, and a genuine key must be accepted. */
+static void test_on_curve25519_check_discriminates(void) {
+    int rejected_masked_random = 0;
+
+    for (int iter = 0; iter < 60; iter++) {
+        uint8_t masked[32];
+        cloak_random_bytes(masked, sizeof(masked));
+        masked[31] &= 0x7f;
+        if (!is_on_curve25519(masked)) {
+            rejected_masked_random = 1;
+        }
+
+        uint8_t priv[32], pub[32];
+        ASSERT_EQ_INT(cloak_x25519_generate_keypair(priv, pub), 0);
+        ASSERT_TRUE(is_on_curve25519(pub));
+    }
+    /* ~50% rejection per draw; 60 draws makes a false failure here about a
+     * 1-in-10^18 event. */
+    ASSERT_TRUE(rejected_masked_random);
 }
 
 /* ECH's config_id is a uniform random byte in real clients and its aead_id
@@ -807,8 +914,9 @@ TEST_MAIN_BEGIN()
     test_firefox_secp256r1_keyshare_is_valid_and_fresh();
     test_safari_padding_recomputed_for_various_sni_lengths();
     test_chrome_mlkem_key_is_structurally_valid_and_fresh();
-    test_chrome_x25519_regions_are_canonical();
-    test_firefox_x25519_regions_are_canonical();
+    test_on_curve25519_check_discriminates();
+    test_chrome_x25519_regions_are_valid_public_keys();
+    test_firefox_x25519_regions_are_valid_public_keys();
     test_chrome_ech_config_id_and_aead_id_vary();
     test_firefox_ech_config_id_and_aead_id_vary();
     test_chrome_ech_payload_length_varies_and_stays_consistent();
