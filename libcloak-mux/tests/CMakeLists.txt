@@ -22,3 +22,8 @@ add_executable(test_conn test_conn.c)
 target_include_directories(test_conn PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_conn PRIVATE cloak-mux)
 add_test(NAME test_conn COMMAND test_conn)
+
+add_executable(test_switchboard test_switchboard.c)
+target_include_directories(test_switchboard PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_switchboard PRIVATE cloak-mux)
+add_test(NAME test_switchboard COMMAND test_switchboard)

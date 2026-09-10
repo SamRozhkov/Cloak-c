@@ -1,0 +1,85 @@
+#ifndef CLOAK_SWITCHBOARD_H
+#define CLOAK_SWITCHBOARD_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "cloak/reactor.h"
+
+typedef struct cloak_switchboard cloak_switchboard_t;
+typedef struct cloak_conn cloak_conn_t;
+
+/* frame_bytes/len: an already length-prefix-stripped, still-obfuscated
+ * frame's bytes, valid only for the duration of this call (points into
+ * the originating cloak_conn_t's reused scratch buffer). */
+typedef void (*cloak_switchboard_envelope_cb)(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len, void *userdata);
+
+/* Called exactly once, the moment ANY connection in the pool becomes
+ * broken (matches Go's switchboard: a single connection's failure is
+ * fatal to the whole pool, not just that connection -- see this
+ * project's plan-level fault-model documentation). sb is NOT
+ * automatically torn down when this fires -- the owner must still call
+ * cloak_switchboard_close_all and/or cloak_switchboard_destroy once it's
+ * done reacting (this lets the owner, e.g. a session, do its own
+ * higher-layer cleanup first, matching Go's Session.closeSession()
+ * running before switchboard.closeAll()). */
+typedef void (*cloak_switchboard_broken_cb)(cloak_switchboard_t *sb, void *userdata);
+
+struct cloak_switchboard {
+    cloak_reactor_t *reactor;
+    cloak_conn_t **conns; /* owned array of owned heap-allocated cloak_conn_t */
+    size_t conns_len;
+    size_t conns_cap;
+
+    size_t max_frame_len;
+    size_t conn_send_queue_cap;
+
+    uint32_t rng_state; /* xorshift32, seeded once at init -- NOT cryptographic, see this file's header comment */
+
+    int broken;
+    cloak_switchboard_envelope_cb on_envelope;
+    void *on_envelope_userdata;
+    cloak_switchboard_broken_cb on_broken;
+    void *on_broken_userdata;
+};
+
+/* max_frame_len/conn_send_queue_cap are forwarded unchanged to every
+ * cloak_conn_t this switchboard creates (see cloak_conn_init's own
+ * documentation for their meaning).
+ *
+ * Returns 0 on success, -1 on invalid parameters (same validation as
+ * cloak_conn_init) or allocation failure. */
+int cloak_switchboard_init(cloak_switchboard_t *sb, cloak_reactor_t *reactor,
+                            size_t max_frame_len, size_t conn_send_queue_cap,
+                            cloak_switchboard_envelope_cb on_envelope, void *on_envelope_userdata,
+                            cloak_switchboard_broken_cb on_broken, void *on_broken_userdata);
+
+/* Calls cloak_switchboard_close_all, then frees sb's own array. */
+void cloak_switchboard_destroy(cloak_switchboard_t *sb);
+
+/* Wraps fd in a new cloak_conn_t and adds it to the pool. fd must already
+ * be an open, non-blocking-capable socket -- ownership of fd passes to
+ * the switchboard (it will be close()d by cloak_switchboard_close_all).
+ * Returns 0 on success, -1 if sb is already broken or on allocation/
+ * cloak_conn_init failure. */
+int cloak_switchboard_add_conn(cloak_switchboard_t *sb, int fd);
+
+/* Picks one connection uniformly at random from the pool and sends
+ * frame_bytes/frame_len through it (length-prefixed by that connection,
+ * see cloak_conn_send). Returns 0 on success, -1 if sb is broken, the
+ * pool is empty, or the picked connection's send fails (in the last
+ * case, on_broken fires synchronously before this call returns -- see
+ * this project's plan-level fault-model documentation: no retry among
+ * other connections). Must not block. */
+int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len);
+
+/* Destroys and close()s every connection in the pool and empties it.
+ * Idempotent (a second call is a harmless no-op). Does not fire
+ * on_broken (that callback signals "something failed", not "cleanup
+ * happened" -- a normal, expected close_all from the owner's own active
+ * teardown is not a failure). */
+void cloak_switchboard_close_all(cloak_switchboard_t *sb);
+
+size_t cloak_switchboard_conn_count(const cloak_switchboard_t *sb);
+
+#endif
