@@ -2,6 +2,7 @@ add_library(cloak-mux STATIC
     src/frame.c
     src/bytequeue.c
     src/stream.c
+    src/strmtab.c
 )
 
 target_include_directories(cloak-mux PUBLIC include)
