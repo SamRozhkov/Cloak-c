@@ -5,6 +5,7 @@ add_library(cloak-mux STATIC
     src/strmtab.c
     src/conn.c
     src/switchboard.c
+    src/session.c
 )
 
 target_include_directories(cloak-mux PUBLIC include)
