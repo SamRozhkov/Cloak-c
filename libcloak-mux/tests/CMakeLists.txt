@@ -17,3 +17,8 @@ add_executable(test_strmtab test_strmtab.c)
 target_include_directories(test_strmtab PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_strmtab PRIVATE cloak-mux)
 add_test(NAME test_strmtab COMMAND test_strmtab)
+
+add_executable(test_conn test_conn.c)
+target_include_directories(test_conn PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_conn PRIVATE cloak-mux)
+add_test(NAME test_conn COMMAND test_conn)
