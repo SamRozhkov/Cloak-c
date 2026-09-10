@@ -61,18 +61,9 @@ static void session_retire_stream(cloak_session_t *sesh, cloak_stream_t *stream)
     }
 }
 
-/* Used only by session_close_internal's whole-session teardown sweep.
- * Unlike session_retire_stream, this DOES unconditionally free every
- * still-active stream's memory -- destroying the whole session is a
- * bigger, more final event than one stream closing, and invalidates
- * every stream pointer this session ever handed out, whether previously
- * released or not (this is documented on cloak_session_close/
- * cloak_session_destroy themselves). Streams that were already retired
- * (tombstoned) before this sweep runs are NOT visited by
- * cloak_strmtab_for_each_active (tombstones aren't ACTIVE) -- their
- * memory remains the responsibility of whoever is holding that pointer,
- * via cloak_session_release_stream, exactly as if the session were still
- * alive. */
+/* Destroys and frees a single stream entry: used both by
+ * session_free_all_active_streams (below) and directly (see its own
+ * comment for why timing differs between the two call sites). */
 static void session_destroy_stream_iter_cb(uint32_t key, void *value, void *userdata) {
     cloak_session_t *sesh = (cloak_session_t *)userdata;
     cloak_stream_t *stream = (cloak_stream_t *)value;
@@ -83,11 +74,29 @@ static void session_destroy_stream_iter_cb(uint32_t key, void *value, void *user
     sesh->active_stream_count--;
 }
 
-/* Shared teardown for both active Close() and passive close (Go's
- * closeSession): idempotent, frees every still-active stream's memory
- * (see session_destroy_stream_iter_cb), cancels the inactivity timer.
- * Returns 1 if this call actually did the work (first call), 0 if sesh
- * was already closed (matches Go's errRepeatSessionClosing being
+/* Frees every still-ACTIVE stream's memory. Called from two places with
+ * two different timing guarantees -- see each call site's own comment:
+ * session_deferred_teardown_cb (always safe -- runs outside any nested
+ * call stack) and cloak_session_destroy (safe by that function's own
+ * documented calling contract, not by anything here). Never call this
+ * synchronously from session_close_internal or from anywhere reachable
+ * from a cloak_conn_t/cloak_stream_t callback -- see this plan's Global
+ * Constraints for why (this is exactly the fifth and sixth instances of
+ * this project's recurring "freed object still has a live pointer above
+ * it on the call stack" bug class, both caused by an earlier draft of
+ * this exact function running synchronously from session_close_internal). */
+static void session_free_all_active_streams(cloak_session_t *sesh) {
+    cloak_strmtab_for_each_active(&sesh->streams, session_destroy_stream_iter_cb, sesh);
+}
+
+/* Marks the session closed and cancels the inactivity timer. Deliberately
+ * does NOT touch any stream's or connection's memory -- see
+ * session_schedule_deferred_teardown's own comment for why freeing
+ * either must never happen synchronously here. Safe to call from
+ * anywhere, including reentrantly from deep inside a cloak_conn_t's or
+ * cloak_stream_t's own dispatch/write call chain, for exactly that
+ * reason. Returns 1 if this call actually did the work (first call), 0
+ * if sesh was already closed (matches Go's errRepeatSessionClosing being
  * surfaced by the caller as appropriate). */
 static int session_close_internal(cloak_session_t *sesh) {
     if (sesh->closed) {
@@ -95,7 +104,6 @@ static int session_close_internal(cloak_session_t *sesh) {
     }
     sesh->closed = 1;
     cloak_reactor_cancel_timer(sesh->reactor, sesh->inactivity_timer_id);
-    cloak_strmtab_for_each_active(&sesh->streams, session_destroy_stream_iter_cb, sesh);
     return 1;
 }
 
@@ -103,6 +111,23 @@ static void session_send_closing_session_frame(cloak_session_t *sesh) {
     uint8_t len_byte;
     cloak_random_bytes(&len_byte, 1);
     size_t pad_len = (size_t)len_byte + 1;
+    /* Clamp so the fully obfuscated frame (header + payload + padding +
+     * AEAD tag, bounded by CLOAK_FRAME_MAX_EXTRA_LEN) never exceeds
+     * max_on_wire_size -- without this, cloak_conn_send would reject an
+     * oversized closing-session frame as a protocol violation and mark
+     * the connection broken, meaning the peer would never receive this
+     * notification and would only learn of the close from the connection
+     * dying instead. Same clamp cloak_stream_send_closing already
+     * applies, for the same reason (stream.c, already merged) -- missing
+     * here until caught during this plan's own design verification.
+     * cloak_session_init already validates max_on_wire_size >
+     * CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN, so this
+     * subtraction cannot underflow. */
+    size_t max_payload = sesh->max_on_wire_size - CLOAK_FRAME_HEADER_LEN - CLOAK_FRAME_MAX_EXTRA_LEN;
+    size_t max_pad = max_payload < 256 ? max_payload : 256;
+    if (pad_len > max_pad) {
+        pad_len = max_pad;
+    }
     uint8_t pad[256];
     cloak_random_bytes(pad, pad_len);
 
@@ -122,65 +147,81 @@ static void session_send_closing_session_frame(cloak_session_t *sesh) {
 }
 
 /* Fired by a 0ms reactor timer scheduled by session_passive_close/
- * cloak_session_close -- see their shared comment for why the actual
- * switchboard teardown must never happen synchronously from within
- * either of those two functions. */
+ * cloak_session_close -- see session_schedule_deferred_teardown's own
+ * comment for why every bit of actual teardown work lives here instead
+ * of running synchronously in session_close_internal. */
 static void session_deferred_teardown_cb(cloak_reactor_t *r, void *userdata) {
     (void)r;
     cloak_session_t *sesh = (cloak_session_t *)userdata;
+    sesh->teardown_timer_id = CLOAK_TIMER_INVALID; /* this timer has now fired -- nothing left to cancel */
+    session_free_all_active_streams(sesh);
     cloak_switchboard_close_all(&sesh->sb);
     if (sesh->on_broken) {
         sesh->on_broken(sesh, sesh->on_broken_userdata);
     }
 }
 
-/* Schedules the actual connection-pool teardown (cloak_switchboard_close_all)
- * and the on_broken notification for the reactor's NEXT dispatch loop
- * iteration, rather than performing them right here.
+/* Schedules the actual teardown -- freeing every stream's memory,
+ * closing the connection pool, and firing on_broken -- for the reactor's
+ * NEXT dispatch loop iteration, rather than performing any of it here.
  *
  * This is required, not just cautious: session_passive_close and
  * cloak_session_close can both be invoked REENTRANTLY, from deep inside
- * one specific cloak_conn_t's own dispatch call chain --
- * conn_reactor_cb -> conn_handle_readable -> conn_extract_and_dispatch ->
- * (the on_envelope callback) -> switchboard_conn_envelope_adapter ->
- * session_on_envelope -> here (a closing-session frame just arrived), or
- * conn_mark_broken -> c->on_closed -> switchboard_conn_closed_adapter ->
- * session_on_switchboard_broken -> here (a connection just broke). If
- * cloak_switchboard_close_all ran synchronously from within either call
- * chain, it would free() every cloak_conn_t in the pool -- including,
- * whenever there's only one connection (always true in the first
- * reproduction of this bug) or whenever it happens to be the
- * currently-dispatching one, the very cloak_conn_t whose call frames are
- * still unwinding above this point on the stack. conn_extract_and_dispatch's
- * loop touches that pointer again (`if (c->broken)`) the moment the
- * on_envelope call returns -- a heap-use-after-free this plan's own
- * design verification caught deterministically under ASan. Deferring to
- * a 0ms timer is the standard "close on next tick" pattern any
- * single-threaded event loop needs for exactly this hazard: by the time
- * session_deferred_teardown_cb runs, every nested call from the
- * triggering event has fully unwound back to the reactor's own dispatch
- * loop, so nothing is still holding a live stack frame into any
- * cloak_conn_t this call is about to free. As a consequence, on_broken
- * is now ALSO guaranteed to fire outside of any cloak_session_t/
- * cloak_conn_t callback's call stack -- safe for a consumer to call
- * cloak_session_destroy synchronously from within it.
+ * either a specific cloak_conn_t's own dispatch call chain (a
+ * closing-session frame arriving mid-read, or a connection breaking
+ * mid-write -- conn_reactor_cb -> ... -> session_on_envelope or
+ * conn_mark_broken -> ... -> session_on_switchboard_broken -> here) OR a
+ * specific cloak_stream_t's own write call chain (cloak_stream_write's
+ * sink call cascading into a connection failure -- session's own
+ * session_stream_sink_adapter -> cloak_switchboard_send -> cloak_conn_send
+ * -> conn_mark_broken -> ... -> here -- while cloak_stream_write is still
+ * on the stack above it, about to touch that same stream's fields again
+ * once the sink call returns) OR from within cloak_session_close_stream/
+ * cloak_session_release_stream's own call to cloak_stream_send_closing
+ * (identical hazard, one frame later).
  *
- * No extra timer-id bookkeeping/cancellation is needed here (unlike the
- * inactivity timer): if cloak_session_destroy runs synchronously before
- * this timer fires, it memsets sesh to all zeros WITHOUT freeing sesh's
- * own storage (matching every other _destroy function in this codebase
- * -- the caller owns sesh's storage) and cloak_switchboard_close_all is
- * itself idempotent (a second call iterates zero connections and no-ops)
- * -- so if this timer later fires against an already-zeroed sesh,
- * sesh->sb.conns_len is 0 and sesh->on_broken is NULL, both no-ops. The
- * only way this could be unsafe is sesh's own storage being freed/reused
- * before the timer fires, which cloak_session_destroy never does itself
- * -- and if the owning reactor is destroyed first (the normal test/
- * caller teardown order), cloak_reactor_destroy discards any still-
- * pending timer without invoking it (see the already-merged reactor
- * module's own contract), so this is safe either way. */
+ * If EITHER freeing every stream OR closing every connection ran
+ * synchronously from any of those call chains, it would free memory a
+ * live stack frame above this point still points into -- a
+ * heap-use-after-free. This project has hit this exact class of bug six
+ * times across this one module (see this plan's Global Constraints for
+ * the full list); the first four were each patched at their own call
+ * site, but the fifth and sixth (found during this plan's own design
+ * verification, after this file's first draft had already "fixed" the
+ * first four) are what led to deferring the ENTIRE teardown -- streams
+ * included, not just connections -- as a single mechanism, rather than
+ * chasing further call sites one at a time. Deferring to a 0ms timer is
+ * the standard "close on next tick" pattern any single-threaded event
+ * loop needs for this hazard: by the time session_deferred_teardown_cb
+ * runs, every nested call from the triggering event has fully unwound
+ * back to the reactor's own dispatch loop, so nothing is still holding a
+ * live stack frame into anything this call is about to free. As a
+ * consequence, on_broken is now ALSO guaranteed to fire outside of any
+ * cloak_session_t/cloak_conn_t/cloak_stream_t callback's call stack --
+ * safe for a consumer to call cloak_session_destroy synchronously from
+ * within it.
+ *
+ * Because session_close_internal no longer touches any stream, a
+ * consumer calling cloak_session_release_stream on a specific stream
+ * during the (usually sub-millisecond) window between this call and the
+ * deferred callback firing works correctly: that call tombstones and
+ * frees just that one stream immediately, and the later deferred sweep's
+ * cloak_strmtab_for_each_active simply no longer sees it (tombstoned
+ * entries aren't ACTIVE), so it isn't touched twice.
+ *
+ * sesh->teardown_timer_id IS tracked and must be cancelled by
+ * cloak_session_destroy (unlike this reasoning's own first draft, which
+ * argued no cancellation was needed here -- that argument was wrong: it
+ * assumed cloak_session_destroy always outlives this timer or the
+ * reactor is destroyed first, but nothing enforces either. A caller that
+ * heap-allocates a cloak_session_t, calls cloak_session_close, then
+ * cloak_session_destroy, then frees its own storage -- all before ever
+ * running the reactor again -- leaves this timer pointing at freed
+ * memory once the reactor finally runs. This was the sixth instance of
+ * this same bug class, also found during this plan's own design
+ * verification.) */
 static void session_schedule_deferred_teardown(cloak_session_t *sesh) {
-    cloak_reactor_add_timer(sesh->reactor, 0, session_deferred_teardown_cb, sesh);
+    sesh->teardown_timer_id = cloak_reactor_add_timer(sesh->reactor, 0, session_deferred_teardown_cb, sesh);
 }
 
 static void session_passive_close(cloak_session_t *sesh) {
@@ -336,6 +377,22 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
 
 void cloak_session_destroy(cloak_session_t *sesh) {
     session_close_internal(sesh); /* idempotent; no-op if already closed or never successfully initialized */
+    /* Cancel any still-pending deferred teardown BEFORE freeing anything
+     * below -- otherwise, if the reactor runs again later (after this
+     * call returns but before it's destroyed), session_deferred_teardown_cb
+     * would fire against memory this function is about to free/zero. See
+     * session_schedule_deferred_teardown's own comment for the full
+     * reasoning (this is what closes the sixth instance of this
+     * project's recurring UAF class). */
+    cloak_reactor_cancel_timer(sesh->reactor, sesh->teardown_timer_id);
+    /* Synchronously free every remaining stream here -- safe only
+     * because of this function's own documented calling contract (never
+     * from within on_new_stream or any cloak_conn_t/cloak_stream_t
+     * callback; only from ordinary code or from within on_broken, which
+     * itself always runs outside any such callback's call stack). This
+     * is the one place in this file allowed to call
+     * session_free_all_active_streams synchronously. */
+    session_free_all_active_streams(sesh);
     cloak_switchboard_destroy(&sesh->sb);
     cloak_strmtab_destroy(&sesh->streams);
     memset(sesh, 0, sizeof(*sesh));
@@ -378,6 +435,20 @@ cloak_stream_t *cloak_session_open_stream(cloak_session_t *sesh, uint32_t *out_i
     return stream;
 }
 
+/* Sends the closing frame BEFORE retiring, matching Go's own order
+ * (notify the peer, then clean up locally) -- this is safe, including
+ * when cloak_stream_send_closing's sink call reentrantly triggers a full
+ * session teardown (e.g. the connection it would have gone out on is
+ * already dead), specifically BECAUSE session_close_internal no longer
+ * touches any stream's memory (see session_schedule_deferred_teardown's
+ * own comment) -- such a reentrant teardown only sets sesh->closed and
+ * schedules a deferred callback; it cannot free `stream` out from under
+ * this function. session_retire_stream below therefore always still
+ * operates on valid memory, regardless of what cloak_stream_send_closing
+ * triggered. (This was NOT true of an earlier draft of this file, before
+ * session_close_internal's stream-freeing sweep was moved into the
+ * deferred callback -- see this plan's Global Constraints for the full
+ * incident.) */
 int cloak_session_close_stream(cloak_session_t *sesh, cloak_stream_t *stream) {
     if (sesh->closed) {
         return -1;
@@ -396,7 +467,8 @@ void cloak_session_release_stream(cloak_session_t *sesh, cloak_stream_t *stream)
     if (!entry->retired) {
         /* Releasing a still-open stream -- perform an implicit active
          * close first (send the closing frame, retire it), matching this
-         * function's documented contract. */
+         * function's documented contract. Safe in the same way
+         * cloak_session_close_stream's own comment explains above. */
         cloak_stream_send_closing(stream, CLOAK_FRAME_CLOSING_STREAM);
         session_retire_stream(sesh, stream);
     }

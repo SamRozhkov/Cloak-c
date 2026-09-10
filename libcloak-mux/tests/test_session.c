@@ -342,9 +342,22 @@ static void test_inactivity_timeout_closes_session(void) {
     ASSERT_EQ_INT(cloak_session_is_closed(&sesh), 0);
 
     /* Pump ONLY this session's own reactor (no peer needed -- this
-     * exercises the timer firing, not the network path) until the timer
-     * fires or a generous round budget is exhausted. */
-    for (int i = 0; i < 50 && !cloak_session_is_closed(&sesh); i++) {
+     * exercises the timer firing, not the network path) until on_broken
+     * actually fires or a generous round budget is exhausted. Waits on
+     * h.broken_count, not cloak_session_is_closed: is_closed() flips
+     * synchronously inside session_check_timeout (before the deferred
+     * teardown that fires on_broken even gets scheduled), so a loop that
+     * stopped as soon as is_closed() became true could exit one round
+     * too early, on the rare occasion this test's own stop_reactor_timer_cb
+     * (used to bound each cloak_reactor_run call) is itself due in the
+     * very same batch as the freshly-scheduled 0ms deferred-teardown
+     * timer and happens to run first, setting the reactor's own stopped
+     * flag before that timer gets a chance to fire. Found as a real,
+     * reproducible ~5% flake during this plan's own design verification
+     * after the deferred-teardown redesign (see this plan's Global
+     * Constraints) separated is_closed() from on_broken() in time where
+     * they used to be simultaneous. */
+    for (int i = 0; i < 50 && h.broken_count == 0; i++) {
         cloak_reactor_add_timer(client_r, 10, stop_reactor_timer_cb, client_r);
         cloak_reactor_run(client_r);
     }
@@ -443,6 +456,106 @@ static void test_on_new_stream_closing_session_is_safe(void) {
     cloak_reactor_destroy(server_r);
 }
 
+/* Regression test for findings 3/4 in this plan's Global Constraints
+ * (the fifth/sixth instances of this project's recurring UAF class):
+ * closing a stream whose underlying connection has already died must
+ * not free that same stream out from under cloak_session_close_stream's
+ * own call chain. Completely ordinary trigger -- a peer disconnecting is
+ * the single most common event a proxy server has to handle -- not an
+ * artificial configuration (no tiny queue caps, no forced small buffers). */
+static void test_close_stream_after_peer_disconnect_is_safe(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    cloak_obfuscator_t obfuscator;
+    make_obfuscator(&obfuscator);
+
+    cloak_session_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.obfuscator = obfuscator;
+    cfg.max_on_wire_size = MAX_ON_WIRE;
+    cfg.stream_recv_capacity = STREAM_RECV_CAP;
+    cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
+    cfg.conn_send_queue_cap = CONN_SEND_QUEUE_CAP;
+    cfg.inactivity_timeout_ms = 60000;
+
+    cloak_session_t sesh;
+    ASSERT_EQ_INT(cloak_session_init(&sesh, 1, r, &cfg), 0);
+
+    int fds[2];
+    ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
+    ASSERT_EQ_INT(cloak_session_add_conn(&sesh, fds[0]), 0);
+
+    uint32_t id;
+    cloak_stream_t *stream = cloak_session_open_stream(&sesh, &id);
+    ASSERT_TRUE(stream != NULL);
+
+    close(fds[1]); /* peer disconnects */
+
+    /* Actively closing this stream now triggers, inside
+     * cloak_stream_send_closing's own sink call, a write failure that
+     * cascades all the way up into a full session teardown -- reentrant
+     * to this very call. Must not crash. */
+    (void)cloak_session_close_stream(&sesh, stream);
+    ASSERT_EQ_INT(cloak_session_is_closed(&sesh), 1);
+
+    /* cloak_session_close_stream only retires stream -- it does not free
+     * it (see cloak_session_release_stream's own contract). Release it
+     * explicitly so this test doesn't leak (cloak_session_destroy's own
+     * deferred/synchronous sweep only reaches still-ACTIVE streams;
+     * stream is already retired by this point, so it would otherwise
+     * never be freed by anything). */
+    cloak_session_release_stream(&sesh, stream);
+
+    cloak_session_destroy(&sesh);
+    cloak_reactor_destroy(r);
+}
+
+/* Sibling regression test: the same reentrant-teardown hazard, but
+ * triggered from cloak_stream_write's own sink call instead of an
+ * explicit close -- the specific path that reordering
+ * cloak_session_close_stream/cloak_session_release_stream alone would
+ * NOT have closed (see this plan's Global Constraints, finding 4) and
+ * which is why the fix defers the whole stream-freeing sweep instead. */
+static void test_stream_write_after_peer_disconnect_is_safe(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    cloak_obfuscator_t obfuscator;
+    make_obfuscator(&obfuscator);
+
+    cloak_session_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.obfuscator = obfuscator;
+    cfg.max_on_wire_size = MAX_ON_WIRE;
+    cfg.stream_recv_capacity = STREAM_RECV_CAP;
+    cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
+    cfg.conn_send_queue_cap = CONN_SEND_QUEUE_CAP;
+    cfg.inactivity_timeout_ms = 60000;
+
+    cloak_session_t sesh;
+    ASSERT_EQ_INT(cloak_session_init(&sesh, 1, r, &cfg), 0);
+
+    int fds[2];
+    ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
+    ASSERT_EQ_INT(cloak_session_add_conn(&sesh, fds[0]), 0);
+
+    uint32_t id;
+    cloak_stream_t *stream = cloak_session_open_stream(&sesh, &id);
+    ASSERT_TRUE(stream != NULL);
+
+    close(fds[1]); /* peer disconnects */
+
+    /* This write's own sink call fails (peer gone), cascading into a
+     * full session teardown reentrant to this very call -- must not
+     * crash, and cloak_stream_write itself must survive touching
+     * `stream` again (s->write_closed = 1) after its sink call returns. */
+    long got = cloak_stream_write(stream, (const uint8_t *)"x", 1);
+    ASSERT_EQ_INT(got, -1);
+    ASSERT_EQ_INT(cloak_session_is_closed(&sesh), 1);
+
+    cloak_session_destroy(&sesh);
+    cloak_reactor_destroy(r);
+}
+
 static void test_destroy_after_failed_init_is_safe(void) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -472,5 +585,7 @@ TEST_MAIN_BEGIN()
     test_active_session_close_notifies_peer();
     test_inactivity_timeout_closes_session();
     test_on_new_stream_closing_session_is_safe();
+    test_close_stream_after_peer_disconnect_is_safe();
+    test_stream_write_after_peer_disconnect_is_safe();
     test_destroy_after_failed_init_is_safe();
 TEST_MAIN_END()

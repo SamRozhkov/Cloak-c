@@ -73,6 +73,7 @@ struct cloak_session {
     size_t stream_max_pending_frames;
     uint64_t inactivity_timeout_ms;
     cloak_timer_id_t inactivity_timer_id;
+    cloak_timer_id_t teardown_timer_id;
 
     int closed;
 
@@ -92,12 +93,22 @@ struct cloak_session {
 int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reactor,
                         const cloak_session_config_t *config);
 
-/* If not already closed, performs the same teardown as
- * cloak_session_close (destroys every stream, closes every connection)
- * WITHOUT sending a closing-session frame first (there is likely nothing
- * left to send it through, and the caller is discarding this session
- * outright, not notifying a peer) -- then frees sesh's own resources.
- * Safe to call on a session left zeroed by a rejected cloak_session_init. */
+/* If not already closed, marks the session closed WITHOUT sending a
+ * closing-session frame first (there is likely nothing left to send it
+ * through, and the caller is discarding this session outright, not
+ * notifying a peer). Then, synchronously and unconditionally (whether or
+ * not a deferred teardown was already pending -- see cloak_session_close's
+ * own doc comment): cancels any pending deferred-teardown timer, destroys
+ * and frees every remaining stream, closes every underlying connection,
+ * and frees sesh's own resources. Does NOT fire on_broken (this is the
+ * caller's own explicit teardown, not a failure notification).
+ *
+ * Must NOT be called from within on_new_stream, or from within any
+ * cloak_conn_t/cloak_switchboard_t callback -- only from ordinary
+ * application code, or from within on_broken (on_broken is documented as
+ * always firing outside of any such callback's call stack, which is what
+ * makes calling this from there safe). Safe to call on a session left
+ * zeroed by a rejected cloak_session_init. */
 void cloak_session_destroy(cloak_session_t *sesh);
 
 /* Wraps fd (an open, non-blocking-capable socket) in a new underlying
@@ -133,11 +144,18 @@ int cloak_session_close_stream(cloak_session_t *sesh, cloak_stream_t *stream);
  * again) -- exactly like calling free() on any other heap pointer. */
 void cloak_session_release_stream(cloak_session_t *sesh, cloak_stream_t *stream);
 
-/* Actively closes the whole session (Go's Session.Close): destroys every
- * remaining stream and sends one session-level closing frame to the peer
- * synchronously, before this call returns; closing every underlying
- * connection and firing on_broken happen on the reactor's next dispatch
- * loop iteration (see cloak_session_broken_cb's own doc comment for why).
+/* Actively closes the whole session (Go's Session.Close): marks the
+ * session closed and sends one session-level closing frame to the peer
+ * synchronously, before this call returns. Destroying every remaining
+ * stream's memory, closing every underlying connection, and firing
+ * on_broken are ALL deferred to the reactor's next dispatch loop
+ * iteration (see cloak_session_broken_cb's own doc comment for why) --
+ * every stream this session ever handed out stays valid (though no
+ * longer routable -- no more frames will ever reach it) for that brief
+ * window; call cloak_session_release_stream on any you still hold if you
+ * need deterministic, immediate cleanup of a specific one rather than
+ * waiting for the deferred sweep to reclaim it.
+ *
  * Returns 0 on success, -1 if already closed (matches Go's
  * errRepeatSessionClosing). Safe to call from within any of this
  * session's own callbacks (on_new_stream, on_broken, etc.), not just from

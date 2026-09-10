@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static void conn_set_want_writable(cloak_conn_t *c, int want) {
@@ -42,7 +43,16 @@ static void conn_try_drain_send(cloak_conn_t *c) {
         }
         size_t want = avail < sizeof(drain_buf) ? avail : sizeof(drain_buf);
         size_t peeked = cloak_bytequeue_peek(&c->send_q, drain_buf, want);
-        ssize_t n = write(c->fd, drain_buf, peeked);
+        /* send() with MSG_NOSIGNAL, not write() -- writing to a socket
+         * whose peer has already closed raises SIGPIPE, which by default
+         * terminates the whole process. A proxy server must survive an
+         * individual client disconnecting; MSG_NOSIGNAL makes this an
+         * ordinary EPIPE error instead (handled below, same as any other
+         * write error -- conn_mark_broken). Found during this plan's own
+         * design verification while constructing a peer-disconnect
+         * regression test for an unrelated bug (see this plan's Global
+         * Constraints) -- not a hypothetical. */
+        ssize_t n = send(c->fd, drain_buf, peeked, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 conn_set_want_writable(c, 1);
@@ -206,5 +216,16 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
     cloak_bytequeue_write(&c->send_q, prefix, CLOAK_CONN_LEN_PREFIX_LEN);
     cloak_bytequeue_write(&c->send_q, frame_bytes, frame_len);
     conn_try_drain_send(c);
-    return 0;
+    /* conn_try_drain_send may have discovered a hard write failure (e.g.
+     * the peer disconnected) and called conn_mark_broken during THIS
+     * call -- in which case the bytes just enqueued above are sitting in
+     * a send_q that's about to be destroyed, never actually delivered.
+     * Reporting success (0) here would silently drop them, violating
+     * this plan's Global Constraints ("never silently drop data"). Found
+     * during this plan's own design verification, via a regression test
+     * for an unrelated bug (a stream write surviving its own connection
+     * dying mid-call -- see the Global Constraints entry on this
+     * project's recurring UAF class) that happened to also exercise this
+     * return-value path for the first time. */
+    return c->broken ? -1 : 0;
 }
