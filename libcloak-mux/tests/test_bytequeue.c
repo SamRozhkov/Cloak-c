@@ -123,6 +123,48 @@ static void test_fuzz_against_reference(void) {
     cloak_bytequeue_destroy(&q);
 }
 
+static void test_peek_does_not_consume(void) {
+    cloak_bytequeue_t q;
+    ASSERT_EQ_INT(cloak_bytequeue_init(&q, 16), 0);
+
+    uint8_t in[5] = {1, 2, 3, 4, 5};
+    ASSERT_EQ_INT(cloak_bytequeue_write(&q, in, 5), 5);
+
+    uint8_t peeked[3];
+    ASSERT_EQ_INT(cloak_bytequeue_peek(&q, peeked, 3), 3);
+    ASSERT_MEM_EQ(peeked, in, 3);
+    ASSERT_EQ_INT(cloak_bytequeue_len(&q), 5); /* unchanged -- not consumed */
+
+    /* A subsequent read returns the SAME bytes peek already saw. */
+    uint8_t out[5];
+    ASSERT_EQ_INT(cloak_bytequeue_read(&q, out, 5), 5);
+    ASSERT_MEM_EQ(out, in, 5);
+
+    /* Peeking more than available returns only what's available. */
+    ASSERT_EQ_INT(cloak_bytequeue_write(&q, in, 2), 2);
+    uint8_t peeked2[10];
+    ASSERT_EQ_INT(cloak_bytequeue_peek(&q, peeked2, 10), 2);
+
+    /* Peek correctly wraps around the ring buffer's internal boundary,
+     * same as read does. */
+    cloak_bytequeue_t q2;
+    ASSERT_EQ_INT(cloak_bytequeue_init(&q2, 4), 0);
+    uint8_t four[4] = {10, 20, 30, 40};
+    ASSERT_EQ_INT(cloak_bytequeue_write(&q2, four, 4), 4);
+    uint8_t tmp[2];
+    ASSERT_EQ_INT(cloak_bytequeue_read(&q2, tmp, 2), 2); /* consume 10,20 -- head now at index 2 */
+    uint8_t more[2] = {50, 60};
+    ASSERT_EQ_INT(cloak_bytequeue_write(&q2, more, 2), 2); /* wraps: 50,60 land at indices 0,1 */
+    uint8_t wrapped_peek[4];
+    ASSERT_EQ_INT(cloak_bytequeue_peek(&q2, wrapped_peek, 4), 4);
+    uint8_t expected[4] = {30, 40, 50, 60};
+    ASSERT_MEM_EQ(wrapped_peek, expected, 4);
+    ASSERT_EQ_INT(cloak_bytequeue_len(&q2), 4); /* still unconsumed */
+
+    cloak_bytequeue_destroy(&q);
+    cloak_bytequeue_destroy(&q2);
+}
+
 TEST_MAIN_BEGIN()
     test_basic_write_read();
     test_capacity_rejects_oversized_write();
@@ -131,4 +173,5 @@ TEST_MAIN_BEGIN()
     test_read_partial();
     test_empty_read_returns_zero();
     test_fuzz_against_reference();
+    test_peek_does_not_consume();
 TEST_MAIN_END()

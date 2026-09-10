@@ -63,6 +63,21 @@ size_t cloak_bytequeue_read(cloak_bytequeue_t *q, uint8_t *out, size_t len) {
     return n;
 }
 
+size_t cloak_bytequeue_peek(const cloak_bytequeue_t *q, uint8_t *out, size_t len) {
+    size_t n = len < q->len ? len : q->len;
+    if (n == 0) {
+        return 0;
+    }
+    size_t first_chunk = q->cap - q->head;
+    if (first_chunk >= n) {
+        memcpy(out, q->data + q->head, n);
+    } else {
+        memcpy(out, q->data + q->head, first_chunk);
+        memcpy(out + first_chunk, q->data, n - first_chunk);
+    }
+    return n;
+}
+
 void cloak_bytequeue_close(cloak_bytequeue_t *q) {
     q->closed = 1;
 }

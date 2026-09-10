@@ -37,6 +37,12 @@ size_t cloak_bytequeue_write(cloak_bytequeue_t *q, const uint8_t *data, size_t l
  * drained". */
 size_t cloak_bytequeue_read(cloak_bytequeue_t *q, uint8_t *out, size_t len);
 
+/* Copies up to len bytes starting at the current head into out, WITHOUT
+ * consuming them -- a subsequent cloak_bytequeue_read (or another peek)
+ * returns the same bytes. Returns bytes copied (may be fewer than len if
+ * that's all that's currently available). */
+size_t cloak_bytequeue_peek(const cloak_bytequeue_t *q, uint8_t *out, size_t len);
+
 /* Marks the queue closed: no further cloak_bytequeue_write calls will
  * succeed (they return 0), but already-buffered bytes remain readable
  * until drained. Idempotent. */
