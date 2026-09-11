@@ -33,15 +33,22 @@ typedef void (*cloak_session_new_stream_cb)(cloak_session_t *sesh, cloak_stream_
 
 /* Fired exactly once, the moment sesh becomes closed for ANY reason
  * (active cloak_session_close, a received closing-session frame, any
- * underlying connection failing, or the inactivity timeout). By the time
- * this fires, every stream sesh owned has already been destroyed and
- * freed and every underlying connection has already been closed.
+ * underlying connection failing, or the inactivity timeout).
+ *
+ * Streams sesh owned are NOT yet destroyed when this fires -- this is
+ * deliberately your last chance to call cloak_session_release_stream on
+ * any you're still holding a reference to (safe to do so from within
+ * this callback). Immediately after this callback returns, every stream
+ * you didn't release yourself is automatically destroyed and freed, and
+ * every underlying connection is closed -- so any stream pointer you
+ * still have becomes invalid the moment this callback returns, whether
+ * or not you released it.
  *
  * Guaranteed to fire OUTSIDE of any cloak_session_t/cloak_conn_t
  * callback's own call stack (deferred internally to the reactor's next
  * dispatch loop iteration even when the close was triggered from within
- * one) -- so it is always safe to call cloak_session_destroy
- * synchronously from within this callback. */
+ * one) -- so it is always safe to call cloak_session_destroy or
+ * cloak_session_release_stream synchronously from within this callback. */
 typedef void (*cloak_session_broken_cb)(cloak_session_t *sesh, void *userdata);
 
 typedef struct {

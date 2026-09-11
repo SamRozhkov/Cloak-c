@@ -154,11 +154,26 @@ static void session_deferred_teardown_cb(cloak_reactor_t *r, void *userdata) {
     (void)r;
     cloak_session_t *sesh = (cloak_session_t *)userdata;
     sesh->teardown_timer_id = CLOAK_TIMER_INVALID; /* this timer has now fired -- nothing left to cancel */
-    session_free_all_active_streams(sesh);
-    cloak_switchboard_close_all(&sesh->sb);
+    /* on_broken fires FIRST, before anything is freed -- this gives the
+     * consumer first refusal to call cloak_session_release_stream on any
+     * stream it's still holding a reference to (still safe: that call
+     * tombstones the entry, so the sweep two lines below correctly skips
+     * it and doesn't double-free). Anything the consumer doesn't release
+     * here gets swept automatically right after, so nothing leaks either
+     * way. The alternative order (sweep first, notify after) was this
+     * function's original shape, but it makes the exact pattern
+     * on_new_stream's own doc comment describes as safe -- releasing a
+     * still-held stream from within a callback -- a use-after-free
+     * instead, since the stream would already be freed by the time the
+     * consumer's callback runs. Found (not fixed blind) during this
+     * plan's own re-review of the fix for findings 5/6 -- flagged as a
+     * real, if not-yet-exercised, hazard since no consumer of this API
+     * exists yet to have hit it. */
     if (sesh->on_broken) {
         sesh->on_broken(sesh, sesh->on_broken_userdata);
     }
+    session_free_all_active_streams(sesh);
+    cloak_switchboard_close_all(&sesh->sb);
 }
 
 /* Schedules the actual teardown -- freeing every stream's memory,
@@ -311,23 +326,26 @@ static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_by
     /* Feed the revealing frame (and retire this stream immediately if
      * that single frame already closes it or violates the protocol)
      * BEFORE invoking on_new_stream below -- not after. This order is
-     * required, not stylistic: on_new_stream is documented as safe to
-     * call cloak_session_close from (see cloak_session_close's own doc
-     * comment), and cloak_session_close's stream-teardown sweep
-     * (session_close_internal -> cloak_strmtab_for_each_active) runs
-     * SYNCHRONOUSLY and unconditionally frees every currently-ACTIVE
-     * stream, including this brand new one. If on_new_stream ran first
-     * and synchronously closed the whole session this way, the
-     * cloak_stream_feed_frame call that used to follow it would read
-     * freed memory -- a heap-use-after-free this plan's own additional
-     * adversarial verification (beyond this module's own written tests)
-     * caught. Feeding first means nothing in this function touches
-     * `stream` again after on_new_stream returns, so it no longer
-     * matters what on_new_stream does with the session -- matching
-     * Go's own actual ordering, where newStream.recvFrame(frame) always
-     * runs (synchronously, in recvDataFromRemote) before any consumer
-     * goroutine calling Accept() could possibly observe the new stream
-     * via the channel send that precedes it. */
+     * required, not stylistic: on_new_stream may reasonably call
+     * cloak_session_release_stream on `stream` synchronously (it's
+     * documented as safe to do so), which DOES free its memory right
+     * then and there -- so this function must not touch `stream` again
+     * once on_new_stream returns. (An earlier version of this comment
+     * justified the same ordering by pointing at session_close_internal's
+     * stream-freeing sweep, reasoning that on_new_stream might
+     * synchronously call cloak_session_close and that sweep ran
+     * synchronously too -- that sweep is now deferred (see this plan's
+     * Global Constraints, finding 4), so that specific path is no longer
+     * the live hazard, but this ordering is still required for the
+     * cloak_session_release_stream reason above. Don't let this comment
+     * go stale a second time: if you ever change what on_new_stream is
+     * allowed to do, re-derive this reasoning from scratch rather than
+     * assuming the sweep being deferred makes the ordering unnecessary.)
+     * This also still matches Go's own actual ordering, where
+     * newStream.recvFrame(frame) always runs (synchronously, in
+     * recvDataFromRemote) before any consumer goroutine calling Accept()
+     * could possibly observe the new stream via the channel send that
+     * precedes it. */
     int rc = cloak_stream_feed_frame(stream, &frame);
     if (rc == 1 || rc == -1) {
         session_retire_stream(sesh, stream);
