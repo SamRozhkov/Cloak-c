@@ -201,6 +201,19 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
     if (c->broken) {
         return -1;
     }
+    /* Checked directly against max_frame_len first, before the addition
+     * below -- frame_len is always this module's own bounded chunking in
+     * practice (never network-derived), but a caller bug passing a
+     * frame_len near SIZE_MAX would otherwise wrap CLOAK_CONN_LEN_PREFIX_LEN
+     * + frame_len back into range and silently bypass the size check
+     * entirely. Flagged as an open Minor by an earlier task review and
+     * triaged (fixed, not deferred) during this plan's final
+     * whole-branch review, since it's free and removes the reasoning
+     * burden for every future caller of this function. */
+    if (frame_len > c->max_frame_len) {
+        conn_mark_broken(c); /* caller/config bug: frame too large for this conn */
+        return -1;
+    }
     size_t total = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + frame_len;
     if (total > c->max_envelope_len) {
         conn_mark_broken(c); /* caller/config bug: frame too large for this conn */

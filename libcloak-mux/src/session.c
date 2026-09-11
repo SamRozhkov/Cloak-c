@@ -146,34 +146,57 @@ static void session_send_closing_session_frame(cloak_session_t *sesh) {
     cloak_switchboard_send(&sesh->sb, buf, (size_t)written);
 }
 
-/* Fired by a 0ms reactor timer scheduled by session_passive_close/
- * cloak_session_close -- see session_schedule_deferred_teardown's own
- * comment for why every bit of actual teardown work lives here instead
- * of running synchronously in session_close_internal. */
-static void session_deferred_teardown_cb(cloak_reactor_t *r, void *userdata) {
+/* Fired by the SECOND of two chained 0ms timers -- see
+ * session_deferred_teardown_cb's own comment for why the actual sweep is
+ * split into its own timer instead of running inline after on_broken. */
+static void session_teardown_sweep_cb(cloak_reactor_t *r, void *userdata) {
     (void)r;
     cloak_session_t *sesh = (cloak_session_t *)userdata;
     sesh->teardown_timer_id = CLOAK_TIMER_INVALID; /* this timer has now fired -- nothing left to cancel */
-    /* on_broken fires FIRST, before anything is freed -- this gives the
-     * consumer first refusal to call cloak_session_release_stream on any
-     * stream it's still holding a reference to (still safe: that call
-     * tombstones the entry, so the sweep two lines below correctly skips
-     * it and doesn't double-free). Anything the consumer doesn't release
-     * here gets swept automatically right after, so nothing leaks either
-     * way. The alternative order (sweep first, notify after) was this
-     * function's original shape, but it makes the exact pattern
-     * on_new_stream's own doc comment describes as safe -- releasing a
-     * still-held stream from within a callback -- a use-after-free
-     * instead, since the stream would already be freed by the time the
-     * consumer's callback runs. Found (not fixed blind) during this
-     * plan's own re-review of the fix for findings 5/6 -- flagged as a
-     * real, if not-yet-exercised, hazard since no consumer of this API
-     * exists yet to have hit it. */
+    session_free_all_active_streams(sesh);
+    cloak_switchboard_close_all(&sesh->sb);
+}
+
+/* Fired by a 0ms reactor timer scheduled by session_passive_close/
+ * cloak_session_close -- see session_schedule_deferred_teardown's own
+ * comment for why every bit of actual teardown work lives here (across
+ * this function and session_teardown_sweep_cb) instead of running
+ * synchronously in session_close_internal.
+ *
+ * Schedules the actual sweep as a SEPARATE, second deferred timer
+ * (session_teardown_sweep_cb) BEFORE calling on_broken below -- does not
+ * do the sweep inline here. This is required, not stylistic:
+ * cloak_session_broken_cb's own doc comment says it is safe to call
+ * cloak_session_destroy synchronously from within on_broken, including
+ * destroying AND freeing sesh's own storage before on_broken returns. If
+ * that happens and this function still had code AFTER the on_broken call
+ * that touched `sesh` (which an earlier version of this function did --
+ * see this plan's Global Constraints, finding 7, the SEVENTH instance of
+ * this module's recurring "freed object still has a live pointer above
+ * it on the call stack" bug class, found during this plan's own final
+ * whole-branch review, introduced by the very fix that closed finding 6),
+ * that code would read/write freed memory the instant on_broken returns.
+ *
+ * Scheduling the sweep as its own timer FIRST closes this: if on_broken
+ * destroys (and possibly frees) sesh, cloak_session_destroy's own
+ * cloak_reactor_cancel_timer(sesh->reactor, sesh->teardown_timer_id) call
+ * cancels THIS freshly-scheduled sweep timer -- synchronously, from
+ * within on_broken, before sesh is ever freed and before this function's
+ * own single remaining statement (calling on_broken) even returns. If
+ * on_broken does NOT destroy sesh, the sweep timer simply fires normally
+ * on the reactor's next tick, exactly as session_deferred_teardown_cb
+ * used to do inline. Either way, nothing below the on_broken call in
+ * THIS function may ever touch `sesh` again -- there is deliberately
+ * nothing there. */
+static void session_deferred_teardown_cb(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    cloak_session_t *sesh = (cloak_session_t *)userdata;
+    sesh->teardown_timer_id = cloak_reactor_add_timer(sesh->reactor, 0, session_teardown_sweep_cb, sesh);
     if (sesh->on_broken) {
         sesh->on_broken(sesh, sesh->on_broken_userdata);
     }
-    session_free_all_active_streams(sesh);
-    cloak_switchboard_close_all(&sesh->sb);
+    /* Do not add any code here -- see this function's own comment above
+     * for why `sesh` must not be touched again past this point. */
 }
 
 /* Schedules the actual teardown -- freeing every stream's memory,

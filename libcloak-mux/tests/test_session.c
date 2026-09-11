@@ -1,6 +1,7 @@
 #include "cloak/session.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -556,6 +557,62 @@ static void test_stream_write_after_peer_disconnect_is_safe(void) {
     cloak_reactor_destroy(r);
 }
 
+static cloak_session_t *g_heap_alloc_destroy_target = NULL;
+
+static void on_broken_destroys_and_frees_heap_session(cloak_session_t *sesh, void *userdata) {
+    (void)userdata;
+    /* Exactly the documented-safe pattern: destroy AND free the
+     * session's own heap storage from within on_broken. Regression test
+     * for the seventh instance of this module's recurring UAF class
+     * (see this plan's Global Constraints, finding 7): the deferred
+     * teardown must survive this without ever touching `sesh` again
+     * once this callback returns -- including the second, sweep-only
+     * timer that was scheduled just before this callback was invoked. */
+    cloak_session_destroy(sesh);
+    free(sesh);
+    g_heap_alloc_destroy_target = NULL; /* sentinel: reached this line without crashing */
+}
+
+static void test_on_broken_destroying_and_freeing_heap_session_is_safe(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    cloak_obfuscator_t obfuscator;
+    make_obfuscator(&obfuscator);
+
+    cloak_session_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.obfuscator = obfuscator;
+    cfg.max_on_wire_size = MAX_ON_WIRE;
+    cfg.stream_recv_capacity = STREAM_RECV_CAP;
+    cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
+    cfg.conn_send_queue_cap = CONN_SEND_QUEUE_CAP;
+    cfg.inactivity_timeout_ms = 30; /* short, real timeout -- fires on its own, no streams ever opened */
+    cfg.on_broken = on_broken_destroys_and_frees_heap_session;
+
+    cloak_session_t *sesh = (cloak_session_t *)malloc(sizeof(cloak_session_t));
+    ASSERT_TRUE(sesh != NULL);
+    ASSERT_EQ_INT(cloak_session_init(sesh, 1, r, &cfg), 0);
+    g_heap_alloc_destroy_target = sesh;
+
+    for (int i = 0; i < 50 && g_heap_alloc_destroy_target != NULL; i++) {
+        cloak_reactor_add_timer(r, 10, stop_reactor_timer_cb, r);
+        cloak_reactor_run(r);
+    }
+    ASSERT_TRUE(g_heap_alloc_destroy_target == NULL); /* on_broken ran, destroyed+freed sesh, no crash */
+
+    /* Pump a few more rounds to make sure nothing was left dangling --
+     * in particular, the sweep timer session_deferred_teardown_cb
+     * schedules just before calling on_broken must have been cancelled
+     * by cloak_session_destroy above, or it would fire here against
+     * already-freed memory. */
+    for (int i = 0; i < 5; i++) {
+        cloak_reactor_add_timer(r, 10, stop_reactor_timer_cb, r);
+        cloak_reactor_run(r);
+    }
+
+    cloak_reactor_destroy(r);
+}
+
 static void test_destroy_after_failed_init_is_safe(void) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -587,5 +644,6 @@ TEST_MAIN_BEGIN()
     test_on_new_stream_closing_session_is_safe();
     test_close_stream_after_peer_disconnect_is_safe();
     test_stream_write_after_peer_disconnect_is_safe();
+    test_on_broken_destroying_and_freeing_heap_session_is_safe();
     test_destroy_after_failed_init_is_safe();
 TEST_MAIN_END()
