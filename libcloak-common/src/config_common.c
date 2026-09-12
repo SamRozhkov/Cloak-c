@@ -117,7 +117,8 @@ int cloak_config_get_b64(const cJSON *obj, const char *name, uint8_t *dst,
     size_t decoded_len = 0;
     if (cloak_base64_decode(item->valuestring, scratch, sizeof(scratch),
                             &decoded_len) != 0) {
-        return cloak_config_set_err(err, err_cap, "%s is not valid base64", name);
+        return cloak_config_set_err(
+            err, err_cap, "%s is not valid base64, or is too long to decode", name);
     }
     if (decoded_len != expected_len) {
         return cloak_config_set_err(err, err_cap,

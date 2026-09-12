@@ -34,8 +34,8 @@ static int parse_proxy_book(const cJSON *root, cloak_server_config_t *cfg, char 
                 err, err_cap,
                 "ProxyBook entry %s must be a [network, address] pair", entry->string);
         }
-        const cJSON *network = cJSON_GetArrayItem((cJSON *)entry, 0);
-        const cJSON *addr = cJSON_GetArrayItem((cJSON *)entry, 1);
+        const cJSON *network = cJSON_GetArrayItem(entry, 0);
+        const cJSON *addr = cJSON_GetArrayItem(entry, 1);
         if (!cJSON_IsString(network) || network->valuestring == NULL ||
             !cJSON_IsString(addr) || addr->valuestring == NULL) {
             return cloak_config_set_err(
@@ -143,8 +143,9 @@ static int parse_bypass_uid(const cJSON *root, cloak_server_config_t *cfg, char 
         size_t decoded_len = 0;
         if (cloak_base64_decode(item->valuestring, decoded, sizeof(decoded),
                                 &decoded_len) != 0) {
-            return cloak_config_set_err(err, err_cap,
-                                        "BypassUID entry is not valid base64");
+            return cloak_config_set_err(
+                err, err_cap,
+                "BypassUID entry is not valid base64, or is too long to decode");
         }
         if (decoded_len != CLOAK_UID_LEN) {
             return cloak_config_set_err(
