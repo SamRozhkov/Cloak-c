@@ -261,10 +261,61 @@ static void test_start_rejects_oversized_preload(void) {
     cloak_reactor_destroy(r);
 }
 
+static void test_stop_after_failed_start_is_safe(void) {
+    /* The struct must be deliberately dirtied first: a freshly-declared or
+     * previously-zeroed cloak_relay_t would pass this test whether or not
+     * cloak_relay_start actually re-initializes it on every failure path,
+     * which is exactly the class of test that would have missed this bug. */
+    struct harness h;
+    ASSERT_EQ_INT(0, harness_init(&h));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    uint8_t big[512];
+    memset(big, 'x', sizeof(big));
+
+    cloak_relay_t dirty;
+    memset(&dirty, 0xAA, sizeof(dirty));
+
+    /* preload_len > buf_cap is rejected after the rl == NULL check, so by
+     * the time this returns, rl must already have been reset to the state
+     * cloak_relay_stop expects -- not only on a path that reaches the end
+     * of the function successfully. */
+    ASSERT_EQ_INT(-1, cloak_relay_start(&dirty, r, h.inner_a, h.inner_b, big,
+                                        sizeof(big), 256, on_done, NULL));
+    /* The direct assertions are the real regression signal: before the fix,
+     * this validation ran before the memset/sentinel-init, so dirty.fd[]
+     * would still hold 0xAAAAAAAA here, not -1 -- these two asserts fail
+     * against that ordering even though 0xAAAAAAAA happens to also be
+     * negative as a signed int, which is why calling cloak_relay_stop on it
+     * would not itself have been guaranteed to crash in this particular
+     * byte pattern (relay_close_fds's `fd >= 0` guard short-circuits on any
+     * negative value, coincidentally including this garbage). A genuinely
+     * zeroed struct (fd == 0, not negative) is the pattern that crashes;
+     * these assertions catch the underlying ordering bug regardless of
+     * which garbage pattern is used to prove it. */
+    ASSERT_EQ_INT(-1, dirty.fd[0]);
+    ASSERT_EQ_INT(-1, dirty.fd[1]);
+
+    /* Must not crash either way. */
+    cloak_relay_stop(&dirty);
+
+    close(h.inner_a);
+    close(h.inner_b);
+    close(h.outer_a);
+    close(h.outer_b);
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_forwards_both_directions();
     test_preload_is_delivered_first();
     test_large_transfer_survives_backpressure();
     test_stop_is_idempotent_and_suppresses_done();
     test_start_rejects_oversized_preload();
+    test_stop_after_failed_start_is_safe();
 TEST_MAIN_END()

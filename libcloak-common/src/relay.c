@@ -31,7 +31,6 @@ static void sync_interest(cloak_relay_t *rl) {
             continue;
         }
         uint32_t want = desired_interest(rl, i);
-        rl->interest[i] = want;
         /* Always re-issue MOD, even when the bitmask is unchanged from
          * before this dispatch: on an edge-triggered fd, EPOLL_CTL_MOD
          * makes the kernel re-probe the fd's current readiness and, if it
@@ -171,7 +170,20 @@ static void relay_teardown(cloak_relay_t *rl, int fire_done) {
 int cloak_relay_start(cloak_relay_t *rl, cloak_reactor_t *r, int fd_a, int fd_b,
                       const uint8_t *preload, size_t preload_len, size_t buf_cap,
                       cloak_relay_done_cb on_done, void *userdata) {
-    if (rl == NULL || r == NULL || fd_a < 0 || fd_b < 0 || buf_cap == 0) {
+    if (rl == NULL) {
+        return -1;
+    }
+
+    /* Every validation below this point can fail and return -1, and the
+     * header promises cloak_relay_stop is then safe to call on rl -- so rl
+     * must already be in the state relay_teardown expects (fd[] sentinels
+     * set to -1, everything else zeroed) before any of those checks run,
+     * not only once they've all passed. */
+    memset(rl, 0, sizeof(*rl));
+    rl->fd[0] = -1;
+    rl->fd[1] = -1;
+
+    if (r == NULL || fd_a < 0 || fd_b < 0 || buf_cap == 0) {
         return -1;
     }
     if (preload_len > buf_cap) {
@@ -181,10 +193,7 @@ int cloak_relay_start(cloak_relay_t *rl, cloak_reactor_t *r, int fd_a, int fd_b,
         return -1;
     }
 
-    memset(rl, 0, sizeof(*rl));
     rl->reactor = r;
-    rl->fd[0] = -1;
-    rl->fd[1] = -1;
     rl->on_done = on_done;
     rl->on_done_userdata = userdata;
 
@@ -215,8 +224,6 @@ int cloak_relay_start(cloak_relay_t *rl, cloak_reactor_t *r, int fd_a, int fd_b,
 
     rl->fd[0] = fd_a;
     rl->fd[1] = fd_b;
-    rl->interest[0] = CLOAK_REACTOR_READABLE;
-    rl->interest[1] = CLOAK_REACTOR_READABLE;
 
     /* A freshly registered socket may already be writable with the preload
      * waiting, and an edge for that may never arrive on its own -- so ask

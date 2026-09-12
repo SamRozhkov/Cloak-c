@@ -147,7 +147,6 @@ struct cloak_relay {
     /* q[i] holds bytes read from fd[i] and awaiting write to fd[1 - i]. */
     cloak_bytequeue_t q[2];
     int read_eof[2];
-    uint32_t interest[2];
     int done;
     cloak_relay_done_cb on_done;
     void *on_done_userdata;
