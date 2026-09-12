@@ -122,11 +122,10 @@ static void listener_on_readable(cloak_reactor_t *r, int fd, uint32_t events, vo
              * to the listener -- stop draining and wait for the next edge. */
             return;
         }
-        if (l->on_accept != NULL) {
-            l->on_accept(l, conn, l->on_accept_userdata);
-        } else {
-            close(conn);
-        }
+        /* cloak_listener_open rejects cb == NULL, so on_accept is always
+         * set on a listener that made it this far -- no NULL fallback
+         * needed here. */
+        l->on_accept(l, conn, l->on_accept_userdata);
     }
 }
 

@@ -221,9 +221,7 @@ static void test_open_rejects_bad_input(void) {
         cloak_listener_close(&l);
     }
 
-    /* a NULL reactor is rejected too, and l is still safe to close
-     * afterwards -- this is the case a prior bug left uninitialized: l was
-     * never touched when validation failed before the memset. */
+    /* a NULL reactor is rejected too */
     err[0] = '\0';
     ASSERT_EQ_INT(-1, cloak_listener_open(&l, NULL, "127.0.0.1:0", on_accept, NULL,
                                           err, sizeof(err)));
@@ -237,6 +235,35 @@ static void test_open_rejects_bad_input(void) {
                                           err, sizeof(err)));
     ASSERT_TRUE(err[0] != '\0');
     cloak_listener_close(&l);
+
+    /* A listener struct that open() must initialize even when it rejects
+     * the call: filled with garbage first, so an implementation that
+     * returns early without touching it leaves a non-sentinel fd behind.
+     * Using a NULL addr (with a valid r) rather than a NULL r means the
+     * close() below cannot dereference a garbage reactor pointer even if
+     * the fix were absent -- the point is to prove fd was reset to the
+     * sentinel, not to crash the test runner. Reusing the shared l above
+     * would not catch this: it already carries a sentinel fd left over
+     * from a previous call's memset, so this needs a struct of its own.
+     *
+     * cloak_listener_t is a complete type here (net.h defines the struct,
+     * not just the typedef), so the test can check the field directly
+     * rather than only through cloak_listener_close -- which matters,
+     * because every byte of a 0xAA fill happens to make the int fd field
+     * negative (0xAAAAAAAA as a signed 32-bit int), so close()'s `fd < 0`
+     * guard would short-circuit identically whether or not the fix is
+     * present. Asserting dirty.fd == -1 (the actual sentinel, not merely
+     * "some negative value") is what makes this case fail against the
+     * pre-fix ordering: pre-fix it reads back as -1431655766. */
+    cloak_listener_t dirty;
+    memset(&dirty, 0xAA, sizeof(dirty));
+    err[0] = '\0';
+    ASSERT_EQ_INT(-1, cloak_listener_open(&dirty, r, NULL, on_accept, NULL,
+                                          err, sizeof(err)));
+    ASSERT_EQ_INT(-1, dirty.fd);
+    ASSERT_EQ_INT(-1, dirty.port);
+    ASSERT_TRUE(err[0] != '\0');
+    cloak_listener_close(&dirty);
 
     cloak_reactor_destroy(r);
 }
