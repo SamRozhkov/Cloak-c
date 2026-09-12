@@ -31,3 +31,8 @@ add_executable(test_base64 test_base64.c)
 target_include_directories(test_base64 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_base64 PRIVATE cloak-common)
 add_test(NAME test_base64 COMMAND test_base64)
+
+add_executable(test_log test_log.c)
+target_include_directories(test_log PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_log PRIVATE cloak-common)
+add_test(NAME test_log COMMAND test_log)
