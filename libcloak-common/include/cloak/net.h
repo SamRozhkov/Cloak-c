@@ -147,6 +147,17 @@ struct cloak_relay {
     /* q[i] holds bytes read from fd[i] and awaiting write to fd[1 - i]. */
     cloak_bytequeue_t q[2];
     int read_eof[2];
+    /* The CLOAK_REACTOR_* mask most recently registered with the reactor
+     * for fd[i] -- via cloak_reactor_add_fd's initial registration, or a
+     * later cloak_reactor_mod_fd issued by sync_interest. sync_interest
+     * reads this to tell "the desired mask is still zero, same as last
+     * time" apart from "the desired mask just became zero"; only the
+     * former is safe to skip re-registering. Do not delete this as
+     * unused dead state -- it is read by exactly that one condition, and
+     * that condition is what keeps a full send queue whose peer has gone
+     * away from spinning the reactor at 100% CPU forever (see sync_interest
+     * in relay.c). */
+    uint32_t interest[2];
     int done;
     cloak_relay_done_cb on_done;
     void *on_done_userdata;

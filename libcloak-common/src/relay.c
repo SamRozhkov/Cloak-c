@@ -16,6 +16,13 @@ static void relay_teardown(cloak_relay_t *rl, int fire_done);
  * while the opposite queue has bytes waiting for it. */
 static uint32_t desired_interest(const cloak_relay_t *rl, int i) {
     uint32_t ev = 0;
+    /* read_eof[i] is defensive: with the current all-or-nothing teardown
+     * (any EOF ends the whole relay in the same turn that discovers it,
+     * before sync_interest runs again), fd[i] never survives long enough
+     * for this to actually suppress a re-arm in practice. Keep it anyway
+     * -- it is what makes this function's contract correct on its own
+     * terms, and is exactly what a future half-close would need -- but it
+     * is not advertising that half-close is supported today; it isn't. */
     if (!rl->read_eof[i] && cloak_bytequeue_free_space(&rl->q[i]) > 0) {
         ev |= CLOAK_REACTOR_READABLE;
     }
@@ -31,6 +38,24 @@ static void sync_interest(cloak_relay_t *rl) {
             continue;
         }
         uint32_t want = desired_interest(rl, i);
+        if (want == 0 && rl->interest[i] == 0) {
+            /* Both the mask we'd register and the mask already registered
+             * are empty -- legitimate backpressure: q[i] is full and
+             * q[1-i] is empty, so fd[i] needs neither read nor write
+             * interest right now. Unlike the nonzero case below, there is
+             * nothing here worth reprobing for: the only things a
+             * zero-mask epoll_ctl(MOD) can surface are EPOLLERR/EPOLLHUP,
+             * which the kernel reports regardless of the registered mask
+             * -- and this code cannot act on either one while the queue
+             * is full (pump_read returns before ever calling read(), so
+             * the error is never actually discovered). Re-issuing the MOD
+             * anyway would just make the kernel re-arm and re-deliver
+             * that ERR/HUP on every following dispatch, forever, spinning
+             * the reactor at 100% CPU on a connection whose peer has
+             * simply gone away. See cloak_relay_t::interest's doc comment
+             * in net.h for why this needs remembered state to detect. */
+            continue;
+        }
         /* Always re-issue MOD, even when the bitmask is unchanged from
          * before this dispatch: on an edge-triggered fd, EPOLL_CTL_MOD
          * makes the kernel re-probe the fd's current readiness and, if it
@@ -45,8 +70,13 @@ static void sync_interest(cloak_relay_t *rl) {
          * kernel socket buffer. Skipping the MOD call whenever the mask
          * happens to match would silently drop that reprobe and stall the
          * fd forever, since no *new* data is coming to generate a fresh
-         * wakeup on its own. */
+         * wakeup on its own. This unconditional re-issue is exactly what
+         * the want==0/interest==0 case above opts out of -- a zero mask
+         * has no readable/writable edge to reprobe for in the first
+         * place, only ERR/HUP, which is the one case this reprobe must
+         * NOT keep re-arming. */
         (void)cloak_reactor_mod_fd(rl->reactor, rl->fd[i], want);
+        rl->interest[i] = want;
     }
 }
 
@@ -224,6 +254,15 @@ int cloak_relay_start(cloak_relay_t *rl, cloak_reactor_t *r, int fd_a, int fd_b,
 
     rl->fd[0] = fd_a;
     rl->fd[1] = fd_b;
+    /* Matches the CLOAK_REACTOR_READABLE both cloak_reactor_add_fd calls
+     * above actually registered, so sync_interest's want==0/interest==0
+     * check compares against the real current registration from its very
+     * first call -- not against the memset-to-0 default, which would be
+     * wrong whenever the first computed want is also 0 (e.g. a preload
+     * that exactly fills q[0], leaving fd_a nothing to read and nothing
+     * queued to write). */
+    rl->interest[0] = CLOAK_REACTOR_READABLE;
+    rl->interest[1] = CLOAK_REACTOR_READABLE;
 
     /* A freshly registered socket may already be writable with the preload
      * waiting, and an edge for that may never arrive on its own -- so ask

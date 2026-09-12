@@ -2,6 +2,7 @@
 #include "cloak/net.h"
 #include "test_framework.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -311,6 +312,116 @@ static void test_stop_after_failed_start_is_safe(void) {
     cloak_reactor_destroy(r);
 }
 
+static void test_zero_mask_backpressure_does_not_spin(void) {
+    /* Regression test for the critical busy-spin finding: desired_interest
+     * legitimately returns 0 when q[i] (the source's queue) is full and
+     * q[1-i] (the destination's) is empty -- ordinary backpressure. Before
+     * the fix, sync_interest re-issued epoll_ctl(MOD) with that same 0
+     * mask on every single dispatch regardless, and on an edge-triggered
+     * fd a MOD re-probes current readiness and redelivers a fresh edge if
+     * it still holds. The kernel reports EPOLLERR/EPOLLHUP on every probe
+     * REGARDLESS of the registered mask, so once the source is RST or
+     * closed, that 0-mask MOD loop rediscovers the same HUP forever:
+     * pump_read can't even tell (room == 0 makes it return before ever
+     * calling read()), so the relay never tears down and the reactor
+     * spins at 100% CPU on a single connection, forever. */
+    struct harness h;
+    int h_ok = harness_init(&h);
+    ASSERT_EQ_INT(0, h_ok);
+    if (h_ok != 0) {
+        return;
+    }
+
+    /* Simulate "the destination stops reading": fill inner_b's kernel
+     * send buffer completely before the relay ever touches it, so nothing
+     * the relay writes to it can ever be accepted. */
+    int flags = fcntl(h.inner_b, F_GETFL, 0);
+    ASSERT_TRUE(flags >= 0);
+    ASSERT_EQ_INT(0, fcntl(h.inner_b, F_SETFL, flags | O_NONBLOCK));
+    uint8_t filler[4096];
+    memset(filler, 'z', sizeof(filler));
+    int inner_b_full = 0;
+    for (int i = 0; i < 4096; i++) {
+        ssize_t n = write(h.inner_b, filler, sizeof(filler));
+        if (n < 0) {
+            ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+            inner_b_full = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(inner_b_full);
+    if (!inner_b_full) {
+        close(h.inner_a);
+        close(h.inner_b);
+        close(h.outer_a);
+        close(h.outer_b);
+        return;
+    }
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        close(h.inner_a);
+        close(h.inner_b);
+        close(h.outer_a);
+        close(h.outer_b);
+        return;
+    }
+
+    struct done_capture cap;
+    memset(&cap, 0, sizeof(cap));
+    cap.reactor = r;
+
+    cloak_relay_t rl;
+    const size_t buf_cap = 64;
+    ASSERT_EQ_INT(0, cloak_relay_start(&rl, r, h.inner_a, h.inner_b, NULL, 0, buf_cap,
+                                       on_done, &cap));
+
+    /* More than buf_cap bytes, so a single read edge fills q[0] to
+     * capacity (desired_interest(rl, 0)'s READABLE bit drops) while q[1]
+     * stays empty (its WRITABLE bit was never set) -- exactly the 0-mask
+     * state the finding describes for fd[0]. pump_write cannot drain any
+     * of it because inner_b's kernel buffer is already full. */
+    uint8_t payload[256];
+    memset(payload, 'p', sizeof(payload));
+    ASSERT_TRUE(write(h.outer_a, payload, sizeof(payload)) == (ssize_t)sizeof(payload));
+
+    /* Let the relay read the payload, fill q[0], discover it can't drain
+     * to fd[1], and (with the fix) register fd[0] with a 0 mask. */
+    ASSERT_TRUE(cloak_reactor_run_once(r, 0) >= 0);
+
+    /* Sever the source. inner_a's peer now sees a fully-closed socket, so
+     * epoll reports HUP on it on the next wait -- regardless of fd[0]'s
+     * now-empty registered mask. */
+    close(h.outer_a);
+
+    int dispatched[4];
+    for (int i = 0; i < 4; i++) {
+        dispatched[i] = cloak_reactor_run_once(r, 0);
+        ASSERT_TRUE(dispatched[i] >= 0);
+    }
+
+    /* The first post-close turn is expected to discover the HUP once --
+     * that much is unavoidable and correct either way. Every turn after
+     * that must dispatch nothing: with the fix, fd[0]'s 0 mask is never
+     * re-issued once it stops changing, so there is no reprobe left to
+     * redeliver the HUP. Before the fix, every one of these would come
+     * back positive instead, forever -- reverting the sync_interest change
+     * and re-running this test reproduces exactly that spin. */
+    ASSERT_TRUE(dispatched[0] > 0);
+    ASSERT_EQ_INT(0, dispatched[1]);
+    ASSERT_EQ_INT(0, dispatched[2]);
+    ASSERT_EQ_INT(0, dispatched[3]);
+
+    /* The relay never discovered the error (pump_read never got far
+     * enough to call read() while the queue was full), so it is still
+     * "running" from its own point of view -- tear it down explicitly
+     * instead of leaking fds. */
+    cloak_relay_stop(&rl);
+    close(h.outer_b);
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_forwards_both_directions();
     test_preload_is_delivered_first();
@@ -318,4 +429,5 @@ TEST_MAIN_BEGIN()
     test_stop_is_idempotent_and_suppresses_done();
     test_start_rejects_oversized_preload();
     test_stop_after_failed_start_is_safe();
+    test_zero_mask_backpressure_does_not_spin();
 TEST_MAIN_END()
