@@ -3,6 +3,7 @@
 #include "cloak/switchboard.h"
 #include "test_framework.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -21,8 +22,32 @@ static int pair_init(struct pair *p) {
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         return -1;
     }
-    p->local = fds[0];
+    p->local = fds[0]; /* handed to cloak_conn_init, which forces O_NONBLOCK itself */
     p->peer = fds[1];
+    /* peer is read directly by this file's own drain loops, interleaved
+     * with cloak_reactor_run_once -- it must be non-blocking too, or a
+     * drain loop can deadlock: once THIS connection's own backlog is
+     * fully read while a DIFFERENT connection in the same pool still has
+     * bytes left (switchboard test) or before the reactor has had a
+     * chance to write anything more (either test), a blocking read here
+     * would wait forever for data nothing is ever going to send, since
+     * the very next statement -- the one that would produce more data --
+     * never gets to run. Found via a real, reproducible (~15-20% of
+     * runs) hang during this plan's own design verification; every
+     * hang's captured state showed conn.c's own send_q/want_writable
+     * bookkeeping still correct throughout, i.e. this was a test bug,
+     * not a production one. Every caller of read() on a `.peer` fd in
+     * this file already discards the byte count via (void), so treating
+     * an EAGAIN/EWOULDBLOCK non-blocking read as "nothing to read this
+     * round" requires no other change: the loop simply proceeds to its
+     * own cloak_reactor_run_once call and tries again next iteration. */
+    int flags = fcntl(p->peer, F_GETFL, 0);
+    if (flags == -1) {
+        return -1;
+    }
+    if (fcntl(p->peer, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return -1;
+    }
     return 0;
 }
 
