@@ -38,9 +38,14 @@ typedef void (*cloak_conn_closed_cb)(cloak_conn_t *conn, void *userdata);
  * kernel accepted outright (nothing was ever queued, so nothing
  * transitioned), and not fired repeatedly while the queue stays empty.
  *
- * Fired from inside the reactor's writable dispatch for this connection.
- * It is safe to call cloak_conn_send from within it; it is NOT safe to
- * destroy the connection from within it. */
+ * Fired either from inside the reactor's writable dispatch for this
+ * connection, or synchronously from inside a cloak_conn_send call that
+ * itself completes the drain (a backpressured connection whose kernel
+ * send buffer has freed up enough room by the time a caller sends again,
+ * without ever going through the reactor in between) -- there is no
+ * single fixed call context this callback runs in. It is safe to call
+ * cloak_conn_send from within it; it is NOT safe to destroy the
+ * connection from within it. */
 typedef void (*cloak_conn_drained_cb)(cloak_conn_t *c, void *userdata);
 
 struct cloak_conn {

@@ -26,8 +26,11 @@ typedef void (*cloak_switchboard_envelope_cb)(cloak_switchboard_t *sb, const uin
 typedef void (*cloak_switchboard_broken_cb)(cloak_switchboard_t *sb, void *userdata);
 
 /* Fired when any connection in the pool finishes draining its outbound
- * queue (see cloak_conn_drained_cb). Because the pool spreads frames
- * across connections, a producer should re-check
+ * queue (see cloak_conn_drained_cb -- in particular, the same "no single
+ * fixed call context" caveat applies here too: this can fire from
+ * reactor dispatch, or synchronously from inside a cloak_switchboard_send
+ * call that itself completes a connection's drain). Because the pool
+ * spreads frames across connections, a producer should re-check
  * cloak_switchboard_send_queued rather than assume the whole pool is
  * empty when this fires. */
 typedef void (*cloak_switchboard_drained_cb)(cloak_switchboard_t *sb, void *userdata);

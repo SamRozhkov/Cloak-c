@@ -79,7 +79,20 @@ typedef void (*cloak_session_broken_cb)(cloak_session_t *sesh, void *userdata);
 /* Fired when the session's outbound queues drain (see
  * cloak_switchboard_drained_cb). A producer that stopped feeding data
  * into a stream because cloak_session_send_queued was approaching
- * capacity resumes here. */
+ * capacity resumes here.
+ *
+ * There is no single fixed call context this runs in: it can fire from
+ * reactor dispatch, but it can equally fire SYNCHRONOUSLY, from inside a
+ * cloak_stream_write call the consumer itself just made, if that write's
+ * underlying send happens to complete a connection's drain inline
+ * (e.g. a connection that was backpressured has since freed up kernel
+ * send-buffer room, and this write is what notices). Concretely: if this
+ * handler itself calls cloak_stream_write in response, that write can
+ * re-enter this same handler before the first call has returned. This is
+ * safe (nothing here reads state after the callback returns), but only
+ * because of that -- a consumer must NOT assume this callback runs at a
+ * reactor turn boundary, and must write its own handler to tolerate
+ * being re-entered from within itself. */
 typedef void (*cloak_session_writable_cb)(cloak_session_t *sesh, void *userdata);
 
 typedef struct {
