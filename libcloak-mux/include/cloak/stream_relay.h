@@ -32,7 +32,25 @@
  *    cloak_session_config_t.on_stream_data and .on_writable and forwards
  *    them in through the two notify functions below. A relay that is
  *    never notified will stall: it has no other way to learn that its
- *    stream became readable or that the session's queue drained. */
+ *    stream became readable or that the session's queue drained.
+ *
+ * MUST, not just "does not do": every relay bound to a session MUST be
+ * stopped (cloak_stream_relay_stop) before or during that session's
+ * on_broken, and before either cloak_session_destroy or
+ * cloak_session_release_stream is called on anything the relay touches.
+ * sr->stream and sr->sesh are raw pointers this object can never validate
+ * on its own -- it has no third notification through which it could ever
+ * learn the session died. cloak_session_broken_cb's own contract is that
+ * immediately after on_broken returns, every still-active stream is
+ * destroyed and freed and every connection is closed; a relay left
+ * running past that point still has its fd registered in the reactor, so
+ * the next byte that arrives on it runs pump_fd_to_stream ->
+ * cloak_stream_write on a stream that may already be freed, and touches
+ * sr->sesh on a session that may already be freed too. This is the single
+ * most likely mistake for a caller wiring up all four session callbacks
+ * to make -- stopping every live relay is exactly the "last chance" work
+ * on_broken's own doc comment describes doing for streams, and a relay
+ * must be added to that same list. */
 typedef struct cloak_stream_relay cloak_stream_relay_t;
 
 /* Fired exactly once, when the relay finishes: the stream ended, the fd

@@ -1020,6 +1020,159 @@ static void test_stop_before_immediate_finish_fires_cancels_timer(void) {
     cloak_reactor_destroy(r);
 }
 
+/* Regression test for finding 1 (final whole-branch review): the header
+ * now documents, as prominently as the ownership note, that every relay
+ * bound to a session MUST be stopped before or during that session's
+ * on_broken -- because immediately after on_broken returns, every
+ * still-active stream (including this relay's own sr->stream) is
+ * destroyed and freed, and the relay has no third notification through
+ * which it could ever learn that on its own. This pins the CORRECT
+ * pattern (stop from on_broken) and proves it actually prevents the
+ * use-after-free the finding described, rather than merely documenting
+ * that it should. */
+struct broken_capture {
+    int calls;
+    cloak_stream_relay_t *sr; /* the relay a correct dispatcher stops */
+};
+
+static void on_broken_stops_relay(cloak_session_t *sesh, void *userdata) {
+    (void)sesh;
+    struct broken_capture *bc = userdata;
+    bc->calls++;
+    if (bc->sr != NULL) {
+        cloak_stream_relay_stop(bc->sr);
+    }
+}
+
+static void test_stopping_relay_from_on_broken_avoids_use_after_free(void) {
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    struct endpoint b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+
+    cloak_session_config_t cfg_a;
+    cloak_session_config_t cfg_b;
+    fill_config(&cfg_a, &a, &obfs);
+    fill_config(&cfg_b, &b, &obfs);
+
+    struct broken_capture bc;
+    memset(&bc, 0, sizeof(bc));
+    cfg_b.on_broken = on_broken_stops_relay;
+    cfg_b.on_broken_userdata = &bc;
+
+    ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 10, r, &cfg_a));
+    ASSERT_EQ_INT(0, cloak_session_init(&b.sesh, 10, r, &cfg_b));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&a.sesh, fds[0]));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&b.sesh, fds[1]));
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        return;
+    }
+
+    ASSERT_EQ_INT(5, (int)cloak_stream_write(s, (const uint8_t *)"hello", 5));
+    for (int i = 0; i < 50 && b.new_stream_calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, b.new_stream_calls);
+
+    struct sockpair sp;
+    ASSERT_EQ_INT(0, sockpair_init(&sp));
+
+    struct done_capture cap;
+    memset(&cap, 0, sizeof(cap));
+
+    cloak_stream_relay_t sr;
+    ASSERT_EQ_INT(0, cloak_stream_relay_start(&sr, r, &b.sesh, b.accepted, sp.inner, 4096,
+                                              on_relay_done, &cap));
+    b.sr = &sr;
+    bc.sr = &sr;
+
+    /* Some data actually flows through the relay first -- genuinely
+     * "mid-transfer", not at the instant the relay was created. */
+    ASSERT_EQ_INT(6, (int)cloak_stream_write(s, (const uint8_t *)"world!", 6));
+    char buf[64];
+    ssize_t n = -2;
+    for (int i = 0; i < 50 && n <= 0; i++) {
+        n = read(sp.outer, buf, sizeof(buf));
+        if (n > 0) {
+            break;
+        }
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_TRUE(n > 0);
+
+    /* Kill the session mid-transfer: an active close on `a` sends a
+     * closing-session frame that reaches `b` and fires b's on_broken
+     * exactly once, with a relay still live and spliced to b.accepted.
+     * cloak_session_broken_cb's own doc comment lists "any underlying
+     * connection failing" and "a received closing-session frame" side by
+     * side as equally valid triggers sharing an identical contract, so
+     * this exercises the exact same teardown-ordering hazard a real
+     * connection failure would, without this test needing to reach
+     * around either session's own fd bookkeeping by closing a raw fd out
+     * from under it. */
+    ASSERT_EQ_INT(0, cloak_session_close(&a.sesh));
+
+    for (int i = 0; i < 50 && bc.calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, bc.calls);
+    b.sr = NULL; /* the relay is gone -- nothing else may touch it */
+
+    /* cloak_stream_relay_stop, called from on_broken above, never fires
+     * on_done by its own documented contract -- this must stay 0, not 1,
+     * for the correct teardown pattern this test exercises. */
+    ASSERT_EQ_INT(0, cap.calls);
+
+    /* The actual regression signal: b's own deferred sweep (already
+     * scheduled before on_broken even ran -- see
+     * session_deferred_teardown_cb) destroys and frees b.accepted
+     * immediately after on_broken returns. The relay's own fd (sp.inner)
+     * is completely independent of the mux connection that just died, so
+     * without the mandated stop() above it would still be registered
+     * with the reactor; pushing more bytes and running the reactor from
+     * here is exactly the pump_fd_to_stream -> cloak_stream_write-on-
+     * freed-memory sequence the finding describes. With stop() already
+     * having closed and deregistered sr's fd, this is a silent no-op --
+     * and, under ASan, exactly where an unfixed dispatcher pattern would
+     * instead abort on a heap-use-after-free. send() with MSG_NOSIGNAL,
+     * not write(): sp.inner is already closed, so the kernel would
+     * otherwise raise SIGPIPE against this test process, and there is no
+     * SIGPIPE handler anywhere in this tree. */
+    for (int i = 0; i < 5; i++) {
+        char junk[8];
+        memset(junk, 'z', sizeof(junk));
+        (void)send(sp.outer, junk, sizeof(junk), MSG_NOSIGNAL);
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, bc.calls);
+    ASSERT_EQ_INT(0, cap.calls);
+
+    close(sp.outer);
+    /* Neither stream is released here: cloak_session_close(&a.sesh)
+     * above already destroyed every stream `a` owned (matching
+     * test_session.c's own test_active_session_close_notifies_peer), and
+     * b's automatic post-on_broken sweep already destroyed b.accepted --
+     * releasing either now would be a double free. */
+    cloak_session_destroy(&a.sesh);
+    cloak_session_destroy(&b.sesh);
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_forwards_both_directions();
     test_large_transfer_survives_backpressure();
@@ -1030,4 +1183,5 @@ TEST_MAIN_BEGIN()
     test_failed_start_leaves_struct_safe();
     test_immediate_finish_defers_on_done();
     test_stop_before_immediate_finish_fires_cancels_timer();
+    test_stopping_relay_from_on_broken_avoids_use_after_free();
 TEST_MAIN_END()

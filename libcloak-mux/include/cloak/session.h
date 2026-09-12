@@ -88,11 +88,24 @@ typedef void (*cloak_session_broken_cb)(cloak_session_t *sesh, void *userdata);
  * (e.g. a connection that was backpressured has since freed up kernel
  * send-buffer room, and this write is what notices). Concretely: if this
  * handler itself calls cloak_stream_write in response, that write can
- * re-enter this same handler before the first call has returned. This is
- * safe (nothing here reads state after the callback returns), but only
- * because of that -- a consumer must NOT assume this callback runs at a
- * reactor turn boundary, and must write its own handler to tolerate
- * being re-entered from within itself. */
+ * re-enter this same handler before the first call has returned, so a
+ * consumer must NOT assume this callback runs at a reactor turn boundary
+ * and must write its own handler to tolerate being re-entered from within
+ * itself.
+ *
+ * Safe to call from within this callback: cloak_stream_write,
+ * cloak_session_release_stream, cloak_session_close. NOT safe: calling
+ * cloak_session_destroy, or otherwise freeing any underlying connection,
+ * from within this callback -- this fires from underneath
+ * cloak_conn_send (by way of the switchboard and session adapters), and
+ * cloak_conn_send's own doc comment says it is NOT safe to destroy the
+ * connection from within a callback it invokes: after this handler
+ * returns, cloak_conn_send still has a `return c->broken ? -1 : 0;` of
+ * its own to run against that same (by-then-freed) connection.
+ * cloak_session_destroy would free every connection in the pool via
+ * cloak_switchboard_close_all, so calling it from here is a
+ * heap-use-after-free one stack frame up, not merely unsafe by
+ * documentation fiat. */
 typedef void (*cloak_session_writable_cb)(cloak_session_t *sesh, void *userdata);
 
 /* Fired when one or more frames are routed into a stream this session
@@ -111,7 +124,11 @@ typedef void (*cloak_session_writable_cb)(cloak_session_t *sesh, void *userdata)
  * Fires after the frame has been fed, so the data is already readable. If
  * the frame closed the stream, the stream is already retired by the time
  * this fires -- it is still safe to read from (draining whatever arrived
- * before the close) and still must be released by the caller. */
+ * before the close) and still must be released by the caller. It is also
+ * safe to call cloak_session_release_stream on the supplied stream
+ * synchronously from within this callback: session_on_envelope (session.c)
+ * returns immediately after invoking this callback and touches neither
+ * sesh nor stream again on that path. */
 typedef void (*cloak_session_stream_data_cb)(cloak_session_t *sesh, cloak_stream_t *stream,
                                               void *userdata);
 
