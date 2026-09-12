@@ -10,6 +10,8 @@ add_library(cloak-common STATIC
     src/x25519.c
     src/reactor.c
     src/clienthello.c
+    src/config_common.c
+    src/config_client.c
 )
 
 target_include_directories(cloak-common PUBLIC include)

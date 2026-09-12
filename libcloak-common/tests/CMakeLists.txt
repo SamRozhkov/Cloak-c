@@ -41,3 +41,8 @@ add_executable(test_cjson_link test_cjson_link.c)
 target_include_directories(test_cjson_link PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_cjson_link PRIVATE cloak-common cjson)
 add_test(NAME test_cjson_link COMMAND test_cjson_link)
+
+add_executable(test_config_client test_config_client.c)
+target_include_directories(test_config_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_config_client PRIVATE cloak-common)
+add_test(NAME test_config_client COMMAND test_config_client)
