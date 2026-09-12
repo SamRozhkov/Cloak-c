@@ -3,6 +3,7 @@ find_package(OpenSSL REQUIRED)
 add_library(cloak-common STATIC
     src/version.c
     src/random.c
+    src/base64.c
     src/aead.c
     src/salsa20.c
     src/x25519.c
