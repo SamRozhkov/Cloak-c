@@ -15,6 +15,7 @@ add_library(cloak-common STATIC
     src/config_client.c
     src/config_server.c
     src/config_ssv.c
+    src/listener.c
 )
 
 target_include_directories(cloak-common PUBLIC include)

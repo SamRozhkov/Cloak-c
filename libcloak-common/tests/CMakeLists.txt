@@ -61,3 +61,8 @@ add_executable(test_bytequeue test_bytequeue.c)
 target_include_directories(test_bytequeue PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_bytequeue PRIVATE cloak-common)
 add_test(NAME test_bytequeue COMMAND test_bytequeue)
+
+add_executable(test_listener test_listener.c)
+target_include_directories(test_listener PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_listener PRIVATE cloak-common)
+add_test(NAME test_listener COMMAND test_listener)
