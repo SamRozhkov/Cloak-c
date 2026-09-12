@@ -97,12 +97,29 @@ static void listener_on_readable(cloak_reactor_t *r, int fd, uint32_t events, vo
     for (;;) {
         int conn = accept4(l->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (conn < 0) {
-            if (errno == EINTR) {
+            /* accept(2) NOTES: several errors are already-pending errors on
+             * the *next* queued connection, not a reason to stop accepting
+             * -- the listening socket can have more connections queued
+             * behind the failed one. Portable programs should treat these
+             * as EAGAIN and retry the loop. All of the errno names below
+             * are defined by glibc on Linux (this project's only target),
+             * so no #ifdef guards are needed here.
+             *
+             * Deliberately NOT included: EMFILE/ENFILE/ENOBUFS/ENOMEM.
+             * Those are resource exhaustion, not per-connection errors --
+             * retrying immediately would spin the reactor at 100% CPU
+             * until a descriptor/buffer frees (the classic epoll-accept
+             * EMFILE trap). Do not "simplify" this into retrying on
+             * anything but EAGAIN/EWOULDBLOCK; that reintroduces the trap. */
+            if (errno == EINTR || errno == ECONNABORTED || errno == EPROTO ||
+                errno == ENETDOWN || errno == ENOPROTOOPT || errno == EHOSTDOWN ||
+                errno == ENONET || errno == EHOSTUNREACH || errno == EOPNOTSUPP ||
+                errno == ENETUNREACH) {
                 continue;
             }
-            /* EAGAIN/EWOULDBLOCK: drained. Anything else (ECONNABORTED, a
-             * per-connection error) is also not fatal to the listener --
-             * stop draining and wait for the next edge. */
+            /* EAGAIN/EWOULDBLOCK: drained. Anything else (a resource
+             * exhaustion error, or something unexpected) is also not fatal
+             * to the listener -- stop draining and wait for the next edge. */
             return;
         }
         if (l->on_accept != NULL) {
@@ -116,13 +133,19 @@ static void listener_on_readable(cloak_reactor_t *r, int fd, uint32_t events, vo
 int cloak_listener_open(cloak_listener_t *l, cloak_reactor_t *r, const char *addr,
                         cloak_listener_accept_cb cb, void *userdata,
                         char *err, size_t err_cap) {
-    if (l == NULL || r == NULL || addr == NULL) {
-        return set_err(err, err_cap, "listener: invalid argument");
+    /* Zero and mark closed before validating anything else, so that on any
+     * failure below -- including a NULL r/addr/cb -- l is still left safe
+     * to pass to cloak_listener_close, as the header promises. Only l
+     * itself being NULL is exempt, since there is nothing to initialize. */
+    if (l != NULL) {
+        memset(l, 0, sizeof(*l));
+        l->fd = -1;
+        l->port = -1;
     }
 
-    memset(l, 0, sizeof(*l));
-    l->fd = -1;
-    l->port = -1;
+    if (l == NULL || r == NULL || addr == NULL || cb == NULL) {
+        return set_err(err, err_cap, "listener: invalid argument");
+    }
 
     char host[256];
     char port[16];

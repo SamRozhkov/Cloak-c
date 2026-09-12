@@ -55,9 +55,11 @@ struct cloak_listener {
  * not have to wait out TIME_WAIT. Port 0 asks the kernel to choose a free
  * port, readable afterwards via cloak_listener_port.
  *
- * Returns 0 on success, -1 with the reason in err on a malformed address,
- * a resolution failure, or a socket/bind/listen failure. On failure l is
- * left safe to pass to cloak_listener_close. */
+ * Returns 0 on success, -1 with the reason in err on a NULL r/addr/cb, a
+ * malformed address, a resolution failure, or a socket/bind/listen
+ * failure. cb == NULL is rejected rather than silently accepting and
+ * discarding every connection, which is never what a caller wanted. On
+ * failure l (when non-NULL) is left safe to pass to cloak_listener_close. */
 int cloak_listener_open(cloak_listener_t *l, cloak_reactor_t *r, const char *addr,
                         cloak_listener_accept_cb cb, void *userdata,
                         char *err, size_t err_cap);

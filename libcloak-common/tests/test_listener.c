@@ -208,6 +208,8 @@ static void test_open_rejects_bad_input(void) {
     ASSERT_EQ_INT(-1, cloak_listener_open(&l, r, "not-an-address", on_accept, NULL,
                                           err, sizeof(err)));
     ASSERT_TRUE(err[0] != '\0');
+    /* the header promises l is safe to close after a failed open */
+    cloak_listener_close(&l);
 
     /* port 1 is privileged: binding it as a normal user fails. Skip the
      * assertion when running as root, where it would succeed. */
@@ -216,7 +218,25 @@ static void test_open_rejects_bad_input(void) {
         ASSERT_EQ_INT(-1, cloak_listener_open(&l, r, "127.0.0.1:1", on_accept, NULL,
                                               err, sizeof(err)));
         ASSERT_TRUE(err[0] != '\0');
+        cloak_listener_close(&l);
     }
+
+    /* a NULL reactor is rejected too, and l is still safe to close
+     * afterwards -- this is the case a prior bug left uninitialized: l was
+     * never touched when validation failed before the memset. */
+    err[0] = '\0';
+    ASSERT_EQ_INT(-1, cloak_listener_open(&l, NULL, "127.0.0.1:0", on_accept, NULL,
+                                          err, sizeof(err)));
+    ASSERT_TRUE(err[0] != '\0');
+    cloak_listener_close(&l);
+
+    /* a NULL callback is rejected rather than silently accepting and
+     * discarding every connection */
+    err[0] = '\0';
+    ASSERT_EQ_INT(-1, cloak_listener_open(&l, r, "127.0.0.1:0", NULL, NULL,
+                                          err, sizeof(err)));
+    ASSERT_TRUE(err[0] != '\0');
+    cloak_listener_close(&l);
 
     cloak_reactor_destroy(r);
 }
