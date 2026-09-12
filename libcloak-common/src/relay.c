@@ -3,9 +3,10 @@
 
 #include <errno.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
-/* Scratch size for one read()/write() syscall. Independent of the queue
+/* Scratch size for one read()/send() syscall. Independent of the queue
  * capacity: the loop below keeps going until EAGAIN either way. */
 #define RELAY_CHUNK 16384
 
@@ -110,7 +111,14 @@ static int pump_read(cloak_relay_t *rl, int i) {
 }
 
 /* Writes q[1 - i] out through fd[i] until the queue empties or the socket
- * blocks. Returns 0 to continue, -1 if the relay should tear down. */
+ * blocks. Returns 0 to continue, -1 if the relay should tear down.
+ *
+ * send() with MSG_NOSIGNAL, not write() -- cloak_relay_t splices two
+ * sockets in a proxy, so a peer disconnecting mid-write is the ordinary
+ * case, not a rare one, and writing to a socket whose peer already closed
+ * raises SIGPIPE, which by default kills the whole process. There is no
+ * SIGPIPE handler anywhere in this tree; conn.c documents hitting this
+ * exact bug for real during an earlier plan and fixed it the same way. */
 static int pump_write(cloak_relay_t *rl, int i) {
     uint8_t buf[RELAY_CHUNK];
     for (;;) {
@@ -118,7 +126,7 @@ static int pump_write(cloak_relay_t *rl, int i) {
         if (have == 0) {
             return 0;
         }
-        ssize_t n = write(rl->fd[i], buf, have);
+        ssize_t n = send(rl->fd[i], buf, have, MSG_NOSIGNAL);
         if (n > 0) {
             cloak_bytequeue_read(&rl->q[1 - i], buf, (size_t)n);
             continue;

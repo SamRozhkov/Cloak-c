@@ -103,6 +103,7 @@ static void test_conn_reports_queue_depth(void) {
     ASSERT_TRUE(cloak_conn_send_queued(&c) <= cloak_conn_send_capacity(&c));
 
     cloak_conn_destroy(&c);
+    close(p.local);
     close(p.peer);
     cloak_reactor_destroy(r);
 }
@@ -156,6 +157,7 @@ static void test_conn_fires_drained_on_the_transition(void) {
     ASSERT_EQ_INT(1, cap.calls);
 
     cloak_conn_destroy(&c);
+    close(p.local);
     close(p.peer);
     cloak_reactor_destroy(r);
 }

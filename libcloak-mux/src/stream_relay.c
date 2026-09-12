@@ -98,7 +98,14 @@ static int stream_relay_is_finishing(const cloak_stream_relay_t *sr) {
 
 static uint32_t desired_interest(const cloak_stream_relay_t *sr) {
     uint32_t ev = 0;
-    if (!sr->fd_read_paused) {
+    /* Also gated on !stream_ended: once the stream has ended, the session
+     * has already retired it (a Cloak closing frame closes the stream in
+     * both directions -- see pump_stream_to_fd's own comment below), so
+     * anything pump_fd_to_stream reads from fd from this point on can only
+     * turn into frames the peer will drop as tombstoned. Without this,
+     * the relay keeps reading fd and emitting dead frames for however
+     * long it takes to_fd to drain and the relay to actually tear down. */
+    if (!sr->fd_read_paused && !sr->stream_ended) {
         ev |= CLOAK_REACTOR_READABLE;
     }
     if (cloak_bytequeue_len(&sr->to_fd) > 0) {
@@ -228,6 +235,16 @@ static int pump_stream_to_fd(cloak_stream_relay_t *sr) {
     } while (filled > 0 || sent > 0);
 
     if (sr->stream_ended && cloak_bytequeue_len(&sr->to_fd) == 0) {
+        /* This is a one-way teardown trigger, not a half-close: there is
+         * deliberately no symmetric "fd reached EOF -> drain the stream
+         * one last time" step on the other side (see pump_fd_to_stream's
+         * own EOF handling below). A socket half-close still lets the
+         * other direction keep flowing, but a Cloak closing frame closes
+         * the stream in BOTH directions at once -- by the time
+         * stream_ended is observable here, cloak_stream_write on this
+         * same stream would already be writing into a retired stream.
+         * "Restoring symmetry" would mean adding exactly that, not fixing
+         * an oversight. */
         return -1; /* everything the stream ever sent has reached the fd */
     }
     return 0;
