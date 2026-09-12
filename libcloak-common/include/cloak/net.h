@@ -16,9 +16,15 @@
  * marked exception of cloak_net_resolve, which performs a synchronous DNS
  * lookup and must therefore be called at startup, not per connection).
  *
- * Failure reporting matches the rest of this library: 0/-1, with a
- * human-readable reason written into a caller-supplied err buffer that may
- * be NULL. */
+ * Failure reporting is not uniform across these entry points -- check each
+ * function's own doc comment. cloak_net_split_hostport, cloak_listener_open,
+ * cloak_net_resolve, and cloak_dial_start report 0/-1 with a human-readable
+ * reason written into a caller-supplied err buffer that may be NULL.
+ * cloak_relay_start reports only 0/-1: its failures (bad arguments, an
+ * oversized preload, allocation failure, reactor registration failure) are
+ * all programming errors a caller controls and can distinguish from the
+ * arguments it passed, not environmental conditions an operator would need
+ * a diagnostic string for. */
 
 /* Splits "host:port" into its parts, matching Go's net.SplitHostPort
  * closely enough for the address forms Cloak's configs use:
@@ -38,9 +44,20 @@ typedef struct cloak_listener cloak_listener_t;
  * connected socket, and OWNERSHIP OF IT PASSES TO THIS CALLBACK: the
  * listener never closes it, so the callback must either take
  * responsibility for closing it or hand it to something that will (a
- * relay, a session). Losing the fd here leaks a descriptor. */
+ * relay, a session). Losing the fd here leaks a descriptor.
+ *
+ * Closing l (cloak_listener_close) from within this callback is permitted
+ * -- the accept loop notices via its own fd and simply stops. Freeing l's
+ * storage from within this callback is NOT permitted: the accept loop
+ * still holds a pointer to it and will read it again on its very next
+ * iteration. */
 typedef void (*cloak_listener_accept_cb)(cloak_listener_t *l, int fd, void *userdata);
 
+/* l must stay live, at a fixed address, from a successful cloak_listener_open
+ * until cloak_listener_close: the reactor holds a pointer to it (passed
+ * back to on_accept as userdata for the underlying epoll registration) for
+ * that whole span, and moving or freeing it (e.g. inside a realloc-grown
+ * array of listeners) while still registered is a use-after-free. */
 struct cloak_listener {
     cloak_reactor_t *reactor;
     int fd;
@@ -153,9 +170,19 @@ typedef struct cloak_relay cloak_relay_t;
 /* Fired exactly once, when the relay finishes: either side reaching EOF,
  * or either side erroring. Both file descriptors are already closed by the
  * time this fires. Never fired by cloak_relay_stop (an explicit teardown
- * is not a completion), and never before cloak_relay_start returns. */
+ * is not a completion), and never before cloak_relay_start returns.
+ * on_done may be NULL if the caller has no need for a completion
+ * notification (e.g. it is polling cloak_relay_t::done, or doesn't care) --
+ * unlike cloak_listener_accept_cb and cloak_dial_cb, a missing on_done
+ * loses nothing, since the relay still tears itself down correctly either
+ * way. */
 typedef void (*cloak_relay_done_cb)(cloak_relay_t *rl, void *userdata);
 
+/* rl must stay live, at a fixed address, from a successful cloak_relay_start
+ * until on_done fires (or until cloak_relay_stop, if stopped first): the
+ * reactor holds a pointer to it for that whole span, and moving or freeing
+ * it (e.g. inside a realloc-grown array of active relays) while still
+ * registered is a use-after-free. */
 struct cloak_relay {
     cloak_reactor_t *reactor;
     int fd[2];

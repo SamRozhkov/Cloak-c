@@ -194,9 +194,20 @@ int cloak_listener_open(cloak_listener_t *l, cloak_reactor_t *r, const char *add
             continue;
         }
 
+        int port = bound_port(fd);
+        if (port < 0) {
+            /* Neither AF_INET nor AF_INET6 -- getaddrinfo shouldn't hand
+             * back anything else for SOCK_STREAM here, but if it ever did,
+             * succeeding with a listener whose port can never be reported
+             * (cloak_listener_port's -1 is defined to mean "not open") is
+             * worse than trying the next candidate address, if any. */
+            close(fd);
+            continue;
+        }
+
         l->reactor = r;
         l->fd = fd;
-        l->port = bound_port(fd);
+        l->port = port;
         l->on_accept = cb;
         l->on_accept_userdata = userdata;
 

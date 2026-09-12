@@ -50,7 +50,11 @@ static int harness_init(struct harness *h) {
 
 static void test_forwards_both_directions(void) {
     struct harness h;
-    ASSERT_EQ_INT(0, harness_init(&h));
+    int h_ok = harness_init(&h);
+    ASSERT_EQ_INT(0, h_ok);
+    if (h_ok != 0) {
+        return;
+    }
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -96,7 +100,11 @@ static void test_preload_is_delivered_first(void) {
     /* goWeb's shape: the first packet was already read off fd_a before the
      * relay existed, and must reach fd_b ahead of anything else. */
     struct harness h;
-    ASSERT_EQ_INT(0, harness_init(&h));
+    int h_ok = harness_init(&h);
+    ASSERT_EQ_INT(0, h_ok);
+    if (h_ok != 0) {
+        return;
+    }
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -135,7 +143,11 @@ static void test_large_transfer_survives_backpressure(void) {
      * the socket buffers, so this only completes if the relay correctly
      * deregisters and re-arms read interest as its queues fill and drain. */
     struct harness h;
-    ASSERT_EQ_INT(0, harness_init(&h));
+    int h_ok = harness_init(&h);
+    ASSERT_EQ_INT(0, h_ok);
+    if (h_ok != 0) {
+        return;
+    }
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -215,7 +227,11 @@ static void test_large_transfer_survives_backpressure(void) {
 
 static void test_stop_is_idempotent_and_suppresses_done(void) {
     struct harness h;
-    ASSERT_EQ_INT(0, harness_init(&h));
+    int h_ok = harness_init(&h);
+    ASSERT_EQ_INT(0, h_ok);
+    if (h_ok != 0) {
+        return;
+    }
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -241,7 +257,11 @@ static void test_stop_is_idempotent_and_suppresses_done(void) {
 
 static void test_start_rejects_oversized_preload(void) {
     struct harness h;
-    ASSERT_EQ_INT(0, harness_init(&h));
+    int h_ok = harness_init(&h);
+    ASSERT_EQ_INT(0, h_ok);
+    if (h_ok != 0) {
+        return;
+    }
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -268,7 +288,11 @@ static void test_stop_after_failed_start_is_safe(void) {
      * cloak_relay_start actually re-initializes it on every failure path,
      * which is exactly the class of test that would have missed this bug. */
     struct harness h;
-    ASSERT_EQ_INT(0, harness_init(&h));
+    int h_ok = harness_init(&h);
+    ASSERT_EQ_INT(0, h_ok);
+    if (h_ok != 0) {
+        return;
+    }
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
