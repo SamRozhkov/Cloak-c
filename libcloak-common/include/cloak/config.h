@@ -119,7 +119,9 @@ typedef struct {
     char bind_addr[CLOAK_MAX_BIND_ADDR][CLOAK_MAX_HOST_LEN];
     size_t num_bind_addr;
 
-    /* UIDs exempt from all credit and bandwidth accounting. */
+    /* UIDs exempt from all credit and bandwidth accounting. Does NOT
+     * include admin_uid: a caller that needs the full bypass set must
+     * union bypass_uid with admin_uid (when has_admin_uid) itself. */
     uint8_t bypass_uid[CLOAK_MAX_BYPASS_UID][CLOAK_UID_LEN];
     size_t num_bypass_uid;
 
@@ -130,7 +132,8 @@ typedef struct {
     uint8_t private_key[CLOAK_X25519_KEY_LEN];
 
     /* has_admin_uid is 0 when the config omitted AdminUID, in which case
-     * admin_uid is all zeroes and must not be used. */
+     * admin_uid is all zeroes and must not be used. Not part of
+     * bypass_uid above; see that field's comment. */
     uint8_t admin_uid[CLOAK_UID_LEN];
     int has_admin_uid;
 
