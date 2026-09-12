@@ -12,6 +12,7 @@ add_library(cloak-common STATIC
     src/clienthello.c
     src/config_common.c
     src/config_client.c
+    src/config_server.c
 )
 
 target_include_directories(cloak-common PUBLIC include)

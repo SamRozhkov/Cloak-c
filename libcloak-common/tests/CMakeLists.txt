@@ -46,3 +46,8 @@ add_executable(test_config_client test_config_client.c)
 target_include_directories(test_config_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_config_client PRIVATE cloak-common)
 add_test(NAME test_config_client COMMAND test_config_client)
+
+add_executable(test_config_server test_config_server.c)
+target_include_directories(test_config_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_config_server PRIVATE cloak-common)
+add_test(NAME test_config_server COMMAND test_config_server)
