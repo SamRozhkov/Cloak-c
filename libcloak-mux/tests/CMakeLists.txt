@@ -39,3 +39,9 @@ target_include_directories(test_stream_data_cb PRIVATE ${CMAKE_SOURCE_DIR}/libcl
 target_link_libraries(test_stream_data_cb PRIVATE cloak-mux)
 add_test(NAME test_stream_data_cb COMMAND test_stream_data_cb)
 set_tests_properties(test_stream_data_cb PROPERTIES TIMEOUT 60)
+
+add_executable(test_stream_relay test_stream_relay.c)
+target_include_directories(test_stream_relay PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_stream_relay PRIVATE cloak-mux)
+add_test(NAME test_stream_relay COMMAND test_stream_relay)
+set_tests_properties(test_stream_relay PROPERTIES TIMEOUT 60)
