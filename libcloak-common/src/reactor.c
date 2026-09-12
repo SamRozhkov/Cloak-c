@@ -303,47 +303,69 @@ void cloak_reactor_cancel_timer(cloak_reactor_t *r, cloak_timer_id_t id) {
     }
 }
 
-void cloak_reactor_run(cloak_reactor_t *r) {
+/* Combines the timer heap's own deadline with the caller's requested
+ * timeout_ms, honoring the -1-means-no-bound convention on both sides:
+ * whichever of the two is finite wins, and the smaller of two finite
+ * values wins. */
+static int effective_timeout_ms(int timer_timeout_ms, int caller_timeout_ms) {
+    if (timer_timeout_ms < 0) {
+        return caller_timeout_ms;
+    }
+    if (caller_timeout_ms < 0) {
+        return timer_timeout_ms;
+    }
+    return timer_timeout_ms < caller_timeout_ms ? timer_timeout_ms : caller_timeout_ms;
+}
+
+int cloak_reactor_run_once(cloak_reactor_t *r, int timeout_ms) {
     struct epoll_event events[64];
+    int wait_ms = effective_timeout_ms(compute_timeout_ms(r), timeout_ms);
+    int n = epoll_wait(r->epoll_fd, events, 64, wait_ms);
+    if (n < 0) {
+        if (errno == EINTR) {
+            return 0;
+        }
+        return -1;
+    }
+    int dispatched = 0;
+    for (int i = 0; i < n && !r->stopped; i++) {
+        struct watcher *w = (struct watcher *)events[i].data.ptr;
+        if (w->dead) {
+            continue; /* removed earlier in this same batch; the watcher's
+                       * memory is kept alive via deferred free below, so
+                       * this read is safe -- unlike checking watchers[fd]
+                       * against a pointer that may already be freed. */
+        }
+        int fd = w->fd;
+
+        uint32_t fired = 0;
+        if (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
+            fired |= CLOAK_REACTOR_READABLE;
+        }
+        if (events[i].events & EPOLLOUT) {
+            fired |= CLOAK_REACTOR_WRITABLE;
+        }
+        if (fired != 0) {
+            w->cb(r, fd, fired, w->userdata);
+            dispatched++;
+        }
+    }
+    while (r->dead_list != NULL) {
+        struct watcher *dead = r->dead_list;
+        r->dead_list = dead->dead_next;
+        free(dead);
+    }
+    if (!r->stopped) {
+        process_expired_timers(r);
+    }
+    return dispatched;
+}
+
+void cloak_reactor_run(cloak_reactor_t *r) {
     r->stopped = 0;
-
     while (!r->stopped) {
-        int timeout_ms = compute_timeout_ms(r);
-        int n = epoll_wait(r->epoll_fd, events, 64, timeout_ms);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        for (int i = 0; i < n && !r->stopped; i++) {
-            struct watcher *w = (struct watcher *)events[i].data.ptr;
-            if (w->dead) {
-                continue; /* removed earlier in this same batch; the watcher's
-                           * memory is kept alive via deferred free below, so
-                           * this read is safe -- unlike checking watchers[fd]
-                           * against a pointer that may already be freed. */
-            }
-            int fd = w->fd;
-
-            uint32_t fired = 0;
-            if (events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) {
-                fired |= CLOAK_REACTOR_READABLE;
-            }
-            if (events[i].events & EPOLLOUT) {
-                fired |= CLOAK_REACTOR_WRITABLE;
-            }
-            if (fired != 0) {
-                w->cb(r, fd, fired, w->userdata);
-            }
-        }
-        while (r->dead_list != NULL) {
-            struct watcher *dead = r->dead_list;
-            r->dead_list = dead->dead_next;
-            free(dead);
-        }
-        if (!r->stopped) {
-            process_expired_timers(r);
+        if (cloak_reactor_run_once(r, -1) < 0) {
+            return;
         }
     }
 }

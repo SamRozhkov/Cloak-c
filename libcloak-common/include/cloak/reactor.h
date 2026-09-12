@@ -67,6 +67,16 @@ void cloak_reactor_run(cloak_reactor_t *r);
  * callback running on the reactor's own thread during cloak_reactor_run. */
 void cloak_reactor_stop(cloak_reactor_t *r);
 
+/* Runs a single dispatch turn: waits up to timeout_ms for readiness (0
+ * returns immediately, -1 waits indefinitely), dispatches whatever fired
+ * along with any timers now due, and returns. Returns the number of fd
+ * events dispatched, or -1 on a fatal epoll error.
+ *
+ * cloak_reactor_run is this called in a loop until stopped; tests and
+ * callers that need to interleave their own work with the event loop use
+ * this directly. */
+int cloak_reactor_run_once(cloak_reactor_t *r, int timeout_ms);
+
 typedef uint64_t cloak_timer_id_t;
 #define CLOAK_TIMER_INVALID ((cloak_timer_id_t)0)
 
