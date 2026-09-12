@@ -64,8 +64,32 @@ void cloak_reactor_run(cloak_reactor_t *r);
 
 /* Requests that the current cloak_reactor_run call return once the
  * in-progress dispatch batch finishes. Must be called from within a
- * callback running on the reactor's own thread during cloak_reactor_run. */
+ * callback running on the reactor's own thread during cloak_reactor_run.
+ * Sets a sticky stop flag -- see cloak_reactor_run_once for what that
+ * means for callers driving the loop directly. */
 void cloak_reactor_stop(cloak_reactor_t *r);
+
+/* Runs a single dispatch turn: waits up to timeout_ms for readiness (0
+ * returns immediately, -1 waits indefinitely), dispatches whatever fired
+ * along with any timers now due, and returns. Returns the number of fd
+ * events dispatched, or -1 on a fatal epoll error.
+ *
+ * cloak_reactor_run is this called in a loop until stopped; tests and
+ * callers that need to interleave their own work with the event loop use
+ * this directly.
+ *
+ * run_once OBSERVES THE STOP FLAG BUT DOES NOT CLEAR IT: only
+ * cloak_reactor_run resets it (on entry, before its first turn). If any
+ * callback calls cloak_reactor_stop while a caller is driving the loop
+ * via run_once directly (rather than via cloak_reactor_run), every
+ * subsequent run_once call sees the flag still set, dispatches nothing,
+ * fires no timers, and returns 0 -- indistinguishable from "nothing was
+ * ready yet". A caller writing its own pump loop around run_once that
+ * needs to honor stop requests must check for this itself (e.g. by having
+ * its own flag set from within a callback, since polling the reactor for
+ * "was stop called" is not exposed) rather than relying on run_once's
+ * return value to signal it. */
+int cloak_reactor_run_once(cloak_reactor_t *r, int timeout_ms);
 
 typedef uint64_t cloak_timer_id_t;
 #define CLOAK_TIMER_INVALID ((cloak_timer_id_t)0)

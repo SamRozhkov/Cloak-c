@@ -4,6 +4,7 @@ add_library(cloak-common STATIC
     src/version.c
     src/random.c
     src/base64.c
+    src/bytequeue.c
     src/log.c
     src/aead.c
     src/salsa20.c
@@ -14,6 +15,9 @@ add_library(cloak-common STATIC
     src/config_client.c
     src/config_server.c
     src/config_ssv.c
+    src/listener.c
+    src/dial.c
+    src/relay.c
 )
 
 target_include_directories(cloak-common PUBLIC include)

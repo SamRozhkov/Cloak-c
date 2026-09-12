@@ -1,6 +1,5 @@
 add_library(cloak-mux STATIC
     src/frame.c
-    src/bytequeue.c
     src/stream.c
     src/strmtab.c
     src/conn.c
