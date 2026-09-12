@@ -377,6 +377,173 @@ static void test_large_transfer_survives_backpressure(void) {
     cloak_reactor_destroy(r);
 }
 
+/* Regression test for a defect the code review found in
+ * pump_stream_to_fd's two independent, sequential phases: bytes the far
+ * end already sent, but that didn't fit in buf_cap on the first pass,
+ * can be stranded forever in the stream's own reassembly buffer if the
+ * destination fd only becomes writable again in a LATER call, once the
+ * far end has nothing further to send (so no further on_stream_data
+ * notification will ever prompt another look).
+ *
+ * Reproduced by: writing far more than buf_cap in one shot BEFORE the
+ * relay exists (so start's own initial pump hits the bug directly);
+ * pre-saturating the relay's own fd so that same initial pump's attempt
+ * to drain what little it could fit gets EAGAIN and makes zero progress
+ * (mirroring test_relay.c's own test_zero_mask_backpressure_does_not_spin
+ * technique); then relieving the stall in one step big enough that a
+ * single later send() can drain the entire (small) queue in one shot --
+ * exactly "a CLOAK_REACTOR_WRITABLE event" from the review's trace. The
+ * far end (this test) never writes anything else afterward. */
+static void test_pump_does_not_strand_bytes_when_fd_unstalls(void) {
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    struct endpoint b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+
+    cloak_session_config_t cfg_a;
+    cloak_session_config_t cfg_b;
+    fill_config(&cfg_a, &a, &obfs);
+    fill_config(&cfg_b, &b, &obfs);
+
+    ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 9, r, &cfg_a));
+    ASSERT_EQ_INT(0, cloak_session_init(&b.sesh, 9, r, &cfg_b));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&a.sesh, fds[0]));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&b.sesh, fds[1]));
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        return;
+    }
+
+    /* One write, far exceeding the relay's own buf_cap below, and the
+     * only one the far end (this test) ever makes. */
+    const size_t total = 3000;
+    uint8_t *sent = malloc(total);
+    ASSERT_TRUE(sent != NULL);
+    if (sent == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < total; i++) {
+        sent[i] = (uint8_t)(i * 17 + 3);
+    }
+    ASSERT_EQ_INT((int)total, (int)cloak_stream_write(s, sent, total));
+
+    for (int i = 0; i < 50 && b.new_stream_calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, b.new_stream_calls);
+
+    struct sockpair sp;
+    ASSERT_EQ_INT(0, sockpair_init(&sp));
+
+    /* Saturate sp.inner's own kernel send buffer BEFORE the relay ever
+     * touches it, so the relay's very first send() attempt on it is
+     * guaranteed to hit EAGAIN regardless of anything else. */
+    int flags = fcntl(sp.inner, F_GETFL, 0);
+    ASSERT_TRUE(flags >= 0);
+    ASSERT_EQ_INT(0, fcntl(sp.inner, F_SETFL, flags | O_NONBLOCK));
+    uint8_t filler[4096];
+    memset(filler, 'z', sizeof(filler));
+    int inner_full = 0;
+    size_t filler_total = 0;
+    for (int i = 0; i < 4096; i++) {
+        ssize_t n = write(sp.inner, filler, sizeof(filler));
+        if (n < 0) {
+            ASSERT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+            inner_full = 1;
+            break;
+        }
+        filler_total += (size_t)n;
+    }
+    ASSERT_TRUE(inner_full);
+    ASSERT_TRUE(filler_total > 0);
+
+    struct done_capture cap;
+    memset(&cap, 0, sizeof(cap));
+
+    /* buf_cap far smaller than `total`: the stream already holds all
+     * 3000 bytes (delivered before this relay existed, exactly like
+     * on_new_stream firing with the first frame already fed), so start's
+     * own initial pump fills to_fd to capacity and leaves the rest
+     * sitting unread in the stream, then fails to send even one byte of
+     * it -- the fd is fully stalled above. */
+    cloak_stream_relay_t sr;
+    ASSERT_EQ_INT(0, cloak_stream_relay_start(&sr, r, &b.sesh, b.accepted, sp.inner, 256,
+                                              on_relay_done, &cap));
+    b.sr = &sr;
+
+    /* Relieve the stall by draining EXACTLY the filler bytes this test
+     * itself queued above -- not "some generous chunk" of it. Nothing
+     * else can possibly be sitting in this pipe yet (the relay's own
+     * send() has not succeeded even once so far: the fd was already
+     * fully stalled before start() ever ran), so this drains the pipe
+     * back to genuinely empty without risking scooping up any real
+     * relayed payload bytes along with leftover filler -- which a
+     * partial drain of an unknown-sized backlog would risk doing, since
+     * the two would sit back-to-back in FIFO order in the same pipe. */
+    uint8_t drain_buf[4096];
+    size_t drained_total = 0;
+    while (drained_total < filler_total) {
+        size_t want = filler_total - drained_total;
+        if (want > sizeof(drain_buf)) {
+            want = sizeof(drain_buf);
+        }
+        ssize_t n = read(sp.outer, drain_buf, want);
+        ASSERT_TRUE(n > 0);
+        if (n <= 0) {
+            break;
+        }
+        drained_total += (size_t)n;
+    }
+    ASSERT_EQ_INT((int)filler_total, (int)drained_total);
+    cloak_reactor_run_once(r, 10);
+
+    /* Behave like an ordinary client from here: keep reading whatever
+     * trickles out, running the reactor in between, for a generous
+     * number of turns, with the far end silent throughout. */
+    uint8_t *got = malloc(total);
+    ASSERT_TRUE(got != NULL);
+    size_t received = 0;
+    for (int i = 0; i < 200 && received < total; i++) {
+        cloak_reactor_run_once(r, 10);
+        for (;;) {
+            ssize_t n = read(sp.outer, got + received, total - received);
+            if (n <= 0) {
+                break;
+            }
+            received += (size_t)n;
+        }
+    }
+
+    ASSERT_EQ_INT((int)total, (int)received);
+    if (received == total) {
+        ASSERT_MEM_EQ(sent, got, total);
+    }
+
+    free(sent);
+    free(got);
+    cloak_stream_relay_stop(&sr);
+    close(sp.outer);
+    cloak_session_release_stream(&b.sesh, b.accepted);
+    cloak_session_release_stream(&a.sesh, s);
+    cloak_session_destroy(&a.sesh);
+    cloak_session_destroy(&b.sesh);
+    cloak_reactor_destroy(r);
+}
+
 static void test_closing_fd_fires_done_once_and_ends_far_stream(void) {
     int fds[2];
     ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
@@ -862,6 +1029,7 @@ static void test_stop_before_immediate_finish_fires_cancels_timer(void) {
 TEST_MAIN_BEGIN()
     test_forwards_both_directions();
     test_large_transfer_survives_backpressure();
+    test_pump_does_not_strand_bytes_when_fd_unstalls();
     test_closing_fd_fires_done_once_and_ends_far_stream();
     test_stream_eof_closes_fd_and_fires_done_once();
     test_stop_is_idempotent_and_suppresses_done();

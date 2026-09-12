@@ -63,30 +63,43 @@ static void sync_interest(cloak_stream_relay_t *sr) {
     (void)cloak_reactor_mod_fd(sr->reactor, sr->fd, want);
 }
 
-/* Drains the stream into the to_fd queue, then writes the queue out.
- * Returns 0 to continue, -1 if the relay should tear down. */
-static int pump_stream_to_fd(cloak_stream_relay_t *sr) {
+/* Fills to_fd from the stream, bounded by whatever free space to_fd
+ * currently has. Returns the number of bytes moved (0 if none), and sets
+ * sr->stream_ended if the stream reported end-of-stream while filling.
+ * "Nothing ready right now" and "stream ended" are both ordinary
+ * terminal conditions for a single call, not errors. */
+static size_t try_fill_from_stream(cloak_stream_relay_t *sr) {
     uint8_t buf[STREAM_RELAY_CHUNK];
-
-    if (!sr->stream_ended) {
-        for (;;) {
-            size_t room = cloak_bytequeue_free_space(&sr->to_fd);
-            if (room == 0) {
-                break; /* backpressure: the fd has not kept up */
-            }
-            size_t want = room < sizeof(buf) ? room : sizeof(buf);
-            long n = cloak_stream_read(sr->stream, buf, want);
-            if (n < 0) {
-                sr->stream_ended = 1; /* peer closed: flush, then finish */
-                break;
-            }
-            if (n == 0) {
-                break; /* nothing ready right now */
-            }
-            cloak_bytequeue_write(&sr->to_fd, buf, (size_t)n);
-        }
+    size_t total = 0;
+    if (sr->stream_ended) {
+        return 0;
     }
+    for (;;) {
+        size_t room = cloak_bytequeue_free_space(&sr->to_fd);
+        if (room == 0) {
+            break; /* backpressure: the fd has not kept up */
+        }
+        size_t want = room < sizeof(buf) ? room : sizeof(buf);
+        long n = cloak_stream_read(sr->stream, buf, want);
+        if (n < 0) {
+            sr->stream_ended = 1; /* peer closed: flush, then finish */
+            break;
+        }
+        if (n == 0) {
+            break; /* nothing ready right now */
+        }
+        cloak_bytequeue_write(&sr->to_fd, buf, (size_t)n);
+        total += (size_t)n;
+    }
+    return total;
+}
 
+/* Drains to_fd to the fd. On success (*out_sent is the number of bytes
+ * actually sent, 0 if none were queued or none could be sent right now)
+ * returns 0; returns -1 if the fd itself is broken. */
+static int try_drain_to_fd(cloak_stream_relay_t *sr, size_t *out_sent) {
+    uint8_t buf[STREAM_RELAY_CHUNK];
+    size_t total = 0;
     for (;;) {
         size_t have = cloak_bytequeue_peek(&sr->to_fd, buf, sizeof(buf));
         if (have == 0) {
@@ -95,6 +108,7 @@ static int pump_stream_to_fd(cloak_stream_relay_t *sr) {
         ssize_t n = send(sr->fd, buf, have, MSG_NOSIGNAL);
         if (n > 0) {
             cloak_bytequeue_read(&sr->to_fd, buf, (size_t)n);
+            total += (size_t)n;
             continue;
         }
         if (n < 0 && errno == EINTR) {
@@ -103,8 +117,52 @@ static int pump_stream_to_fd(cloak_stream_relay_t *sr) {
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
         }
+        *out_sent = total;
         return -1;
     }
+    *out_sent = total;
+    return 0;
+}
+
+/* Moves bytes from the stream to the fd, retrying both directions
+ * together until neither makes further progress in a single call.
+ *
+ * This is NOT the same as calling "fill once, then drain once": room
+ * try_drain_to_fd frees in to_fd must be revisited by try_fill_from_stream
+ * within THIS SAME call, or bytes the stream already holds -- but that
+ * didn't fit in to_fd on an earlier, separate call -- can be stranded
+ * forever. Concretely: to_fd fills to capacity while the fd is stalled,
+ * leaving excess unread in the stream's own reassembly buffer; later,
+ * once the fd becomes writable again, a naive "fill once, drain once"
+ * structure would check room before this call's own drain has freed any,
+ * see none, skip filling, then drain the queue to empty and (via
+ * sync_interest) drop WRITABLE interest entirely -- with the stream's
+ * leftover bytes never revisited, since a fd-writable event carries no
+ * information about the stream and cloak_stream_relay_notify_stream_data
+ * only fires for a NEW frame, which may never come again (e.g. the far
+ * end already sent everything and is now waiting for a reply). The
+ * do/while below closes that gap by re-checking room every time either
+ * side just moved bytes.
+ *
+ * Terminates because each iteration that repeats has moved a strictly
+ * positive, bounded number of bytes: try_fill_from_stream is bounded by
+ * whatever the stream currently holds, and try_drain_to_fd by whatever
+ * to_fd currently holds -- both finite quantities that only shrink
+ * (nothing refills the stream's own reassembly buffer from within this
+ * function). The loop is not reachable with both returning 0 while
+ * either side still has real progress available, and stops the instant
+ * both genuinely have none.
+ *
+ * Returns 0 to continue, -1 if the relay should tear down. */
+static int pump_stream_to_fd(cloak_stream_relay_t *sr) {
+    size_t filled;
+    size_t sent;
+    do {
+        filled = try_fill_from_stream(sr);
+        if (try_drain_to_fd(sr, &sent) != 0) {
+            return -1;
+        }
+    } while (filled > 0 || sent > 0);
 
     if (sr->stream_ended && cloak_bytequeue_len(&sr->to_fd) == 0) {
         return -1; /* everything the stream ever sent has reached the fd */
