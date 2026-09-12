@@ -39,6 +39,8 @@ static void test_parses_a_minimal_config(void) {
     ASSERT_EQ_INT(0, (int)cfg.num_bypass_uid);
     ASSERT_EQ_INT(0, cfg.database_path[0]);
     ASSERT_EQ_INT(-1, cfg.keep_alive_sec);
+    ASSERT_MEM_EQ(cfg.private_key, "private-key-material-exactly-32!",
+                  CLOAK_X25519_KEY_LEN);
 }
 
 static void test_proxy_book_lowercases_names_and_reads_udp(void) {
@@ -77,6 +79,8 @@ static void test_reads_admin_and_bypass_uids(void) {
     ASSERT_EQ_INT(1, (int)cfg.num_bypass_uid);
     ASSERT_EQ_INT(0, strcmp(cfg.database_path, "/var/lib/cloak/userinfo.db"));
     ASSERT_EQ_INT(30, cfg.keep_alive_sec);
+    ASSERT_MEM_EQ(cfg.admin_uid, "adminUID-16byte!", CLOAK_UID_LEN);
+    ASSERT_MEM_EQ(cfg.bypass_uid[0], "bypassUID-16byt!", CLOAK_UID_LEN);
 }
 
 static void test_missing_required_fields(void) {
@@ -144,6 +148,80 @@ static void test_rejects_bad_proxy_book_entries(void) {
     ASSERT_TRUE(strstr(err, "thirteenchars") != NULL);
 }
 
+static void test_proxy_book_overflow_is_rejected(void) {
+    /* one more entry than CLOAK_MAX_PROXY_BOOK allows */
+    char entries[2048];
+    size_t off = 0;
+    for (int i = 0; i <= CLOAK_MAX_PROXY_BOOK; i++) {
+        off += (size_t)snprintf(entries + off, sizeof(entries) - off,
+                                "%s\"p%d\":[\"tcp\",\"localhost:1\"]",
+                                i == 0 ? "" : ",", i);
+    }
+
+    char json[4096];
+    snprintf(json, sizeof(json),
+             "{\"ProxyBook\":{%s},"
+             "\"BindAddr\":[\":443\"],\"RedirAddr\":\"a.com\",\"PrivateKey\":\"%s\"}",
+             entries, PRIV_B64);
+
+    cloak_server_config_t cfg;
+    char err[CLOAK_CONFIG_ERR_LEN] = {0};
+    ASSERT_EQ_INT(-1, cloak_server_config_parse_json(json, &cfg, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "ProxyBook") != NULL);
+}
+
+static void test_bind_addr_overflow_is_rejected(void) {
+    /* one more entry than CLOAK_MAX_BIND_ADDR allows */
+    char entries[1024];
+    size_t off = 0;
+    for (int i = 0; i <= CLOAK_MAX_BIND_ADDR; i++) {
+        off += (size_t)snprintf(entries + off, sizeof(entries) - off, "%s\":%d\"",
+                                i == 0 ? "" : ",", 1000 + i);
+    }
+
+    char json[2048];
+    snprintf(json, sizeof(json),
+             "{\"ProxyBook\":{\"ss\":[\"tcp\",\"localhost:1\"]},"
+             "\"BindAddr\":[%s],\"RedirAddr\":\"a.com\",\"PrivateKey\":\"%s\"}",
+             entries, PRIV_B64);
+
+    cloak_server_config_t cfg;
+    char err[CLOAK_CONFIG_ERR_LEN] = {0};
+    ASSERT_EQ_INT(-1, cloak_server_config_parse_json(json, &cfg, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "BindAddr") != NULL);
+}
+
+static void test_bypass_uid_overflow_is_rejected(void) {
+    /* one more entry than CLOAK_MAX_BYPASS_UID allows */
+    char entries[4096];
+    size_t off = 0;
+    for (int i = 0; i <= CLOAK_MAX_BYPASS_UID; i++) {
+        off += (size_t)snprintf(entries + off, sizeof(entries) - off, "%s\"%s\"",
+                                i == 0 ? "" : ",", BYPASS_B64);
+    }
+
+    char json[8192];
+    snprintf(json, sizeof(json),
+             "{\"ProxyBook\":{\"ss\":[\"tcp\",\"localhost:1\"]},"
+             "\"BindAddr\":[\":443\"],\"RedirAddr\":\"a.com\",\"PrivateKey\":\"%s\","
+             "\"BypassUID\":[%s]}",
+             PRIV_B64, entries);
+
+    cloak_server_config_t cfg;
+    char err[CLOAK_CONFIG_ERR_LEN] = {0};
+    ASSERT_EQ_INT(-1, cloak_server_config_parse_json(json, &cfg, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "BypassUID") != NULL);
+}
+
+static void test_err_may_be_null_on_failure(void) {
+    /* no PrivateKey -- a guaranteed parse failure. err may be NULL per
+     * cloak/config.h; a failing parse must never touch it. */
+    const char *json = "{\"ProxyBook\":{\"ss\":[\"tcp\",\"localhost:1\"]},"
+                       "\"BindAddr\":[\":443\"],\"RedirAddr\":\"a.com\"}";
+    cloak_server_config_t cfg;
+    ASSERT_EQ_INT(-1, cloak_server_config_parse_json(json, &cfg, NULL, 0));
+}
+
 static void test_rejects_cnc_mode(void) {
     char json[1024];
     snprintf(json, sizeof(json),
@@ -206,6 +284,10 @@ TEST_MAIN_BEGIN()
     test_reads_admin_and_bypass_uids();
     test_missing_required_fields();
     test_rejects_bad_proxy_book_entries();
+    test_proxy_book_overflow_is_rejected();
+    test_bind_addr_overflow_is_rejected();
+    test_bypass_uid_overflow_is_rejected();
+    test_err_may_be_null_on_failure();
     test_rejects_cnc_mode();
     test_rejects_wrong_length_keys();
     test_parse_file_round_trip();

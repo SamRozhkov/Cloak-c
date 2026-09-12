@@ -17,7 +17,10 @@ static void capture(char *buf, size_t buf_cap, void (*body)(void)) {
     size_t n = fread(buf, 1, buf_cap - 1, f);
     buf[n] = '\0';
     fclose(f);
-    cloak_log_set_stream(stderr);
+    /* cloak/log.h documents that passing NULL restores stderr; restoring
+     * that way (rather than passing stderr explicitly) puts that branch
+     * of cloak_log_set_stream under test on every call to capture(). */
+    cloak_log_set_stream(NULL);
 }
 
 static void emit_one_of_each(void) {

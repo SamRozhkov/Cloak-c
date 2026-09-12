@@ -77,10 +77,16 @@ static void test_decode_rejects_malformed(void) {
     ASSERT_EQ_INT(-1, cloak_base64_decode("Zm9v Zm9v", out, sizeof(out), &out_len));
     /* padding in a non-final quantum */
     ASSERT_EQ_INT(-1, cloak_base64_decode("Zg==Zg==", out, sizeof(out), &out_len));
-    /* three padding characters */
+    /* '=' at position 1: caught by the "'=' at position 0 or 1 is never
+     * legal" rule before the count of padding characters ever matters */
     ASSERT_EQ_INT(-1, cloak_base64_decode("Z===", out, sizeof(out), &out_len));
-    /* data character after padding within the final quantum */
+    /* '=' at position 1 again, for the same reason -- despite appearances
+     * this never reaches the "data character after padding" check below */
     ASSERT_EQ_INT(-1, cloak_base64_decode("Z=g=", out, sizeof(out), &out_len));
+    /* '=' legally at position 2, followed by a data character at position
+     * 3: the only input in this suite that reaches the j == 2 look-ahead
+     * check (a data byte can't follow a single padding character) */
+    ASSERT_EQ_INT(-1, cloak_base64_decode("Zg=g", out, sizeof(out), &out_len));
     /* NULL input */
     ASSERT_EQ_INT(-1, cloak_base64_decode(NULL, out, sizeof(out), &out_len));
 }

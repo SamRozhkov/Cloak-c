@@ -176,6 +176,37 @@ static void test_alternative_names_are_collected_and_empties_dropped(void) {
     ASSERT_EQ_INT(0, strcmp(cfg.alt_names[1], "c.com"));
 }
 
+static void test_alternative_names_overflow_is_rejected(void) {
+    /* one more entry than CLOAK_MAX_ALT_NAMES allows */
+    char entries[2048];
+    size_t off = 0;
+    for (int i = 0; i <= CLOAK_MAX_ALT_NAMES; i++) {
+        off += (size_t)snprintf(entries + off, sizeof(entries) - off,
+                                "%s\"alt%d.example\"", i == 0 ? "" : ",", i);
+    }
+
+    char json[4096];
+    snprintf(json, sizeof(json),
+             "{\"ServerName\":\"a.com\",\"ProxyMethod\":\"ss\","
+             "\"EncryptionMethod\":\"plain\",\"UID\":\"%s\",\"PublicKey\":\"%s\","
+             "\"RemoteHost\":\"h\",\"RemotePort\":\"443\","
+             "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"1984\","
+             "\"AlternativeNames\":[%s]}",
+             UID_B64, PUB_B64, entries);
+
+    cloak_client_config_t cfg;
+    char err[CLOAK_CONFIG_ERR_LEN] = {0};
+    ASSERT_EQ_INT(-1, cloak_client_config_parse_json(json, &cfg, err, sizeof(err)));
+    ASSERT_TRUE(strstr(err, "AlternativeNames") != NULL);
+}
+
+static void test_err_may_be_null_on_failure(void) {
+    /* not JSON at all -- a guaranteed parse failure. err may be NULL per
+     * cloak/config.h; a failing parse must never touch it. */
+    cloak_client_config_t cfg;
+    ASSERT_EQ_INT(-1, cloak_client_config_parse_json("not json", &cfg, NULL, 0));
+}
+
 static void test_missing_required_fields_are_named_in_the_error(void) {
     struct {
         const char *drop;
@@ -316,6 +347,8 @@ TEST_MAIN_BEGIN()
     test_browser_and_transport_names();
     test_cdn_transport_defaults_ws_path();
     test_alternative_names_are_collected_and_empties_dropped();
+    test_alternative_names_overflow_is_rejected();
+    test_err_may_be_null_on_failure();
     test_missing_required_fields_are_named_in_the_error();
     test_rejects_bad_values();
     test_parse_file_round_trip();

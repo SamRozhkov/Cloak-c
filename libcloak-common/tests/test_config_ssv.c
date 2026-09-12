@@ -125,6 +125,13 @@ static void test_rejects_malformed_options(void) {
     ASSERT_TRUE(err[0] != '\0');
 }
 
+static void test_err_may_be_null_on_failure(void) {
+    /* an empty ssv string is a guaranteed parse failure. err may be NULL
+     * per cloak/config.h; a failing parse must never touch it. */
+    cloak_client_config_t cfg;
+    ASSERT_EQ_INT(-1, cloak_client_config_parse_ssv("", &cfg, NULL, 0));
+}
+
 static void test_load_dispatches_on_shape(void) {
     cloak_client_config_t cfg;
     char err[CLOAK_CONFIG_ERR_LEN] = {0};
@@ -165,5 +172,6 @@ TEST_MAIN_BEGIN()
     test_escaped_backslash();
     test_trailing_semicolon_is_tolerated();
     test_rejects_malformed_options();
+    test_err_may_be_null_on_failure();
     test_load_dispatches_on_shape();
 TEST_MAIN_END()
