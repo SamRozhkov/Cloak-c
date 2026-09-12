@@ -23,6 +23,11 @@ add_executable(test_reactor test_reactor.c)
 target_link_libraries(test_reactor PRIVATE cloak-common)
 add_test(NAME test_reactor COMMAND test_reactor)
 
+add_executable(test_reactor_once test_reactor_once.c)
+target_link_libraries(test_reactor_once PRIVATE cloak-common)
+add_test(NAME test_reactor_once COMMAND test_reactor_once)
+set_tests_properties(test_reactor_once PROPERTIES TIMEOUT 60)
+
 add_executable(test_clienthello test_clienthello.c)
 target_link_libraries(test_clienthello PRIVATE cloak-common)
 add_test(NAME test_clienthello COMMAND test_clienthello)
