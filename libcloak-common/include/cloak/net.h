@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 #include "cloak/bytequeue.h"
 #include "cloak/reactor.h"
@@ -71,5 +72,65 @@ void cloak_listener_close(cloak_listener_t *l);
 
 /* The bound port, or -1 if the listener is not open. */
 int cloak_listener_port(const cloak_listener_t *l);
+
+/* A resolved socket address, ready to connect to without another lookup. */
+typedef struct {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    int socktype; /* SOCK_STREAM or SOCK_DGRAM */
+    int protocol;
+} cloak_addr_t;
+
+/* Resolves "host:port" into a connectable address.
+ *
+ * THIS CALL BLOCKS: it performs a synchronous DNS lookup. Call it at
+ * startup (when parsing config, as Go Cloak's InitState does for RedirAddr
+ * and ProxyBook), never per connection on the reactor's thread. A numeric
+ * address resolves without touching the network.
+ *
+ * is_udp selects SOCK_DGRAM instead of SOCK_STREAM. Returns 0 on success,
+ * -1 with the reason in err on a malformed address or a resolution
+ * failure. The first result returned by the resolver is used. */
+int cloak_net_resolve(const char *addr, int is_udp, cloak_addr_t *out,
+                      char *err, size_t err_cap);
+
+typedef struct cloak_dial cloak_dial_t;
+
+/* Fired exactly once per cloak_dial_start, with a connected, non-blocking
+ * socket, or fd < 0 if the connect failed or timed out. OWNERSHIP OF fd
+ * PASSES TO THIS CALLBACK (it is already unregistered from the reactor);
+ * closing it is the callback's responsibility.
+ *
+ * Guaranteed never to fire before cloak_dial_start returns -- even when
+ * the connect completes immediately, as it does on loopback -- so a caller
+ * can finish initializing its own state after calling start without
+ * racing its own callback. */
+typedef void (*cloak_dial_cb)(int fd, void *userdata);
+
+struct cloak_dial {
+    cloak_reactor_t *reactor;
+    int fd;
+    cloak_timer_id_t timeout_timer;
+    cloak_timer_id_t immediate_timer;
+    cloak_dial_cb cb;
+    void *userdata;
+    int finished;
+};
+
+/* Starts a non-blocking connect to addr. timeout_ms bounds the attempt (0
+ * means no timeout). On completion, success or failure, cb fires exactly
+ * once.
+ *
+ * Returns 0 if the attempt started, -1 if it could not be started at all
+ * (bad argument, socket creation failure, or a reactor registration
+ * failure) -- in which case cb never fires and the caller owns the
+ * failure. */
+int cloak_dial_start(cloak_dial_t *d, cloak_reactor_t *r, const cloak_addr_t *addr,
+                     uint64_t timeout_ms, cloak_dial_cb cb, void *userdata);
+
+/* Abandons an in-flight dial: closes the socket, cancels the timeout, and
+ * guarantees cb will NOT fire. A no-op if the dial already completed.
+ * Must not be called from within cb itself. */
+void cloak_dial_cancel(cloak_dial_t *d);
 
 #endif

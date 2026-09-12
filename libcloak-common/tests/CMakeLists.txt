@@ -66,3 +66,8 @@ add_executable(test_listener test_listener.c)
 target_include_directories(test_listener PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_listener PRIVATE cloak-common)
 add_test(NAME test_listener COMMAND test_listener)
+
+add_executable(test_dial test_dial.c)
+target_include_directories(test_dial PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_dial PRIVATE cloak-common)
+add_test(NAME test_dial COMMAND test_dial)
