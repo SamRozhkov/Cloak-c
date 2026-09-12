@@ -95,6 +95,26 @@ typedef void (*cloak_session_broken_cb)(cloak_session_t *sesh, void *userdata);
  * being re-entered from within itself. */
 typedef void (*cloak_session_writable_cb)(cloak_session_t *sesh, void *userdata);
 
+/* Fired when one or more frames are routed into a stream this session
+ * already knows about, so a reactor-driven consumer knows to drain it
+ * with cloak_stream_read.
+ *
+ * NOT fired for the frame that first creates a stream: on_new_stream
+ * already reports that case, and its own doc comment notes the stream may
+ * already have readable data when it fires. This is deliberate rather
+ * than an omission -- on_new_stream is explicitly permitted to call
+ * cloak_session_release_stream, which frees the stream, so firing a
+ * second callback with that pointer afterwards would hand the consumer
+ * freed memory. Drain on on_new_stream for a stream's first bytes, and on
+ * this callback for everything after.
+ *
+ * Fires after the frame has been fed, so the data is already readable. If
+ * the frame closed the stream, the stream is already retired by the time
+ * this fires -- it is still safe to read from (draining whatever arrived
+ * before the close) and still must be released by the caller. */
+typedef void (*cloak_session_stream_data_cb)(cloak_session_t *sesh, cloak_stream_t *stream,
+                                              void *userdata);
+
 typedef struct {
     cloak_obfuscator_t obfuscator;   /* copied by value into the session -- see this task's own file header comment for why */
     size_t max_on_wire_size;         /* forwarded to every cloak_stream_init and cloak_conn_init this session performs */
@@ -108,6 +128,8 @@ typedef struct {
     void *on_broken_userdata;
     cloak_session_writable_cb on_writable;
     void *on_writable_userdata;
+    cloak_session_stream_data_cb on_stream_data;
+    void *on_stream_data_userdata;
 } cloak_session_config_t;
 
 struct cloak_session {
@@ -136,6 +158,8 @@ struct cloak_session {
     void *on_broken_userdata;
     cloak_session_writable_cb on_writable;
     void *on_writable_userdata;
+    cloak_session_stream_data_cb on_stream_data;
+    void *on_stream_data_userdata;
 };
 
 /* Returns 0 on success, -1 on invalid parameters (same validation

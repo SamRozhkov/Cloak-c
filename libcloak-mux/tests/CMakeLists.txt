@@ -33,3 +33,9 @@ target_include_directories(test_backpressure PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_backpressure PRIVATE cloak-mux)
 add_test(NAME test_backpressure COMMAND test_backpressure)
 set_tests_properties(test_backpressure PROPERTIES TIMEOUT 60)
+
+add_executable(test_stream_data_cb test_stream_data_cb.c)
+target_include_directories(test_stream_data_cb PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_stream_data_cb PRIVATE cloak-mux)
+add_test(NAME test_stream_data_cb COMMAND test_stream_data_cb)
+set_tests_properties(test_stream_data_cb PROPERTIES TIMEOUT 60)

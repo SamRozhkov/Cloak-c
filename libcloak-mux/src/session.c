@@ -329,6 +329,15 @@ static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_by
              * ownership" note. */
             session_retire_stream(sesh, stream);
         }
+        /* Notify last, after routing and any retirement, so the consumer
+         * sees final state: the bytes are readable, and a stream closed
+         * by this frame already reads as ended. Fired even when the frame
+         * was a protocol violation (rc == -1) so a consumer holding this
+         * stream learns to tear its own side down rather than waiting
+         * forever for data that will never come. */
+        if (sesh->on_stream_data != NULL) {
+            sesh->on_stream_data(sesh, stream, sesh->on_stream_data_userdata);
+        }
         return;
     }
 
@@ -412,6 +421,8 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
     sesh->on_broken_userdata = config->on_broken_userdata;
     sesh->on_writable = config->on_writable;
     sesh->on_writable_userdata = config->on_writable_userdata;
+    sesh->on_stream_data = config->on_stream_data;
+    sesh->on_stream_data_userdata = config->on_stream_data_userdata;
 
     if (cloak_strmtab_init(&sesh->streams, 16) != 0) {
         return -1;
