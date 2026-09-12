@@ -94,8 +94,11 @@ typedef struct {
     char cdn_origin_host[CLOAK_MAX_HOST_LEN];
     char cdn_ws_url_path[CLOAK_MAX_PATH_LEN];
 
-    /* Seconds. stream_timeout_sec defaults to 300. keep_alive_sec is -1
-     * when TCP keepalive is disabled, which is the default. */
+    /* Seconds. stream_timeout_sec defaults to 300. A negative
+     * StreamTimeout is a config error here; Go's client (state.go:269-273)
+     * accepts a negative value silently and passes it straight through to
+     * time.Duration. keep_alive_sec is -1 when TCP keepalive is disabled,
+     * which is the default. */
     int stream_timeout_sec;
     int keep_alive_sec;
 } cloak_client_config_t;
@@ -104,7 +107,11 @@ typedef struct {
     /* Lower-cased proxy method name, matched against the method the client
      * sends in its auth payload. */
     char name[CLOAK_PROXY_METHOD_LEN + 1];
-    /* 0 for "tcp", 1 for "udp". */
+    /* 0 for "tcp", 1 for "udp". A ProxyBook entry naming any other network
+     * is a config error here; Go's parseProxyBook (state.go:88-105) has no
+     * default case in its switch, so such an entry is silently dropped
+     * from the proxy book rather than rejected -- a server config that
+     * boots under Go Cloak may fail to parse under this implementation. */
     int is_udp;
     /* The upstream proxy endpoint as written in the config, e.g.
      * "localhost:51443". Resolution happens at dial time, not here. */

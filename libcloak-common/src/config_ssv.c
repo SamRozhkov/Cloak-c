@@ -18,8 +18,22 @@ static int is_unquoted_key(const char *key) {
 
 /* Copies src into dst, resolving the three escapes ssv defines: "\\" -> '\',
  * "\=" -> '=', "\;" -> ';'. A backslash before any other character is kept
- * literally, matching Go's three-way string replacement. Returns -1 if the
- * result would not fit in dst_cap (including the NUL). */
+ * literally. Returns -1 if the result would not fit in dst_cap (including
+ * the NUL).
+ *
+ * Divergence from Go, deliberate: Go's ssvToJson unescapes the *entire*
+ * option string up front (a global three-way strings.Replace) and only
+ * afterwards splits the result on ';'. That means an escaped ';' or '='
+ * has already turned into a literal byte by the time Go looks for field
+ * boundaries, so Go's splitter cuts a value like "\;" right through the
+ * escape, produces a bogus second "field" with no '=' in it, and drops
+ * that field as malformed -- Go's escaping is broken for precisely the
+ * input it exists to support. This implementation instead scans for
+ * unescaped ';' and '=' first (see the caller's cursor walk below) to find
+ * field and key/value boundaries, and only unescapes each field's value
+ * afterwards, which is what the escape syntax was meant to provide.
+ * test_config_ssv.c's escape test (test_escapes_are_unescaped) locks this
+ * behaviour in and would fail under Go's order of operations. */
 static int unescape(const char *src, size_t src_len, char *dst, size_t dst_cap) {
     size_t o = 0;
     for (size_t i = 0; i < src_len; i++) {

@@ -26,7 +26,14 @@ typedef enum {
  * truncated -- logging never fails and never allocates. */
 #define CLOAK_LOG_MAX_MSG 2048
 
+/* Sets the process-global minimum severity: a call to cloak_log_write (or
+ * one of the CLOAK_LOG* macros below) is emitted only when its level is
+ * numerically <= level. Takes effect immediately for all subsequent
+ * writes; there is no per-call override. */
 void cloak_log_set_level(cloak_log_level_t level);
+
+/* Returns the level most recently passed to cloak_log_set_level, or
+ * CLOAK_LOG_DEFAULT_LEVEL if it has never been called. */
 cloak_log_level_t cloak_log_get_level(void);
 
 /* Parses a level name, case-insensitively: "error", "warn", "info",
