@@ -156,3 +156,17 @@ size_t cloak_switchboard_send_capacity(const cloak_switchboard_t *sb) {
     }
     return total;
 }
+
+size_t cloak_switchboard_send_min_conn_free(const cloak_switchboard_t *sb) {
+    if (sb == NULL || sb->conns_len == 0) {
+        return 0;
+    }
+    size_t min_free = cloak_conn_send_free(sb->conns[0]);
+    for (size_t i = 1; i < sb->conns_len; i++) {
+        size_t free_space = cloak_conn_send_free(sb->conns[i]);
+        if (free_space < min_free) {
+            min_free = free_space;
+        }
+    }
+    return min_free;
+}

@@ -125,4 +125,14 @@ void cloak_conn_set_drained_cb(cloak_conn_t *c, cloak_conn_drained_cb cb, void *
 size_t cloak_conn_send_queued(const cloak_conn_t *c);
 size_t cloak_conn_send_capacity(const cloak_conn_t *c);
 
+/* Free space left in THIS connection's own send queue right now
+ * (cloak_conn_send_capacity(c) - cloak_conn_send_queued(c)) -- exactly
+ * how many more bytes cloak_conn_send could still enqueue on this one
+ * connection before its own hard cap fires conn_mark_broken. NULL
+ * reports 0. See cloak_switchboard_send_min_conn_free's own doc comment
+ * for why a caller spreading writes across a pool via
+ * cloak_switchboard_send needs the MINIMUM of this over the whole pool,
+ * not the sum cloak_conn_send_capacity/_queued would otherwise suggest. */
+size_t cloak_conn_send_free(const cloak_conn_t *c);
+
 #endif

@@ -1173,6 +1173,168 @@ static void test_stopping_relay_from_on_broken_avoids_use_after_free(void) {
     cloak_reactor_destroy(r);
 }
 
+/* Regression test for finding 3 (final whole-branch review): the
+ * realistic failure cloak_switchboard_send's random-connection pick
+ * creates is not an unlucky run, it is one congested connection in a
+ * pool of N. connA below is a real, healthy connection whose peer (a's
+ * own session) this test actively drains every turn; connDead's peer is
+ * deliberately never read anywhere in this test, modeling one stuck
+ * connection sitting behind an otherwise-healthy pool. Before this
+ * plan's fix, stream_relay's read budget was derived from the pool's
+ * AGGREGATE free space, which stays large throughout (dominated by
+ * connA's continuously-drained room) right up until the random pick
+ * lands on connDead often enough to exceed ITS OWN send_q cap --
+ * fatal to the whole pool via conn_mark_broken, taking b.sesh (and, once
+ * the dead connection's closure propagates, a.sesh too) down with it.
+ * After the fix, the budget is derived from the MINIMUM free space over
+ * the pool, which shrinks as connDead fills and throttles further reads
+ * before connDead's own cap is ever exceeded -- so the session survives
+ * (the transfer itself stalls once connDead saturates, since nothing
+ * ever reads its peer to let it drain, but that is not what this test
+ * asserts). */
+static void test_session_survives_one_congested_connection_among_many(void) {
+    int fds_ab[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds_ab));
+    int dead_pair[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, dead_pair));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    struct endpoint b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+
+    cloak_session_config_t cfg_a;
+    cloak_session_config_t cfg_b;
+    fill_config(&cfg_a, &a, &obfs);
+    fill_config(&cfg_b, &b, &obfs);
+    /* Small enough that connDead's own send_q -- on top of whatever the
+     * kernel itself buffers for that socket -- fills well within the
+     * transfer size below. */
+    cfg_b.conn_send_queue_cap = 65536;
+
+    ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 12, r, &cfg_a));
+    ASSERT_EQ_INT(0, cloak_session_init(&b.sesh, 12, r, &cfg_b));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&a.sesh, fds_ab[1]));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&b.sesh, fds_ab[0]));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&b.sesh, dead_pair[0]));
+    /* dead_pair[1] is deliberately never read anywhere in this test --
+     * it plays the role of a stalled peer on one connection in the pool. */
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        return;
+    }
+
+    ASSERT_EQ_INT(1, (int)cloak_stream_write(s, (const uint8_t *)"x", 1));
+    for (int i = 0; i < 50 && b.new_stream_calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, b.new_stream_calls);
+
+    struct sockpair sp;
+    ASSERT_EQ_INT(0, sockpair_init(&sp));
+
+    struct done_capture cap;
+    memset(&cap, 0, sizeof(cap));
+
+    cloak_stream_relay_t sr;
+    ASSERT_EQ_INT(0, cloak_stream_relay_start(&sr, r, &b.sesh, b.accepted, sp.inner, 4096,
+                                              on_relay_done, &cap));
+    b.sr = &sr;
+
+    /* Drain the priming byte. */
+    char priming[4];
+    ssize_t pn = -1;
+    for (int i = 0; i < 50 && pn <= 0; i++) {
+        pn = read(sp.outer, priming, sizeof(priming));
+        if (pn > 0) {
+            break;
+        }
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_TRUE(pn == 1);
+
+    /* Push up to several MB through the relay's own outer fd: enough
+     * that, if roughly half of the resulting frames route to connDead
+     * (as cloak_switchboard_send's uniform-random pick would over this
+     * many frames), connDead's cumulative share vastly exceeds its own
+     * 65536-byte cap plus any kernel socket buffering -- comfortably
+     * beyond statistical noise, so this is not a flaky assertion. This
+     * test's own success does not depend on ever finishing the transfer:
+     * once connDead saturates, the fix is expected to throttle the
+     * relay's own reads to a permanent stall (nothing ever drains
+     * connDead), not to keep writing past it -- so the loop below detects
+     * that stall (neither side making any further progress for
+     * STALL_LIMIT consecutive rounds) and stops spinning instead of
+     * burning the full iteration budget waiting on a reactor that has
+     * nothing left to do, which is exactly what happens once the fix
+     * takes hold and would otherwise make this test needlessly slow. */
+    uint8_t chunk[4096];
+    memset(chunk, 'q', sizeof(chunk));
+    const size_t target_total = 4 * 1024 * 1024;
+    const int STALL_LIMIT = 30;
+    size_t total_written = 0;
+    int stall_spins = 0;
+    for (int spin = 0; spin < 2000 && stall_spins < STALL_LIMIT; spin++) {
+        int made_progress = 0;
+        /* Drain as much as the kernel currently accepts in one go, rather
+         * than paying a reactor turn per 4 KiB chunk. */
+        for (int w = 0; w < 64 && total_written < target_total; w++) {
+            ssize_t n = write(sp.outer, chunk, sizeof(chunk));
+            if (n <= 0) {
+                break;
+            }
+            total_written += (size_t)n;
+            made_progress = 1;
+        }
+        cloak_reactor_run_once(r, 5);
+        /* Keep a's own stream reassembly buffer from blocking connA's
+         * continued draining -- not required for this test's own
+         * assertions, just keeps the healthy side of the pool moving. */
+        uint8_t sink[4096];
+        for (;;) {
+            long rn = cloak_stream_read(s, sink, sizeof(sink));
+            if (rn <= 0) {
+                break;
+            }
+            made_progress = 1;
+        }
+        if (cloak_session_is_closed(&a.sesh) || cloak_session_is_closed(&b.sesh)) {
+            break; /* stop early on the very regression this test exists to catch */
+        }
+        if (total_written >= target_total) {
+            break;
+        }
+        stall_spins = made_progress ? 0 : stall_spins + 1;
+    }
+
+    ASSERT_TRUE(!cloak_session_is_closed(&a.sesh));
+    ASSERT_TRUE(!cloak_session_is_closed(&b.sesh));
+
+    cloak_stream_relay_stop(&sr);
+    close(sp.outer);
+    if (!cloak_session_is_closed(&b.sesh)) {
+        cloak_session_release_stream(&b.sesh, b.accepted);
+    }
+    if (!cloak_session_is_closed(&a.sesh)) {
+        cloak_session_release_stream(&a.sesh, s);
+    }
+    cloak_session_destroy(&a.sesh);
+    cloak_session_destroy(&b.sesh);
+    close(dead_pair[1]);
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_forwards_both_directions();
     test_large_transfer_survives_backpressure();
@@ -1184,4 +1346,5 @@ TEST_MAIN_BEGIN()
     test_immediate_finish_defers_on_done();
     test_stop_before_immediate_finish_fires_cancels_timer();
     test_stopping_relay_from_on_broken_avoids_use_after_free();
+    test_session_survives_one_congested_connection_among_many();
 TEST_MAIN_END()

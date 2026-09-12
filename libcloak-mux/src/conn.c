@@ -279,3 +279,10 @@ size_t cloak_conn_send_capacity(const cloak_conn_t *c) {
     }
     return cloak_bytequeue_len(&c->send_q) + cloak_bytequeue_free_space(&c->send_q);
 }
+
+size_t cloak_conn_send_free(const cloak_conn_t *c) {
+    if (c == NULL) {
+        return 0;
+    }
+    return cloak_bytequeue_free_space(&c->send_q);
+}

@@ -64,32 +64,33 @@ typedef struct cloak_stream_relay cloak_stream_relay_t;
 typedef void (*cloak_stream_relay_done_cb)(cloak_stream_relay_t *sr, void *userdata);
 
 /* Read pacing, not policy the caller needs to size around: the relay
- * never asks its fd for more bytes than the session's outbound pool
- * (cloak_session_send_capacity minus cloak_session_send_queued) can
- * currently absorb, re-derived before every single read -- so a burst
- * can never push the session's aggregate outbound total past its
- * aggregate capacity, whatever buf_cap or conn_send_queue_cap the caller
- * chose. cloak_stream_write does not fail on a full queue -- an overrun
- * would otherwise surface one layer down as a broken connection pool
- * that kills the entire session, taking every other stream with it -- so
- * this removes that cross-value sizing constraint by construction rather
- * than asking the caller to leave enough advisory headroom (an earlier
- * version of this file did the latter, with a fixed watermark checked
- * only once per read of up to a fixed internal chunk size; a
- * conn_send_queue_cap chosen too close to that chunk size could still
- * overrun the pool's hard cap in a single step -- exactly the class of
- * defect this exact, per-read bound eliminates).
- *
- * This bounds the AGGREGATE pool cloak_session_send_queued/_capacity
- * report, summed across every connection in the session. It does not by
- * itself guarantee any one underlying connection's own send queue cap is
- * respected: cloak_switchboard_send hands each whole frame to a single
- * connection chosen at random, not spread across all of them. Keeping
- * conn_send_queue_cap comfortably larger than the largest possible
- * single frame payload (derived from max_on_wire_size) is what actually
- * guards against that -- a property of session/switchboard
- * configuration, not something this object can see or enforce, since it
- * only ever consumes the session's own aggregate accessors. */
+ * never asks its fd for more bytes than cloak_session_send_min_conn_free
+ * -- the minimum free space over every connection in the session's pool
+ * -- can currently absorb, re-derived before every single read. That
+ * quantity, not the session's aggregate outbound pool, is what actually
+ * bounds a safe read: cloak_switchboard_send hands each whole frame to
+ * ONE connection chosen uniformly at random, not spread across the pool,
+ * so the realistic failure is one congested connection hiding behind
+ * many idle ones -- an aggregate bound stays large right up until the
+ * random pick lands on the congested connection and its own hard cap
+ * fires, which is fatal to the whole pool and the whole session no
+ * matter how generous conn_send_queue_cap is. Budgeting off the minimum
+ * instead guarantees the frames one read produces fit REGARDLESS of
+ * which connection gets picked next, whatever buf_cap or
+ * conn_send_queue_cap the caller chose. cloak_stream_write does not fail
+ * on a full queue -- an overrun would otherwise surface one layer down as
+ * a broken connection, taking the whole pool and every other stream in
+ * the session down with it -- so this removes that cross-value sizing
+ * constraint by construction rather than asking the caller to leave
+ * enough advisory headroom (an earlier version of this file did the
+ * latter, with a fixed watermark checked only once per read of up to a
+ * fixed internal chunk size; a conn_send_queue_cap chosen too close to
+ * that chunk size could still overrun the pool's hard cap in a single
+ * step -- exactly the class of defect this exact, per-read bound
+ * eliminates. A later version budgeted off the aggregate pool instead of
+ * the minimum, which is exact against the aggregate but not against the
+ * failure that actually happens in practice -- see
+ * cloak_session_send_min_conn_free's own doc comment). */
 
 struct cloak_stream_relay {
     cloak_reactor_t *reactor;

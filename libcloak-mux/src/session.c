@@ -573,3 +573,10 @@ size_t cloak_session_send_capacity(const cloak_session_t *sesh) {
     }
     return cloak_switchboard_send_capacity(&sesh->sb);
 }
+
+size_t cloak_session_send_min_conn_free(const cloak_session_t *sesh) {
+    if (sesh == NULL) {
+        return 0;
+    }
+    return cloak_switchboard_send_min_conn_free(&sesh->sb);
+}

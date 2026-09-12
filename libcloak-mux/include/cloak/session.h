@@ -289,8 +289,27 @@ int cloak_session_is_closed(const cloak_session_t *sesh);
  * connections. cloak_stream_write does not fail on a full queue -- the
  * failure surfaces one layer down as a broken pool that kills the whole
  * session -- so a producer MUST consult these before writing large
- * amounts, rather than relying on an error return that comes too late. */
+ * amounts, rather than relying on an error return that comes too late.
+ *
+ * These two report the AGGREGATE pool state, which is NOT a safe bound
+ * for a single upcoming write: the session sends every frame through
+ * cloak_switchboard_send, which spreads across the pool by picking one
+ * connection uniformly at random, not by filling connections evenly. One
+ * congested connection among many idle ones can leave the aggregate
+ * capacity looking fine while that one connection's own cap is about to
+ * fire and take the whole session down. See
+ * cloak_session_send_min_conn_free below for the accessor that is
+ * actually safe to size a write against. */
 size_t cloak_session_send_queued(const cloak_session_t *sesh);
 size_t cloak_session_send_capacity(const cloak_session_t *sesh);
+
+/* The minimum, over every connection in the session's pool, of that
+ * connection's own free send-queue space (0 for a session with no
+ * connections yet) -- see cloak_switchboard_send_min_conn_free, which
+ * this forwards to. This is the number of bytes guaranteed to fit no
+ * matter which connection the session's next cloak_switchboard_send
+ * picks, and is what cloak_stream_relay_t now budgets fd reads against
+ * (see stream_relay.c's own rationale). */
+size_t cloak_session_send_min_conn_free(const cloak_session_t *sesh);
 
 #endif

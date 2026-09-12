@@ -15,65 +15,70 @@
 
 static void stream_relay_teardown(cloak_stream_relay_t *sr, int fire_done);
 
+/* The worst-case on-wire bytes a single full frame can ever cost
+ * (matching cloak_frame_obfuscate's own worst case: CLOAK_FRAME_HEADER_LEN
+ * + payload + up to CLOAK_FRAME_MAX_EXTRA_LEN of padding/AEAD tag, plus
+ * the connection layer's own CLOAK_CONN_LEN_PREFIX_LEN length prefix).
+ * Shared by stream_relay_fd_read_budget and cloak_stream_relay_start's own
+ * start-time rejection check so the two can never disagree about what
+ * "one frame's worth of room" means. */
+static size_t stream_relay_frame_cost_for(const cloak_stream_t *stream) {
+    return (size_t)CLOAK_CONN_LEN_PREFIX_LEN + stream->max_payload_per_frame +
+           (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
+}
+
+static size_t stream_relay_frame_cost(const cloak_stream_relay_t *sr) {
+    return stream_relay_frame_cost_for(sr->stream);
+}
+
 /* The number of raw bytes it is currently safe to pull from the fd and
- * hand to cloak_stream_write without asking the session's outbound pool
- * to hold more than it can actually take right now. 0 means fully backed
- * up (including capacity == 0, an empty pool with nowhere to send at
- * all) -- the caller must pause rather than read with that length
- * (reading 0 bytes on purpose is indistinguishable from the fd itself
- * reaching EOF, which read() also reports as 0).
+ * hand to cloak_stream_write without asking any connection cloak_switch-
+ * board_send might pick to hold more than it can actually take right
+ * now. 0 means fully backed up -- the caller must pause rather than read
+ * with that length (reading 0 bytes on purpose is indistinguishable from
+ * the fd itself reaching EOF, which read() also reports as 0).
  *
  * This is sized in whole FRAMES, not raw bytes, and that distinction is
  * the whole point: cloak_stream_write's actual on-wire cost for n raw
- * bytes is NOT n. It is n plus a fixed per-frame overhead
- * (CLOAK_CONN_LEN_PREFIX_LEN + CLOAK_FRAME_HEADER_LEN +
- * CLOAK_FRAME_MAX_EXTRA_LEN -- all fixed wire-format constants,
- * independent of session config) for EVERY frame the chunk is split into
- * -- ceil(n / stream->max_payload_per_frame) of them, chunked exactly
- * that way by cloak_stream_write itself. An earlier version of this
- * function sized the read in raw bytes alone (min(STREAM_RELAY_CHUNK,
- * capacity - queued)), which looked exact but wasn't: a single
- * already-permitted read of up to STREAM_RELAY_CHUNK bytes could still
- * chunk into enough frames that their summed overhead alone pushed the
- * pool's aggregate queued total past its capacity in one step -- the
- * same class of overrun this function exists to prevent, just moved from
- * "advisory sizing constraint" to "off-by-a-forgotten-unit", and it took
- * a real (100%-reproducible, not flaky) run of this file's own
- * large-transfer test to catch it.
+ * bytes is NOT n. It is n plus a fixed per-frame overhead (see
+ * stream_relay_frame_cost) for EVERY frame the chunk is split into --
+ * ceil(n / stream->max_payload_per_frame) of them, chunked exactly that
+ * way by cloak_stream_write itself. An earlier version of this function
+ * sized the read in raw bytes alone (min(STREAM_RELAY_CHUNK, capacity -
+ * queued)), which looked exact but wasn't: a single already-permitted
+ * read of up to STREAM_RELAY_CHUNK bytes could still chunk into enough
+ * frames that their summed overhead alone pushed the bound past capacity
+ * in one step -- the same class of overrun this function exists to
+ * prevent, just moved from "advisory sizing constraint" to
+ * "off-by-a-forgotten-unit", and it took a real (100%-reproducible, not
+ * flaky) run of this file's own large-transfer test to catch it.
+ * min_free / frame_cost (rounded down) is therefore the number of frames
+ * guaranteed to fit no matter how much padding cloak_frame_obfuscate
+ * actually adds, and budgeting exactly that many frames' worth of raw
+ * payload keeps the bound exact -- provably unable to overrun capacity --
+ * rather than an approximation relying on a hand-picked safety margin.
  *
- * frame_cost is the worst-case on-wire bytes a single full frame can
- * ever cost (matching cloak_frame_obfuscate's own worst case:
- * CLOAK_FRAME_HEADER_LEN + payload + up to CLOAK_FRAME_MAX_EXTRA_LEN of
- * padding/AEAD tag, plus the connection layer's own
- * CLOAK_CONN_LEN_PREFIX_LEN length prefix). room / frame_cost (rounded
- * down) is therefore the number of frames guaranteed to fit no matter
- * how much padding cloak_frame_obfuscate actually adds, and budgeting
- * exactly that many frames' worth of raw payload keeps the bound exact
- * -- provably unable to overrun capacity -- rather than an approximation
- * relying on a hand-picked safety margin.
- *
- * This bounds the AGGREGATE pool cloak_session_send_queued/_capacity
- * report; it does not by itself guarantee any one underlying
- * connection's own send queue cap is respected, since
- * cloak_switchboard_send hands each whole frame to one connection chosen
- * at random, not spread across all of them. Keeping conn_send_queue_cap
- * comfortably larger than one frame_cost (i.e. than max_on_wire_size) is
- * what actually guards against that -- a property of session/switchboard
- * configuration, not something this object can see or enforce, since it
- * only ever consumes the session's own aggregate accessors and stream's
- * own max_payload_per_frame, by the same design that keeps every layer
- * from reaching around the one below it. */
+ * This budgets off cloak_session_send_min_conn_free -- the MINIMUM free
+ * space over every connection in the pool -- not the aggregate
+ * cloak_session_send_capacity/_queued this function used to use. The
+ * aggregate is the wrong quantity for anything downstream of
+ * cloak_switchboard_send: that function hands each whole frame to ONE
+ * connection chosen uniformly at random, not spread across the pool, so
+ * the realistic failure is one congested connection among many idle
+ * ones -- the aggregate stays large (dominated by the N-1 idle
+ * connections) right up until the random pick lands on the congested one
+ * again and cloak_conn_send's own per-connection cap fires
+ * conn_mark_broken, which is fatal to the whole pool and the whole
+ * session. No conn_send_queue_cap fixes that against the aggregate bound,
+ * because the aggregate scales with N * cap while the limit that
+ * actually binds is one connection's own cap. Budgeting off the minimum
+ * instead guarantees the number of frames this call permits will fit
+ * REGARDLESS of which connection cloak_switchboard_send's next random
+ * pick lands on -- the guarantee this object actually needs to make. */
 static size_t stream_relay_fd_read_budget(const cloak_stream_relay_t *sr) {
-    size_t cap = cloak_session_send_capacity(sr->sesh);
-    size_t queued = cloak_session_send_queued(sr->sesh);
-    if (queued >= cap) {
-        return 0;
-    }
-    size_t room = cap - queued;
-
-    size_t frame_cost = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + sr->stream->max_payload_per_frame +
-                         (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
-    size_t frames = room / frame_cost;
+    size_t min_free = cloak_session_send_min_conn_free(sr->sesh);
+    size_t frame_cost = stream_relay_frame_cost(sr);
+    size_t frames = min_free / frame_cost;
     if (frames == 0) {
         return 0;
     }
