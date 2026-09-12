@@ -90,7 +90,12 @@ typedef void (*cloak_stream_relay_done_cb)(cloak_stream_relay_t *sr, void *userd
  * eliminates. A later version budgeted off the aggregate pool instead of
  * the minimum, which is exact against the aggregate but not against the
  * failure that actually happens in practice -- see
- * cloak_session_send_min_conn_free's own doc comment). */
+ * cloak_session_send_min_conn_free's own doc comment).
+ *
+ * cloak_stream_relay_start rejects outright (returns -1) rather than
+ * starting a relay that could never move a single byte: see its own doc
+ * comment for the exact condition, expressed in terms of this same
+ * per-connection quantity so the two can never disagree. */
 
 struct cloak_stream_relay {
     cloak_reactor_t *reactor;
@@ -159,8 +164,16 @@ struct cloak_stream_relay {
  * (including the exceedingly rare case of failing to arm that deferred
  * completion timer, which forces an already-finished relay to fail start
  * outright since it would otherwise have no way left to ever report
- * completion), or a reactor registration failure. On failure sr is left
- * safe to pass to cloak_stream_relay_stop. */
+ * completion), a reactor registration failure, or if the session's pool
+ * could never hold even a single worst-case frame right now (the minimum
+ * free space over the pool -- see cloak_session_send_min_conn_free -- is
+ * smaller than one frame's full on-wire cost for this stream). That last
+ * case is caught here rather than left to surface later as a silent
+ * stall: a relay started anyway would compute a read budget of 0 on its
+ * very first read, with nothing ever queued to eventually prompt a
+ * drain-driven resume, and would hang forever holding an open fd with no
+ * error anywhere. On failure sr is left safe to pass to
+ * cloak_stream_relay_stop. */
 int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
                               cloak_session_t *sesh, cloak_stream_t *stream, int fd,
                               size_t buf_cap, cloak_stream_relay_done_cb on_done,

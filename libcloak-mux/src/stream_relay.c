@@ -352,6 +352,23 @@ int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
         return -1;
     }
 
+    /* Reject outright rather than start a relay that could never move a
+     * single byte fd->stream. If not even the least-congested connection
+     * in the session's pool could ever hold one worst-case frame,
+     * stream_relay_fd_read_budget will compute 0 on this relay's very
+     * first read forever -- nothing would ever be queued on that
+     * connection, so it can never drain-to-zero, so on_drained/on_writable
+     * can never fire, so notify_writable is never called to re-arm read
+     * interest. The relay would hang forever holding an open fd, with no
+     * error anywhere (this exact shape: conn_send_queue_cap == 8192,
+     * max_on_wire_size == 16401 -- both individually accepted by
+     * cloak_conn_init/cloak_session_init -- silently stalls the very
+     * first read). Checked against the SAME per-connection quantity the
+     * running budget uses, so the two can never drift apart. */
+    if (cloak_session_send_min_conn_free(sesh) < stream_relay_frame_cost_for(stream)) {
+        return -1;
+    }
+
     if (cloak_bytequeue_init(&sr->to_fd, buf_cap) != 0) {
         return -1;
     }

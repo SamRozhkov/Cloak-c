@@ -1173,6 +1173,71 @@ static void test_stopping_relay_from_on_broken_avoids_use_after_free(void) {
     cloak_reactor_destroy(r);
 }
 
+/* Regression test for finding 4 (final whole-branch review):
+ * cloak_stream_relay_start must reject outright, rather than silently
+ * hang forever later, when the session's pool could never hold even one
+ * worst-case frame -- conn_send_queue_cap smaller than max_on_wire_size
+ * (plus the connection layer's own length-prefix overhead), both
+ * individually valid to cloak_conn_init/cloak_session_init. Uses the
+ * fresh-0xAA-struct pattern test_failed_start_leaves_struct_safe already
+ * established in this file, for the same reason: a struct an earlier
+ * successful call had already zeroed would pass the direct field
+ * assertion below whether or not this exact failure path resets it. */
+static void test_start_rejects_when_no_connection_can_ever_fit_one_frame(void) {
+    cloak_stream_relay_t dirty;
+    memset(&dirty, 0xAA, sizeof(dirty));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    memset(&a, 0, sizeof(a));
+    cloak_session_config_t cfg_a;
+    fill_config(&cfg_a, &a, &obfs);
+    /* max_on_wire_size 16401 (this file's own default) plus
+     * CLOAK_CONN_LEN_PREFIX_LEN means one worst-case frame costs 16403
+     * on-wire bytes -- comfortably more than this 8192-byte cap, so no
+     * connection in this one-connection pool could ever hold a single
+     * full frame, no matter how empty it is. */
+    cfg_a.conn_send_queue_cap = 8192;
+    ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 11, r, &cfg_a));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&a.sesh, fds[0]));
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        return;
+    }
+
+    int sock_fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds));
+
+    ASSERT_EQ_INT(-1, cloak_stream_relay_start(&dirty, r, &a.sesh, s, sock_fds[0], 4096,
+                                               on_relay_done, NULL));
+    ASSERT_EQ_INT(-1, dirty.fd);
+
+    /* Must not crash, and on a failed start the caller keeps fd. */
+    cloak_stream_relay_stop(&dirty);
+    char c = 'z';
+    ASSERT_TRUE(write(sock_fds[0], &c, 1) == 1);
+
+    close(sock_fds[0]);
+    close(sock_fds[1]);
+    close(fds[1]);
+    cloak_session_release_stream(&a.sesh, s);
+    cloak_session_destroy(&a.sesh);
+    cloak_reactor_destroy(r);
+}
+
 /* Regression test for finding 3 (final whole-branch review): the
  * realistic failure cloak_switchboard_send's random-connection pick
  * creates is not an unlucky run, it is one congested connection in a
@@ -1346,5 +1411,6 @@ TEST_MAIN_BEGIN()
     test_immediate_finish_defers_on_done();
     test_stop_before_immediate_finish_fires_cancels_timer();
     test_stopping_relay_from_on_broken_avoids_use_after_free();
+    test_start_rejects_when_no_connection_can_ever_fit_one_frame();
     test_session_survives_one_congested_connection_among_many();
 TEST_MAIN_END()
