@@ -250,21 +250,15 @@ static void test_large_transfer_survives_backpressure(void) {
      * direction genuinely has to backpressure through
      * cloak_session_send_queued/_capacity many times over the course of
      * the transfer -- not just through the relay's own small buf_cap --
-     * or b's session pool breaks. Kept comfortably above the relay's own
-     * internal per-read chunk size (16 KiB, STREAM_RELAY_CHUNK in
-     * stream_relay.c): cloak_session_send_queued is only re-checked
-     * between whole fd reads, so a single already-permitted read/write
-     * can add up to about one chunk's worth of framed bytes to the queue
-     * in one step: with a cap too close to that chunk size, a burst that
-     * starts just under the watermark could land past the queue's hard
-     * cap in that single step and break the session outright -- the
-     * documented "surfaces one layer down" failure mode -- rather than
-     * exercising the graceful pause/resume this test means to cover. This
-     * is exactly what a first attempt at this test (conn_send_queue_cap
-     * == STREAM_RELAY_CHUNK == 16384) hit: b's pool broke and the relay
-     * tore itself down mid-transfer, which is a real, if narrow, sizing
-     * constraint worth documenting for real callers too -- see
-     * cloak/stream_relay.h's own note above CLOAK_STREAM_RELAY_HIGH_WATER_NUM. */
+     * or b's session pool breaks. stream_relay.c now bounds every single
+     * fd read by exactly the room the session's aggregate pool currently
+     * has (see stream_relay_fd_read_budget), so unlike an earlier version
+     * of this file, this value no longer needs any safety margin above
+     * the relay's own internal chunk size to avoid a single burst
+     * overrunning the hard cap in one step -- any value works correctness-
+     * wise; this one is just small enough, relative to the 512 KiB total,
+     * to force many real pause/resume cycles over the course of the
+     * transfer. */
     cfg_b.conn_send_queue_cap = 65536;
 
     ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 2, r, &cfg_a));

@@ -6,21 +6,79 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "cloak/conn.h" /* CLOAK_CONN_LEN_PREFIX_LEN: a fixed wire-format
+                          * constant, needed below to compute the true
+                          * worst-case on-wire cost of one frame -- not a
+                          * reach into any per-instance connection state. */
+
 #define STREAM_RELAY_CHUNK 16384
 
 static void stream_relay_teardown(cloak_stream_relay_t *sr, int fire_done);
 
-/* True while the session's outbound queue is at or above the watermark,
- * so pushing more into the stream risks overrunning it. An empty pool
- * (capacity 0) counts as backed up: there is nowhere to send. */
-static int session_is_backed_up(const cloak_stream_relay_t *sr) {
+/* The number of raw bytes it is currently safe to pull from the fd and
+ * hand to cloak_stream_write without asking the session's outbound pool
+ * to hold more than it can actually take right now. 0 means fully backed
+ * up (including capacity == 0, an empty pool with nowhere to send at
+ * all) -- the caller must pause rather than read with that length
+ * (reading 0 bytes on purpose is indistinguishable from the fd itself
+ * reaching EOF, which read() also reports as 0).
+ *
+ * This is sized in whole FRAMES, not raw bytes, and that distinction is
+ * the whole point: cloak_stream_write's actual on-wire cost for n raw
+ * bytes is NOT n. It is n plus a fixed per-frame overhead
+ * (CLOAK_CONN_LEN_PREFIX_LEN + CLOAK_FRAME_HEADER_LEN +
+ * CLOAK_FRAME_MAX_EXTRA_LEN -- all fixed wire-format constants,
+ * independent of session config) for EVERY frame the chunk is split into
+ * -- ceil(n / stream->max_payload_per_frame) of them, chunked exactly
+ * that way by cloak_stream_write itself. An earlier version of this
+ * function sized the read in raw bytes alone (min(STREAM_RELAY_CHUNK,
+ * capacity - queued)), which looked exact but wasn't: a single
+ * already-permitted read of up to STREAM_RELAY_CHUNK bytes could still
+ * chunk into enough frames that their summed overhead alone pushed the
+ * pool's aggregate queued total past its capacity in one step -- the
+ * same class of overrun this function exists to prevent, just moved from
+ * "advisory sizing constraint" to "off-by-a-forgotten-unit", and it took
+ * a real (100%-reproducible, not flaky) run of this file's own
+ * large-transfer test to catch it.
+ *
+ * frame_cost is the worst-case on-wire bytes a single full frame can
+ * ever cost (matching cloak_frame_obfuscate's own worst case:
+ * CLOAK_FRAME_HEADER_LEN + payload + up to CLOAK_FRAME_MAX_EXTRA_LEN of
+ * padding/AEAD tag, plus the connection layer's own
+ * CLOAK_CONN_LEN_PREFIX_LEN length prefix). room / frame_cost (rounded
+ * down) is therefore the number of frames guaranteed to fit no matter
+ * how much padding cloak_frame_obfuscate actually adds, and budgeting
+ * exactly that many frames' worth of raw payload keeps the bound exact
+ * -- provably unable to overrun capacity -- rather than an approximation
+ * relying on a hand-picked safety margin.
+ *
+ * This bounds the AGGREGATE pool cloak_session_send_queued/_capacity
+ * report; it does not by itself guarantee any one underlying
+ * connection's own send queue cap is respected, since
+ * cloak_switchboard_send hands each whole frame to one connection chosen
+ * at random, not spread across all of them. Keeping conn_send_queue_cap
+ * comfortably larger than one frame_cost (i.e. than max_on_wire_size) is
+ * what actually guards against that -- a property of session/switchboard
+ * configuration, not something this object can see or enforce, since it
+ * only ever consumes the session's own aggregate accessors and stream's
+ * own max_payload_per_frame, by the same design that keeps every layer
+ * from reaching around the one below it. */
+static size_t stream_relay_fd_read_budget(const cloak_stream_relay_t *sr) {
     size_t cap = cloak_session_send_capacity(sr->sesh);
-    if (cap == 0) {
-        return 1;
-    }
     size_t queued = cloak_session_send_queued(sr->sesh);
-    return queued * CLOAK_STREAM_RELAY_HIGH_WATER_DEN >=
-           cap * CLOAK_STREAM_RELAY_HIGH_WATER_NUM;
+    if (queued >= cap) {
+        return 0;
+    }
+    size_t room = cap - queued;
+
+    size_t frame_cost = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + sr->stream->max_payload_per_frame +
+                         (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
+    size_t frames = room / frame_cost;
+    if (frames == 0) {
+        return 0;
+    }
+    size_t budget = frames * sr->stream->max_payload_per_frame;
+    return budget < STREAM_RELAY_CHUNK ? budget : STREAM_RELAY_CHUNK;
 }
 
 /* True once the relay has finished, or has already decided to finish and
@@ -170,17 +228,19 @@ static int pump_stream_to_fd(cloak_stream_relay_t *sr) {
     return 0;
 }
 
-/* Reads the fd into the stream while the session has room. Returns 0 to
- * continue, -1 if the relay should tear down. */
+/* Reads the fd into the stream while the session has room, never asking
+ * for more than stream_relay_fd_read_budget currently allows. Returns 0
+ * to continue, -1 if the relay should tear down. */
 static int pump_fd_to_stream(cloak_stream_relay_t *sr) {
     uint8_t buf[STREAM_RELAY_CHUNK];
     for (;;) {
-        if (session_is_backed_up(sr)) {
+        size_t budget = stream_relay_fd_read_budget(sr);
+        if (budget == 0) {
             /* Stop reading; cloak_stream_relay_notify_writable re-arms. */
             sr->fd_read_paused = 1;
             return 0;
         }
-        ssize_t n = read(sr->fd, buf, sizeof(buf));
+        ssize_t n = read(sr->fd, buf, budget);
         if (n > 0) {
             if (cloak_stream_write(sr->stream, buf, (size_t)n) < 0) {
                 return -1;
@@ -346,8 +406,8 @@ void cloak_stream_relay_notify_writable(cloak_stream_relay_t *sr) {
     if (sr == NULL || stream_relay_is_finishing(sr) || !sr->fd_read_paused) {
         return;
     }
-    if (session_is_backed_up(sr)) {
-        return; /* drained, but not below the watermark yet */
+    if (stream_relay_fd_read_budget(sr) == 0) {
+        return; /* drained some, but still nothing safe to read yet */
     }
     sr->fd_read_paused = 0;
     sync_interest(sr);

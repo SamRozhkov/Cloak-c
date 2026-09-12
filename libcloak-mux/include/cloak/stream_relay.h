@@ -45,26 +45,33 @@ typedef struct cloak_stream_relay cloak_stream_relay_t;
  * rather than firing synchronously. */
 typedef void (*cloak_stream_relay_done_cb)(cloak_stream_relay_t *sr, void *userdata);
 
-/* The relay stops reading its fd once the session's outbound queue is
- * this fraction full, and resumes when cloak_stream_relay_notify_writable
- * reports it drained. It is deliberately conservative: cloak_stream_write
- * does not fail on a full queue -- the overrun surfaces one layer down as
- * a broken connection pool that kills the entire session, taking every
- * other stream with it -- so the watermark leaves room for the frames
- * already in flight rather than running the queue to its limit.
+/* Read pacing, not policy the caller needs to size around: the relay
+ * never asks its fd for more bytes than the session's outbound pool
+ * (cloak_session_send_capacity minus cloak_session_send_queued) can
+ * currently absorb, re-derived before every single read -- so a burst
+ * can never push the session's aggregate outbound total past its
+ * aggregate capacity, whatever buf_cap or conn_send_queue_cap the caller
+ * chose. cloak_stream_write does not fail on a full queue -- an overrun
+ * would otherwise surface one layer down as a broken connection pool
+ * that kills the entire session, taking every other stream with it -- so
+ * this removes that cross-value sizing constraint by construction rather
+ * than asking the caller to leave enough advisory headroom (an earlier
+ * version of this file did the latter, with a fixed watermark checked
+ * only once per read of up to a fixed internal chunk size; a
+ * conn_send_queue_cap chosen too close to that chunk size could still
+ * overrun the pool's hard cap in a single step -- exactly the class of
+ * defect this exact, per-read bound eliminates).
  *
- * That headroom is checked once per fd read, not continuously, so a
- * single already-permitted read can still add up to about one read's
- * worth of framed bytes (16 KiB, this file's own internal chunk size) to
- * the queue in one step. Configure sesh's conn_send_queue_cap comfortably
- * above that -- tens of KiB of headroom, not a close multiple of it -- or
- * a burst that starts just under the watermark can land past the queue's
- * actual hard cap in that one step and break the session outright, the
- * same failure this watermark exists to avoid. Every conn_send_queue_cap
- * already in use elsewhere in this project's own tests (65536 and up) is
- * safely clear of this; only a deliberately tiny cap is at risk. */
-#define CLOAK_STREAM_RELAY_HIGH_WATER_NUM 1
-#define CLOAK_STREAM_RELAY_HIGH_WATER_DEN 2
+ * This bounds the AGGREGATE pool cloak_session_send_queued/_capacity
+ * report, summed across every connection in the session. It does not by
+ * itself guarantee any one underlying connection's own send queue cap is
+ * respected: cloak_switchboard_send hands each whole frame to a single
+ * connection chosen at random, not spread across all of them. Keeping
+ * conn_send_queue_cap comfortably larger than the largest possible
+ * single frame payload (derived from max_on_wire_size) is what actually
+ * guards against that -- a property of session/switchboard
+ * configuration, not something this object can see or enforce, since it
+ * only ever consumes the session's own aggregate accessors. */
 
 struct cloak_stream_relay {
     cloak_reactor_t *reactor;
@@ -78,7 +85,8 @@ struct cloak_stream_relay {
     cloak_bytequeue_t to_fd;
 
     /* 1 while read interest on fd is deregistered because the session's
-     * outbound queue is above the watermark. */
+     * outbound pool currently has no room at all (see
+     * stream_relay_fd_read_budget in stream_relay.c). */
     int fd_read_paused;
     uint32_t interest;
     int stream_ended;
