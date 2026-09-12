@@ -76,6 +76,12 @@ typedef void (*cloak_session_new_stream_cb)(cloak_session_t *sesh, cloak_stream_
  * ordinary application code. */
 typedef void (*cloak_session_broken_cb)(cloak_session_t *sesh, void *userdata);
 
+/* Fired when the session's outbound queues drain (see
+ * cloak_switchboard_drained_cb). A producer that stopped feeding data
+ * into a stream because cloak_session_send_queued was approaching
+ * capacity resumes here. */
+typedef void (*cloak_session_writable_cb)(cloak_session_t *sesh, void *userdata);
+
 typedef struct {
     cloak_obfuscator_t obfuscator;   /* copied by value into the session -- see this task's own file header comment for why */
     size_t max_on_wire_size;         /* forwarded to every cloak_stream_init and cloak_conn_init this session performs */
@@ -87,6 +93,8 @@ typedef struct {
     void *on_new_stream_userdata;
     cloak_session_broken_cb on_broken;
     void *on_broken_userdata;
+    cloak_session_writable_cb on_writable;
+    void *on_writable_userdata;
 } cloak_session_config_t;
 
 struct cloak_session {
@@ -113,6 +121,8 @@ struct cloak_session {
     void *on_new_stream_userdata;
     cloak_session_broken_cb on_broken;
     void *on_broken_userdata;
+    cloak_session_writable_cb on_writable;
+    void *on_writable_userdata;
 };
 
 /* Returns 0 on success, -1 on invalid parameters (same validation
@@ -220,5 +230,13 @@ void cloak_session_release_stream(cloak_session_t *sesh, cloak_stream_t *stream)
 int cloak_session_close(cloak_session_t *sesh);
 
 int cloak_session_is_closed(const cloak_session_t *sesh);
+
+/* The session's outbound pressure, summed over its underlying
+ * connections. cloak_stream_write does not fail on a full queue -- the
+ * failure surfaces one layer down as a broken pool that kills the whole
+ * session -- so a producer MUST consult these before writing large
+ * amounts, rather than relying on an error return that comes too late. */
+size_t cloak_session_send_queued(const cloak_session_t *sesh);
+size_t cloak_session_send_capacity(const cloak_session_t *sesh);
 
 #endif

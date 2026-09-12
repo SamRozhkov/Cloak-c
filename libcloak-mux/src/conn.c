@@ -35,10 +35,25 @@ static void conn_mark_broken(cloak_conn_t *c) {
  * if more remains. */
 static void conn_try_drain_send(cloak_conn_t *c) {
     uint8_t drain_buf[4096];
+    /* "Were we in backpressure when this drain began?" -- want_writable
+     * is set only when a previous write hit EAGAIN, so it is exactly the
+     * state a producer is waiting to see cleared. Deliberately NOT
+     * "was anything queued": cloak_conn_send enqueues and then calls this
+     * function inline, so a send the kernel swallows whole would look
+     * like a queued-then-drained transition and fire the callback on
+     * every ordinary write. */
+    int was_backpressured = c->want_writable;
     for (;;) {
         size_t avail = cloak_bytequeue_len(&c->send_q);
         if (avail == 0) {
             conn_set_want_writable(c, 0);
+            /* The moment a backpressured producer may resume. Fired last,
+             * after the interest mask is already correct, so a
+             * cloak_conn_send from within the callback sees consistent
+             * state. */
+            if (was_backpressured && c->on_drained != NULL) {
+                c->on_drained(c, c->on_drained_userdata);
+            }
             return;
         }
         size_t want = avail < sizeof(drain_buf) ? avail : sizeof(drain_buf);
@@ -241,4 +256,26 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
      * project's recurring UAF class) that happened to also exercise this
      * return-value path for the first time. */
     return c->broken ? -1 : 0;
+}
+
+void cloak_conn_set_drained_cb(cloak_conn_t *c, cloak_conn_drained_cb cb, void *userdata) {
+    if (c == NULL) {
+        return;
+    }
+    c->on_drained = cb;
+    c->on_drained_userdata = userdata;
+}
+
+size_t cloak_conn_send_queued(const cloak_conn_t *c) {
+    if (c == NULL) {
+        return 0;
+    }
+    return cloak_bytequeue_len(&c->send_q);
+}
+
+size_t cloak_conn_send_capacity(const cloak_conn_t *c) {
+    if (c == NULL) {
+        return 0;
+    }
+    return cloak_bytequeue_len(&c->send_q) + cloak_bytequeue_free_space(&c->send_q);
 }

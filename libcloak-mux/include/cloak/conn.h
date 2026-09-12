@@ -32,6 +32,17 @@ typedef void (*cloak_conn_envelope_cb)(cloak_conn_t *conn, const uint8_t *bytes,
  * which conn never owns) once it's done reacting. */
 typedef void (*cloak_conn_closed_cb)(cloak_conn_t *conn, void *userdata);
 
+/* Fired when this connection's outbound queue transitions from holding
+ * buffered bytes to holding none -- the moment a producer that stopped
+ * writing because of backpressure may resume. NOT fired for a send the
+ * kernel accepted outright (nothing was ever queued, so nothing
+ * transitioned), and not fired repeatedly while the queue stays empty.
+ *
+ * Fired from inside the reactor's writable dispatch for this connection.
+ * It is safe to call cloak_conn_send from within it; it is NOT safe to
+ * destroy the connection from within it. */
+typedef void (*cloak_conn_drained_cb)(cloak_conn_t *c, void *userdata);
+
 struct cloak_conn {
     int fd;
     cloak_reactor_t *reactor;
@@ -47,6 +58,8 @@ struct cloak_conn {
     void *on_envelope_userdata;
     cloak_conn_closed_cb on_closed;
     void *on_closed_userdata;
+    cloak_conn_drained_cb on_drained;
+    void *on_drained_userdata;
 
     int broken;
     int want_writable; /* whether EPOLLWRITABLE is currently part of our registered interest */
@@ -95,5 +108,16 @@ void cloak_conn_destroy(cloak_conn_t *c);
  * cases, on_closed fires synchronously, before this call returns). Must
  * not block. */
 int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_len);
+
+/* Installs (or, with cb == NULL, removes) the drained notification.
+ * Separate from cloak_conn_init so existing callers keep compiling. */
+void cloak_conn_set_drained_cb(cloak_conn_t *c, cloak_conn_drained_cb cb, void *userdata);
+
+/* Bytes currently buffered for transmission, and the hard cap given to
+ * cloak_conn_init. A producer should treat queued approaching capacity as
+ * "stop producing": cloak_conn_send fails once a frame no longer fits,
+ * and that failure is fatal to the whole pool, not just this connection. */
+size_t cloak_conn_send_queued(const cloak_conn_t *c);
+size_t cloak_conn_send_capacity(const cloak_conn_t *c);
 
 #endif

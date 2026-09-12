@@ -24,6 +24,14 @@ static void switchboard_conn_envelope_adapter(cloak_conn_t *conn, const uint8_t 
     }
 }
 
+static void switchboard_conn_drained_adapter(cloak_conn_t *c, void *userdata) {
+    (void)c;
+    cloak_switchboard_t *sb = (cloak_switchboard_t *)userdata;
+    if (sb->on_drained != NULL) {
+        sb->on_drained(sb, sb->on_drained_userdata);
+    }
+}
+
 static void switchboard_conn_closed_adapter(cloak_conn_t *conn, void *userdata) {
     (void)conn;
     cloak_switchboard_t *sb = (cloak_switchboard_t *)userdata;
@@ -91,6 +99,7 @@ int cloak_switchboard_add_conn(cloak_switchboard_t *sb, int fd) {
         free(c);
         return -1;
     }
+    cloak_conn_set_drained_cb(c, switchboard_conn_drained_adapter, sb);
     sb->conns[sb->conns_len++] = c;
     return 0;
 }
@@ -115,4 +124,35 @@ void cloak_switchboard_close_all(cloak_switchboard_t *sb) {
 
 size_t cloak_switchboard_conn_count(const cloak_switchboard_t *sb) {
     return sb->conns_len;
+}
+
+void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard_drained_cb cb,
+                                       void *userdata) {
+    if (sb == NULL) {
+        return;
+    }
+    sb->on_drained = cb;
+    sb->on_drained_userdata = userdata;
+}
+
+size_t cloak_switchboard_send_queued(const cloak_switchboard_t *sb) {
+    if (sb == NULL) {
+        return 0;
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < sb->conns_len; i++) {
+        total += cloak_conn_send_queued(sb->conns[i]);
+    }
+    return total;
+}
+
+size_t cloak_switchboard_send_capacity(const cloak_switchboard_t *sb) {
+    if (sb == NULL) {
+        return 0;
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < sb->conns_len; i++) {
+        total += cloak_conn_send_capacity(sb->conns[i]);
+    }
+    return total;
 }

@@ -274,6 +274,14 @@ static void session_on_switchboard_broken(cloak_switchboard_t *sb, void *userdat
     session_passive_close((cloak_session_t *)userdata);
 }
 
+static void session_switchboard_drained_adapter(cloak_switchboard_t *sb, void *userdata) {
+    (void)sb;
+    cloak_session_t *sesh = (cloak_session_t *)userdata;
+    if (sesh->on_writable != NULL) {
+        sesh->on_writable(sesh, sesh->on_writable_userdata);
+    }
+}
+
 static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len, void *userdata) {
     (void)sb;
     cloak_session_t *sesh = (cloak_session_t *)userdata;
@@ -402,6 +410,8 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
     sesh->on_new_stream_userdata = config->on_new_stream_userdata;
     sesh->on_broken = config->on_broken;
     sesh->on_broken_userdata = config->on_broken_userdata;
+    sesh->on_writable = config->on_writable;
+    sesh->on_writable_userdata = config->on_writable_userdata;
 
     if (cloak_strmtab_init(&sesh->streams, 16) != 0) {
         return -1;
@@ -411,6 +421,7 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
         cloak_strmtab_destroy(&sesh->streams);
         return -1;
     }
+    cloak_switchboard_set_drained_cb(&sesh->sb, session_switchboard_drained_adapter, sesh);
 
     session_reschedule_inactivity_timer(sesh);
     return 0;
@@ -536,4 +547,18 @@ int cloak_session_close(cloak_session_t *sesh) {
 
 int cloak_session_is_closed(const cloak_session_t *sesh) {
     return sesh->closed;
+}
+
+size_t cloak_session_send_queued(const cloak_session_t *sesh) {
+    if (sesh == NULL) {
+        return 0;
+    }
+    return cloak_switchboard_send_queued(&sesh->sb);
+}
+
+size_t cloak_session_send_capacity(const cloak_session_t *sesh) {
+    if (sesh == NULL) {
+        return 0;
+    }
+    return cloak_switchboard_send_capacity(&sesh->sb);
 }

@@ -25,6 +25,13 @@ typedef void (*cloak_switchboard_envelope_cb)(cloak_switchboard_t *sb, const uin
  * running before switchboard.closeAll()). */
 typedef void (*cloak_switchboard_broken_cb)(cloak_switchboard_t *sb, void *userdata);
 
+/* Fired when any connection in the pool finishes draining its outbound
+ * queue (see cloak_conn_drained_cb). Because the pool spreads frames
+ * across connections, a producer should re-check
+ * cloak_switchboard_send_queued rather than assume the whole pool is
+ * empty when this fires. */
+typedef void (*cloak_switchboard_drained_cb)(cloak_switchboard_t *sb, void *userdata);
+
 struct cloak_switchboard {
     cloak_reactor_t *reactor;
     cloak_conn_t **conns; /* owned array of owned heap-allocated cloak_conn_t */
@@ -41,6 +48,8 @@ struct cloak_switchboard {
     void *on_envelope_userdata;
     cloak_switchboard_broken_cb on_broken;
     void *on_broken_userdata;
+    cloak_switchboard_drained_cb on_drained;
+    void *on_drained_userdata;
 };
 
 /* max_frame_len/conn_send_queue_cap are forwarded unchanged to every
@@ -81,5 +90,14 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
 void cloak_switchboard_close_all(cloak_switchboard_t *sb);
 
 size_t cloak_switchboard_conn_count(const cloak_switchboard_t *sb);
+
+void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard_drained_cb cb,
+                                       void *userdata);
+
+/* Summed over every connection in the pool. An empty pool reports 0 for
+ * both -- a producer must therefore treat capacity == 0 as "cannot send
+ * right now", not as "no limit". */
+size_t cloak_switchboard_send_queued(const cloak_switchboard_t *sb);
+size_t cloak_switchboard_send_capacity(const cloak_switchboard_t *sb);
 
 #endif
