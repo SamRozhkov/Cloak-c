@@ -13,6 +13,7 @@ add_library(cloak-common STATIC
     src/config_common.c
     src/config_client.c
     src/config_server.c
+    src/config_ssv.c
 )
 
 target_include_directories(cloak-common PUBLIC include)
