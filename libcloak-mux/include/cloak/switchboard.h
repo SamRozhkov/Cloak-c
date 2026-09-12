@@ -25,6 +25,16 @@ typedef void (*cloak_switchboard_envelope_cb)(cloak_switchboard_t *sb, const uin
  * running before switchboard.closeAll()). */
 typedef void (*cloak_switchboard_broken_cb)(cloak_switchboard_t *sb, void *userdata);
 
+/* Fired when any connection in the pool finishes draining its outbound
+ * queue (see cloak_conn_drained_cb -- in particular, the same "no single
+ * fixed call context" caveat applies here too: this can fire from
+ * reactor dispatch, or synchronously from inside a cloak_switchboard_send
+ * call that itself completes a connection's drain). Because the pool
+ * spreads frames across connections, a producer should re-check
+ * cloak_switchboard_send_queued rather than assume the whole pool is
+ * empty when this fires. */
+typedef void (*cloak_switchboard_drained_cb)(cloak_switchboard_t *sb, void *userdata);
+
 struct cloak_switchboard {
     cloak_reactor_t *reactor;
     cloak_conn_t **conns; /* owned array of owned heap-allocated cloak_conn_t */
@@ -41,6 +51,8 @@ struct cloak_switchboard {
     void *on_envelope_userdata;
     cloak_switchboard_broken_cb on_broken;
     void *on_broken_userdata;
+    cloak_switchboard_drained_cb on_drained;
+    void *on_drained_userdata;
 };
 
 /* max_frame_len/conn_send_queue_cap are forwarded unchanged to every
@@ -81,5 +93,37 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
 void cloak_switchboard_close_all(cloak_switchboard_t *sb);
 
 size_t cloak_switchboard_conn_count(const cloak_switchboard_t *sb);
+
+void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard_drained_cb cb,
+                                       void *userdata);
+
+/* Summed over every connection in the pool. An empty pool reports 0 for
+ * both -- a producer must therefore treat capacity == 0 as "cannot send
+ * right now", not as "no limit".
+ *
+ * These two are NOT the right pair to derive a safe write budget from,
+ * for any caller (like cloak_stream_relay_t) whose writes eventually go
+ * through cloak_switchboard_send: that function picks ONE connection
+ * uniformly at random per call, it does not spread a write across the
+ * pool. The realistic failure is one congested connection out of N: that
+ * connection's own queue fills while the other N-1 stay near-empty, so
+ * the AGGREGATE room these two report stays large right up until
+ * cloak_switchboard_send happens to pick the congested one again and
+ * cloak_conn_send's own per-connection cap fires conn_mark_broken --
+ * fatal to the whole pool. See cloak_switchboard_send_min_conn_free
+ * below for the accessor that actually bounds this. */
+size_t cloak_switchboard_send_queued(const cloak_switchboard_t *sb);
+size_t cloak_switchboard_send_capacity(const cloak_switchboard_t *sb);
+
+/* The MINIMUM of cloak_conn_send_free over every connection in the pool
+ * (0 for an empty pool) -- the number of bytes guaranteed to fit no
+ * matter which connection cloak_switchboard_send's random pick lands on
+ * next. This is the quantity a caller sizing a single upcoming
+ * cloak_switchboard_send-driven write against the pool actually needs:
+ * unlike the aggregate accessors above, it cannot be defeated by one
+ * congested connection hiding behind (N-1) idle ones, because it does
+ * not sum across the pool at all. O(n) over the pool, same as the
+ * aggregate accessors. */
+size_t cloak_switchboard_send_min_conn_free(const cloak_switchboard_t *sb);
 
 #endif
