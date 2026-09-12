@@ -1363,6 +1363,14 @@ It also carries the obligation recorded in the config module's plan: when it bui
 
 Out of scope here: any policy about which stream connects to what, the UDP/datagram direction (this relay is stream-oriented only), and rate limiting — Go's `Valve` has no equivalent yet and belongs with the user manager.
 
+**Three obligations this plan hands to the dispatcher**, all found by review rather than anticipated here:
+
+1. **Stop every relay before its session tears down.** `cloak_session_broken_cb`'s contract frees every still-active stream immediately after `on_broken` returns, and a `cloak_stream_relay_t` holds its stream and session as raw pointers with no notification through which it could learn. A dispatcher that wires all four session callbacks and does nothing special in `on_broken` writes into freed memory on the next byte that arrives on any relay's socket. `cloak/stream_relay.h` states this as a MUST; it is the single most likely dispatcher bug.
+
+2. **The start-time rejection measures current free space, not capacity.** `cloak_stream_relay_start` refuses to start when no connection can currently fit one worst-case frame. On a session whose pool is transiently busy with other streams' traffic, that can fail a relay whose config would have been fine once the traffic drained. Not a stall and not a regression — but a dispatcher holding many relays per session will hit it, and should be prepared to retry rather than treat the rejection as fatal.
+
+3. **The read budget is per-relay, with no cross-relay coordination.** Each relay independently budgets against the session's minimum per-connection free space, so N concurrent relays on one session can each believe they have room that only one of them actually has. This is strictly better than the aggregate-room bound it replaced, and safe for the single-relay case the tests cover, but it is the next thing that needs attention when one session carries many streams.
+
 ## Self-review notes
 
 - **Spec coverage:** §6's data-plane sentence is implemented for the stream half by Task 3 (`desired_interest`/`sync_interest` plus the `fd_read_paused` watermark), completing what the socket half already did. Tasks 1 and 2 exist because §3's "no blocking I/O anywhere" removes Go's mechanism for both signals: Go backpressures by blocking a goroutine inside `Write` and learns about inbound data by blocking in `Read`, neither of which a reactor can do. Nothing here has a Go counterpart to mirror, which is why the plan argues from the spec rather than from `/Users/sam/Cloak`.
