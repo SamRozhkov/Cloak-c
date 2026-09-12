@@ -36,3 +36,8 @@ add_executable(test_log test_log.c)
 target_include_directories(test_log PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_log PRIVATE cloak-common)
 add_test(NAME test_log COMMAND test_log)
+
+add_executable(test_cjson_link test_cjson_link.c)
+target_include_directories(test_cjson_link PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_cjson_link PRIVATE cloak-common cjson)
+add_test(NAME test_cjson_link COMMAND test_cjson_link)

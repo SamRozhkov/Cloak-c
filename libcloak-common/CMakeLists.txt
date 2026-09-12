@@ -13,6 +13,6 @@ add_library(cloak-common STATIC
 )
 
 target_include_directories(cloak-common PUBLIC include)
-target_link_libraries(cloak-common PUBLIC OpenSSL::Crypto)
+target_link_libraries(cloak-common PUBLIC OpenSSL::Crypto PRIVATE cjson)
 
 add_subdirectory(tests)
