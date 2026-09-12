@@ -14,7 +14,8 @@ struct dial_capture {
     int calls;
 };
 
-static void on_dialed(int fd, void *userdata) {
+static void on_dialed(cloak_dial_t *d, int fd, void *userdata) {
+    (void)d;
     struct dial_capture *cap = userdata;
     cap->fd = fd;
     cap->calls++;
@@ -105,7 +106,8 @@ static void test_dials_a_listening_port(void) {
     cap.fd = -2;
 
     cloak_dial_t d;
-    ASSERT_EQ_INT(0, cloak_dial_start(&d, r, &addr, 5000, on_dialed, &cap));
+    err[0] = '\0';
+    ASSERT_EQ_INT(0, cloak_dial_start(&d, r, &addr, 5000, on_dialed, &cap, err, sizeof(err)));
     /* the contract: the callback never fires before start returns, even
      * when the connect completed immediately (which it does on loopback) */
     ASSERT_EQ_INT(0, cap.calls);
@@ -151,7 +153,8 @@ static void test_dial_to_closed_port_fails(void) {
     cap.fd = -2;
 
     cloak_dial_t d;
-    ASSERT_EQ_INT(0, cloak_dial_start(&d, r, &addr, 5000, on_dialed, &cap));
+    err[0] = '\0';
+    ASSERT_EQ_INT(0, cloak_dial_start(&d, r, &addr, 5000, on_dialed, &cap, err, sizeof(err)));
     cloak_reactor_run(r);
 
     ASSERT_EQ_INT(1, cap.calls);
@@ -187,7 +190,8 @@ static void test_cancel_before_completion(void) {
     cap.fd = -2;
 
     cloak_dial_t d;
-    ASSERT_EQ_INT(0, cloak_dial_start(&d, r, &addr, 5000, on_dialed, &cap));
+    err[0] = '\0';
+    ASSERT_EQ_INT(0, cloak_dial_start(&d, r, &addr, 5000, on_dialed, &cap, err, sizeof(err)));
     cloak_dial_cancel(&d);
 
     /* Nothing is left registered after cancel (fd removed, timer
@@ -203,9 +207,78 @@ static void test_cancel_before_completion(void) {
     cloak_reactor_destroy(r);
 }
 
+static void test_cancel_after_failed_start_is_safe(void) {
+    /* The struct must be deliberately dirtied first: a freshly-declared or
+     * previously-zeroed cloak_dial_t would pass this test whether or not
+     * cloak_dial_start actually re-initializes it on every failure path,
+     * which is exactly the class of test that would have missed this bug
+     * (cloak_dial_cancel dereferences d->finished and d->reactor, and a
+     * failed start used to leave those untouched). */
+    cloak_dial_t dirty;
+    memset(&dirty, 0xAA, sizeof(dirty));
+
+    char err[128] = {0};
+    /* cb == NULL is rejected after the d == NULL check, so by the time
+     * this returns, dirty must already have been reset to the sentinel
+     * state cloak_dial_cancel expects -- not only on a path that reaches
+     * the end of the function successfully. */
+    ASSERT_EQ_INT(-1, cloak_dial_start(&dirty, NULL, NULL, 0, NULL, NULL, err, sizeof(err)));
+    ASSERT_TRUE(err[0] != '\0');
+    /* Direct assertions are the real regression signal here, the same way
+     * test_relay.c's test_stop_after_failed_start_is_safe reasons about
+     * cloak_relay_t: 0xAA happens to read back as a negative int for fd,
+     * so close()'s (or here, cloak_dial_cancel's) `fd >= 0` guard would
+     * short-circuit identically whether or not the fix is present. The
+     * sentinel values below (0 for finished, -1 for fd, CLOAK_TIMER_INVALID
+     * for both timers) are what a genuinely zeroed-then-reset struct holds,
+     * and are what catches the pre-fix ordering. */
+    ASSERT_EQ_INT(0, dirty.finished);
+    ASSERT_EQ_INT(-1, dirty.fd);
+    ASSERT_EQ_INT((long long)CLOAK_TIMER_INVALID, (long long)dirty.timeout_timer);
+    ASSERT_EQ_INT((long long)CLOAK_TIMER_INVALID, (long long)dirty.immediate_timer);
+
+    /* Must not crash either way. */
+    cloak_dial_cancel(&dirty);
+}
+
+static void test_dial_to_blackhole_times_out(void) {
+    /* 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed unrouteable, so the
+     * SYN is simply never answered rather than being actively refused --
+     * exactly what exercises dial_on_timeout instead of the ECONNREFUSED
+     * path test_dial_to_closed_port_fails already covers. Port 9 (discard)
+     * is arbitrary; nothing there will ever answer either way. */
+    cloak_addr_t addr;
+    char err[128] = {0};
+    ASSERT_EQ_INT(0, cloak_net_resolve("192.0.2.1:9", 0, &addr, err, sizeof(err)));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    struct dial_capture cap;
+    memset(&cap, 0, sizeof(cap));
+    cap.reactor = r;
+    cap.fd = -2;
+
+    cloak_dial_t d;
+    err[0] = '\0';
+    ASSERT_EQ_INT(0, cloak_dial_start(&d, r, &addr, 50, on_dialed, &cap, err, sizeof(err)));
+
+    cloak_reactor_run(r);
+
+    ASSERT_EQ_INT(1, cap.calls);
+    ASSERT_TRUE(cap.fd < 0);
+
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_resolve_loopback();
     test_dials_a_listening_port();
     test_dial_to_closed_port_fails();
     test_cancel_before_completion();
+    test_cancel_after_failed_start_is_safe();
+    test_dial_to_blackhole_times_out();
 TEST_MAIN_END()

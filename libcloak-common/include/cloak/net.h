@@ -104,9 +104,17 @@ typedef struct cloak_dial cloak_dial_t;
  * Guaranteed never to fire before cloak_dial_start returns -- even when
  * the connect completes immediately, as it does on loopback -- so a caller
  * can finish initializing its own state after calling start without
- * racing its own callback. */
-typedef void (*cloak_dial_cb)(int fd, void *userdata);
+ * racing its own callback. d is the same object passed to cloak_dial_start,
+ * matching cloak_listener_accept_cb and cloak_relay_done_cb, which both
+ * hand back their own object too -- useful to a dispatcher juggling many
+ * concurrent dials. */
+typedef void (*cloak_dial_cb)(cloak_dial_t *d, int fd, void *userdata);
 
+/* d must stay live, at a fixed address, from a successful cloak_dial_start
+ * until cb fires (or until cloak_dial_cancel, if cancelled first): the
+ * reactor holds a pointer to it for that whole span, and moving or freeing
+ * it (e.g. inside a realloc-grown array of in-flight dials) while still
+ * registered is a use-after-free. */
 struct cloak_dial {
     cloak_reactor_t *reactor;
     int fd;
@@ -119,18 +127,25 @@ struct cloak_dial {
 
 /* Starts a non-blocking connect to addr. timeout_ms bounds the attempt (0
  * means no timeout). On completion, success or failure, cb fires exactly
- * once.
+ * once. cb == NULL is rejected, like cloak_listener_open rejecting a NULL
+ * accept callback -- there would be no way to ever learn the outcome.
  *
- * Returns 0 if the attempt started, -1 if it could not be started at all
- * (bad argument, socket creation failure, or a reactor registration
- * failure) -- in which case cb never fires and the caller owns the
- * failure. */
+ * Returns 0 if the attempt started, -1 with the reason in err on a NULL
+ * d/r/addr/cb, a socket() failure, a synchronous connect() error (e.g.
+ * EACCES, ENETUNREACH, EADDRNOTAVAIL), or a reactor registration failure
+ * -- in which case cb never fires and the caller owns the failure. Every
+ * failure path closes the socket itself, so err is the only way to learn
+ * why; errno is no longer meaningful by the time this returns. */
 int cloak_dial_start(cloak_dial_t *d, cloak_reactor_t *r, const cloak_addr_t *addr,
-                     uint64_t timeout_ms, cloak_dial_cb cb, void *userdata);
+                     uint64_t timeout_ms, cloak_dial_cb cb, void *userdata,
+                     char *err, size_t err_cap);
 
 /* Abandons an in-flight dial: closes the socket, cancels the timeout, and
  * guarantees cb will NOT fire. A no-op if the dial already completed.
- * Must not be called from within cb itself. */
+ * Must not be called from within cb itself. Safe to call on d left zeroed,
+ * or on d left however a failed cloak_dial_start leaves it -- both are
+ * safe for the same reason cloak_listener_close and cloak_relay_stop are
+ * safe after a failed open/start. */
 void cloak_dial_cancel(cloak_dial_t *d);
 
 typedef struct cloak_relay cloak_relay_t;
