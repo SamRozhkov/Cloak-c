@@ -111,8 +111,6 @@ static void test_round_trip_all_byte_values(void) {
     for (size_t i = 0; i < sizeof(plain); i++) {
         plain[i] = (uint8_t)i;
     }
-    char encoded[cloak_base64_encoded_size_static];
-    (void)encoded;
     char buf[512];
     ASSERT_EQ_INT(0, cloak_base64_encode(plain, sizeof(plain), buf, sizeof(buf)));
 
@@ -177,8 +175,6 @@ TEST_MAIN_BEGIN()
     test_decodes_a_16_byte_uid();
 TEST_MAIN_END()
 ```
-
-Note: remove the two stray lines `char encoded[cloak_base64_encoded_size_static];` and `(void)encoded;` from `test_round_trip_all_byte_values` — they are not part of the API. The function should declare only `char buf[512];`.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -994,7 +990,7 @@ Create `libcloak-common/tests/test_config_client.c`:
 
 /* 16 raw bytes -> 24 base64 chars; 32 raw bytes -> 44 base64 chars */
 #define UID_B64 "SGVsbG9DbG9ha1VJRCEhIQ=="
-#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyIQ=="
+#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyISE="
 
 static const char *minimal_json(void) {
     static char buf[1024];
@@ -1066,19 +1062,9 @@ static void test_decodes_uid_and_public_key(void) {
     char err[CLOAK_CONFIG_ERR_LEN] = {0};
     ASSERT_EQ_INT(0, cloak_client_config_parse_json(minimal_json(), &cfg, err, sizeof(err)));
 
-    const uint8_t expected_uid[16] = {
-        'H', 'e', 'l', 'l', 'o', 'C', 'l', 'o',
-        'a', 'k', 'U', 'I', 'D', '!', '!', '!'};
-    ASSERT_MEM_EQ(cfg.uid, expected_uid, sizeof(expected_uid));
-
-    const uint8_t expected_pub[32] = {
-        'l', 'o', 'n', 'g', 'e', 'r', '-', 'k',
-        'e', 'y', '-', 'm', 'a', 't', 'e', 'r',
-        'i', 'a', 'l', '-', 'e', 'x', 'a', 'c',
-        't', 'l', 'y', '-', '3', '2', '!', 0};
-    /* the 32nd byte of the decoded key is 0x21 ('!') followed by nothing --
-     * recompute below rather than trusting this literal */
-    (void)expected_pub;
+    ASSERT_MEM_EQ(cfg.uid, "HelloCloakUID!!!", CLOAK_UID_LEN);
+    ASSERT_MEM_EQ(cfg.server_pub_key, "longer-key-material-exactly-32!!",
+                  CLOAK_X25519_KEY_LEN);
 }
 
 static void test_all_encryption_method_names(void) {
@@ -1318,9 +1304,7 @@ TEST_MAIN_BEGIN()
 TEST_MAIN_END()
 ```
 
-Two fixups to apply while writing the file:
-1. `test_decodes_uid_and_public_key` must assert the decoded public key properly. Replace its `expected_pub` block with a decode of `PUB_B64` through `cloak_base64_decode` and an `ASSERT_MEM_EQ` against `cfg.server_pub_key` (include `cloak/base64.h` for it). `PUB_B64` is 44 characters and decodes to exactly 32 bytes.
-2. `test_parse_file_round_trip` uses `mkstemp`, `write`, `close` and `unlink`: add `#define _POSIX_C_SOURCE 200809L` as the file's first line and include `<unistd.h>`.
+Note: `test_parse_file_round_trip` uses `mkstemp`, `write`, `close` and `unlink`, so this file needs `#define _POSIX_C_SOURCE 200809L` as its first line and `#include <unistd.h>` alongside the other includes. The test vectors decode to exactly the lengths the parser requires: `UID_B64` is `"HelloCloakUID!!!"` (16 bytes) and `PUB_B64` is `"longer-key-material-exactly-32!!"` (32 bytes).
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -2098,8 +2082,8 @@ Create `libcloak-common/tests/test_config_server.c`:
 #include <unistd.h>
 
 #define PRIV_B64 "cHJpdmF0ZS1rZXktbWF0ZXJpYWwtZXhhY3RseS0zMiE="
-#define ADMIN_B64 "YWRtaW5VSUQtMTZieXRlcyE="
-#define BYPASS_B64 "Ynlwc3NVSUQtMTZieXRlcyE="
+#define ADMIN_B64 "YWRtaW5VSUQtMTZieXRlIQ=="
+#define BYPASS_B64 "YnlwYXNzVUlELTE2Ynl0IQ=="
 
 static const char *minimal_json(void) {
     static char buf[1024];
@@ -2650,7 +2634,7 @@ Create `libcloak-common/tests/test_config_ssv.c`:
 #include <unistd.h>
 
 #define UID_B64 "SGVsbG9DbG9ha1VJRCEhIQ=="
-#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyIQ=="
+#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyISE="
 
 static const char *minimal_ssv(void) {
     static char buf[1024];
@@ -3086,9 +3070,18 @@ Per the master spec, the next module is the **server dispatcher** (§7): the per
 
 Explicitly out of scope here: any use of these configs (nothing links them yet beyond their tests), CLI flag handling and the flag-over-config precedence rules (those belong with the binaries, module 7), and server-side key/UID generation (also module 7).
 
+**One obligation this plan hands to the dispatcher module.** `cloak_server_config_t.bypass_uid` holds exactly the UIDs the config file listed under `BypassUID` — it does **not** include `admin_uid`. Go folds the admin UID into the bypass set, but it does so in `InitState` (`internal/server/state.go`), which is runtime state rather than parsed config, and this port keeps that boundary: derived data stays out of the config struct. So whichever module builds the runtime bypass lookup **must union `admin_uid` into it when `has_admin_uid` is set**, or the admin user will be subject to credit and bandwidth accounting. The contract is also stated on both fields in `cloak/config.h`; this note exists so the requirement is visible from the plan as well.
+
 ## Self-review notes
 
 - **Spec coverage (§10):** JSON config parsed with vendored cJSON — Tasks 3, 4, 5. Field names match the Go config structs verbatim, both client (`UID`, `Transport`, `PublicKey`, `ProxyMethod`, `EncryptionMethod`, `ServerName`, `AlternativeNames`, `CDNOriginHost`, `CDNWsUrlPath`, `NumConn`, `BrowserSig`, `StreamTimeout`, `LocalHost`/`LocalPort`/`RemoteHost`/`RemotePort`, `UDP`, `KeepAlive`) and server (`ProxyBook`, `BindAddr`, `RedirAddr`, `PrivateKey`, `BypassUID`, `AdminUID`, `DatabasePath`, `KeepAlive`, `CncMode`). §10's CLI half is deliberately deferred to module 7, as noted above. Base64 (Task 1) and logging (Task 2) are not named as separate spec sections but are prerequisites the spec assumes throughout (`-key`/`-uid` output, every module's diagnostics).
 - **Placeholder scan:** no TBD/TODO steps; every code step contains complete, compilable code. The two annotated fixups in Task 4 Step 1 and the one in Task 1 Step 1 are deliberate, explicit instructions, not placeholders.
 - **Type consistency:** `cloak_config_set_err(char*, size_t, const char*, ...)` returns `int` (-1) and is used as `return cloak_config_set_err(...)` throughout Tasks 4, 5 and 6. The accessor family `cloak_config_get_string/int/bool/b64` shares one signature shape — `(obj, name, dst[, len], int *found, char *err, size_t err_cap)` returning 0/-1 — and every call site passes a `found` variable. `cloak_client_config_from_cjson`/`cloak_server_config_from_cjson` are declared in `config_internal.h` (Task 4) and defined in `config_client.c` (Task 4) and `config_server.c` (Task 5) respectively; `config_ssv.c` (Task 6) calls the client one. `CLOAK_UID_LEN`, `CLOAK_PROXY_METHOD_LEN`, `CLOAK_MAX_HOST_LEN` and `CLOAK_CONFIG_ERR_LEN` are defined once in `cloak/config.h` and used unchanged in all later tasks and tests.
-- **Divergences from the Go original, deliberate and documented in the header:** collections are capped (`CLOAK_MAX_ALT_NAMES` etc.) where Go's slices are unbounded, and exceeding a cap is an error rather than a truncation; `ProxyMethod` longer than 12 bytes is rejected at parse time rather than silently truncated on the wire; `BindAddr` is required (Go would start with none and simply listen nowhere).
+- **Divergences from the Go original, deliberate and documented in the header:** collections are capped (`CLOAK_MAX_ALT_NAMES` etc.) where Go's slices are unbounded, and exceeding a cap is an error rather than a truncation; `ProxyMethod` longer than 12 bytes is rejected at parse time rather than silently truncated on the wire; `BindAddr` is required (Go would start with none and simply listen nowhere). Five more exist, found in final review and now documented at their point of use (two of them, being user-visible, are called out in `cloak/config.h` itself):
+  - `config_client.c`: a negative `StreamTimeout` is rejected; Go (`internal/client/state.go:269-273`) accepts it silently and passes it straight to `time.Duration`.
+  - `config_ssv.c`: Go's `ssvToJson` unescapes the *whole option string* before splitting it on `;`, so an escaped `;` or `=` has already become a literal character by the time Go's splitter looks for field boundaries; the resulting bogus second field (with no `=` in it) is then silently discarded as malformed. This implementation splits on unescaped `;`/`=` first and unescapes each field afterwards, which is what the escape syntax was meant to achieve; `test_config_ssv.c`'s `test_escapes_are_unescaped` locks in the corrected behaviour and would fail under Go's order of operations. The C behaviour is strictly better here; a source comment at `config_ssv.c:19-21` previously claimed parity with Go and was wrong -- it has been corrected to describe the actual, better, behaviour.
+  - `config_ssv.c`: an ssv field with no `=` aborts the whole parse with an error; Go logs the malformed option and `continue`s, keeping the rest of the string.
+  - `config_ssv.c`: an empty ssv field (as in `a=b;;c=d`) is skipped, with parsing continuing to the next field; Go's `if ln == "" { break }` stops parsing at the first empty field, silently dropping everything after it (`c=d` in that example).
+  - `config_server.c`: a `ProxyBook` entry naming a network other than `tcp`/`udp` is a hard parse error; Go's `parseProxyBook` (`internal/server/state.go:88-105`) has no `default` case in its `switch` and silently drops the entry instead. This is the one with real operational bite: a server config that boots under Go Cloak may refuse to start under this port.
+
+  Also worth recording, though it is not a divergence this implementation introduces so much as a Go bug this implementation does not reproduce: Go's client-side `KeepAlive` handling (`internal/client/state.go:257-261`) reads `remote.KeepAlive = remote.KeepAlive * time.Second` -- the left-hand `remote.KeepAlive` on the right-hand side is the zero-valued destination field, not `raw.KeepAlive` from the parsed config -- so Go's client `KeepAlive` is always 0 regardless of what the config says. `config_client.c`'s `keep_alive_sec` handling reads the parsed value as intended. A future reader diffing against Go should not "fix" this to match Go's actual (buggy) behaviour.

@@ -12,6 +12,7 @@ add_compile_options(-Wall -Wextra)
 
 enable_testing()
 
+add_subdirectory(third_party/cjson)
 add_subdirectory(libcloak-common)
 add_subdirectory(libcloak-mux)
 add_subdirectory(libcloak-server)
