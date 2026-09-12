@@ -111,8 +111,6 @@ static void test_round_trip_all_byte_values(void) {
     for (size_t i = 0; i < sizeof(plain); i++) {
         plain[i] = (uint8_t)i;
     }
-    char encoded[cloak_base64_encoded_size_static];
-    (void)encoded;
     char buf[512];
     ASSERT_EQ_INT(0, cloak_base64_encode(plain, sizeof(plain), buf, sizeof(buf)));
 
@@ -177,8 +175,6 @@ TEST_MAIN_BEGIN()
     test_decodes_a_16_byte_uid();
 TEST_MAIN_END()
 ```
-
-Note: remove the two stray lines `char encoded[cloak_base64_encoded_size_static];` and `(void)encoded;` from `test_round_trip_all_byte_values` — they are not part of the API. The function should declare only `char buf[512];`.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -994,7 +990,7 @@ Create `libcloak-common/tests/test_config_client.c`:
 
 /* 16 raw bytes -> 24 base64 chars; 32 raw bytes -> 44 base64 chars */
 #define UID_B64 "SGVsbG9DbG9ha1VJRCEhIQ=="
-#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyIQ=="
+#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyISE="
 
 static const char *minimal_json(void) {
     static char buf[1024];
@@ -1066,19 +1062,9 @@ static void test_decodes_uid_and_public_key(void) {
     char err[CLOAK_CONFIG_ERR_LEN] = {0};
     ASSERT_EQ_INT(0, cloak_client_config_parse_json(minimal_json(), &cfg, err, sizeof(err)));
 
-    const uint8_t expected_uid[16] = {
-        'H', 'e', 'l', 'l', 'o', 'C', 'l', 'o',
-        'a', 'k', 'U', 'I', 'D', '!', '!', '!'};
-    ASSERT_MEM_EQ(cfg.uid, expected_uid, sizeof(expected_uid));
-
-    const uint8_t expected_pub[32] = {
-        'l', 'o', 'n', 'g', 'e', 'r', '-', 'k',
-        'e', 'y', '-', 'm', 'a', 't', 'e', 'r',
-        'i', 'a', 'l', '-', 'e', 'x', 'a', 'c',
-        't', 'l', 'y', '-', '3', '2', '!', 0};
-    /* the 32nd byte of the decoded key is 0x21 ('!') followed by nothing --
-     * recompute below rather than trusting this literal */
-    (void)expected_pub;
+    ASSERT_MEM_EQ(cfg.uid, "HelloCloakUID!!!", CLOAK_UID_LEN);
+    ASSERT_MEM_EQ(cfg.server_pub_key, "longer-key-material-exactly-32!!",
+                  CLOAK_X25519_KEY_LEN);
 }
 
 static void test_all_encryption_method_names(void) {
@@ -1318,9 +1304,7 @@ TEST_MAIN_BEGIN()
 TEST_MAIN_END()
 ```
 
-Two fixups to apply while writing the file:
-1. `test_decodes_uid_and_public_key` must assert the decoded public key properly. Replace its `expected_pub` block with a decode of `PUB_B64` through `cloak_base64_decode` and an `ASSERT_MEM_EQ` against `cfg.server_pub_key` (include `cloak/base64.h` for it). `PUB_B64` is 44 characters and decodes to exactly 32 bytes.
-2. `test_parse_file_round_trip` uses `mkstemp`, `write`, `close` and `unlink`: add `#define _POSIX_C_SOURCE 200809L` as the file's first line and include `<unistd.h>`.
+Note: `test_parse_file_round_trip` uses `mkstemp`, `write`, `close` and `unlink`, so this file needs `#define _POSIX_C_SOURCE 200809L` as its first line and `#include <unistd.h>` alongside the other includes. The test vectors decode to exactly the lengths the parser requires: `UID_B64` is `"HelloCloakUID!!!"` (16 bytes) and `PUB_B64` is `"longer-key-material-exactly-32!!"` (32 bytes).
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -2098,8 +2082,8 @@ Create `libcloak-common/tests/test_config_server.c`:
 #include <unistd.h>
 
 #define PRIV_B64 "cHJpdmF0ZS1rZXktbWF0ZXJpYWwtZXhhY3RseS0zMiE="
-#define ADMIN_B64 "YWRtaW5VSUQtMTZieXRlcyE="
-#define BYPASS_B64 "Ynlwc3NVSUQtMTZieXRlcyE="
+#define ADMIN_B64 "YWRtaW5VSUQtMTZieXRlIQ=="
+#define BYPASS_B64 "YnlwYXNzVUlELTE2Ynl0IQ=="
 
 static const char *minimal_json(void) {
     static char buf[1024];
@@ -2650,7 +2634,7 @@ Create `libcloak-common/tests/test_config_ssv.c`:
 #include <unistd.h>
 
 #define UID_B64 "SGVsbG9DbG9ha1VJRCEhIQ=="
-#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyIQ=="
+#define PUB_B64 "bG9uZ2VyLWtleS1tYXRlcmlhbC1leGFjdGx5LTMyISE="
 
 static const char *minimal_ssv(void) {
     static char buf[1024];

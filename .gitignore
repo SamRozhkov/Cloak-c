@@ -3,3 +3,4 @@ build/
 build-*/
 build2/
 .DS_Store
+.superpowers/
