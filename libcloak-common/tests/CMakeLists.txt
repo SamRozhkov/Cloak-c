@@ -71,3 +71,8 @@ add_executable(test_dial test_dial.c)
 target_include_directories(test_dial PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_dial PRIVATE cloak-common)
 add_test(NAME test_dial COMMAND test_dial)
+
+add_executable(test_relay test_relay.c)
+target_include_directories(test_relay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_relay PRIVATE cloak-common)
+add_test(NAME test_relay COMMAND test_relay)

@@ -133,4 +133,57 @@ int cloak_dial_start(cloak_dial_t *d, cloak_reactor_t *r, const cloak_addr_t *ad
  * Must not be called from within cb itself. */
 void cloak_dial_cancel(cloak_dial_t *d);
 
+typedef struct cloak_relay cloak_relay_t;
+
+/* Fired exactly once, when the relay finishes: either side reaching EOF,
+ * or either side erroring. Both file descriptors are already closed by the
+ * time this fires. Never fired by cloak_relay_stop (an explicit teardown
+ * is not a completion), and never before cloak_relay_start returns. */
+typedef void (*cloak_relay_done_cb)(cloak_relay_t *rl, void *userdata);
+
+struct cloak_relay {
+    cloak_reactor_t *reactor;
+    int fd[2];
+    /* q[i] holds bytes read from fd[i] and awaiting write to fd[1 - i]. */
+    cloak_bytequeue_t q[2];
+    int read_eof[2];
+    uint32_t interest[2];
+    int done;
+    cloak_relay_done_cb on_done;
+    void *on_done_userdata;
+};
+
+/* Splices fd_a and fd_b together until one of them ends.
+ *
+ * Ownership of both descriptors passes to the relay: it closes both when
+ * it finishes, and cloak_relay_stop closes both too. Each direction gets
+ * its own buf_cap-byte queue; when a queue fills, read interest on its
+ * source is deregistered until the destination drains it, which is what
+ * keeps a fast producer from growing memory without bound.
+ *
+ * preload/preload_len is data already read from fd_a before the relay
+ * existed, to be written to fd_b ahead of anything else -- the server
+ * dispatcher's redirect path, which has already consumed its client's
+ * first packet, is what this is for. preload_len must not exceed buf_cap.
+ *
+ * Teardown is symmetric and immediate, matching Go Cloak's own
+ * common.Copy: the first EOF or error on either side ends the whole
+ * relay. Before closing, it makes one best-effort non-blocking pass over
+ * the data still in flight -- draining whatever the other side has
+ * already sent, then flushing both queues -- so a short reply that
+ * crossed paths with the EOF still gets delivered. Neither side is
+ * half-closed and left running.
+ *
+ * Returns 0 on success, -1 on invalid arguments (including an oversized
+ * preload), allocation failure, or a reactor registration failure. On
+ * failure neither descriptor is closed -- the caller still owns them. */
+int cloak_relay_start(cloak_relay_t *rl, cloak_reactor_t *r, int fd_a, int fd_b,
+                      const uint8_t *preload, size_t preload_len, size_t buf_cap,
+                      cloak_relay_done_cb on_done, void *userdata);
+
+/* Tears the relay down without firing on_done: unregisters and closes both
+ * descriptors and frees both queues. Idempotent, and safe on a relay left
+ * zeroed by a failed start. */
+void cloak_relay_stop(cloak_relay_t *rl);
+
 #endif

@@ -17,6 +17,7 @@ add_library(cloak-common STATIC
     src/config_ssv.c
     src/listener.c
     src/dial.c
+    src/relay.c
 )
 
 target_include_directories(cloak-common PUBLIC include)
