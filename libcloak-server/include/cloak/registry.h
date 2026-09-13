@@ -87,7 +87,22 @@ typedef struct cloak_server_registry cloak_server_registry_t;
  * callback never gets armed (cloak_server_registry_destroy sets an
  * internal destroyed flag this adapter checks first) -- reg's own
  * contract of cancelling/completing every sweep before returning is
- * upheld, not bypassed. What is NOT safe: calling
+ * upheld, not bypassed.
+ *
+ * MUST NOT, even with the above in mind: freeing reg's OWN backing
+ * storage (e.g. `free(reg)` for a heap-allocated registry, or otherwise
+ * deallocating or reusing the memory reg itself occupies) from within
+ * this callback. cloak_server_registry_destroy only frees what reg OWNS
+ * (its entries and their sessions); it never touches reg's own storage,
+ * which remains the caller's to manage. The adapter that invoked this
+ * callback (registry_on_session_broken) still runs code that reads reg
+ * AFTER this callback returns -- specifically the sweep-arming check this
+ * paragraph just described as safe -- so if reg's own memory is freed
+ * before that point, that check is a read of freed memory regardless of
+ * what cloak_server_registry_destroy did or didn't do first. In short:
+ * destroying the registry from here is safe; destroying reg is not.
+ *
+ * What is NOT safe (in addition to the above): calling
  * cloak_server_registry_close or cloak_server_registry_destroy on this
  * registry from any OTHER callback context (e.g. from inside
  * on_stream_data) -- see cloak_server_registry_close's own doc comment. */

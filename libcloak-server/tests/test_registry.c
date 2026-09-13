@@ -66,7 +66,12 @@ typedef struct {
     /* If set, cloak_server_registry_destroy(reg) is called from inside
      * the callback -- review finding 1: destroy must leave reg safe
      * (specifically: must not let the sweep this on_broken call is about
-     * to arm actually get armed against an already-destroyed reg). */
+     * to arm actually get armed against an already-destroyed reg). This
+     * also calls cloak_reactor_stop(reg->reactor) immediately afterward,
+     * for a reason that belongs here rather than at the call site: see
+     * test_destroy_registry_from_inside_on_broken_is_safe's own top
+     * comment for why the discriminating assertion needs the reactor's
+     * end-of-turn timer processing suppressed for this exact dispatch. */
     int destroy_reg_from_inside;
 } broken_ctx_t;
 
@@ -91,6 +96,22 @@ static void on_registry_broken(cloak_server_registry_t *reg, cloak_session_t *se
 
     if (ctx->destroy_reg_from_inside) {
         cloak_server_registry_destroy(reg);
+        /* Freeze this reactor turn right here: cloak_reactor_run_once
+         * calls process_expired_timers() at the END of the SAME turn
+         * that dispatched the fd event which led here, so a zero-delay
+         * timer armed by registry_arm_sweep (called by
+         * registry_on_session_broken right after this callback returns)
+         * would otherwise fire and reset itself to CLOAK_TIMER_INVALID
+         * before the test ever gets to look at it -- making a plain
+         * post-loop check of reg->sweep_timer pass identically whether
+         * or not the guard this callback is testing actually ran.
+         * cloak_reactor_stop is documented as callable from within a
+         * callback and, per cloak_reactor_run_once's own doc, is
+         * observed but not cleared by run_once -- so this reliably
+         * suppresses process_expired_timers for the rest of THIS turn
+         * (reg->reactor is still the live reactor here: destroy() does
+         * not touch that field). */
+        cloak_reactor_stop(reg->reactor);
     }
 }
 
@@ -417,6 +438,13 @@ static void test_close_from_inside_on_broken_is_noop(void) {
     cloak_reactor_destroy(r);
 }
 
+/* Fires cloak_reactor_stop on the reactor it's given -- used below as a
+ * bounded watchdog so a cloak_reactor_run call cannot hang forever. */
+static void stop_reactor_timer_cb(cloak_reactor_t *r, void *userdata) {
+    (void)userdata;
+    cloak_reactor_stop(r);
+}
+
 /* 4b (review finding 1). Destroying the registry from INSIDE the owner's
  * on_broken -- reachable in practice, and dangerous specifically because
  * registry_on_session_broken still has a registry_arm_sweep(reg) call to
@@ -424,8 +452,41 @@ static void test_close_from_inside_on_broken_is_noop(void) {
  * arm call would succeed against an already-destroyed reg, arming a
  * fresh zero-delay timer with reg as userdata; if the owner went on to
  * free reg's own storage, that timer firing later would read and write
- * freed memory. Run under ASan: pump the reactor well past where that
- * timer would have fired and it must not touch anything. */
+ * freed memory.
+ *
+ * THIS TEST USED TO CHECK reg.sweep_timer RIGHT AFTER THE BREAK LOOP,
+ * WITH NO cloak_reactor_stop CALL, AND THAT DID NOT WORK: a scoped
+ * re-review found it passed identically with the destroyed guard removed
+ * from registry_arm_sweep, because it never actually observed an armed
+ * timer. Traced why: cloak_reactor_run_once calls process_expired_timers
+ * at the END of the SAME turn that dispatched the fd event that broke the
+ * session -- so a zero-delay timer armed by registry_arm_sweep during
+ * that same turn's dispatch fires and resets itself to
+ * CLOAK_TIMER_INVALID before run_once even returns to this test's loop.
+ * Confirmed directly: temporarily removing the `if (reg->destroyed)`
+ * guard from registry_arm_sweep and instrumenting it with fprintf showed
+ * add_timer legitimately returning a live, non-invalid id, immediately
+ * followed (same run_once call, via process_expired_timers re-checking
+ * its heap against a `now` captured once at the top of that function)
+ * by registry_sweep_timer_cb firing and resetting reg->sweep_timer back
+ * to CLOAK_TIMER_INVALID -- all before the test's own next line ran. A
+ * plain post-loop check of reg.sweep_timer is therefore exactly the kind
+ * of non-discriminating assertion this whole exercise was trying to
+ * eliminate, just moved one layer down.
+ *
+ * The fix: on_registry_broken (see its own comment on
+ * destroy_reg_from_inside) calls cloak_reactor_stop(reg->reactor)
+ * immediately after cloak_server_registry_destroy(reg), from within the
+ * SAME callback invocation, i.e. before registry_arm_sweep has even run
+ * for this entry. cloak_reactor_stop is documented as safe to call from
+ * within a callback, and cloak_reactor_run_once's own doc states the stop
+ * flag is observed but not cleared by run_once -- so once set, it
+ * suppresses process_expired_timers for the REST of this turn (checked
+ * with `if (!r->stopped)` after the fd-dispatch loop, in reactor.c). That
+ * happens after registry_arm_sweep has already run (arm_sweep doesn't
+ * check the stop flag itself), so reg.sweep_timer reliably holds
+ * whatever arm_sweep just set it to -- a live id pre-fix, CLOAK_TIMER_INVALID
+ * post-fix -- by the time run_once returns here, with no self-firing race. */
 static void test_destroy_registry_from_inside_on_broken_is_safe(void) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -455,19 +516,39 @@ static void test_destroy_registry_from_inside_on_broken_is_safe(void) {
     ASSERT_EQ_INT(0, cloak_session_add_conn(sesh_b, fds[0]));
     close(fds[1]); /* peer vanishes -> sesh_b sees EOF and breaks */
 
+    /* The turn that dispatches this break is also the turn
+     * on_registry_broken calls cloak_reactor_stop on, per the mechanism
+     * explained above -- so as soon as this loop observes the break,
+     * reg.sweep_timer is frozen at whatever value arm_sweep just gave
+     * it, immune to process_expired_timers for the rest of this turn. */
     for (int i = 0; i < 50 && ctx.broken_calls == 0; i++) {
         cloak_reactor_run_once(r, 10);
     }
     ASSERT_EQ_INT(1, ctx.broken_calls);
 
-    /* reg is now fully destroyed (entries freed, sweep_timer cancelled or
-     * never armed, destroyed == 1). Pump the reactor well past a
-     * zero-delay timer's fire point -- if registry_arm_sweep had armed
-     * one against this now-destroyed reg despite the fix, this is where
-     * registry_sweep_timer_cb would run and write reg->sweep_timer. */
-    for (int i = 0; i < 20; i++) {
-        cloak_reactor_run_once(r, 5);
-    }
+    /* THE discriminating assertion. */
+    ASSERT_EQ_INT((int)CLOAK_TIMER_INVALID, (int)reg.sweep_timer);
+
+    /* Corroborating evidence, made to actually mean something rather than
+     * being a guaranteed no-op: r's stop flag is now set and
+     * cloak_reactor_run_once never clears it (see the comment above), so
+     * plain run_once calls from here on would dispatch and fire nothing
+     * at all regardless of what reg.sweep_timer held -- not a real pump.
+     * cloak_reactor_run DOES clear the flag on entry, so drive a real,
+     * bounded turn through it instead, guarded by a watchdog timer so it
+     * cannot hang: if the guard in registry_arm_sweep were absent (the
+     * pre-fix case above), the id already sitting in reg.sweep_timer
+     * would come due and registry_sweep_timer_cb would run for real
+     * here, harmlessly sweeping the already-empty table -- proving that
+     * even a leaked pre-fix timer doesn't crash *this* test (reg is
+     * never freed here; only cloak_server_registry_destroy's own storage-
+     * management is exercised, per the coordinator's explicit
+     * instruction not to free reg's backing memory from inside
+     * on_broken -- see registry.h's cloak_registry_broken_cb doc for why
+     * that specifically remains unsafe even with this fix in place). */
+    cloak_timer_id_t watchdog = cloak_reactor_add_timer(r, 50, stop_reactor_timer_cb, NULL);
+    ASSERT_TRUE(watchdog != CLOAK_TIMER_INVALID);
+    cloak_reactor_run(r);
     ASSERT_EQ_INT(1, ctx.broken_calls);
 
     /* A second, ordinary destroy call must still be safe and idempotent
