@@ -645,11 +645,27 @@ static int elapsed_at_least(void *ctx) {
     return d >= w->ms;
 }
 
+/* The iteration cap is DERIVED FROM ms, and generously, so that the wall
+ * clock is always the bound that binds. A fixed cap does not work and
+ * quietly lost this file real coverage once already: run_once returns in
+ * well under a microsecond when an fd is always ready, so a flat 100000
+ * iterations was exhausted after 84ms of a 400ms request in four of the
+ * five call sites -- and the discarded return value hid it. 20000
+ * iterations per millisecond allows for a reactor spinning at 20M turns
+ * a second before the cap could bind again; if it ever does, the assert
+ * below fails the test rather than silently shortening the window a
+ * mutation is supposed to be caught in. */
+#define PUMP_ITERS_PER_MS 20000
+
 static void pump_for_ms(cloak_reactor_t *r, long ms) {
     struct until_ms w;
     clock_gettime(CLOCK_MONOTONIC, &w.start);
     w.ms = ms;
-    (void)pump_until(r, elapsed_at_least, &w, 100000, 2);
+    int reached = pump_until(r, elapsed_at_least, &w, (int)(ms * PUMP_ITERS_PER_MS), 2);
+    /* NOT decoration: every caller's comment claims to have pumped past
+     * some timer's deadline, and this is what makes that claim true
+     * rather than merely intended. */
+    ASSERT_TRUE(reached);
 }
 
 /* Every teardown wait in this file is on the CALLBACK having run, never
@@ -694,6 +710,23 @@ static int some_stream_retrying(void *ctx) {
         }
     }
     return 0;
+}
+
+/* Waits for the broken callback while latching, on every turn, whether
+ * the session's stream was still DIALING -- updated only while a stream
+ * context exists, so the final value is the state the teardown walk
+ * actually saw rather than the state some earlier assertion saw. */
+struct dial_watch {
+    struct fixture *fx;
+    int last_dialing;
+};
+
+static int chain_after_dialing(void *ctx) {
+    struct dial_watch *w = ctx;
+    if (cloak_proxy_stream_count(&w->fx->proxy) > 0) {
+        w->last_dialing = some_stream_dialing(w->fx);
+    }
+    return w->fx->chain_calls >= 1;
 }
 
 static int some_stream_relaying(void *ctx) {
@@ -792,12 +825,21 @@ static void test_broken_session_with_pending_dial(void) {
      * is stuck mid-connect. */
     ASSERT_TRUE(pump_until(fx.reactor, some_stream_dialing, &fx, 400, 5));
     ASSERT_EQ_INT(1, (int)cloak_proxy_stream_count(&fx.proxy));
-    ASSERT_EQ_INT(0, fx.up.accept_count);
 
     client_session_close(&cs);
 
-    struct fx_wait w = {&fx, 1};
-    ASSERT_TRUE(pump_until(fx.reactor, chain_calls_at_least, &w, 600, 5));
+    /* THE STATE AT TEARDOWN IS WHAT THIS TEST IS ABOUT, and asserting it
+     * before the break is not the same claim: the break lands several
+     * reactor turns after client_session_close, and if the black hole
+     * ever stopped black-holing, the dial would complete during those
+     * turns, the teardown would take the relay branch instead, and this
+     * test would go green having covered nothing it exists to cover. So
+     * the dialing flag is re-sampled on every turn for as long as a
+     * stream context exists; last_dialing is therefore its value on the
+     * last turn before the teardown freed it. */
+    struct dial_watch dw = {&fx, 0};
+    ASSERT_TRUE(pump_until(fx.reactor, chain_after_dialing, &dw, 600, 5));
+    ASSERT_EQ_INT(1, dw.last_dialing);
     ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(&fx.proxy));
     ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&fx.proxy));
 

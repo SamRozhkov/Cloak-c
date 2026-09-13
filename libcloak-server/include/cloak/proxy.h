@@ -484,6 +484,18 @@ void cloak_proxy_registry_broken(cloak_server_registry_t *reg, cloak_session_t *
  * and nothing else would ever free that context. That is a small, remotely
  * reachable, unbounded leak: one context per abandoned handshake.
  *
+ * THE SAME OBLIGATION FALLS ON AN OWNER THAT CALLS
+ * cloak_server_registry_close ITSELF. That function is public and fires
+ * neither on_broken (cloak/registry.h: it is the owner's own action) nor
+ * this callback, which only the dispatcher's own unwinds raise -- so an
+ * owner that closes a session by hand must call this function for that
+ * same (uid, session_id) FIRST, while the session is still alive, exactly
+ * as dispatcher.c's sites B and C do. Closing without it leaves the
+ * context orphaned until cloak_proxy_destroy, and leaves any relay bound
+ * to that session running past its destruction. Nothing in this codebase
+ * does that today; this sentence exists so the next owner learns it here
+ * rather than from a leak.
+ *
  * Tears down and frees the context for (uid, session_id) if this proxy
  * has one, and does nothing at all if it does not (the dispatcher fires
  * this for a session it created, which is not necessarily one this proxy
