@@ -11,6 +11,13 @@
 #include "cloak/common.h"
 #include "cloak/crypto.h"
 
+/* Forward-declared: armed both at accept (the first-packet read deadline)
+ * and again in conn_on_firstpacket_done (the reply-write/hand-off
+ * deadline), but its own natural home -- alongside on_readable, the other
+ * reactor callback registered against a connection's fd -- is well after
+ * both of those call sites. See its own doc comment, below. */
+static void on_deadline(cloak_reactor_t *r, void *userdata);
+
 /* ---- connection lifecycle helpers -------------------------------------- */
 
 static void conn_unlink(cloak_dispatch_conn_t *c) {
@@ -404,6 +411,15 @@ static void conn_handoff(cloak_dispatch_conn_t *c) {
     }
 
     c->fd = -1;
+    /* The one exit from the reply-write/hand-off state that does NOT go
+     * through conn_teardown (see on_relay_done's sibling pattern) --
+     * conn_teardown is what cancels the deadline armed for this state on
+     * every other exit, so this success path must do it explicitly
+     * itself, exactly once, here. */
+    if (c->deadline != CLOAK_TIMER_INVALID) {
+        cloak_reactor_cancel_timer(d->cfg.reactor, c->deadline);
+        c->deadline = CLOAK_TIMER_INVALID;
+    }
     if (d->cfg.attached != NULL) {
         d->cfg.attached(d, sesh, &info, created, d->cfg.attached_userdata);
     }
@@ -451,7 +467,18 @@ static void conn_continue_reply_write(cloak_dispatch_conn_t *c) {
                  * dispatches the resulting event back into this
                  * function -- see its own comment for why the same
                  * callback handles both phases. */
-                cloak_reactor_mod_fd(c->d->cfg.reactor, c->fd, CLOAK_REACTOR_WRITABLE);
+                if (cloak_reactor_mod_fd(c->d->cfg.reactor, c->fd, CLOAK_REACTOR_WRITABLE) != 0) {
+                    /* An unlikely failure (this fd is definitely still
+                     * registered, from either cloak_dispatcher_accept's
+                     * original add_fd or an earlier mod_fd call), but
+                     * leaving writing_reply == 1 against a mask that
+                     * never actually changed to WRITABLE would silently
+                     * stall this connection with no further event ever
+                     * arriving for it. Handled the same way every other
+                     * failure in this state is: close, not redirect --
+                     * see conn_reply_write_failed's own comment. */
+                    conn_reply_write_failed(c);
+                }
             }
             return;
         }
@@ -491,6 +518,45 @@ static void conn_on_firstpacket_done(cloak_dispatch_conn_t *c) {
 
     if (dispatcher_authenticate(c) != 0) {
         conn_start_redirect(c);
+        return;
+    }
+
+    /* Entering the reply-write/hand-off state: arm a deadline covering
+     * it. This module's own stated philosophy (see the redirect-dial
+     * timeout's comment, and the first-packet deadline this one just
+     * replaces) is that no state here is unbounded -- a step-10 write
+     * that never drains because the client never reads is exactly the
+     * same failure shape as a first-packet read that never completes,
+     * and deserves the same treatment rather than being allowed to pin
+     * this connection's heap state (including, potentially, a
+     * freshly-created session sitting in the registry) forever.
+     * handshake_timeout_ms is reused rather than given its own knob:
+     * this phase is a single bounded write of at most
+     * CLOAK_SERVER_AUTH_REPLY_MAX_BYTES followed by one
+     * cloak_session_add_conn call, no less bounded than the first-packet
+     * read it follows, so the same timeout is an equally reasonable
+     * bound and it is not worth a second configuration surface for it.
+     * Cancelled on every exit from this state: conn_handoff's success
+     * path cancels it explicitly (see its own comment, since success is
+     * the one exit that does not go through conn_teardown), and every
+     * other exit (redirect is not reachable from here; a step-10 write
+     * failure or a step-11 hand-off failure both route through
+     * conn_drop) cancels it via conn_teardown's own unconditional check
+     * at its top. */
+    c->deadline =
+        cloak_reactor_add_timer(c->d->cfg.reactor, c->d->cfg.handshake_timeout_ms, on_deadline, c);
+    if (c->deadline == CLOAK_TIMER_INVALID) {
+        /* Cannot honor a deadline for this state either -- the same
+         * allocation failure growing the reactor's timer heap that
+         * cloak_dispatcher_accept's own arm-failure handling documents,
+         * with the same conclusion: refusing to enter an unbounded state
+         * is not an option, so this connection is dropped rather than
+         * left to write its reply with nothing to bound it. Routed
+         * through conn_reply_write_failed (close, not redirect) rather
+         * than conn_start_redirect for the same reason every other
+         * failure in this state is: matches this function's own
+         * top-of-state comment above. */
+        conn_reply_write_failed(c);
         return;
     }
 
@@ -567,6 +633,15 @@ static void on_readable(cloak_reactor_t *r, int fd, uint32_t events, void *userd
     }
 }
 
+/* Fires for BOTH deadlines this module ever arms against c->deadline: the
+ * first-packet read deadline (armed in cloak_dispatcher_accept) and the
+ * reply-write/hand-off deadline (armed in conn_on_firstpacket_done) --
+ * never both at once, since the second is armed only after the first has
+ * already been cancelled. Either way, conn_drop is the right response: a
+ * client that never finishes sending its first packet and a client that
+ * never drains this connection's write buffer fail the same way, by
+ * pinning this connection's state forever, and both are handled by
+ * simply dropping the connection. */
 static void on_deadline(cloak_reactor_t *r, void *userdata) {
     (void)r;
     cloak_dispatch_conn_t *c = userdata;
