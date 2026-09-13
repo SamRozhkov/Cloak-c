@@ -80,7 +80,9 @@ int cloak_server_redir_addr(const cloak_server_t *srv, uint16_t local_port,
  * cloak_replay_cache_check_and_insert with the age limit
  * cloak/server_auth.h requires; call it BEFORE decrypting, matching Go's
  * AuthFirstPacket, which checks replay against the raw not-yet-
- * authenticated random. */
+ * authenticated random. srv or random NULL returns 0 (fails open, i.e.
+ * "not a replay") rather than crashing -- consistent with the replay
+ * cache's own zero-capacity behaviour (see cloak/replay_cache.h). */
 int cloak_server_check_replay(cloak_server_t *srv, const uint8_t random[32],
                                int64_t now_unix);
 

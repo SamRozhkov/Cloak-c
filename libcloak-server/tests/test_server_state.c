@@ -310,6 +310,39 @@ static void test_bare_ipv6_redir_addr_starts_and_patches_port(void) {
     }
 }
 
+/* 9 (review fix, finding 2). cloak_server_redir_addr only ever reads
+ * srv->redir and srv->redir_has_port, both plain struct fields, so this
+ * builds a cloak_server_t by hand -- no config parsing, no DNS -- and
+ * checks exactly the two lines that matter: an AF_INET6 address with
+ * redir_has_port == 0 must come back with sin6_port patched to
+ * local_port. This is independent of whether the IPv6 branch is
+ * reachable through cloak_server_init at all, so it isolates the patch
+ * logic itself from the port-detection logic case 8 exercises. */
+static void test_redir_addr_patches_ipv6_port_directly(void) {
+    cloak_server_t srv;
+    memset(&srv, 0, sizeof(srv));
+
+    struct sockaddr_in6 sin6;
+    memset(&sin6, 0, sizeof(sin6));
+    sin6.sin6_family = AF_INET6;
+    sin6.sin6_port = htons(9999); /* must be overwritten */
+    sin6.sin6_addr = in6addr_loopback;
+
+    memcpy(&srv.redir.ss, &sin6, sizeof(sin6));
+    srv.redir.len = sizeof(sin6);
+    srv.redir.socktype = SOCK_STREAM;
+    srv.redir_has_port = 0;
+
+    cloak_addr_t out;
+    memset(&out, 0, sizeof(out));
+    ASSERT_EQ_INT(0, cloak_server_redir_addr(&srv, 4242, &out));
+    const struct sockaddr_in6 *got = (const struct sockaddr_in6 *)&out.ss;
+    ASSERT_EQ_INT(AF_INET6, got->sin6_family);
+    ASSERT_EQ_INT(4242, (int)ntohs(got->sin6_port));
+
+    cloak_server_destroy(&srv);
+}
+
 TEST_MAIN_BEGIN()
     test_admin_uid_is_added_to_bypass_set();
     test_no_admin_uid_leaves_bypass_set_untouched();
@@ -319,4 +352,5 @@ TEST_MAIN_BEGIN()
     test_init_rejects_unresolvable_redir_addr();
     test_destroy_is_idempotent_on_zeroed_struct();
     test_bare_ipv6_redir_addr_starts_and_patches_port();
+    test_redir_addr_patches_ipv6_port_directly();
 TEST_MAIN_END()

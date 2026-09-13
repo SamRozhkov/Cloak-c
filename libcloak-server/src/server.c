@@ -64,10 +64,14 @@ int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
      * only when a port is present, so it doubles as the detector. */
     char redir_host[CLOAK_MAX_HOST_LEN];
     char redir_port[CLOAK_MAX_PORT_LEN];
+    char redir_reason[CLOAK_CONFIG_ERR_LEN];
+    redir_reason[0] = '\0';
     if (cloak_net_split_hostport(cfg->redir_addr, redir_host, sizeof(redir_host),
                                  redir_port, sizeof(redir_port)) == 0) {
-        if (cloak_net_resolve(cfg->redir_addr, 0, &srv->redir, err, err_cap) != 0) {
-            return -1;
+        if (cloak_net_resolve(cfg->redir_addr, 0, &srv->redir, redir_reason,
+                              sizeof(redir_reason)) != 0) {
+            return set_err(err, err_cap, "server: RedirAddr \"%s\": %s",
+                          cfg->redir_addr, redir_reason);
         }
         srv->redir_has_port = 1;
     } else {
@@ -94,8 +98,10 @@ int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
             return set_err(err, err_cap, "server: RedirAddr \"%s\" is too long",
                           cfg->redir_addr);
         }
-        if (cloak_net_resolve(placeholder, 0, &srv->redir, err, err_cap) != 0) {
-            return -1;
+        if (cloak_net_resolve(placeholder, 0, &srv->redir, redir_reason,
+                              sizeof(redir_reason)) != 0) {
+            return set_err(err, err_cap, "server: RedirAddr \"%s\": %s",
+                          cfg->redir_addr, redir_reason);
         }
         srv->redir_has_port = 0;
     }
@@ -210,6 +216,11 @@ int cloak_server_redir_addr(const cloak_server_t *srv, uint16_t local_port,
             ((struct sockaddr_in6 *)sa)->sin6_port = htons(local_port);
             break;
         default:
+            /* Unreachable: srv->redir was populated by cloak_net_resolve,
+             * which only ever produces AF_INET or AF_INET6 (see
+             * cloak/net.h). Left as a no-op rather than a failure -- an
+             * unpatched port is a safer failure mode than crashing given
+             * this can only happen if that guarantee is ever broken. */
             break;
         }
     }
