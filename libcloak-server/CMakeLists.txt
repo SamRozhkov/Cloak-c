@@ -3,6 +3,7 @@ add_library(cloak-server STATIC
     src/server_auth.c
     src/replay_cache.c
     src/firstpacket.c
+    src/server.c
 )
 
 target_include_directories(cloak-server PUBLIC include)

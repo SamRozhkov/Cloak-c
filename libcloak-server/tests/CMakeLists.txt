@@ -18,3 +18,9 @@ target_include_directories(test_firstpacket PRIVATE ${CMAKE_SOURCE_DIR}/libcloak
 target_link_libraries(test_firstpacket PRIVATE cloak-server)
 add_test(NAME test_firstpacket COMMAND test_firstpacket)
 set_tests_properties(test_firstpacket PROPERTIES TIMEOUT 60)
+
+add_executable(test_server_state test_server_state.c)
+target_include_directories(test_server_state PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_server_state PRIVATE cloak-server)
+add_test(NAME test_server_state COMMAND test_server_state)
+set_tests_properties(test_server_state PROPERTIES TIMEOUT 60)
