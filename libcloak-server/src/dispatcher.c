@@ -4,7 +4,12 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "cloak/clienthello_parse.h"
+#include "cloak/common.h"
+#include "cloak/crypto.h"
 
 /* ---- connection lifecycle helpers -------------------------------------- */
 
@@ -37,6 +42,28 @@ static void conn_teardown(cloak_dispatch_conn_t *c) {
         c->deadline = CLOAK_TIMER_INVALID;
     }
 
+    /* If dispatcher_authenticate got as far as creating a brand-new
+     * session for this connection (auth_created) but the connection
+     * itself never completed hand-off to it -- a step-10 write failure,
+     * a step-11 cloak_session_add_conn failure, or the whole dispatcher
+     * tearing down while this connection was mid-reply-write -- that
+     * session would otherwise sit in the registry forever with zero
+     * connections and nobody left who could ever add one. Every one of
+     * those paths funnels through conn_drop (hence here) rather than
+     * through conn_handoff's success branch, which never calls this
+     * function at all (see on_relay_done's sibling pattern) -- so this
+     * check never fires for a connection that actually made it onto its
+     * session. auth_created is 0 for an additional connection to an
+     * ALREADY-existing session, so this never tears one of those down
+     * over one bad late-stage failure -- exactly the discrimination
+     * cloak/registry.h's own "created == 1" guidance on
+     * cloak_server_registry_close requires. Guarded so this runs at most
+     * once even if conn_teardown is ever called twice on the same c. */
+    if (c->auth_created) {
+        cloak_server_registry_close(c->d->cfg.registry, c->auth_uid, c->auth_session_id);
+        c->auth_created = 0;
+    }
+
     if (c->relaying) {
         /* The relay owns both fds by now; stopping it closes both and
          * fires no completion callback (this is a teardown, not the
@@ -53,6 +80,11 @@ static void conn_teardown(cloak_dispatch_conn_t *c) {
             cloak_dial_cancel(&c->dial);
             c->dialing = 0;
         }
+        /* Covers the writing_reply case too: a connection mid-reply-write
+         * has no dial or relay live, just an fd registered
+         * CLOAK_REACTOR_WRITABLE, which this removes and closes exactly
+         * like any other still-owned fd. */
+        c->writing_reply = 0;
         if (c->fd >= 0) {
             /* A no-op (returns -1) if fd is not currently registered,
              * e.g. because we are mid-dial and already removed it --
@@ -74,20 +106,181 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
     free(c);
 }
 
-/* ---- authentication stub ------------------------------------------------
+/* ---- authentication ------------------------------------------------------
  *
- * Always fails. Task 2 replaces this with real ClientHello parsing,
- * decryption, replay checking and session lookup
- * (cloak_clienthello_parse + cloak_server_check_replay +
- * cloak_server_auth_decrypt + cloak_server_registry_get_or_create); a
- * successful authentication there hands the connection to
- * cloak_session_add_conn instead of falling through to redirect. Until
- * then, every connection that completes its first packet -- Cloak or
- * not -- is treated as unauthenticated, which is exactly Go's behaviour
- * for any connection this server cannot yet recognise. */
+ * The maximum length cloak_server_auth_cert_lens can ever contain (see
+ * cloak/server_auth.h's own CLOAK_SERVER_AUTH_REPLY_MAX_BYTES comment,
+ * which derives the same number: 68). A stack buffer this size can hold
+ * any cert length that constant offers, chosen uniformly per connection
+ * below. */
+#define DISPATCHER_MAX_FAKE_CERT_LEN 68
+
+/* Steps 1-9 of the task-2 brief's authenticated path, in order, with the
+ * reason each is where it is:
+ *
+ *  1. Only CLOAK_FIRSTPACKET_TRANSPORT_TLS proceeds --
+ *     CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET has no consumer until the CDN
+ *     module exists (cloak/firstpacket.h says so).
+ *  2. cloak_clienthello_parse over the already-framed record.
+ *  3. cloak_server_check_replay against the RAW, not-yet-authenticated
+ *     ch.random -- BEFORE any decryption, so a replayed handshake is
+ *     rejected without the server doing any asymmetric work (both
+ *     cloak/server.h and cloak/server_auth.h state this ordering; Go does
+ *     the same).
+ *  4. cloak_server_auth_decrypt. Everything in info is attacker-chosen
+ *     until step 6 authorises info.uid.
+ *  5. cloak_aead_method_is_valid on info.encryption_method BEFORE it is
+ *     used for anything -- cloak/crypto.h requires this of any
+ *     wire-sourced method byte; skipping it is how a wire byte becomes an
+ *     out-of-range array index later (cloak_aead_overhead,
+ *     cloak_session_config_t's obfuscator).
+ *  6. cloak_server_is_bypass is the whole authorisation policy until a
+ *     user manager exists. No logging on failure -- a prober learns
+ *     nothing from a silent redirect.
+ *  7. cloak_server_lookup_proxy(info.proxy_method) must resolve; this
+ *     task only checks existence; the address itself is a later task's
+ *     concern.
+ *  8. cloak_server_registry_find FIRST. If found, this is an additional
+ *     connection to a session that already exists: THE LIVE-KEY RULE --
+ *     compose the reply with sesh->obfuscator.session_key, never a fresh
+ *     one (cloak/registry.h's own get_or_create doc comment explains why
+ *     composing with fresh material here silently breaks every frame on
+ *     this connection with no error at the handshake). If not found,
+ *     generate a fresh key, build the session config from
+ *     cfg.session_config_template plus the decrypted encryption method,
+ *     run the owner's prepare_session callback (if any), and
+ *     cloak_server_registry_get_or_create.
+ *  9. cloak_server_auth_compose_reply with a fresh nonce, a fresh pad4,
+ *     and a cert length chosen uniformly from cloak_server_auth_cert_lens
+ *     (a DPI-plausibility measure -- a fixed length would itself be a
+ *     fingerprint).
+ *
+ * On success, fills c->reply/reply_len and c->auth_* (consumed by
+ * conn_continue_reply_write and conn_handoff, steps 10-11) and returns 0.
+ * On any failure this function returns -1 having left the connection
+ * exactly as it found it (redirectable) EXCEPT for one thing: if step 8
+ * created a brand-new session and a LATER step in this same function
+ * (only step 9 can fail after that point) then fails, that session is
+ * torn down here, via cloak_server_registry_close, before returning --
+ * matching cloak/registry.h's "created == 1 is the only correct
+ * discriminator" guidance. A failure at or before step 8's create never
+ * has a session to unwind. */
 static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
-    (void)c;
-    return -1;
+    cloak_dispatcher_t *d = c->d;
+    cloak_server_t *srv = d->cfg.srv;
+
+    /* 1. Transport. */
+    if (c->fp.transport != CLOAK_FIRSTPACKET_TRANSPORT_TLS) {
+        return -1;
+    }
+
+    /* 2. Parse. */
+    cloak_clienthello_parsed_t ch;
+    if (cloak_clienthello_parse(cloak_firstpacket_data(&c->fp), cloak_firstpacket_len(&c->fp),
+                                &ch) != 0) {
+        return -1;
+    }
+
+    int64_t now = (int64_t)time(NULL);
+
+    /* 3. Replay, against the raw random, before decrypting. */
+    if (cloak_server_check_replay(srv, ch.random, now)) {
+        return -1;
+    }
+
+    /* 4. Decrypt. */
+    cloak_server_clientinfo_t info;
+    uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
+    if (cloak_server_auth_decrypt(ch.random, ch.session_id, ch.session_id_len,
+                                  ch.x25519_key_share, srv->cfg->private_key, now, &info,
+                                  shared_secret) != 0) {
+        return -1;
+    }
+
+    /* 5. Validate the wire-sourced method byte before it is used for
+     * anything at all. */
+    if (!cloak_aead_method_is_valid((cloak_aead_method_t)info.encryption_method)) {
+        return -1;
+    }
+
+    /* 6. Authorise the UID. */
+    if (!cloak_server_is_bypass(srv, info.uid)) {
+        return -1;
+    }
+
+    /* 7. Proxy method must be known; the resolved address itself is a
+     * later task's concern. */
+    if (cloak_server_lookup_proxy(srv, info.proxy_method) == NULL) {
+        return -1;
+    }
+
+    /* 8. Find, then (only if not found) create. */
+    int created = 0;
+    uint8_t session_key[CLOAK_AEAD_KEY_LEN];
+    cloak_session_t *sesh = cloak_server_registry_find(d->cfg.registry, info.uid, info.session_id);
+    if (sesh != NULL) {
+        /* THE LIVE-KEY RULE: an existing session's config (obfuscator
+         * included) was fixed at whatever creation first used -- read
+         * ITS key back out rather than generating a fresh one. See
+         * cloak/registry.h's own get_or_create doc comment. */
+        memcpy(session_key, sesh->obfuscator.session_key, CLOAK_AEAD_KEY_LEN);
+    } else {
+        cloak_random_bytes(session_key, sizeof(session_key));
+
+        cloak_session_config_t session_cfg = d->cfg.session_config_template;
+        session_cfg.obfuscator.method = (cloak_aead_method_t)info.encryption_method;
+        memcpy(session_cfg.obfuscator.session_key, session_key, CLOAK_AEAD_KEY_LEN);
+
+        if (d->cfg.prepare_session != NULL &&
+            d->cfg.prepare_session(d, &info, &session_cfg, d->cfg.prepare_session_userdata) != 0) {
+            /* Nothing was created yet -- nothing to unwind. */
+            return -1;
+        }
+
+        sesh = cloak_server_registry_get_or_create(d->cfg.registry, info.uid, info.session_id,
+                                                    &session_cfg, &created);
+        if (sesh == NULL) {
+            /* Resource limit or cloak_session_init/allocation failure --
+             * cloak/registry.h documents *out_created as untouched here,
+             * and indeed nothing was created either way. */
+            return -1;
+        }
+    }
+
+    /* 9. Compose the reply: fresh nonce, fresh pad4, a uniformly chosen
+     * cert length. */
+    uint8_t reply_nonce[CLOAK_AEAD_NONCE_LEN];
+    uint8_t pad4[4];
+    cloak_random_bytes(reply_nonce, sizeof(reply_nonce));
+    cloak_random_bytes(pad4, sizeof(pad4));
+
+    uint8_t cert_pick;
+    cloak_random_bytes(&cert_pick, 1);
+    size_t cert_len = cloak_server_auth_cert_lens[cert_pick % CLOAK_SERVER_AUTH_CERT_LEN_COUNT];
+    uint8_t fake_cert[DISPATCHER_MAX_FAKE_CERT_LEN];
+    cloak_random_bytes(fake_cert, cert_len);
+
+    long n = cloak_server_auth_compose_reply(shared_secret, session_key, reply_nonce, ch.session_id,
+                                             pad4, fake_cert, cert_len, c->reply, sizeof(c->reply));
+    if (n <= 0) {
+        /* Unwind: this is the one failure in this function that can
+         * happen AFTER step 8 created a session. created == 1 is the
+         * only correct discriminator -- see this function's own
+         * top-of-task comment and cloak/registry.h. */
+        if (created) {
+            cloak_server_registry_close(d->cfg.registry, info.uid, info.session_id);
+        }
+        return -1;
+    }
+
+    c->reply_len = (size_t)n;
+    c->reply_sent = 0;
+    c->auth_sesh = sesh;
+    c->auth_created = created;
+    c->auth_info = info;
+    memcpy(c->auth_uid, info.uid, CLOAK_UID_LEN);
+    c->auth_session_id = info.session_id;
+    return 0;
 }
 
 /* ---- redirect path ------------------------------------------------------ */
@@ -175,6 +368,103 @@ static void conn_start_redirect(cloak_dispatch_conn_t *c) {
     c->dialing = 1;
 }
 
+/* ---- post-authentication: reply write and hand-off ---------------------- */
+
+/* Step 11. Only ever called once c->reply has been written in full.
+ * c->fd is still ours; this is the one place that either hands it, still
+ * open, to cloak_session_add_conn, or closes it itself. */
+static void conn_handoff(cloak_dispatch_conn_t *c) {
+    cloak_dispatcher_t *d = c->d;
+    int fd = c->fd;
+    cloak_session_t *sesh = c->auth_sesh;
+    int created = c->auth_created;
+    cloak_server_clientinfo_t info = c->auth_info;
+
+    /* c->fd was registered CLOAK_REACTOR_WRITABLE (or never re-registered
+     * at all, if step 10's write completed synchronously on the first
+     * attempt) for the reply write; either way it must come off the
+     * reactor before cloak_session_add_conn wraps it in a cloak_conn_t of
+     * its own, exactly like the redirect path's own dial hand-off. */
+    cloak_reactor_remove_fd(d->cfg.reactor, fd);
+
+    if (cloak_session_add_conn(sesh, fd) != 0) {
+        /* The dispatcher still owns fd on failure (cloak_session_add_conn's
+         * own contract). The client has already received a ServerHello by
+         * this point -- the reply this connection just finished writing
+         * -- so the cover story is blown regardless of what happens now;
+         * close rather than redirect, the same reasoning
+         * conn_reply_write_failed documents for a step-10 write error.
+         * conn_drop's call into conn_teardown is what unwinds a
+         * brand-new session here, if this connection was the one that
+         * created it (auth_created is still set on c at this point). */
+        close(fd);
+        c->fd = -1;
+        conn_drop(c);
+        return;
+    }
+
+    c->fd = -1;
+    if (d->cfg.attached != NULL) {
+        d->cfg.attached(d, sesh, &info, created, d->cfg.attached_userdata);
+    }
+    conn_unlink(c);
+    free(c);
+}
+
+/* Step 10's failure path. A write error here is the ONE place in this
+ * whole module that closes instead of redirecting: by the time this can
+ * fire, the client has already received a ServerHello (composed in
+ * dispatcher_authenticate, step 9), so the cover story is already blown
+ * -- forwarding to the cover site now would be visibly incoherent (a real
+ * web server never follows a ServerHello with a second, unrelated
+ * handshake attempt). Do NOT "fix" this into a redirect. conn_drop's call
+ * into conn_teardown is what unwinds a brand-new session here, if this
+ * connection was the one that created it. */
+static void conn_reply_write_failed(cloak_dispatch_conn_t *c) {
+    conn_drop(c);
+}
+
+/* Step 10. Writes c->reply[c->reply_sent, c->reply_len) to c->fd,
+ * non-blocking: what the socket takes is taken, and on a short write or
+ * EAGAIN this registers c->fd for writable and returns, to be called
+ * again from on_readable (see its own comment) once the reactor says the
+ * fd is writable. Only once the last byte is out does the connection
+ * proceed to hand-off (step 11) -- this is the one non-blocking
+ * write-then-handover primitive the project did not already have. */
+static void conn_continue_reply_write(cloak_dispatch_conn_t *c) {
+    while (c->reply_sent < c->reply_len) {
+        size_t remaining = c->reply_len - c->reply_sent;
+        ssize_t n = write(c->fd, c->reply + c->reply_sent, remaining);
+        if (n > 0) {
+            c->reply_sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!c->writing_reply) {
+                c->writing_reply = 1;
+                /* Switches this fd's registration from whatever it was
+                 * (READABLE, during first-packet reading) to WRITABLE;
+                 * on_readable (registered once, at accept) is what
+                 * dispatches the resulting event back into this
+                 * function -- see its own comment for why the same
+                 * callback handles both phases. */
+                cloak_reactor_mod_fd(c->d->cfg.reactor, c->fd, CLOAK_REACTOR_WRITABLE);
+            }
+            return;
+        }
+        /* A real write error: the peer is gone or the socket is broken. */
+        conn_reply_write_failed(c);
+        return;
+    }
+
+    /* Fully drained. */
+    c->writing_reply = 0;
+    conn_handoff(c);
+}
+
 /* ---- reading the first packet -------------------------------------------- */
 
 static void conn_on_firstpacket_error(cloak_dispatch_conn_t *c) {
@@ -188,12 +478,23 @@ static void conn_on_firstpacket_error(cloak_dispatch_conn_t *c) {
 }
 
 static void conn_on_firstpacket_done(cloak_dispatch_conn_t *c) {
+    /* Past this point the connection is no longer "reading its first
+     * packet" regardless of what happens next -- authentication success,
+     * authentication failure (redirect), or a step-10 write failure
+     * (close) -- so the deadline is cancelled here, once, on every path
+     * out of this state. conn_start_redirect's own cancellation below is
+     * then a documented no-op (CLOAK_TIMER_INVALID guard). */
+    if (c->deadline != CLOAK_TIMER_INVALID) {
+        cloak_reactor_cancel_timer(c->d->cfg.reactor, c->deadline);
+        c->deadline = CLOAK_TIMER_INVALID;
+    }
+
     if (dispatcher_authenticate(c) != 0) {
         conn_start_redirect(c);
         return;
     }
-    /* Task 2: a successful authentication hands c->fd to
-     * cloak_session_add_conn here instead. */
+
+    conn_continue_reply_write(c);
 }
 
 static void conn_drop_peer_gone(cloak_dispatch_conn_t *c) {
@@ -204,10 +505,25 @@ static void conn_drop_peer_gone(cloak_dispatch_conn_t *c) {
     conn_drop(c);
 }
 
+/* The single callback registered (once, at accept) for a connection's own
+ * fd, for the whole time this module owns that fd. It serves two,
+ * mutually exclusive, phases of that fd's life: reading the first packet
+ * (registered CLOAK_REACTOR_READABLE) and, after a successful
+ * authentication, draining the non-blocking reply write (registered
+ * CLOAK_REACTOR_WRITABLE via cloak_reactor_mod_fd in
+ * conn_continue_reply_write) -- cloak_reactor_mod_fd changes the event
+ * mask of an existing registration, not its callback, so this same
+ * function is what the reactor calls for both; c->writing_reply is what
+ * tells it which phase it is in. */
 static void on_readable(cloak_reactor_t *r, int fd, uint32_t events, void *userdata) {
     (void)r;
     (void)events;
     cloak_dispatch_conn_t *c = userdata;
+
+    if (c->writing_reply) {
+        conn_continue_reply_write(c);
+        return;
+    }
 
     /* Edge-triggered: this loop must keep reading until want() reaches 0
      * or read() returns EAGAIN, or data that arrived within this same

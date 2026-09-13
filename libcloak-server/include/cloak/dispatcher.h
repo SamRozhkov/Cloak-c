@@ -7,7 +7,10 @@
 #include "cloak/firstpacket.h"
 #include "cloak/net.h"
 #include "cloak/reactor.h"
+#include "cloak/registry.h"
 #include "cloak/server.h"
+#include "cloak/server_auth.h"
+#include "cloak/session.h"
 
 /* The server's front door: turns an accepted connection into either a
  * redirect to the cover site or (from a later task) an authenticated
@@ -58,20 +61,30 @@
  * taking on for a signal that already fails to distinguish this server
  * from a real one.
  *
- * AUTHENTICATION IS STUBBED IN THIS TASK: every connection that completes
- * its first packet is treated as unauthenticated and redirected. This
- * makes the server behave exactly like Go Cloak does for any non-Cloak
- * connection today, which is why it is a real milestone rather than
- * scaffolding -- Task 2 replaces the stub with real ClientHello parsing,
- * decryption, replay checking and session lookup, at which point a
- * successful authentication starts handing connections to a
- * cloak_session_t instead of always falling through here.
+ * AUTHENTICATION: a connection whose first packet is a TLS record parses
+ * as a real Cloak ClientHello, passes the replay check, decrypts, carries
+ * a valid encryption method, an authorised UID, and a known proxy method
+ * attaches to a cloak_session_t (new or existing) instead of falling
+ * through to redirect -- see dispatcher.c's dispatcher_authenticate for
+ * the ordered list of checks and docs/superpowers/plans/
+ * 2026-09-13-libcloak-server-dispatcher-plan.md's task-2 brief for why
+ * each one is where it is. Every other connection -- wrong transport,
+ * unparseable, replayed, undecryptable, unauthorised, or an unknown proxy
+ * method -- is treated exactly like any other non-Cloak connection and
+ * redirected, matching Go Cloak's own behaviour. The ONE exception is a
+ * failure writing the post-authentication reply (step 10 in that brief):
+ * by then the client has already received a ServerHello, so the cover
+ * story is blown regardless, and that path closes rather than redirects
+ * -- see conn_reply_write_failed's own comment in dispatcher.c.
  *
  * TEARDOWN: cloak_dispatcher_destroy walks every connection still
- * in-flight (reading its first packet, mid-dial, or mid-relay) and tears
- * each one down -- cancelling its deadline, cancelling or stopping
- * whatever redirect machinery is live, and closing whatever fd(s) the
- * connection still owns. This is the caller's own shutdown, not a failure
+ * in-flight (reading its first packet, mid-dial, mid-relay, or mid-reply-
+ * write) and tears each one down -- cancelling its deadline, cancelling
+ * or stopping whatever redirect machinery is live, closing a brand-new
+ * session this connection created but never finished attaching to (see
+ * conn_teardown's own comment in dispatcher.c), and closing whatever
+ * fd(s) the connection still owns. This is the caller's own shutdown, not
+ * a failure
  * path, so nothing here is reported back to whoever initiated it.
  *
  * OWNERSHIP, stated once: a connection owns its client fd from the moment
@@ -109,9 +122,91 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * bytes) plus room to make forward progress under ordinary backpressure. */
 #define CLOAK_DISPATCHER_DEFAULT_RELAY_BUF_CAP ((size_t)16384)
 
-/* Everything cloak_dispatcher_init needs. reactor and srv are borrowed,
- * not copied or owned: both must outlive every connection the dispatcher
- * ever accepts, i.e. for the dispatcher's own whole lifetime.
+/* Invoked exactly once per authenticated connection, ONLY when that
+ * connection's (uid, session_id) is about to create a brand-new session
+ * (cloak_server_registry_find found nothing) -- never for an additional
+ * connection to a session that already exists, since there is nothing
+ * left for this callback to prepare in that case. This is the owner's one
+ * chance to install its own on_new_stream/on_stream_data/on_writable
+ * (plus their userdata) into *config before cloak_server_registry_get_or_
+ * create runs; info is the fully authorised cloak_server_clientinfo_t
+ * (uid already checked against cloak_server_is_bypass, proxy_method
+ * already checked against cloak_server_lookup_proxy) this session is
+ * being created for.
+ *
+ * The owner MUST NOT set config->on_broken or config->on_broken_userdata
+ * -- cloak_server_registry_get_or_create overwrites both unconditionally
+ * regardless of what is here, and cloak/registry.h's own doc comment
+ * explains why: the registry needs its own hook to do the bookkeeping
+ * that makes cloak_server_registry_close and the sweep timer work at all.
+ * Anything written to either field here is simply discarded.
+ *
+ * Returning -1 abandons the handshake: the connection is redirected to
+ * RedirAddr exactly as if authentication itself had failed, and
+ * cloak_server_registry_get_or_create is never called -- so nothing is
+ * left in the registry. Returning 0 proceeds to create the session with
+ * *config as (possibly) modified by this callback. */
+typedef int (*cloak_dispatch_prepare_session_cb)(cloak_dispatcher_t *d,
+                                                  const cloak_server_clientinfo_t *info,
+                                                  cloak_session_config_t *config,
+                                                  void *userdata);
+
+/* Fired once per authenticated connection, after cloak_session_add_conn
+ * has already succeeded -- i.e. this connection is now genuinely part of
+ * sesh's pool. created is 1 if this connection is what just created sesh
+ * (cloak_dispatch_prepare_session_cb, if non-NULL, already ran for it) or
+ * 0 if sesh already existed and this connection merely attached to it.
+ * info is the same authorised cloak_server_clientinfo_t
+ * cloak_dispatch_prepare_session_cb would have seen (had it run) --
+ * notably, on the created == 0 path, info still describes THIS
+ * connection's own authentication, not whatever created sesh originally,
+ * so a caller wanting session-identifying data should prefer sesh's own
+ * (uid, session_id) it already tracks rather than re-deriving it from
+ * info on this path. */
+typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_t *sesh,
+                                            const cloak_server_clientinfo_t *info, int created,
+                                            void *userdata);
+
+/* Everything cloak_dispatcher_init needs. reactor, srv and registry are
+ * all borrowed, not copied or owned: every one of them must outlive every
+ * connection the dispatcher ever accepts, i.e. for the dispatcher's own
+ * whole lifetime.
+ *
+ * srv is deliberately NOT const (unlike a plain read-only accessor):
+ * cloak_server_check_replay mutates srv's replay cache, and the
+ * dispatcher must call it on every authentication attempt (see
+ * dispatcher.c's dispatcher_authenticate) -- so the caller's own
+ * cloak_server_t must itself be non-const/mutable, exactly like every
+ * existing caller in this codebase already constructs it as.
+ *
+ * registry may be NULL: authentication can then never succeed (every
+ * cloak_server_registry_find/get_or_create call this module makes
+ * tolerates a NULL registry by reporting "not found"/"cannot create",
+ * exactly like every other NULL-tolerant accessor cloak/registry.h
+ * documents), so every otherwise-successful handshake redirects instead
+ * -- useful for a caller (or a test) that only wants the redirect path
+ * exercised and has no registry to offer yet.
+ *
+ * session_config_template is copied by value into every NEWLY created
+ * session's config (cloak_server_registry_find found nothing): the
+ * dispatcher overwrites exactly two fields of the copy before passing it
+ * to cloak_server_registry_get_or_create --
+ * obfuscator.method (the client's authenticated, wire-validated
+ * encryption method) and obfuscator.session_key (a fresh
+ * cloak_random_bytes key) -- so whatever this template's own obfuscator
+ * field holds is irrelevant and always replaced. on_broken/
+ * on_broken_userdata are similarly irrelevant here for the same reason
+ * cloak_dispatch_prepare_session_cb's own doc comment gives: get_or_create
+ * overwrites both unconditionally. This template is NEVER consulted on
+ * the existing-session path (cloak_server_registry_find succeeded) --
+ * see cloak/registry.h's own warning that the existing-session path
+ * discards *config entirely, obfuscator included, which is why the live
+ * session's own key must be read back out of it rather than recomputed
+ * from this template; dispatcher.c's dispatcher_authenticate does exactly
+ * that.
+ *
+ * prepare_session/prepare_session_userdata and attached/attached_userdata
+ * may each be NULL independently (no-op / nothing to fire).
  *
  * The three *_ms/_cap fields each default (0 means "use the default")
  * to the CLOAK_DISPATCHER_DEFAULT_* constant above; a config that leaves
@@ -120,7 +215,14 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * set handshake_timeout_ms explicitly instead. */
 typedef struct {
     cloak_reactor_t *reactor;
-    const cloak_server_t *srv;
+    cloak_server_t *srv;
+    cloak_server_registry_t *registry;
+
+    cloak_session_config_t session_config_template;
+    cloak_dispatch_prepare_session_cb prepare_session;
+    void *prepare_session_userdata;
+    cloak_dispatch_attached_cb attached;
+    void *attached_userdata;
 
     uint64_t handshake_timeout_ms;
     uint64_t redirect_dial_timeout_ms;
@@ -140,11 +242,22 @@ typedef struct cloak_dispatch_conn cloak_dispatch_conn_t;
  * connection) -- see cloak_dispatcher_t's own doc comment for the
  * ownership rule this implements.
  *
- * dialing and relaying are never both set: they mark which of dial/relay
- * (if either) currently has a live registration with the reactor, so
- * teardown code knows which of cloak_dial_cancel/cloak_relay_stop (if
- * either) it must call, rather than calling both defensively against
- * whichever one happens to hold stale zeroed state. */
+ * dialing, relaying and writing_reply are never more than one set at a
+ * time: they mark which piece of post-first-packet machinery (if any)
+ * currently has a live registration with the reactor, so teardown code
+ * knows which of cloak_dial_cancel/cloak_relay_stop/"just remove_fd and
+ * close" it must apply, rather than trying all of them defensively
+ * against whichever one happens to hold stale zeroed state.
+ *
+ * auth_created, auth_uid, auth_session_id, auth_sesh and auth_info are
+ * populated by a SUCCESSFUL dispatcher_authenticate (dispatcher.c) and
+ * are what carries a connection's authentication result across the
+ * non-blocking reply write (writing_reply) to the eventual hand-off --
+ * they are meaningless (and untouched) before that point. auth_created
+ * is THE unwind discriminator conn_teardown uses: see its own comment in
+ * dispatcher.c and cloak/registry.h's own "created == 1" guidance on
+ * cloak_server_registry_close for why closing unconditionally instead
+ * would be wrong. */
 struct cloak_dispatch_conn {
     cloak_dispatcher_t *d;
     int fd;
@@ -152,11 +265,31 @@ struct cloak_dispatch_conn {
     cloak_firstpacket_t fp;
     cloak_timer_id_t deadline;
 
-    /* Redirect state. Only one of these is live at a time. */
+    /* Redirect state. Only one of dialing/relaying/writing_reply is live
+     * at a time. */
     cloak_dial_t dial;
     int dialing;
     cloak_relay_t relay;
     int relaying;
+
+    /* Authenticated-reply-write state (dispatcher.c's step 10). reply_len
+     * is the total number of bytes cloak_server_auth_compose_reply wrote;
+     * reply_sent is how many of those this connection has successfully
+     * written to fd so far. writing_reply is 1 exactly while fd is
+     * registered CLOAK_REACTOR_WRITABLE for this purpose. */
+    int writing_reply;
+    uint8_t reply[CLOAK_SERVER_AUTH_REPLY_MAX_BYTES];
+    size_t reply_len;
+    size_t reply_sent;
+
+    /* Authentication result, valid only once dispatcher_authenticate has
+     * returned success for this connection -- see this struct's own
+     * top-of-task comment above. */
+    int auth_created;
+    uint8_t auth_uid[CLOAK_UID_LEN];
+    uint32_t auth_session_id;
+    cloak_session_t *auth_sesh;
+    cloak_server_clientinfo_t auth_info;
 
     struct cloak_dispatch_conn *prev, *next; /* dispatcher's intrusive list */
 };
@@ -165,10 +298,11 @@ struct cloak_dispatcher {
     cloak_dispatcher_config_t cfg;
 
     /* Every connection currently reading its first packet, dialing the
-     * cover site, or being relayed to it. NULL when empty. A connection
-     * unlinks itself (and frees itself) the moment it is finished --
-     * handed off, redirected to completion, or dropped -- so this list is
-     * exactly "still in flight", never a history. */
+     * cover site, being relayed to it, or (once authenticated) draining
+     * its non-blocking reply write before hand-off. NULL when empty. A
+     * connection unlinks itself (and frees itself) the moment it is
+     * finished -- handed off, redirected to completion, or dropped -- so
+     * this list is exactly "still in flight", never a history. */
     cloak_dispatch_conn_t *conns;
     size_t conn_count;
 };
@@ -225,7 +359,8 @@ void cloak_dispatcher_destroy(cloak_dispatcher_t *d);
 void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata);
 
 /* The number of connections currently in flight (reading their first
- * packet, dialing, or being relayed). NULL d returns 0. */
+ * packet, dialing, being relayed, or draining a post-authentication reply
+ * write). NULL d returns 0. */
 size_t cloak_dispatcher_conn_count(const cloak_dispatcher_t *d);
 
 #endif

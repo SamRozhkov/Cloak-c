@@ -36,3 +36,9 @@ target_include_directories(test_dispatcher_redirect PRIVATE ${CMAKE_SOURCE_DIR}/
 target_link_libraries(test_dispatcher_redirect PRIVATE cloak-server)
 add_test(NAME test_dispatcher_redirect COMMAND test_dispatcher_redirect)
 set_tests_properties(test_dispatcher_redirect PROPERTIES TIMEOUT 60)
+
+add_executable(test_dispatcher_auth test_dispatcher_auth.c)
+target_include_directories(test_dispatcher_auth PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_auth PRIVATE cloak-server)
+add_test(NAME test_dispatcher_auth COMMAND test_dispatcher_auth)
+set_tests_properties(test_dispatcher_auth PROPERTIES TIMEOUT 60)
