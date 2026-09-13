@@ -92,10 +92,12 @@ typedef void (*cloak_stream_relay_done_cb)(cloak_stream_relay_t *sr, void *userd
  * failure that actually happens in practice -- see
  * cloak_session_send_min_conn_free's own doc comment).
  *
- * cloak_stream_relay_start rejects outright (returns -1) rather than
- * starting a relay that could never move a single byte: see its own doc
- * comment for the exact condition, expressed in terms of this same
- * per-connection quantity so the two can never disagree. */
+ * cloak_stream_relay_start rejects outright (returns -2, the retryable
+ * code -- this quantity is what a draining pool recovers, so the same
+ * relay may start fine a moment later) rather than starting a relay that
+ * could never move a single byte: see its own doc comment for the exact
+ * condition, expressed in terms of this same per-connection quantity so
+ * the two can never disagree. */
 
 struct cloak_stream_relay {
     cloak_reactor_t *reactor;
