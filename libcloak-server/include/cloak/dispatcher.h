@@ -315,15 +315,27 @@ typedef struct cloak_dispatch_conn cloak_dispatch_conn_t;
  * close" it must apply, rather than trying all of them defensively
  * against whichever one happens to hold stale zeroed state.
  *
- * auth_created, auth_uid, auth_session_id, auth_sesh and auth_info are
- * populated by a SUCCESSFUL dispatcher_authenticate (dispatcher.c) and
- * are what carries a connection's authentication result across the
- * non-blocking reply write (writing_reply) to the eventual hand-off --
- * they are meaningless (and untouched) before that point. auth_created
- * is THE unwind discriminator conn_teardown uses: see its own comment in
+ * auth_created, auth_uid, auth_session_id and auth_info are populated by
+ * a SUCCESSFUL dispatcher_authenticate (dispatcher.c) and are what
+ * carries a connection's authentication result across the non-blocking
+ * reply write (writing_reply) to the eventual hand-off -- they are
+ * meaningless (and untouched) before that point. auth_created is THE
+ * unwind discriminator conn_teardown uses: see its own comment in
  * dispatcher.c and cloak/registry.h's own "created == 1" guidance on
  * cloak_server_registry_close for why closing unconditionally instead
- * would be wrong.
+ * would be wrong -- and why even auth_created == 1 alone is not quite
+ * enough; conn_teardown's own comment has the rest.
+ *
+ * Deliberately NOT stored here: a cloak_session_t* captured at
+ * authentication time. auth_uid/auth_session_id are what conn_handoff and
+ * conn_teardown both use to re-resolve the session via
+ * cloak_server_registry_find immediately before touching it, rather than
+ * dereferencing a raw pointer that spans the writing_reply gap -- a gap
+ * the registry can free that exact memory within, via either another
+ * connection's session breaking (a zero-delay sweep timer) or this
+ * session's own inactivity timeout. A stored pointer field here would
+ * invite exactly the use-after-free re-resolving avoids; see
+ * conn_handoff's own comment in dispatcher.c for the full sequence.
  *
  * pending is 1 from cloak_dispatcher_accept until this connection either
  * starts relaying or is handed off to a session, and 0 for the rest of
@@ -366,7 +378,6 @@ struct cloak_dispatch_conn {
     int auth_created;
     uint8_t auth_uid[CLOAK_UID_LEN];
     uint32_t auth_session_id;
-    cloak_session_t *auth_sesh;
     cloak_server_clientinfo_t auth_info;
 
     struct cloak_dispatch_conn *prev, *next; /* dispatcher's intrusive list */

@@ -66,22 +66,43 @@ static void conn_teardown(cloak_dispatch_conn_t *c) {
     /* If dispatcher_authenticate got as far as creating a brand-new
      * session for this connection (auth_created) but the connection
      * itself never completed hand-off to it -- a step-10 write failure,
-     * a step-11 cloak_session_add_conn failure, or the whole dispatcher
-     * tearing down while this connection was mid-reply-write -- that
-     * session would otherwise sit in the registry forever with zero
-     * connections and nobody left who could ever add one. Every one of
-     * those paths funnels through conn_drop (hence here) rather than
-     * through conn_handoff's success branch, which never calls this
-     * function at all (see on_relay_done's sibling pattern) -- so this
-     * check never fires for a connection that actually made it onto its
-     * session. auth_created is 0 for an additional connection to an
-     * ALREADY-existing session, so this never tears one of those down
-     * over one bad late-stage failure -- exactly the discrimination
-     * cloak/registry.h's own "created == 1" guidance on
-     * cloak_server_registry_close requires. Guarded so this runs at most
-     * once even if conn_teardown is ever called twice on the same c. */
+     * a step-11 cloak_session_add_conn failure, the reply-write deadline
+     * firing, or the whole dispatcher tearing down while this connection
+     * was mid-reply-write -- that session would otherwise sit in the
+     * registry forever with zero connections and nobody left who could
+     * ever add one. Every one of those paths funnels through conn_drop
+     * (hence here) rather than through conn_handoff's success branch,
+     * which never calls this function at all (see on_relay_done's
+     * sibling pattern) -- so this check never fires for a connection
+     * that actually made it onto its session. auth_created is 0 for an
+     * additional connection to an ALREADY-existing session, so this never
+     * tears one of those down over one bad late-stage failure on its own
+     * -- but auth_created == 1 alone is NOT enough: the session THIS
+     * connection created is addressable by (uid, session_id) from the
+     * moment cloak_server_registry_get_or_create returns, which is well
+     * before this connection ever reaches hand-off, so another
+     * connection with the same (uid, session_id) can find it and attach
+     * (cloak_session_add_conn) while this one is still stuck in
+     * writing_reply. Closing unconditionally on auth_created would then
+     * take that other, already-attached connection down with it over
+     * THIS connection's own unrelated late failure -- Go does not do
+     * this (it only closes a session it just created, never one another
+     * connection has since joined). So re-resolve by (uid, session_id)
+     * -- never trust auth_sesh, a raw pointer that can already be
+     * pointing at freed memory by the time this runs (see conn_handoff's
+     * own comment for why) -- and require BOTH that the session is still
+     * live AND that it is still empty (sesh->sb.conns_len == 0) before
+     * closing it. If cloak_server_registry_find returns NULL the session
+     * is already gone by some other path (e.g. its own inactivity timer
+     * raced this one), so there is nothing left to close. Guarded so this
+     * runs at most once even if conn_teardown is ever called twice on the
+     * same c. */
     if (c->auth_created) {
-        cloak_server_registry_close(c->d->cfg.registry, c->auth_uid, c->auth_session_id);
+        cloak_session_t *sesh =
+            cloak_server_registry_find(c->d->cfg.registry, c->auth_uid, c->auth_session_id);
+        if (sesh != NULL && sesh->sb.conns_len == 0) {
+            cloak_server_registry_close(c->d->cfg.registry, c->auth_uid, c->auth_session_id);
+        }
         c->auth_created = 0;
     }
 
@@ -296,7 +317,6 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
 
     c->reply_len = (size_t)n;
     c->reply_sent = 0;
-    c->auth_sesh = sesh;
     c->auth_created = created;
     c->auth_info = info;
     memcpy(c->auth_uid, info.uid, CLOAK_UID_LEN);
@@ -416,7 +436,6 @@ static void conn_start_redirect(cloak_dispatch_conn_t *c) {
 static void conn_handoff(cloak_dispatch_conn_t *c) {
     cloak_dispatcher_t *d = c->d;
     int fd = c->fd;
-    cloak_session_t *sesh = c->auth_sesh;
     int created = c->auth_created;
     cloak_server_clientinfo_t info = c->auth_info;
 
@@ -426,6 +445,38 @@ static void conn_handoff(cloak_dispatch_conn_t *c) {
      * reactor before cloak_session_add_conn wraps it in a cloak_conn_t of
      * its own, exactly like the redirect path's own dial hand-off. */
     cloak_reactor_remove_fd(d->cfg.reactor, fd);
+
+    /* Re-resolve the session by (uid, session_id) rather than trusting a
+     * raw pointer captured back in dispatcher_authenticate: writing_reply
+     * spans reactor turns by design, and the registry can free that exact
+     * memory on an intervening turn -- a session another connection broke
+     * arms a zero-delay sweep timer that runs before this turn ends, or
+     * (when THIS connection is the one that created the session,
+     * auth_created == 1) the session's own inactivity timer can fire and
+     * free it first if inactivity_timeout_ms is shorter than
+     * handshake_timeout_ms. Either way, a stored cloak_session_t* can be
+     * dangling by the time this function runs -- see cloak/dispatcher.h's
+     * OWNERSHIP comment and this module's C1 finding for the full
+     * sequence. conn_teardown already addresses this way for exactly the
+     * same reason; this is the one other place that used to trust the raw
+     * pointer instead. auth_uid/auth_session_id are plain byte/integer
+     * fields captured by value, so they are never stale the way a pointer
+     * would be. */
+    cloak_session_t *sesh =
+        cloak_server_registry_find(d->cfg.registry, c->auth_uid, c->auth_session_id);
+    if (sesh == NULL) {
+        /* The session is gone. The client already has a ServerHello (the
+         * reply this connection just finished writing), so the cover
+         * story is blown regardless of what happens now -- close, not
+         * redirect, the same reasoning conn_reply_write_failed documents
+         * for a step-10 write error. There is no session left to unwind
+         * via conn_teardown's auth_created check either: whatever
+         * destroyed it already did so. */
+        close(fd);
+        c->fd = -1;
+        conn_drop(c);
+        return;
+    }
 
     if (cloak_session_add_conn(sesh, fd) != 0) {
         /* The dispatcher still owns fd on failure (cloak_session_add_conn's
