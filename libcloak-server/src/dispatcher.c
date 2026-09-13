@@ -687,6 +687,9 @@ int cloak_dispatcher_init(cloak_dispatcher_t *d, const cloak_dispatcher_config_t
     if (d->cfg.relay_buf_cap == 0) {
         d->cfg.relay_buf_cap = CLOAK_DISPATCHER_DEFAULT_RELAY_BUF_CAP;
     }
+    if (d->cfg.max_pending_conns == 0) {
+        d->cfg.max_pending_conns = CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS;
+    }
 
     d->conns = NULL;
     d->conn_count = 0;
@@ -711,6 +714,24 @@ void cloak_dispatcher_destroy(cloak_dispatcher_t *d) {
 void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata) {
     cloak_dispatcher_t *d = userdata;
     if (d == NULL) {
+        close(fd);
+        return;
+    }
+
+    /* THE CAP, checked before any allocation happens for this fd -- see
+     * CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's and this function's own
+     * doc comments in cloak/dispatcher.h for the full reasoning. Short
+     * version: this is a C server allocating ~3KB of heap per
+     * unauthenticated connection, Go has no equivalent cap because it has
+     * no equivalent allocation, and CLOSING (not redirecting) is the
+     * correct response at the cap -- redirecting would spend a second fd
+     * and, on a successful dial, a live relay's buffers, which is exactly
+     * backwards when the reason we are here is that resources are already
+     * exhausted. Every other close-instead-of-redirect path in this
+     * module fires because there is nowhere to redirect TO; this is the
+     * only one that closes despite somewhere to redirect existing, so a
+     * future reader should not "fix" this into a redirect. */
+    if (d->conn_count >= d->cfg.max_pending_conns) {
         close(fd);
         return;
     }

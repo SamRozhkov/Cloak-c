@@ -122,6 +122,24 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * bytes) plus room to make forward progress under ordinary backpressure. */
 #define CLOAK_DISPATCHER_DEFAULT_RELAY_BUF_CAP ((size_t)16384)
 
+/* A DELIBERATE DIVERGENCE FROM GO: Go's dispatchConnection has no cap on
+ * how many connections it will handle concurrently and relies on its
+ * runtime instead -- goroutines are cheap, and there is no per-connection
+ * heap allocation of this module's shape for a cap to protect. This is a
+ * C server: cloak_dispatcher_accept heap-allocates one
+ * cloak_dispatch_conn_t (~3KB, dominated by cloak_firstpacket_t's own
+ * buffer) for every accepted fd, before that connection has proven it is
+ * anything but an attacker -- unauthenticated, unvalidated, wholly
+ * attacker-controlled input, exactly the property this whole module's
+ * top-of-file comment opens with. Without a cap, an attacker who simply
+ * opens connections and sends nothing grows that allocation without
+ * bound, long before any per-connection deadline would reclaim it.
+ * max_pending_conns bounds d->conn_count instead: see
+ * cloak_dispatcher_accept's own comment for what happens, and why closing
+ * rather than redirecting is the one place in this module where that is
+ * the right call, at the cap. */
+#define CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS ((size_t)512)
+
 /* Invoked exactly once per authenticated connection, ONLY when that
  * connection's (uid, session_id) is about to create a brand-new session
  * (cloak_server_registry_find found nothing) -- never for an additional
@@ -208,11 +226,14 @@ typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_
  * prepare_session/prepare_session_userdata and attached/attached_userdata
  * may each be NULL independently (no-op / nothing to fire).
  *
- * The three *_ms/_cap fields each default (0 means "use the default")
- * to the CLOAK_DISPATCHER_DEFAULT_* constant above; a config that leaves
- * them zeroed gets exactly Go's 15-second first-packet deadline. Tests
- * that need to exercise the deadline without an actual 15-second wait
- * set handshake_timeout_ms explicitly instead. */
+ * The four *_ms/_cap/_conns fields each default (0 means "use the
+ * default") to the CLOAK_DISPATCHER_DEFAULT_* constant above; a config
+ * that leaves them zeroed gets exactly Go's 15-second first-packet
+ * deadline and this port's own 512-connection cap. Tests that need to
+ * exercise the deadline without an actual 15-second wait set
+ * handshake_timeout_ms explicitly instead, and tests that need to
+ * exercise the cap without opening 512 connections set max_pending_conns
+ * explicitly the same way. */
 typedef struct {
     cloak_reactor_t *reactor;
     cloak_server_t *srv;
@@ -227,6 +248,12 @@ typedef struct {
     uint64_t handshake_timeout_ms;
     uint64_t redirect_dial_timeout_ms;
     size_t relay_buf_cap;
+
+    /* See CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own comment for
+     * why this exists at all. Checked in cloak_dispatcher_accept against
+     * cloak_dispatcher_conn_count (the same counter that accessor
+     * reports) BEFORE any allocation happens for the new fd. */
+    size_t max_pending_conns;
 } cloak_dispatcher_config_t;
 
 typedef struct cloak_dispatch_conn cloak_dispatch_conn_t;
@@ -316,8 +343,8 @@ struct cloak_dispatcher {
  *
  * Copies *cfg by value (d does not borrow the cfg struct itself), filling
  * in CLOAK_DISPATCHER_DEFAULT_* for any of handshake_timeout_ms,
- * redirect_dial_timeout_ms or relay_buf_cap left at 0. cfg->reactor and
- * cfg->srv are themselves still borrowed pointers -- see
+ * redirect_dial_timeout_ms, relay_buf_cap or max_pending_conns left at 0.
+ * cfg->reactor and cfg->srv are themselves still borrowed pointers -- see
  * cloak_dispatcher_config_t's own doc comment.
  *
  * A non-zero relay_buf_cap smaller than CLOAK_FIRSTPACKET_MAX is REJECTED
@@ -355,7 +382,23 @@ void cloak_dispatcher_destroy(cloak_dispatcher_t *d);
  * live cloak_dispatcher_t as userdata. See this file's own top-of-file
  * comment for the full wiring and ownership contract; in short, ownership
  * of fd passes here, unconditionally -- every path through this function
- * either keeps it (linking a new connection into d) or closes it. */
+ * either keeps it (linking a new connection into d) or closes it.
+ *
+ * THE CAP: if cloak_dispatcher_conn_count(d) is already at
+ * cfg.max_pending_conns, fd is closed immediately and nothing is
+ * allocated -- see CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own
+ * comment for why a C dispatcher needs this where Go's does not. This is
+ * the one place in this module where closing, not redirecting, is
+ * correct: every other close-instead-of-redirect path in this file is a
+ * case with nowhere to redirect TO (the peer is already gone, or the
+ * dial itself failed); this one has somewhere to redirect to but
+ * deliberately declines, because redirecting here costs a second fd (the
+ * dial) and, if that dial succeeds, a live relay holding buffers for
+ * both sides -- exactly the resources this cap exists to conserve
+ * because they are already exhausted. Spending them to keep up the cover
+ * story at the exact moment resources ran out would defeat the cap
+ * entirely, so this is not the bug it looks like next to every other
+ * rule in this file. */
 void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata);
 
 /* The number of connections currently in flight (reading their first

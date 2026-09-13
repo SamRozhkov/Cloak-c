@@ -29,7 +29,19 @@
  * call is affected, and every other write() everywhere else in the
  * process (including the client's own send of its ClientHello, and every
  * other test in this same binary that never sets this variable) passes
- * straight through to the real write(). */
+ * straight through to the real write().
+ *
+ * Optionally, CLOAK_TEST_FORCE_STICKY=1 keeps CLOAK_TEST_FORCE_PEER_PORT
+ * set across a forced failure instead of consuming it, so EVERY
+ * subsequent write() to the matching peer keeps failing (CLOAK_TEST_
+ * FORCE_MODE still governs which errno) until the test itself calls
+ * unsetenv on it. This exists for one reason: proving a bounded deadline
+ * actually fires against a reply write that never drains, which requires
+ * a write that can never succeed -- and genuine socket-buffer
+ * backpressure cannot do that for a reply this small either (same
+ * reasoning as above, repeated indefinitely instead of once). Without
+ * CLOAK_TEST_FORCE_STICKY set to exactly "1", behaviour is unchanged from
+ * the one-shot protocol above. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dlfcn.h>
@@ -56,11 +68,19 @@ ssize_t write(int fd, const void *buf, size_t count) {
         socklen_t plen = sizeof(peer);
         if (getpeername(fd, (struct sockaddr *)&peer, &plen) == 0 && peer.sin_family == AF_INET &&
             ntohs(peer.sin_port) == (uint16_t)atoi(port_str)) {
-            /* Consume the trigger before returning, so a retry on this
-             * same fd (the whole point of the resume path under test)
-             * goes through to the real write() rather than looping
-             * forever on the fake failure. */
-            unsetenv("CLOAK_TEST_FORCE_PEER_PORT");
+            const char *sticky = getenv("CLOAK_TEST_FORCE_STICKY");
+            if (sticky == NULL || strcmp(sticky, "1") != 0) {
+                /* One-shot (default): consume the trigger before
+                 * returning, so a retry on this same fd (the whole point
+                 * of the resume path under test) goes through to the real
+                 * write() rather than looping forever on the fake
+                 * failure. */
+                unsetenv("CLOAK_TEST_FORCE_PEER_PORT");
+            }
+            /* Sticky: CLOAK_TEST_FORCE_PEER_PORT stays set, so every
+             * subsequent write() to this same peer keeps failing until
+             * the test itself clears it -- see this file's own
+             * top-of-file comment. */
 
             const char *mode = getenv("CLOAK_TEST_FORCE_MODE");
             errno = (mode != NULL && strcmp(mode, "error") == 0) ? ECONNRESET : EAGAIN;

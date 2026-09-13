@@ -61,6 +61,20 @@ target_link_libraries(cloak_test_write_shim PRIVATE ${CMAKE_DL_LIBS})
 # (space-separated, per LD_PRELOAD's own documented syntax).
 set(_cloak_ld_preload "$<TARGET_FILE:cloak_test_write_shim>")
 if(CMAKE_C_FLAGS MATCHES "-fsanitize=[^ ]*address")
+    # ASSUMPTION: -print-file-name=libasan.so is a GCC-runtime-naming
+    # query and only means anything to a GCC ${CMAKE_C_COMPILER}. Under a
+    # Clang/compiler-rt toolchain this resolves to the literal string
+    # "libasan.so" (compiler-rt's own runtime has a different name and
+    # location entirely), the EXISTS check below fails, and this whole
+    # block silently no-ops -- LD_PRELOAD then carries only our shim, ASan
+    # aborts at startup ("ASan runtime does not come first in initial
+    # library list"), and this coverage (the whole of test_dispatcher_auth
+    # and test_dispatcher_limits under the sanitizer suite) is lost
+    # without any build failure to flag it. This project's own build is
+    # GCC-only today, so that gap is not live, but a future Clang CI leg
+    # would hit it silently; fixing that is out of scope here (no attempt
+    # is made to restructure this build for Clang) -- this comment exists
+    # so the assumption is visible instead of implicit.
     execute_process(
         COMMAND ${CMAKE_C_COMPILER} -print-file-name=libasan.so
         OUTPUT_VARIABLE _cloak_asan_rt
@@ -70,4 +84,18 @@ if(CMAKE_C_FLAGS MATCHES "-fsanitize=[^ ]*address")
     endif()
 endif()
 set_tests_properties(test_dispatcher_auth PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+add_executable(test_dispatcher_limits test_dispatcher_limits.c)
+target_include_directories(test_dispatcher_limits PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_limits PRIVATE cloak-server)
+add_test(NAME test_dispatcher_limits COMMAND test_dispatcher_limits)
+set_tests_properties(test_dispatcher_limits PROPERTIES TIMEOUT 60)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth): test_dispatcher_limits' mid-reply-write and
+# reply-write-deadline cases need the exact same LD_PRELOAD interposition,
+# for the exact same reason -- see test_write_shim.c's own top-of-file
+# comment.
+set_tests_properties(test_dispatcher_limits PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
