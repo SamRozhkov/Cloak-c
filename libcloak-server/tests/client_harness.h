@@ -26,16 +26,13 @@
  * would (verified against this project's actual -Wall -Wextra build, not
  * merely assumed).
  *
- * This header also assumes its includer has already brought in the
- * ordinary dispatcher-test includes -- cloak/net.h (cloak_listener_t),
- * cloak/dispatcher.h or cloak/registry.h/server.h (CLOAK_UID_LEN, by way
- * of cloak/config.h) -- exactly as every existing dispatcher test file
- * already does before it would include this one; it does not re-include
- * those itself. */
+ */
 
 #include "cloak/base64.h"
 #include "cloak/clienthello.h"
+#include "cloak/config.h"
 #include "cloak/crypto.h"
+#include "cloak/net.h"
 #include "cloak/reactor.h"
 #include "cloak/server_auth.h"
 #include "cloak/session.h"
