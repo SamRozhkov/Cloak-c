@@ -267,7 +267,14 @@ struct fixture {
     int have_front;
 
     uint8_t server_pub[CLOAK_X25519_KEY_LEN];
+    /* TWO bypass UIDs, because one is not enough to test the thing every
+     * abort path in this module depends on: proxy_find_session matches on
+     * (uid, session_id), and with a single UID in the config no test can
+     * ever hold two contexts whose session_ids collide. Clients choose
+     * their own session ids and they are small, so that collision is
+     * routine in production. See test_same_session_id_different_uid. */
     uint8_t uid_ok[CLOAK_UID_LEN];
+    uint8_t uid_ok2[CLOAK_UID_LEN];
 
     /* What the chained cloak_registry_broken_cb saw, recorded at the
      * moment it ran -- i.e. AFTER cloak_proxy_registry_broken's own
@@ -413,21 +420,25 @@ static int fixture_init_opts(struct fixture *fx, size_t conn_send_queue_cap,
 
     for (size_t i = 0; i < CLOAK_UID_LEN; i++) {
         fx->uid_ok[i] = (uint8_t)(0x10 + i);
+        fx->uid_ok2[i] = (uint8_t)(0xA0 + i);
     }
 
     char priv_b64[64];
     char uidok_b64[32];
+    char uidok2_b64[32];
     ASSERT_EQ_INT(
         0, cloak_base64_encode(server_priv, CLOAK_X25519_KEY_LEN, priv_b64, sizeof(priv_b64)));
     ASSERT_EQ_INT(0, cloak_base64_encode(fx->uid_ok, CLOAK_UID_LEN, uidok_b64, sizeof(uidok_b64)));
+    ASSERT_EQ_INT(
+        0, cloak_base64_encode(fx->uid_ok2, CLOAK_UID_LEN, uidok2_b64, sizeof(uidok2_b64)));
 
     char json[1024];
     snprintf(json, sizeof(json),
              "{\"ProxyBook\":{\"ss\":[\"tcp\",\"127.0.0.1:%d\"],"
              "\"bh\":[\"tcp\",\"127.0.0.1:%d\"]},"
              "\"BindAddr\":[\":443\"],\"RedirAddr\":\"127.0.0.1:%d\","
-             "\"PrivateKey\":\"%s\",\"BypassUID\":[\"%s\"]}",
-             fx->up_port, fx->bh_port, cover_port, priv_b64, uidok_b64);
+             "\"PrivateKey\":\"%s\",\"BypassUID\":[\"%s\",\"%s\"]}",
+             fx->up_port, fx->bh_port, cover_port, priv_b64, uidok_b64, uidok2_b64);
     err[0] = '\0';
     ASSERT_EQ_INT(0, cloak_server_config_parse_json(json, &fx->cfg, err, sizeof(err)));
 
@@ -569,8 +580,9 @@ static int front_port(struct fixture *fx) {
     return cloak_listener_port(&fx->front);
 }
 
-static int open_client_via(struct fixture *fx, client_session_t *cs, uint32_t session_id,
-                           const char *proxy_method) {
+static int open_client_as(struct fixture *fx, client_session_t *cs,
+                          const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
+                          const char *proxy_method) {
     cloak_session_config_t ccfg;
     memset(&ccfg, 0, sizeof(ccfg));
     ccfg.max_on_wire_size = 16401;
@@ -578,8 +590,13 @@ static int open_client_via(struct fixture *fx, client_session_t *cs, uint32_t se
     ccfg.stream_max_pending_frames = 64;
     ccfg.conn_send_queue_cap = 262144;
     ccfg.inactivity_timeout_ms = 60000;
-    return client_session_open(cs, fx->reactor, front_port(fx), fx->server_pub, fx->uid_ok,
-                               proxy_method, session_id, 0, &ccfg);
+    return client_session_open(cs, fx->reactor, front_port(fx), fx->server_pub, uid, proxy_method,
+                               session_id, 0, &ccfg);
+}
+
+static int open_client_via(struct fixture *fx, client_session_t *cs, uint32_t session_id,
+                           const char *proxy_method) {
+    return open_client_as(fx, cs, fx->uid_ok, session_id, proxy_method);
 }
 
 static int open_client(struct fixture *fx, client_session_t *cs, uint32_t session_id) {
@@ -1373,6 +1390,174 @@ static void test_reply_write_failure_reclaims_prepared_context(void) {
     fixture_destroy(&fx);
 }
 
+/* A client-side accumulating reader, polled from inside a bounded
+ * pump_until predicate -- the same discipline test_proxy_stream.c uses
+ * and for the same reason: a poll cannot miss an edge, so a wait built on
+ * it is bounded by construction where one built on a callback is not. */
+struct sb_reader {
+    cloak_stream_t *stream;
+    uint8_t buf[32];
+    size_t len;
+};
+
+static int sb_has_nine(void *ctx) {
+    struct sb_reader *r = ctx;
+    while (r->len < sizeof(r->buf)) {
+        long n = cloak_stream_read(r->stream, r->buf + r->len, sizeof(r->buf) - r->len);
+        if (n <= 0) {
+            break;
+        }
+        r->len += (size_t)n;
+    }
+    return r->len >= 9;
+}
+
+/* The context this proxy holds for exactly (uid, session_id), or NULL --
+ * the test-side equivalent of proxy_find_session, written out here so the
+ * test can name WHICH context survived rather than only how many did.
+ * Deliberately not calling into the module's own lookup: a test that
+ * asked the code under test which context it thinks it has would pass
+ * under the very mutation it exists to catch. */
+static cloak_proxy_session_t *ctx_for(struct fixture *fx, const uint8_t uid[CLOAK_UID_LEN],
+                                      uint32_t session_id) {
+    for (cloak_proxy_session_t *ps = fx->proxy.sessions; ps != NULL; ps = ps->next) {
+        if (ps->session_id == session_id && memcmp(ps->uid, uid, CLOAK_UID_LEN) == 0) {
+            return ps;
+        }
+    }
+    return NULL;
+}
+
+/* 11. TWO SESSIONS WITH THE SAME session_id UNDER DIFFERENT UIDs, one of
+ * them broken. This is the discriminator every abort path in this module
+ * rests on and it had no test at all: proxy_find_session matches on
+ * (uid, session_id), and both cloak_proxy_registry_broken and
+ * cloak_proxy_session_aborted funnel through it. A regression to
+ * id-only matching frees the WRONG user's context -- after which that
+ * user's relays hold raw pointers into a live session with no owner, and
+ * their next upstream byte is a use-after-free.
+ *
+ * The collision is routine, not exotic: clients pick their own session
+ * ids and pick small ones, so two users landing on the same id is
+ * ordinary. A is opened first (so it sits at the TAIL of the proxy's
+ * session list) and A is the one broken, so an id-only scan -- which
+ * returns the first match from the head -- would tear down B.
+ *
+ * WHAT MAKES THIS A TEST rather than an arrangement: the counters alone
+ * would NOT catch id-only matching (one context and one stream die either
+ * way, so both counts read 1 regardless). The assertions that bite are
+ * the two identity ones -- A's context is gone and B's is still there,
+ * still holding its one relaying stream -- and B still carrying bytes
+ * both ways afterwards. Verified by mutation; see this file's header on
+ * why the post-teardown byte matters. */
+static void test_same_session_id_different_uid(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    const uint32_t shared_id = 2701;
+
+    client_session_t cs_a;
+    ASSERT_EQ_INT(0, open_client_as(&fx, &cs_a, fx.uid_ok, shared_id, "ss"));
+    cloak_stream_t *sa = cloak_session_open_stream(&cs_a.sesh, NULL);
+    ASSERT_TRUE(sa != NULL);
+    if (sa == NULL) {
+        client_session_close(&cs_a);
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(2, (int)cloak_stream_write(sa, (const uint8_t *)"aa", 2));
+    struct up_wait uwa = {&fx.up, 0, 2};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uwa, 600, 5));
+
+    client_session_t cs_b;
+    ASSERT_EQ_INT(0, open_client_as(&fx, &cs_b, fx.uid_ok2, shared_id, "ss"));
+    cloak_stream_t *sb = cloak_session_open_stream(&cs_b.sesh, NULL);
+    ASSERT_TRUE(sb != NULL);
+    if (sb == NULL) {
+        cloak_session_release_stream(&cs_a.sesh, sa);
+        client_session_close(&cs_a);
+        client_session_close(&cs_b);
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(2, (int)cloak_stream_write(sb, (const uint8_t *)"bb", 2));
+    struct up_wait uwb = {&fx.up, 1, 2};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uwb, 600, 5));
+
+    /* Two genuinely distinct contexts, same id, both live and relaying. */
+    ASSERT_EQ_INT(2, (int)cloak_proxy_session_count(&fx.proxy));
+    ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
+    cloak_proxy_session_t *ctx_a = ctx_for(&fx, fx.uid_ok, shared_id);
+    cloak_proxy_session_t *ctx_b = ctx_for(&fx, fx.uid_ok2, shared_id);
+    ASSERT_TRUE(ctx_a != NULL);
+    ASSERT_TRUE(ctx_b != NULL);
+    ASSERT_TRUE(ctx_a != ctx_b);
+
+    /* Break A, and only A. */
+    client_session_close(&cs_a);
+
+    struct fx_wait w = {&fx, 1};
+    ASSERT_TRUE(pump_until(fx.reactor, chain_calls_at_least, &w, 600, 5));
+    ASSERT_EQ_INT(1, fx.chain_calls);
+    ASSERT_EQ_INT((int)shared_id, (int)fx.chain_last_session_id);
+
+    /* THE ASSERTIONS THAT DISTINGUISH THE TWO MATCH RULES. */
+    ASSERT_TRUE(ctx_for(&fx, fx.uid_ok, shared_id) == NULL);
+    cloak_proxy_session_t *still_b = ctx_for(&fx, fx.uid_ok2, shared_id);
+    ASSERT_TRUE(still_b == ctx_b);
+    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&fx.proxy));
+    ASSERT_EQ_INT(1, (int)cloak_proxy_stream_count(&fx.proxy));
+    if (still_b != NULL) {
+        ASSERT_EQ_INT(1, (int)still_b->stream_count);
+        ASSERT_TRUE(still_b->streams != NULL);
+        if (still_b->streams != NULL) {
+            ASSERT_EQ_INT(1, still_b->streams->relaying);
+        }
+    }
+    ASSERT_EQ_INT(0, cs_b.broken);
+
+    /* A's upstream socket sat at EOF from the moment A's teardown closed
+     * the proxy's end, and it is STILL REGISTERED with the reactor: this
+     * file's fake upstream re-arms interest (cloak_reactor_mod_fd) on
+     * every event, so an EOF'd connection is ready on every single turn
+     * and cloak_reactor_run_once returns instantly forever. Every
+     * iteration-counted pump below would then burn its whole budget in no
+     * wall-clock time at all -- which is not hypothetical here: with this
+     * line absent, the four post-teardown bytes below never arrived
+     * within 600 iterations and the assertion failed. Closing it is what
+     * makes the waits that follow bounded by time rather than by spin. */
+    up_close_conn(&fx.up, 0);
+
+    /* And B is not merely present, it still works: a byte each way,
+     * across the relay whose session A's teardown could have killed. The
+     * upstream-to-client direction is the one that reproduces the actual
+     * use-after-free rather than its symptom (see this file's header). */
+    ASSERT_EQ_INT(3, (int)cloak_stream_write(sb, (const uint8_t *)"bbb", 3));
+    uwb.want = 5;
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uwb, 600, 5));
+    ASSERT_MEM_EQ(fx.up.conns[1].in, "bbbbb", 5);
+
+    up_send(&fx.up, 1, "down", 4);
+    /* 9 = the echoes of "bb" and "bbb" (5) plus "down" (4). Nothing has
+     * read this stream yet, so all of it is still queued. */
+    struct sb_reader rr = {sb, {0}, 0};
+    ASSERT_TRUE(pump_until(fx.reactor, sb_has_nine, &rr, 600, 5));
+    ASSERT_EQ_INT(9, (int)rr.len);
+    ASSERT_MEM_EQ(rr.buf, "bbbbbdown", 9);
+
+    pump_for_ms(fx.reactor, POST_TEARDOWN_MS);
+    ASSERT_EQ_INT(1, fx.chain_calls);
+
+    /* sa is NOT released here: client_session_close(&cs_a) above destroyed
+     * A's client session while sa was still active, and cloak_session_
+     * destroy frees every active stream itself (cloak/session.h). B's is
+     * the opposite case -- its session is alive, so its stream is the
+     * test's to release. */
+    cloak_session_release_stream(&cs_b.sesh, sb);
+    client_session_close(&cs_b);
+    fixture_destroy(&fx);
+}
+
 /* 10. Argument discipline for the two new entry points, matching what
  * this project asserts for every other public function: neither may
  * dereference a NULL, and neither may do anything at all for a key it
@@ -1423,5 +1608,6 @@ test_chain_observes_cleanup_already_done();
 test_foreign_session_reaches_chain_untouched();
 test_registry_full_reclaims_prepared_context();
 test_reply_write_failure_reclaims_prepared_context();
+test_same_session_id_different_uid();
 test_new_entry_points_tolerate_junk();
 TEST_MAIN_END()
