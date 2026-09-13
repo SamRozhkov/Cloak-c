@@ -4,7 +4,6 @@
 #include "cloak/clienthello.h"
 #include "cloak/common.h"
 #include "cloak/crypto.h"
-#include "cloak/firstpacket.h"
 #include "cloak/net.h"
 #include "cloak/reactor.h"
 #include "cloak/registry.h"
@@ -15,6 +14,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -131,6 +131,20 @@ static int client_connect(int port) {
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return fd;
+}
+
+/* The client's own local (ephemeral) port -- which is exactly the PEER
+ * port the dispatcher's accepted socket for this same connection will
+ * report via getpeername(), and therefore what test_write_shim.c's
+ * CLOAK_TEST_FORCE_PEER_PORT must be set to in order to target this
+ * specific connection's reply write. Returns -1 on failure. */
+static int client_local_port(int fd) {
+    struct sockaddr_in sa;
+    socklen_t len = sizeof(sa);
+    if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) {
+        return -1;
+    }
+    return ntohs(sa.sin_port);
 }
 
 /* ---- building a real Cloak ClientHello ---------------------------------- */
@@ -830,6 +844,124 @@ static void test_admin_uid_session_zero_is_recognised(void) {
     fixture_destroy(&fx);
 }
 
+/* 10. Step 10's resume path: a forced EAGAIN on the dispatcher's FIRST
+ * attempt to write the reply (via test_write_shim.c's LD_PRELOAD
+ * interposition -- genuine socket-buffer backpressure cannot be forced
+ * for a reply this small; see that file's own top-of-file comment for
+ * why, and what was tried before settling on this) must not lose or
+ * corrupt anything: the connection still attaches, and the client still
+ * receives a complete, correctly-encrypted reply. This is what actually
+ * exercises conn_continue_reply_write's cloak_reactor_mod_fd-to-WRITABLE
+ * branch and on_readable's writing_reply dispatch -- every other test in
+ * this file only ever exercises the single-write-succeeds-immediately
+ * path, which is the common case on loopback but not the one this test
+ * targets. */
+static void test_write_resumes_after_eagain(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+    int64_t now = (int64_t)time(NULL);
+    uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
+    size_t record_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                            (uint8_t)CLOAK_AEAD_AES_256_GCM, now, 9009, 0, record,
+                                            sizeof(record), shared_secret);
+
+    int client = client_connect(front_port(&fx));
+    ASSERT_TRUE(client >= 0);
+
+    int local_port = client_local_port(client);
+    ASSERT_TRUE(local_port > 0);
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", local_port);
+    ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_PEER_PORT", port_str, 1));
+    unsetenv("CLOAK_TEST_FORCE_MODE"); /* default mode: eagain */
+
+    ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
+
+    uint8_t reply[512];
+    size_t reply_len = 0;
+    ASSERT_EQ_INT(0, read_reply(fx.reactor, client, reply, sizeof(reply), &reply_len));
+
+    /* The shim consumes the env var on the one write() call it fakes --
+     * if it's still set, the forced EAGAIN never actually matched
+     * anything (e.g. a peer-port mismatch) and this test would otherwise
+     * silently exercise only the ordinary, already-covered path. */
+    ASSERT_TRUE(getenv("CLOAK_TEST_FORCE_PEER_PORT") == NULL);
+
+    ASSERT_TRUE(reply_len >= 165);
+    ASSERT_TRUE(reply_len <= 206);
+    ASSERT_EQ_INT(1, fx.attached.calls);
+    ASSERT_EQ_INT(1, fx.attached.last_created);
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx.registry));
+
+    uint8_t key[CLOAK_AEAD_KEY_LEN];
+    ASSERT_EQ_INT(0, extract_session_key_from_reply(shared_secret, reply, reply_len, key));
+
+    close(client);
+    fixture_destroy(&fx);
+}
+
+/* 11. Step 10's failure path: a forced write error (ECONNRESET, via the
+ * same shim) must close the connection, NOT redirect it -- the exact
+ * asymmetry conn_reply_write_failed's own comment argues for and warns
+ * against "fixing". A regression that redirected here instead would
+ * still pass every other test in this file (none of them force a write
+ * failure at all), so this is the one assertion that would actually catch
+ * it: the cover site must see NOTHING (no connection, no bytes), and
+ * nothing must be left attached or registered. */
+static void test_write_error_closes_not_redirect(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+    int64_t now = (int64_t)time(NULL);
+    uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
+    size_t record_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                            (uint8_t)CLOAK_AEAD_AES_256_GCM, now, 10010, 0, record,
+                                            sizeof(record), shared_secret);
+
+    int client = client_connect(front_port(&fx));
+    ASSERT_TRUE(client >= 0);
+
+    int local_port = client_local_port(client);
+    ASSERT_TRUE(local_port > 0);
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", local_port);
+    ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_PEER_PORT", port_str, 1));
+    ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_MODE", "error", 1));
+
+    ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
+
+    /* Bounded wait for the dispatcher to process the (immediately
+     * failing) write and tear the connection down. */
+    int done = 0;
+    for (int i = 0; i < 200 && !done; i++) {
+        cloak_reactor_run_once(fx.reactor, 10);
+        if (cloak_dispatcher_conn_count(&fx.d) == 0) {
+            done = 1;
+        }
+    }
+    ASSERT_TRUE(done);
+    ASSERT_EQ_INT(0, (int)cloak_dispatcher_conn_count(&fx.d));
+
+    ASSERT_TRUE(getenv("CLOAK_TEST_FORCE_PEER_PORT") == NULL);
+
+    /* Not redirected: the cover site never saw this connection at all. */
+    ASSERT_EQ_INT(0, fx.cover.accept_count);
+    ASSERT_EQ_INT(0, (int)fx.cover.len);
+    ASSERT_EQ_INT(0, fx.attached.calls);
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count(&fx.registry));
+
+    /* The client observes the connection closed, not merely idle. */
+    char c;
+    ssize_t n = recv(client, &c, 1, 0);
+    ASSERT_TRUE(n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK));
+
+    close(client);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
     test_valid_handshake_attaches();
     test_existing_session_uses_live_key();
@@ -840,4 +972,6 @@ TEST_MAIN_BEGIN()
     test_stale_timestamp_redirects();
     test_prepare_rejection_redirects();
     test_admin_uid_session_zero_is_recognised();
+    test_write_resumes_after_eagain();
+    test_write_error_closes_not_redirect();
 TEST_MAIN_END()

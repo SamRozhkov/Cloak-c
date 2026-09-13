@@ -42,3 +42,32 @@ target_include_directories(test_dispatcher_auth PRIVATE ${CMAKE_SOURCE_DIR}/libc
 target_link_libraries(test_dispatcher_auth PRIVATE cloak-server)
 add_test(NAME test_dispatcher_auth COMMAND test_dispatcher_auth)
 set_tests_properties(test_dispatcher_auth PROPERTIES TIMEOUT 60)
+
+# Test-only LD_PRELOAD shim (see test_write_shim.c's own top-of-file
+# comment) that lets test_dispatcher_auth deterministically force the
+# dispatcher's step-10 reply write to see EAGAIN or a real error, which
+# genuine socket-buffer backpressure cannot do for a reply this small.
+add_library(cloak_test_write_shim SHARED test_write_shim.c)
+target_link_libraries(cloak_test_write_shim PRIVATE ${CMAKE_DL_LIBS})
+
+# Under an ASan-instrumented build (CMAKE_C_FLAGS carries -fsanitize=address
+# out of band -- this project has no CMake-level ASan option of its own),
+# ASan requires its own runtime to be the FIRST thing LD_PRELOAD loads, or
+# it aborts at startup ("ASan runtime does not come first in initial
+# library list"): our shim is built and ASan-instrumented too (see its
+# target_link_libraries above / CMAKE_SHARED_LINKER_FLAGS), but merely
+# preloading it is not enough on its own. Detect that case and preload
+# libasan.so first, ahead of our own shim, in LD_PRELOAD's search order
+# (space-separated, per LD_PRELOAD's own documented syntax).
+set(_cloak_ld_preload "$<TARGET_FILE:cloak_test_write_shim>")
+if(CMAKE_C_FLAGS MATCHES "-fsanitize=[^ ]*address")
+    execute_process(
+        COMMAND ${CMAKE_C_COMPILER} -print-file-name=libasan.so
+        OUTPUT_VARIABLE _cloak_asan_rt
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_cloak_asan_rt AND EXISTS "${_cloak_asan_rt}")
+        set(_cloak_ld_preload "${_cloak_asan_rt} ${_cloak_ld_preload}")
+    endif()
+endif()
+set_tests_properties(test_dispatcher_auth PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
