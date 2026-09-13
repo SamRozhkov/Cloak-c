@@ -1,10 +1,60 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cloak/proxy.h"
 
+#include "cloak/log.h"
+
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+/* ---- the stream caps: derivation, and the state behind the log --------- */
+
+/* Half the process's RLIMIT_NOFILE soft limit, clamped into
+ * [FLOOR, CEILING]. cloak/proxy.h carries the reasoning; this is only the
+ * arithmetic. getrlimit failing yields the FLOOR rather than failing init
+ * -- a caller that cannot learn its own descriptor limit should assume a
+ * small one. An unlimited soft limit yields the CEILING. */
+static size_t proxy_derive_max_streams_total(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        return CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR;
+    }
+    if (rl.rlim_cur == RLIM_INFINITY) {
+        return CLOAK_PROXY_MAX_STREAMS_TOTAL_CEILING;
+    }
+    /* Compared in rlim_t, never narrowed first: the ceiling check is what
+     * makes the cast below safe on any platform whose rlim_t is wider
+     * than size_t. */
+    rlim_t half = rl.rlim_cur / 2;
+    if (half >= (rlim_t)CLOAK_PROXY_MAX_STREAMS_TOTAL_CEILING) {
+        return CLOAK_PROXY_MAX_STREAMS_TOTAL_CEILING;
+    }
+    if (half <= (rlim_t)CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR) {
+        return CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR;
+    }
+    return (size_t)half;
+}
+
+/* The count at or below which a cap is considered RECOVERED, an eighth of
+ * the cap below the cap itself.
+ *
+ * THE HYSTERESIS IS THE WHOLE MECHANISM and not a refinement. Without it
+ * the capped flag flips every time a client closes one stream and opens
+ * two, so a "transition only" log would still emit at the attacker's
+ * rate -- which is the exact failure mode logging per refusal has. With
+ * it, a line pair costs the attacker an eighth of the cap's worth of
+ * stream lifecycles. The eighth is clamped to at least 1 so that a cap of
+ * 1 or 2 (which only a test or a deliberately crippled config produces)
+ * still has somewhere to recover to. */
+static size_t proxy_cap_low_water(size_t cap) {
+    size_t h = cap / 8;
+    if (h == 0) {
+        h = 1;
+    }
+    return h >= cap ? 0 : cap - h;
+}
 
 /* ---- intrusive list bookkeeping ----------------------------------------- */
 
@@ -56,6 +106,24 @@ static void proxy_stream_unlink(cloak_proxy_session_t *ps, cloak_proxy_stream_t 
     pst->next = NULL;
     ps->stream_count--;
     ps->p->stream_count--;
+
+    /* THE ONLY PLACE EITHER COUNT EVER FALLS, which is why the recovery
+     * side of the log lives here rather than at the five call sites that
+     * free a stream context -- the same reason the decrement itself does.
+     * A recovery line emitted from a session that is being torn down
+     * would be a lie, and proxy_session_teardown clears ps->capped before
+     * its walk so that one cannot happen. */
+    if (ps->capped && ps->stream_count <= proxy_cap_low_water(ps->p->cfg.max_streams_per_session)) {
+        ps->capped = 0;
+        CLOAK_LOGI("proxy: session %u no longer at its stream cap (%zu of %zu in use)",
+                   ps->session_id, ps->stream_count, ps->p->cfg.max_streams_per_session);
+    }
+    if (ps->p->total_capped &&
+        ps->p->stream_count <= proxy_cap_low_water(ps->p->cfg.max_streams_total)) {
+        ps->p->total_capped = 0;
+        CLOAK_LOGI("proxy: no longer at the total stream cap (%zu of %zu in use)",
+                   ps->p->stream_count, ps->p->cfg.max_streams_total);
+    }
 }
 
 /* ---- teardown ------------------------------------------------------------
@@ -125,6 +193,13 @@ static void proxy_stream_teardown(cloak_proxy_stream_t *pst) {
 /* Tears down every stream context this session holds, then unlinks and
  * frees the session context. ps must not be touched after this returns. */
 static void proxy_session_teardown(cloak_proxy_session_t *ps) {
+    /* Silently, and BEFORE the walk: this session is going away, so its
+     * cap state is moot and a "no longer at its stream cap" line about a
+     * context being destroyed would mislead whoever read it. The
+     * proxy-wide flag is deliberately NOT cleared here -- descriptors
+     * really are coming back, so that recovery is genuine. */
+    ps->capped = 0;
+
     while (ps->streams != NULL) {
         proxy_stream_teardown(ps->streams);
     }
@@ -333,8 +408,29 @@ static void proxy_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, v
      * own cover-site redirect -- which is what an exhausted descriptor
      * table would actually cost -- does not. See
      * cloak_proxy_config_t::max_streams_total. */
-    if (ps->stream_count >= p->cfg.max_streams_per_session ||
-        p->stream_count >= p->cfg.max_streams_total) {
+    if (p->stream_count >= p->cfg.max_streams_total) {
+        /* Checked before the per-session cap because it is the server-wide
+         * condition: an operator seeing only "session N is capped" when
+         * the whole proxy is full would be told the less useful of the two
+         * facts. One line per episode, never one per refusal -- see
+         * cloak_proxy_t::total_capped. */
+        if (!p->total_capped) {
+            p->total_capped = 1;
+            CLOAK_LOGW("proxy: refusing new streams -- total cap of %zu reached; descriptors "
+                       "beyond it are reserved so the dispatcher can still dial its cover-site "
+                       "redirects",
+                       p->cfg.max_streams_total);
+        }
+        cloak_session_release_stream(sesh, stream);
+        return;
+    }
+    if (ps->stream_count >= p->cfg.max_streams_per_session) {
+        if (!ps->capped) {
+            ps->capped = 1;
+            CLOAK_LOGW("proxy: refusing new streams for session %u -- per-session cap of %zu "
+                       "reached; other sessions are unaffected",
+                       ps->session_id, p->cfg.max_streams_per_session);
+        }
         cloak_session_release_stream(sesh, stream);
         return;
     }
@@ -478,7 +574,11 @@ int cloak_proxy_init(cloak_proxy_t *p, const cloak_proxy_config_t *cfg) {
         p->cfg.max_streams_per_session = CLOAK_PROXY_DEFAULT_MAX_STREAMS_PER_SESSION;
     }
     if (p->cfg.max_streams_total == 0) {
-        p->cfg.max_streams_total = CLOAK_PROXY_DEFAULT_MAX_STREAMS_TOTAL;
+        /* DERIVED, not a constant: see the two CLOAK_PROXY_MAX_STREAMS_
+         * TOTAL_* constants for why a fixed number is inert on exactly the
+         * hosts that need this cap. An explicit non-zero value is honoured
+         * verbatim and never reaches here. */
+        p->cfg.max_streams_total = proxy_derive_max_streams_total();
     }
     return 0;
 }
@@ -621,4 +721,8 @@ size_t cloak_proxy_session_count(const cloak_proxy_t *p) {
 
 size_t cloak_proxy_stream_count(const cloak_proxy_t *p) {
     return p == NULL ? 0 : p->stream_count;
+}
+
+size_t cloak_proxy_max_streams_total(const cloak_proxy_t *p) {
+    return p == NULL ? 0 : p->cfg.max_streams_total;
 }

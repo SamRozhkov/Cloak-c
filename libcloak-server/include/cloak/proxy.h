@@ -207,35 +207,54 @@ typedef struct cloak_proxy_session cloak_proxy_session_t;
  * the whole descriptor budget. */
 #define CLOAK_PROXY_DEFAULT_MAX_STREAMS_PER_SESSION ((size_t)256)
 
-/* The most streams the WHOLE proxy may hold contexts for at once, summed
- * over every session. This is the cap that actually protects the process:
- * cloak_server_registry_t bounds sessions (CLOAK_REGISTRY_MAX_SESSIONS),
- * but that bound times the per-session cap above is far more than any
- * descriptor limit a server is run with, so the per-session cap alone
- * bounds nothing an operator cares about.
+/* The bounds on the most streams the WHOLE proxy may hold contexts for at
+ * once, summed over every session. Unlike every other default in this
+ * file, the value itself is DERIVED AT cloak_proxy_init FROM THE
+ * PROCESS'S OWN DESCRIPTOR LIMIT rather than fixed here, and these two
+ * constants are the range that derivation is clamped into.
  *
- * IT IS SIZED TO LEAVE HEADROOM, AND THE HEADROOM IS THE POINT -- this is
- * a cover-story property, not a capacity one. When the process is out of
- * descriptors the DISPATCHER's own redirect breaks: conn_start_redirect
- * calls cloak_dial_start, its socket() fails with EMFILE/ENFILE, and
- * conn_drop runs instead (libcloak-server/src/dispatcher.c), so a prober
- * gets an abrupt close where it should have got the cover site. One
- * greedy or hostile UID would otherwise flip the entire server from
- * "looks like a web server" to "closes connections", for every other user
- * on it. Losing one client's 4097th stream is cheap; losing the cover
- * story is the failure this whole project exists to avoid.
+ * THE DERIVATION: half of getrlimit(RLIMIT_NOFILE)'s SOFT limit, clamped
+ * to [FLOOR, CEILING]. An unlimited soft limit yields the ceiling; a
+ * getrlimit that fails yields the FLOOR, because a caller that cannot
+ * learn its own limit should assume a small one rather than a generous
+ * one. cloak_proxy_max_streams_total reports what a given proxy ended up
+ * with.
  *
- * 4096 assumes a server whose RLIMIT_NOFILE an operator has raised to the
- * usual tens of thousands: the proxy's own upstream descriptors then stay
- * an order of magnitude below it, leaving the accepted connections, the
- * listeners and -- the part that matters -- the redirect dials with room.
- * It is a ceiling on this module's share, NOT a substitute for setting
- * that limit: a server left on a 1024-descriptor default must lower this
- * to match, since 4096 streams cannot fit under it and the cap would then
- * never be the thing that fired first. Much larger and it stops reserving
- * anything; much smaller and an ordinary multi-user server refuses
- * streams it had the descriptors for. */
-#define CLOAK_PROXY_DEFAULT_MAX_STREAMS_TOTAL ((size_t)4096)
+ * WHY IT IS DERIVED AND NOT A NUMBER. A fixed cap only bounds the servers
+ * that did not need bounding. This module's per-session cap times the
+ * registry's session cap is far more than any descriptor limit, so the
+ * total cap is the one that protects the process -- and a fixed 4096 is
+ * inert on a host left at the common 1024-descriptor default, where the
+ * process hits EMFILE long before the cap does. That is precisely the
+ * state this cap exists to prevent, on precisely the hosts most likely to
+ * be in it.
+ *
+ * WHAT THE RESERVED HALF IS FOR, which is the whole point and is not
+ * capacity: the DISPATCHER's own cover story needs descriptors.
+ * conn_start_redirect dials the cover site, and under EMFILE/ENFILE that
+ * socket() fails and conn_drop runs instead (libcloak-server/src/
+ * dispatcher.c) -- so a prober gets an abrupt close where it should have
+ * got the redirect. The listener's own accept(2) fails the same way.
+ * Reserving half the descriptor budget for those, and never letting this
+ * module's upstream sockets past the other half, is what keeps a resource
+ * shortage from becoming a distinguisher. Losing one client's next stream
+ * is cheap; losing the cover story is the failure this project exists to
+ * avoid.
+ *
+ * THE FLOOR exists so a container with a miserly limit gets a proxy that
+ * still works rather than one that refuses everything -- it is allowed to
+ * exceed half the soft limit, and on such a host the descriptor limit
+ * itself, not this cap, is what binds. THE CEILING exists so a host with
+ * a million descriptors does not hand this module an effectively
+ * unbounded cap: past a few thousand concurrent streams the bound that
+ * matters is memory and reactor turn cost, neither of which scales with
+ * RLIMIT_NOFILE.
+ *
+ * An explicitly configured non-zero cloak_proxy_config_t::max_streams_
+ * total is honoured verbatim and skips all of this: a caller that knows
+ * its deployment knows better than a heuristic. */
+#define CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR ((size_t)64)
+#define CLOAK_PROXY_MAX_STREAMS_TOTAL_CEILING ((size_t)4096)
 
 /* One accepted stream, being connected to or spliced with its upstream.
  * Heap-allocated and never moved: its address is the userdata for its own
@@ -310,6 +329,14 @@ struct cloak_proxy_session {
     uint32_t session_id;
     cloak_proxy_stream_t *streams;
     size_t stream_count;
+
+    /* 1 while this session is refusing streams at max_streams_per_session.
+     * State, not a statistic: it is what makes the operator log fire on
+     * the TRANSITION rather than once per refused stream -- see
+     * cloak_proxy_t::total_capped, which explains why that distinction is
+     * a security property and not a matter of taste. */
+    int capped;
+
     struct cloak_proxy_session *prev, *next;
 };
 
@@ -377,7 +404,7 @@ typedef struct {
      * stream refused at the cap never counted against it, and a stream
      * that ends frees its share the instant its context is freed. */
     size_t max_streams_per_session; /* 0 -> ..._DEFAULT_MAX_STREAMS_PER_SESSION */
-    size_t max_streams_total;       /* 0 -> ..._DEFAULT_MAX_STREAMS_TOTAL */
+    size_t max_streams_total;       /* 0 -> derived; see the two _TOTAL_ constants */
 
     /* OPTIONAL, and the reason cloak_proxy_registry_broken can afford to
      * BE the registry's one on_broken callback rather than something the
@@ -416,6 +443,24 @@ struct cloak_proxy {
      * became a permanent, server-wide refusal to accept any stream at
      * all, which is a worse failure than the exhaustion it prevents. */
     size_t stream_count;
+
+    /* 1 while the proxy is refusing streams at max_streams_total.
+     *
+     * IT EXISTS SO THE OPERATOR LOG IS BOUNDED BY THE STATE, NOT BY THE
+     * ATTACKER. An operator otherwise has no way to tell this cap from a
+     * failing upstream -- a refused stream is deliberately
+     * indistinguishable from a refused upstream to the CLIENT, which is
+     * right, but it leaves the person running the server blind. One line
+     * when a cap starts refusing and one when it stops is enough to
+     * diagnose; a line per refusal would be an amplifier, since refusals
+     * are exactly what an attacker generates in bulk.
+     *
+     * The flag alone would still flip at the attacker's rate (close one
+     * stream, open two), so recovery is HYSTERETIC: the capped state is
+     * only left once the count has fallen an eighth of the cap below it.
+     * That makes the log rate bounded by cap/8 stream lifecycles per line
+     * pair rather than by one. */
+    int total_capped;
 };
 
 /* Zeroes p and validates the rest -- IN THAT ORDER, so that any failure
@@ -425,8 +470,12 @@ struct cloak_proxy {
  * struct.
  *
  * Copies *cfg by value, substituting CLOAK_PROXY_DEFAULT_* for any of the
- * six sizing fields left at 0. cfg->reactor and cfg->srv remain borrowed
- * pointers.
+ * five fixed sizing fields left at 0, and DERIVING the sixth -- a
+ * max_streams_total of 0 becomes half the process's RLIMIT_NOFILE soft
+ * limit, clamped into [CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR, ..._CEILING].
+ * A getrlimit failure is not an init failure: it yields the floor. See
+ * those constants for the whole derivation and why it is one.
+ * cfg->reactor and cfg->srv remain borrowed pointers.
  *
  * Returns 0 on success, -1 if p is NULL, or cfg, cfg->reactor or
  * cfg->srv is NULL. */
@@ -605,5 +654,14 @@ void cloak_proxy_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[CLOAK_
  * p == NULL returns 0. */
 size_t cloak_proxy_session_count(const cloak_proxy_t *p);
 size_t cloak_proxy_stream_count(const cloak_proxy_t *p);
+
+/* The total-stream cap this proxy is actually enforcing: whatever
+ * cloak_proxy_config_t::max_streams_total was set to, or the value
+ * cloak_proxy_init derived from RLIMIT_NOFILE when it was left at 0. It
+ * exists because that derived number is otherwise unobservable -- a
+ * caller cannot check what it got, and a test cannot assert that the
+ * derivation left the process any headroom at all. Never 0 for an
+ * initialized proxy; p == NULL returns 0. */
+size_t cloak_proxy_max_streams_total(const cloak_proxy_t *p);
 
 #endif

@@ -4,6 +4,7 @@
 #include "cloak/clienthello.h"
 #include "cloak/crypto.h"
 #include "cloak/dispatcher.h"
+#include "cloak/log.h"
 #include "cloak/net.h"
 #include "cloak/reactor.h"
 #include "cloak/registry.h"
@@ -20,7 +21,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1175,6 +1178,57 @@ static void expect_stream_refused(struct fixture *fx, client_session_t *cs, int 
     cloak_session_release_stream(&cs->sesh, st);
 }
 
+/* ---- capturing the operator log ------------------------------------------
+ *
+ * cloak/log.h writes one line per message to a settable stream, so an
+ * open_memstream is all it takes to make the cap's operator signal
+ * assertable rather than merely claimed. The default level is INFO, so
+ * both the WARN (entering a capped state) and the INFO (leaving one) are
+ * emitted without touching the level -- deliberately, since an operator
+ * gets these at the default level too or they are useless. */
+typedef struct {
+    FILE *f;
+    char *buf;
+    size_t len;
+} logcap_t;
+
+static int logcap_open(logcap_t *lc) {
+    lc->buf = NULL;
+    lc->len = 0;
+    lc->f = open_memstream(&lc->buf, &lc->len);
+    ASSERT_TRUE(lc->f != NULL);
+    if (lc->f == NULL) {
+        return -1;
+    }
+    cloak_log_set_stream(lc->f);
+    return 0;
+}
+
+static void logcap_close(logcap_t *lc) {
+    cloak_log_set_stream(NULL); /* back to stderr before the buffer dies */
+    if (lc->f != NULL) {
+        fclose(lc->f);
+        lc->f = NULL;
+    }
+    free(lc->buf);
+    lc->buf = NULL;
+}
+
+/* How many emitted lines contain `needle`. The fflush is what makes the
+ * buffer both current and NUL-terminated (open_memstream guarantees the
+ * terminator); without it this would read a stale, unterminated buffer. */
+static int logcap_count(logcap_t *lc, const char *needle) {
+    fflush(lc->f);
+    if (lc->buf == NULL) {
+        return 0;
+    }
+    int n = 0;
+    for (const char *q = lc->buf; (q = strstr(q, needle)) != NULL; q++) {
+        n++;
+    }
+    return n;
+}
+
 /* 13. The PER-SESSION cap: the first N streams work end to end, the
  * (N+1)th is refused, and the N are still carrying afterwards -- the last
  * part being what distinguishes "refused the extra stream" from "broke
@@ -1195,9 +1249,9 @@ static void test_per_session_stream_cap(void) {
     }
     ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
 
-    expect_stream_refused(&fx, &cs, 2, 2);
-
-    /* Both streams under the cap still carry bytes both ways. */
+    /* Both streams under the cap carry bytes both ways, asserted BEFORE
+     * anything is refused so that the refusals below are the only thing
+     * that changes. */
     ASSERT_EQ_INT(4, (int)cloak_stream_write(s1, (const uint8_t *)"more", 4));
     struct up_wait uw = {&fx.up, 0, 7};
     ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw, 600, 5));
@@ -1209,11 +1263,52 @@ static void test_per_session_stream_cap(void) {
     ASSERT_TRUE(pump_until(fx.reactor, reader_has, &rw2, 600, 5));
     ASSERT_MEM_EQ(r2.buf, "two", 3);
 
+    logcap_t lc;
+    ASSERT_EQ_INT(0, logcap_open(&lc));
+
+    /* THREE refusals, not one, and that is the entire point of counting
+     * the log: one line proves the signal is bounded by the STATE, where
+     * three would prove it is bounded by the attacker's own rate -- and
+     * refusals are exactly what an attacker generates in bulk. */
+    expect_stream_refused(&fx, &cs, 2, 2);
+    expect_stream_refused(&fx, &cs, 2, 2);
+    expect_stream_refused(&fx, &cs, 2, 2);
+    ASSERT_EQ_INT(1, logcap_count(&lc, "per-session cap"));
+    ASSERT_EQ_INT(0, logcap_count(&lc, "total cap"));
+    ASSERT_EQ_INT(0, logcap_count(&lc, "no longer"));
+
+    /* The session is untouched by its own refusals. */
     ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
     ASSERT_EQ_INT(0, cs.broken);
 
-    cloak_session_release_stream(&cs.sesh, s1);
+    /* Recovery: one stream ends, the count falls to the low-water mark,
+     * and the operator gets exactly one line saying so. */
+    ASSERT_EQ_INT(0, cloak_session_close_stream(&cs.sesh, s2));
+    struct count_wait cw = {&fx.proxy, 1};
+    ASSERT_TRUE(pump_until(fx.reactor, proxy_streams_eq, &cw, 600, 5));
+    ASSERT_EQ_INT(1, logcap_count(&lc, "no longer at its stream cap"));
     cloak_session_release_stream(&cs.sesh, s2);
+    /* Its upstream is at EOF and still registered; left alone it is ready
+     * on every reactor turn and the iteration-counted pumps below would
+     * burn their budget in no wall-clock time. */
+    up_close_conn(&fx.up, 1);
+
+    /* A SECOND EPISODE, which is what distinguishes "one line per
+     * transition" from "one line ever": the cap is reached again and must
+     * announce itself again. */
+    cloak_stream_t *s3 = open_and_confirm(&fx, &cs, 2, "three");
+    ASSERT_TRUE(s3 != NULL);
+    ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
+    expect_stream_refused(&fx, &cs, 3, 2);
+    ASSERT_EQ_INT(2, logcap_count(&lc, "per-session cap"));
+    ASSERT_EQ_INT(1, logcap_count(&lc, "no longer at its stream cap"));
+
+    logcap_close(&lc);
+
+    cloak_session_release_stream(&cs.sesh, s1);
+    if (s3 != NULL) {
+        cloak_session_release_stream(&cs.sesh, s3);
+    }
     client_session_close(&cs);
     fixture_destroy(&fx);
 }
@@ -1395,7 +1490,45 @@ static void test_init_validation_and_destroy_discipline(void) {
     ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_MAX_RETRIES, (int)live.cfg.max_retries);
     ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_MAX_STREAMS_PER_SESSION,
                   (int)live.cfg.max_streams_per_session);
-    ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_MAX_STREAMS_TOTAL, (int)live.cfg.max_streams_total);
+
+    /* THE TOTAL CAP IS DERIVED, so what is asserted is the PROPERTY the
+     * derivation exists for rather than the arithmetic that produces it
+     * -- a test that recomputed half-the-soft-limit here would agree with
+     * the implementation by construction and catch nothing.
+     *
+     * The property: whatever this host's descriptor limit is, the cap
+     * this proxy enforces leaves the process descriptors that are NOT
+     * this module's to spend -- the ones conn_start_redirect needs to
+     * dial the cover site, whose failure is what turns a resource
+     * shortage into a distinguisher. */
+    size_t derived = cloak_proxy_max_streams_total(&live);
+    ASSERT_TRUE(derived > 0);
+    ASSERT_TRUE(derived <= CLOAK_PROXY_MAX_STREAMS_TOTAL_CEILING);
+    ASSERT_TRUE(derived >= CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR);
+    struct rlimit rl;
+    ASSERT_EQ_INT(0, getrlimit(RLIMIT_NOFILE, &rl));
+    if (rl.rlim_cur != RLIM_INFINITY) {
+        ASSERT_TRUE((uint64_t)derived <= (uint64_t)rl.rlim_cur);
+        /* Half, not merely "under it" -- but only where the floor is not
+         * the thing that bound, since the floor is deliberately allowed
+         * to exceed half a miserly limit (cloak/proxy.h says why). */
+        if ((uint64_t)rl.rlim_cur / 2 > (uint64_t)CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR) {
+            ASSERT_TRUE((uint64_t)derived <= (uint64_t)rl.rlim_cur / 2);
+        }
+    }
+
+    /* An explicit non-zero cap is honoured verbatim and skips the
+     * derivation entirely: a caller that knows its deployment overrides
+     * the heuristic. 7 is chosen because no derivation could produce it. */
+    cloak_proxy_t explicit_cap;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.reactor = r;
+    pcfg.srv = &srv;
+    pcfg.max_streams_total = 7;
+    ASSERT_EQ_INT(0, cloak_proxy_init(&explicit_cap, &pcfg));
+    ASSERT_EQ_INT(7, (int)cloak_proxy_max_streams_total(&explicit_cap));
+    ASSERT_EQ_INT(0, (int)cloak_proxy_max_streams_total(NULL));
+    cloak_proxy_destroy(&explicit_cap);
     ASSERT_TRUE(live.sessions == NULL);
     ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&live));
     ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(&live));
@@ -1403,6 +1536,108 @@ static void test_init_validation_and_destroy_discipline(void) {
     ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(NULL));
     cloak_proxy_destroy(&live);
     cloak_proxy_destroy(&live);
+
+    cloak_reactor_destroy(r);
+}
+
+/* 16. THE DERIVATION ITSELF, which nothing else in this file can reach.
+ *
+ * The property assertions in test 12 run against whatever RLIMIT_NOFILE
+ * the build host happens to have, and on a host with a large one (a
+ * million descriptors is the default in this project's container) EVERY
+ * branch of the derivation returns the ceiling and "at most half the soft
+ * limit" is true of any value at all. Those assertions are therefore
+ * worth almost nothing there -- they would pass against a derivation that
+ * ignored getrlimit entirely. This test exists because of that, and each
+ * case below picks a limit that lands in a DIFFERENT branch.
+ *
+ * IT RUNS IN A FORKED CHILD, and that is not incidental: lowering
+ * RLIMIT_NOFILE in the test process would either leave the whole suite
+ * running under a reduced descriptor limit (every later test opens
+ * sockets) or require raising it back, which is a trap of its own. A
+ * child that lowers its own limit, checks, and _exit()s -- skipping
+ * atexit handlers, so LeakSanitizer does not run twice -- costs the
+ * parent nothing at all. The child reports the failing case as its exit
+ * status, since its own assertion output would not reach the parent's
+ * counter. */
+static const struct {
+    rlim_t soft;
+    size_t want;
+} derive_cases[] = {
+    /* Well above the ceiling: clamped down, which is the only branch a
+     * large-limit host ever exercises on its own. */
+    {(rlim_t)100000, CLOAK_PROXY_MAX_STREAMS_TOTAL_CEILING},
+    /* The common server default: half of it, exactly. */
+    {(rlim_t)1024, (size_t)512},
+    /* Between the floor and the ceiling, so neither clamp applies. */
+    {(rlim_t)200, (size_t)100},
+    /* Below twice the floor: the floor wins, and is ALLOWED to exceed
+     * half the soft limit -- see cloak/proxy.h on why. */
+    {(rlim_t)40, CLOAK_PROXY_MAX_STREAMS_TOTAL_FLOOR},
+};
+
+static void test_total_cap_is_derived_from_rlimit(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+    cloak_server_t srv;
+    memset(&srv, 0, sizeof(srv));
+
+    struct rlimit saved;
+    ASSERT_EQ_INT(0, getrlimit(RLIMIT_NOFILE, &saved));
+
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid < 0) {
+        cloak_reactor_destroy(r);
+        return;
+    }
+    if (pid == 0) {
+        /* Child. Descending order is deliberate: lowering the soft limit
+         * always succeeds, where raising it again is only permitted up to
+         * the hard limit. Nothing here opens a descriptor, so a limit of
+         * 40 is survivable. */
+        int rc = 0;
+        for (size_t i = 0; i < sizeof(derive_cases) / sizeof(derive_cases[0]) && rc == 0; i++) {
+            struct rlimit rl = saved;
+            rl.rlim_cur = derive_cases[i].soft;
+            if (rl.rlim_max != RLIM_INFINITY && rl.rlim_cur > rl.rlim_max) {
+                continue; /* a host too constrained for this case */
+            }
+            if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+                rc = 100;
+                break;
+            }
+            cloak_proxy_config_t c;
+            memset(&c, 0, sizeof(c));
+            c.reactor = r;
+            c.srv = &srv;
+            /* max_streams_total left at 0: this is the derivation. */
+            cloak_proxy_t pr;
+            if (cloak_proxy_init(&pr, &c) != 0) {
+                rc = 101;
+                break;
+            }
+            if (cloak_proxy_max_streams_total(&pr) != derive_cases[i].want) {
+                rc = (int)(i + 1);
+            }
+            cloak_proxy_destroy(&pr);
+        }
+        _exit(rc);
+    }
+
+    int status = 0;
+    ASSERT_TRUE(waitpid(pid, &status, 0) == pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    /* 1..N name the failing case, 100/101 a setrlimit/init failure. */
+    ASSERT_EQ_INT(0, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+
+    /* The parent's own limit is exactly as it was. */
+    struct rlimit now;
+    ASSERT_EQ_INT(0, getrlimit(RLIMIT_NOFILE, &now));
+    ASSERT_TRUE(now.rlim_cur == saved.rlim_cur);
 
     cloak_reactor_destroy(r);
 }
@@ -1422,5 +1657,6 @@ test_permanent_start_failure_is_not_retried();
 test_per_session_stream_cap();
 test_total_stream_cap_spans_sessions();
 test_stream_cap_is_released_when_streams_end();
+test_total_cap_is_derived_from_rlimit();
 test_init_validation_and_destroy_discipline();
 TEST_MAIN_END()
