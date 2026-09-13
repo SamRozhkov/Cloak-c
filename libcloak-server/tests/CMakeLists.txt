@@ -144,3 +144,19 @@ set_tests_properties(test_proxy_teardown PROPERTIES TIMEOUT 60)
 # buffer floor, so genuine backpressure cannot produce that failure.
 set_tests_properties(test_proxy_teardown PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+add_executable(test_server_e2e test_server_e2e.c)
+target_include_directories(test_server_e2e PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_server_e2e PRIVATE cloak-server)
+add_test(NAME test_server_e2e COMMAND test_server_e2e)
+set_tests_properties(test_server_e2e PROPERTIES TIMEOUT 60)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for the same reason test_dispatcher_limits and
+# test_proxy_teardown do: this file's buffered-frame case needs the
+# dispatcher's step-10 reply write to take the EAGAIN path deterministically,
+# which defers conn_handoff to a later reactor turn -- and the reply is far
+# smaller than any socket buffer floor, so genuine backpressure cannot
+# produce that EAGAIN. See test_write_shim.c's own top-of-file comment.
+set_tests_properties(test_server_e2e PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
