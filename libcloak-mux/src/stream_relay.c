@@ -382,8 +382,11 @@ int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
      * cloak_conn_init/cloak_session_init -- silently stalls the very
      * first read). Checked against the SAME per-connection quantity the
      * running budget uses, so the two can never drift apart. */
+    /* -2, NOT -1: this is the one TRANSIENT rejection this function has.
+     * See this function's own doc comment for why the caller must be able
+     * to tell it apart from every permanent failure. */
     if (cloak_session_send_min_conn_free(sesh) < stream_relay_frame_cost_for(stream)) {
-        return -1;
+        return -2;
     }
 
     if (cloak_bytequeue_init(&sr->to_fd, buf_cap) != 0) {

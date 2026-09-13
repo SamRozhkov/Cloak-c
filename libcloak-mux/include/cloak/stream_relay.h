@@ -143,6 +143,20 @@ struct cloak_stream_relay {
  * fd before the failure occurred, in which case the relay closes it
  * itself as part of unwinding.
  *
+ * HOW TO TELL THOSE TWO APART, since a caller that guesses wrong either
+ * leaks a descriptor or double-closes one: after a failed start, read
+ * sr->done. It is non-zero ONLY on that narrow path (the relay ran its
+ * own stream_relay_teardown while unwinding, which is what closed fd),
+ * and zero on every other failure, because this function memsets sr
+ * before it validates anything at all. This is a CONTRACT, not an
+ * internal invariant a caller is reaching past: struct cloak_stream_relay
+ * is fully defined in this header precisely so callers can embed it, and
+ * sr->done is the one field they are told to read. Do not instead probe
+ * the descriptor number for validity -- that is correct only while
+ * nothing between the relay's close() and the probe can allocate a
+ * descriptor, which is a property of today's call graph rather than of
+ * this interface, and is a latent double close the day that changes.
+ *
  * buf_cap sizes the stream-to-fd queue. sesh must be the session stream
  * belongs to -- it is consulted for outbound pressure, never written to
  * directly.
@@ -160,20 +174,46 @@ struct cloak_stream_relay {
  * ran for a while first. This still returns 0, since start genuinely did
  * succeed; the relay just also happens to already be done.
  *
- * Returns 0 on success, -1 on invalid arguments, allocation failure
- * (including the exceedingly rare case of failing to arm that deferred
- * completion timer, which forces an already-finished relay to fail start
- * outright since it would otherwise have no way left to ever report
- * completion), a reactor registration failure, or if the session's pool
- * could never hold even a single worst-case frame right now (the minimum
- * free space over the pool -- see cloak_session_send_min_conn_free -- is
- * smaller than one frame's full on-wire cost for this stream). That last
- * case is caught here rather than left to surface later as a silent
- * stall: a relay started anyway would compute a read budget of 0 on its
- * very first read, with nothing ever queued to eventually prompt a
- * drain-driven resume, and would hang forever holding an open fd with no
- * error anywhere. On failure sr is left safe to pass to
- * cloak_stream_relay_stop. */
+ * THREE RETURN VALUES, and the distinction between the two failures is
+ * the whole point:
+ *
+ *   0  Started. (Possibly already finished too -- see the
+ *      already-ended-stream paragraph above.)
+ *
+ *  -1  PERMANENT failure: invalid arguments, allocation failure
+ *      (including the exceedingly rare case of failing to arm that
+ *      deferred completion timer, which forces an already-finished relay
+ *      to fail start outright since it would otherwise have no way left
+ *      to ever report completion), or a reactor registration failure.
+ *      Nothing about the session or its pool will change to make a later
+ *      attempt with the same arguments succeed, so retrying is pure
+ *      waste: it holds a connected descriptor and the caller's own
+ *      per-stream state open for the whole retry budget and then fails
+ *      anyway.
+ *
+ *  -2  TRANSIENT rejection: the session's pool could not hold even a
+ *      single worst-case frame AT THIS MOMENT -- the minimum free space
+ *      over the pool (see cloak_session_send_min_conn_free) is smaller
+ *      than one frame's full on-wire cost for this stream. This is
+ *      caught here rather than left to surface later as a silent stall:
+ *      a relay started anyway would compute a read budget of 0 on its
+ *      very first read, with nothing ever queued to eventually prompt a
+ *      drain-driven resume, and would hang forever holding an open fd
+ *      with no error anywhere. It is EXPECTED under ordinary congestion
+ *      and says nothing is wrong: a relay already running on this
+ *      session deliberately holds min_conn_free below exactly this
+ *      threshold whenever its peer is slow to drain (see
+ *      stream_relay_fd_read_budget), so a second stream opened during a
+ *      bulk transfer sees this routinely, for as long as the congestion
+ *      lasts. A caller should wait and try again, not give up.
+ *
+ * These are separated because a caller that cannot tell them apart has
+ * only two options and both are wrong: retry every failure (and hold a
+ * descriptor open across a budget that can never succeed) or give up on
+ * every failure (and drop streams during ordinary congestion, which is
+ * precisely the condition backpressure exists to survive).
+ *
+ * On any failure sr is left safe to pass to cloak_stream_relay_stop. */
 int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
                               cloak_session_t *sesh, cloak_stream_t *stream, int fd,
                               size_t buf_cap, cloak_stream_relay_done_cb on_done,

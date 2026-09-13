@@ -98,11 +98,11 @@ typedef struct cloak_proxy_session cloak_proxy_session_t;
 #define CLOAK_PROXY_DEFAULT_DIAL_TIMEOUT_MS ((uint64_t)10000)
 
 /* How long to wait before re-attempting a cloak_stream_relay_start that
- * was rejected (see cloak_proxy_config_t::max_retries for why the retry
- * exists at all). The condition being waited out is the session's
- * outbound pool draining, which happens when the kernel accepts more
- * bytes on a connection to the client -- so the natural timescale is one
- * client round trip, tens of milliseconds.
+ * was rejected with -2 (see cloak_proxy_config_t::max_retries for the
+ * policy). The condition being waited out is the session's outbound pool
+ * draining, which happens when the kernel accepts more bytes on a
+ * connection to the client -- so the natural timescale is one client
+ * round trip, tens of milliseconds.
  *
  * Much smaller and this is a busy-wait: it burns the whole retry budget
  * inside a window far shorter than any real drain could complete in, so
@@ -111,17 +111,44 @@ typedef struct cloak_proxy_session cloak_proxy_session_t;
  * had probably already cleared. */
 #define CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS ((uint64_t)50)
 
-/* How many times a rejected cloak_stream_relay_start is re-attempted
- * before that one stream is given up on. With the delay above this is a
- * ceiling of about one second per stream.
+/* How many times a -2 (transient) rejection is re-attempted before that
+ * one stream is given up on. With the delay above this is a ceiling of
+ * about twenty seconds per stream.
  *
- * Much smaller and a genuinely transient congestion spike -- the case
- * this retry exists for -- kills a stream that would have worked a
- * moment later. Much larger and the PERMANENT failures this cannot tell
- * apart from the transient one (see max_retries' own comment below) hold
- * a connected socket and a heap context for proportionally longer, once
- * per stream, for a stream count the client chooses. */
-#define CLOAK_PROXY_DEFAULT_MAX_RETRIES ((unsigned)20)
+ * WHAT THIS CEILING IS PROTECTING AGAINST, which is not what it looks
+ * like: it is NOT a bound on congestion. Congestion ends the ladder by
+ * ITSELF, the moment the pool drains, after however few or many retries
+ * that took. The ceiling exists because -2 is also produced by a
+ * condition that is transient in SHAPE but permanent in FACT, and that
+ * the relay cannot distinguish from congestion at that call site: a pool
+ * whose conn_send_queue_cap is simply smaller than one worst-case
+ * frame's on-wire cost for this stream can NEVER satisfy the check, no
+ * matter how long anyone waits. That is an operator misconfiguration
+ * (two individually valid mux parameters that do not fit together --
+ * cloak/stream_relay.h's start-time rejection exists to catch exactly
+ * it), and without a ceiling every stream such a server accepted would
+ * park a connected upstream descriptor and a heap context on a timer
+ * forever.
+ *
+ * So: long enough to outlast any congestion episode during which the
+ * stream would still have been worth starting, and short enough that a
+ * misconfigured server reclaims each descriptor instead of accumulating
+ * one per stream. Twenty seconds sits above this project's own dial and
+ * handshake timeouts (10s, 15s) and below the session inactivity
+ * timeouts its callers configure. Much smaller and an ordinary bulk
+ * transfer on the same session can kill a second stream that was merely
+ * waiting its turn -- which is precisely what an earlier one-second
+ * ceiling would have done, chosen when this ladder still had to absorb
+ * permanent failures too. Much larger and the misconfiguration case
+ * above is barely bounded at all.
+ *
+ * IT MUST STAY BELOW THE SESSION'S OWN inactivity_timeout_ms, so that a
+ * stream which can never start is reclaimed on the stream path rather
+ * than left for the session's. A caller configuring an inactivity
+ * timeout shorter than retry_delay_ms * max_retries must lower
+ * max_retries to match; nothing here can check that, because the session
+ * config belongs to the dispatcher, not to this module. */
+#define CLOAK_PROXY_DEFAULT_MAX_RETRIES ((unsigned)400)
 
 /* One accepted stream, being connected to or spliced with its upstream.
  * Heap-allocated and never moved: its address is the userdata for its own
@@ -193,26 +220,28 @@ typedef struct {
     size_t relay_buf_cap;     /* 0 -> CLOAK_PROXY_DEFAULT_RELAY_BUF_CAP */
     uint64_t dial_timeout_ms; /* 0 -> CLOAK_PROXY_DEFAULT_DIAL_TIMEOUT_MS */
 
-    /* THE RETRY POLICY, AND WHY IT EXISTS AT ALL. cloak_stream_relay_start
-     * returns -1 for two categorically different reasons and gives the
-     * caller no way to tell them apart: a permanent failure (bad
-     * arguments, allocation, reactor registration) and a transient one
-     * ("the session's outbound pool could not hold even a single
-     * worst-case frame right now" -- see that function's own doc
-     * comment, which documents both under one return value). Treating
-     * every -1 as permanent would drop streams during ordinary
-     * congestion; treating every -1 as transient costs a bounded number
-     * of retries on a failure that was never going to clear. This takes
-     * the second, conservative branch: retry up to max_retries, spaced
-     * retry_delay_ms apart, holding the connected descriptor in
-     * cloak_proxy_stream_t::fd_pending meanwhile, then give up on THAT
-     * ONE STREAM (never the session).
+    /* THE RETRY POLICY. cloak_stream_relay_start distinguishes its two
+     * failure kinds by return value, and this module branches on that
+     * distinction rather than guessing:
      *
-     * IF cloak/stream_relay.h EVER DISTINGUISHES THE TWO -- a distinct
-     * return value, or an out-parameter -- this whole mechanism (both
-     * fields, retry_timer, fd_pending and retries) should collapse to
-     * "retry the transient case, fail the permanent one immediately".
-     * That is the change this comment exists to point at. */
+     *   -1 PERMANENT (bad arguments, allocation, reactor registration).
+     *      Failed immediately. Retrying cannot help, and would hold a
+     *      connected upstream descriptor and this stream's context open
+     *      for the whole budget before failing anyway.
+     *
+     *   -2 TRANSIENT ("the pool cannot hold one worst-case frame right
+     *      now"). Retried up to max_retries, spaced retry_delay_ms
+     *      apart, with the connected descriptor held in
+     *      cloak_proxy_stream_t::fd_pending meanwhile. This is NOT a
+     *      rare corner: a relay already running on the session
+     *      deliberately holds the pool below exactly that threshold for
+     *      as long as its own peer is slow to drain, so a second stream
+     *      opened during a bulk transfer takes this path routinely, and
+     *      for as long as the congestion lasts.
+     *
+     * Exhausting the budget gives up on THAT ONE STREAM, never on the
+     * session. See CLOAK_PROXY_DEFAULT_MAX_RETRIES for what that finite
+     * budget is actually protecting against, which is not congestion. */
     uint64_t retry_delay_ms; /* 0 -> CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS */
     unsigned max_retries;    /* 0 -> CLOAK_PROXY_DEFAULT_MAX_RETRIES */
 } cloak_proxy_config_t;

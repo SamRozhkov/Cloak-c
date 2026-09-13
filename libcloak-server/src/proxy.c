@@ -1,8 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cloak/proxy.h"
 
-#include <errno.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -128,38 +126,11 @@ static void proxy_session_teardown(cloak_proxy_session_t *ps) {
 static void proxy_on_relay_done(cloak_stream_relay_t *sr, void *userdata);
 static void proxy_on_retry_timer(cloak_reactor_t *r, void *userdata);
 
-/* Does this process still own fd, or has something already closed it?
- *
- * This exists for ONE narrow case. cloak_stream_relay_start's contract is
- * that a failed start leaves the descriptor with the caller -- "except in
- * the extremely narrow case documented below where the relay had already
- * taken ownership of fd before the failure occurred, in which case the
- * relay closes it itself as part of unwinding" (cloak/stream_relay.h).
- * The return value is -1 either way and the header offers no discriminator
- * at all, so the retry path below would otherwise have to either leak a
- * descriptor or double-close one.
- *
- * Probing the descriptor answers the actual question rather than a proxy
- * for it, and it is exact here: this reactor is single-threaded, and
- * between the relay's own close() and this call nothing that could
- * allocate a descriptor runs (the relay's unwind only destroys a byte
- * queue and enqueues a closing frame on already-open sockets), so this
- * descriptor number cannot have been recycled underneath us. The
- * alternative -- reading the relay's own `done` flag, which is 1 on that
- * one path and 0 on every other failure -- is an undocumented internal
- * invariant, and this module does not want to be the thing that breaks
- * when it changes. */
-static int proxy_fd_still_open(int fd) {
-    if (fcntl(fd, F_GETFD) != -1) {
-        return 1;
-    }
-    return errno != EBADF;
-}
-
 /* Attempts to splice pst->stream with the descriptor currently held in
- * pst->fd_pending, retrying on a timer if the relay rejects the start.
- * Every exit either hands the descriptor to the relay or tears the stream
- * context down -- pst may be freed by the time this returns. */
+ * pst->fd_pending, retrying on a timer if -- and only if -- the relay
+ * rejects the start for its one transient reason. Every exit either hands
+ * the descriptor to the relay or tears the stream context down; pst may
+ * be freed by the time this returns. */
 static void proxy_try_start_relay(cloak_proxy_stream_t *pst) {
     cloak_proxy_session_t *ps = pst->ps;
     cloak_proxy_t *p = ps->p;
@@ -169,9 +140,10 @@ static void proxy_try_start_relay(cloak_proxy_stream_t *pst) {
         return;
     }
 
-    int fd = pst->fd_pending;
-    if (cloak_stream_relay_start(&pst->relay, p->cfg.reactor, ps->sesh, pst->stream, fd,
-                                 p->cfg.relay_buf_cap, proxy_on_relay_done, pst) == 0) {
+    int rc = cloak_stream_relay_start(&pst->relay, p->cfg.reactor, ps->sesh, pst->stream,
+                                      pst->fd_pending, p->cfg.relay_buf_cap, proxy_on_relay_done,
+                                      pst);
+    if (rc == 0) {
         /* Ownership of fd is the relay's from here; see this module's
          * header for the fd_pending == -1 rule this implements. */
         pst->fd_pending = -1;
@@ -179,21 +151,38 @@ static void proxy_try_start_relay(cloak_proxy_stream_t *pst) {
         return;
     }
 
-    if (!proxy_fd_still_open(fd)) {
-        /* The narrow case proxy_fd_still_open exists for: the relay
-         * already took and closed the descriptor (and closed the stream)
-         * while unwinding. There is nothing left to retry WITH. */
+    /* WHO OWNS THE DESCRIPTOR NOW. cloak_stream_relay_start's doc comment
+     * makes sr->done the discriminator: non-zero means the relay had
+     * already taken fd and closed it while unwinding (it closed the
+     * stream too), zero means the caller still holds it. Reading it is
+     * the documented contract, not a reach into internal state -- and
+     * deliberately NOT an fd-number probe, which would only be correct
+     * while nothing between that close and the probe can allocate a
+     * descriptor, i.e. a property of today's call graph rather than of
+     * the interface, and a latent double close. */
+    if (pst->relay.done) {
         pst->fd_pending = -1;
         proxy_stream_teardown(pst);
         return;
     }
 
-    /* Every other -1 is retried, because the interface cannot tell us
-     * which kind it was -- see cloak_proxy_config_t::retry_delay_ms for
-     * the full reasoning and for what should be simplified here if
-     * cloak/stream_relay.h ever distinguishes the two. Exhausting the
-     * budget closes THIS ONE STREAM; the session and its other streams
-     * are untouched. */
+    if (rc != -2) {
+        /* PERMANENT (-1): bad arguments, allocation failure, or a reactor
+         * registration failure. Nothing about this session will change to
+         * make the identical call succeed later, so retrying would hold a
+         * connected upstream socket and this context open for the whole
+         * budget and fail anyway. Close this one stream now; the session
+         * and its other streams are untouched. */
+        proxy_stream_teardown(pst);
+        return;
+    }
+
+    /* TRANSIENT (-2): the session's pool cannot hold one worst-case frame
+     * right now. This is ordinary congestion -- a relay already running
+     * on this session holds min_conn_free below exactly this threshold
+     * for as long as its peer is slow to drain -- so it is waited out,
+     * not treated as a failure. See cloak_proxy_config_t::max_retries for
+     * what the finite ceiling is actually protecting against. */
     if (pst->retries >= p->cfg.max_retries) {
         proxy_stream_teardown(pst);
         return;

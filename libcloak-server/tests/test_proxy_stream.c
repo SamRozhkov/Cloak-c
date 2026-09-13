@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -34,6 +35,22 @@
  * the reactor, which forces O_NONBLOCK itself). Three tests on this
  * project have hung or flaked in CI and two of them were blocking read()
  * calls on a peer socket; this file deliberately contains none. */
+
+/* test_permanent_start_failure_is_not_retried provokes a PERMANENT
+ * cloak_stream_relay_start failure the only way this module's public
+ * surface allows: a relay_buf_cap so large that the relay's byte-queue
+ * allocation cannot succeed. Under the sanitizer suite an allocation
+ * that big is an "allocation-size-too-big" hard error rather than a NULL
+ * return, which would abort the whole binary before the code under test
+ * ever ran. This is ASan's own documented opt-out hook, linked into the
+ * test binary itself so the build needs no ASAN_OPTIONS plumbing and the
+ * plain Debug build is unaffected (nothing ever calls it there). It is
+ * scoped to allocator behaviour only: every memory-error check ASan
+ * performs for this binary is untouched. */
+const char *__asan_default_options(void);
+const char *__asan_default_options(void) {
+    return "allocator_may_return_null=1";
+}
 
 /* ---- fake upstream: records everything it receives, echoes it back ---- */
 
@@ -230,14 +247,17 @@ struct fixture {
 /* transport is the ProxyBook entry's declared transport: "tcp" for every
  * traffic-carrying test, "udp" for the redirect case (test 9).
  *
- * conn_send_queue_cap sizes the SERVER session's outbound pool, and
- * retry_delay_ms/max_retries go straight into cloak_proxy_config_t. Every
- * test but one passes the defaults (see fixture_init below); test 10
- * overrides all three, because the condition it exercises is defined
- * entirely in terms of that pool's size. */
+ * conn_send_queue_cap sizes the SERVER session's outbound pool;
+ * relay_buf_cap, retry_delay_ms and max_retries go straight into
+ * cloak_proxy_config_t. Every test but the two retry-policy ones passes
+ * the defaults (see fixture_init below): test 10 overrides the pool size
+ * and the ladder, because the transient rejection it exercises is
+ * defined entirely in terms of that pool; test 11 overrides
+ * relay_buf_cap, because a permanent failure is the only kind this
+ * module's public surface can provoke at all. */
 static int fixture_init_opts(struct fixture *fx, const char *transport,
-                             size_t conn_send_queue_cap, uint64_t retry_delay_ms,
-                             unsigned max_retries) {
+                             size_t conn_send_queue_cap, size_t relay_buf_cap,
+                             uint64_t retry_delay_ms, unsigned max_retries) {
     memset(fx, 0, sizeof(*fx));
     char err[256] = {0};
 
@@ -301,8 +321,10 @@ static int fixture_init_opts(struct fixture *fx, const char *transport,
     memset(&pcfg, 0, sizeof(pcfg));
     pcfg.reactor = fx->reactor;
     pcfg.srv = &fx->srv;
-    /* Left at 0 by every caller but test 10, so these tests exercise the
-     * CLOAK_PROXY_DEFAULT_* constants rather than values invented here. */
+    /* Left at 0 by every caller but tests 10 and 11, so the rest exercise
+     * the CLOAK_PROXY_DEFAULT_* constants rather than values invented
+     * here. */
+    pcfg.relay_buf_cap = relay_buf_cap;
     pcfg.retry_delay_ms = retry_delay_ms;
     pcfg.max_retries = max_retries;
     ASSERT_EQ_INT(0, cloak_proxy_init(&fx->proxy, &pcfg));
@@ -359,7 +381,7 @@ static int fixture_init_opts(struct fixture *fx, const char *transport,
 /* The ordinary fixture: a roomy server-side pool and cloak_proxy_t's own
  * defaults for everything. */
 static int fixture_init(struct fixture *fx, const char *transport) {
-    return fixture_init_opts(fx, transport, 262144, 0, 0);
+    return fixture_init_opts(fx, transport, 262144, 0, 0, 0);
 }
 
 /* Destroy order, and why each step is where it is:
@@ -938,7 +960,7 @@ static int retry_step(void *ctx) {
 
 static void test_relay_start_rejection_retries_then_gives_up(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 16402, 5, 3));
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 16402, 0, 5, 3));
 
     client_session_t cs;
     ASSERT_EQ_INT(0, open_client(&fx, &cs, 1010));
@@ -1026,6 +1048,146 @@ static void test_udp_proxy_book_entry_redirects(void) {
     fixture_destroy(&fx);
 }
 
+/* 11. The other side of the same branch: a PERMANENT
+ * cloak_stream_relay_start failure (-1) must NOT enter the retry ladder.
+ * Retrying one would hold a connected upstream descriptor and this
+ * stream's context open for the whole budget and then fail anyway.
+ *
+ * `relay_buf_cap = SIZE_MAX` is the only permanent failure this module's
+ * public surface can provoke: every other -1 cause is either an argument
+ * cloak_proxy_t structurally never passes (a NULL reactor/session/stream,
+ * fd < 0, buf_cap 0) or an allocator/epoll_ctl failure with no injection
+ * seam. It makes the relay's own byte-queue allocation return NULL, which
+ * is a -1 -- and it is reached only after the transient (-2) check has
+ * already passed, since this fixture's pool is the roomy default one.
+ *
+ * `retries == 0` is the assertion that distinguishes the two branches;
+ * the upstream's EOF is what proves the descriptor was closed rather
+ * than leaked on a path that never armed a timer. */
+static void test_permanent_start_failure_is_not_retried(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 262144, SIZE_MAX, 5, 3));
+
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 1011));
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(1, (int)cloak_stream_write(st, (const uint8_t *)"x", 1));
+
+    uint8_t back[16];
+    reader_t rd = {st, back, sizeof(back), 0, 0};
+    struct retry_watch rw = {&fx, 0, &rd};
+    ASSERT_TRUE(pump_until(fx.reactor, retry_step, &rw, 2000, 5));
+
+    ASSERT_EQ_INT(1, rd.ended);
+    ASSERT_EQ_INT(0, (int)rw.max_retries_seen);
+    ASSERT_EQ_INT(1, fx.up.accept_count);
+
+    struct up_wait uw = {&fx.up, 0, 0};
+    ASSERT_TRUE(pump_until(fx.reactor, up_saw_eof, &uw, 400, 5));
+    ASSERT_EQ_INT(1, fx.up.conns[0].eof);
+
+    ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(&fx.proxy));
+    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&fx.proxy));
+    ASSERT_EQ_INT(0, cs.broken);
+
+    cloak_session_release_stream(&cs.sesh, st);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* 12. Constructor/destructor discipline, the two shapes this project
+ * asserts for every such pair (test_dispatcher_redirect.c's rejected-init
+ * test and test_server_state.c's idempotent-destroy test are the models).
+ *
+ * The 0xAA prefill is what makes the init assertions non-vacuous: a
+ * freshly zeroed struct would satisfy them whether or not
+ * cloak_proxy_init actually re-initializes on its REJECTION paths, rather
+ * than only on the one that runs to the end. */
+static void test_init_validation_and_destroy_discipline(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+    /* Never used for anything but its address: cloak_proxy_init only
+     * stores the pointer. */
+    cloak_server_t srv;
+    memset(&srv, 0, sizeof(srv));
+
+    cloak_proxy_t dirty;
+    cloak_proxy_config_t pcfg;
+
+    /* NULL cfg. */
+    memset(&dirty, 0xAA, sizeof(dirty));
+    ASSERT_EQ_INT(-1, cloak_proxy_init(&dirty, NULL));
+    ASSERT_TRUE(dirty.sessions == NULL);
+    ASSERT_EQ_INT(0, (int)dirty.session_count);
+    ASSERT_EQ_INT(0, (int)dirty.stream_count);
+    /* The whole point of initialize-before-validate: destroy must be safe
+     * against a struct a rejected constructor left behind. */
+    cloak_proxy_destroy(&dirty);
+
+    /* NULL reactor. */
+    memset(&dirty, 0xAA, sizeof(dirty));
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.reactor = NULL;
+    pcfg.srv = &srv;
+    ASSERT_EQ_INT(-1, cloak_proxy_init(&dirty, &pcfg));
+    ASSERT_TRUE(dirty.sessions == NULL);
+    ASSERT_EQ_INT(0, (int)dirty.session_count);
+    cloak_proxy_destroy(&dirty);
+
+    /* NULL srv. */
+    memset(&dirty, 0xAA, sizeof(dirty));
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.reactor = r;
+    pcfg.srv = NULL;
+    ASSERT_EQ_INT(-1, cloak_proxy_init(&dirty, &pcfg));
+    ASSERT_TRUE(dirty.sessions == NULL);
+    ASSERT_EQ_INT(0, (int)dirty.session_count);
+    cloak_proxy_destroy(&dirty);
+
+    /* NULL p is rejected without dereferencing it, and destroy tolerates
+     * NULL too. */
+    ASSERT_EQ_INT(-1, cloak_proxy_init(NULL, &pcfg));
+    cloak_proxy_destroy(NULL);
+
+    /* Idempotent and safe on a zeroed struct. */
+    cloak_proxy_t zeroed;
+    memset(&zeroed, 0, sizeof(zeroed));
+    cloak_proxy_destroy(&zeroed);
+    cloak_proxy_destroy(&zeroed);
+
+    /* A successful init fills in every CLOAK_PROXY_DEFAULT_*, and destroy
+     * on the result is idempotent too. */
+    cloak_proxy_t live;
+    memset(&live, 0xAA, sizeof(live));
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.reactor = r;
+    pcfg.srv = &srv;
+    ASSERT_EQ_INT(0, cloak_proxy_init(&live, &pcfg));
+    ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_RELAY_BUF_CAP, (int)live.cfg.relay_buf_cap);
+    ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_DIAL_TIMEOUT_MS, (int)live.cfg.dial_timeout_ms);
+    ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS, (int)live.cfg.retry_delay_ms);
+    ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_MAX_RETRIES, (int)live.cfg.max_retries);
+    ASSERT_TRUE(live.sessions == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&live));
+    ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(&live));
+    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(NULL));
+    ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(NULL));
+    cloak_proxy_destroy(&live);
+    cloak_proxy_destroy(&live);
+
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
 test_one_stream_both_ways();
 test_preexisting_bytes_reach_upstream();
@@ -1037,4 +1199,6 @@ test_refused_upstream_closes_only_that_stream();
 test_unordered_redirects();
 test_udp_proxy_book_entry_redirects();
 test_relay_start_rejection_retries_then_gives_up();
+test_permanent_start_failure_is_not_retried();
+test_init_validation_and_destroy_discipline();
 TEST_MAIN_END()
