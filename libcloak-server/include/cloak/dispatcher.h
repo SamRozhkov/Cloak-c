@@ -13,9 +13,9 @@
 #include "cloak/session.h"
 
 /* The server's front door: turns an accepted connection into either a
- * redirect to the cover site or (from a later task) an authenticated
- * session. This is the C equivalent of Go Cloak's dispatchConnection
- * (internal/server/dispatcher.go).
+ * redirect to the cover site or an authenticated session. This is the C
+ * equivalent of Go Cloak's dispatchConnection (internal/server/
+ * dispatcher.go).
  *
  * WIRING: the caller passes cloak_dispatcher_accept as the on_accept
  * callback to cloak_listener_open, with a live cloak_dispatcher_t as its
@@ -28,16 +28,64 @@
  * failure, closes it itself. The listener never sees it again.
  *
  * THE PROPERTY THIS MODULE EXISTS TO PROTECT: every failure redirects to
- * RedirAddr rather than closing the connection. Closing tells a prober
- * that something other than a web server is listening, which is exactly
- * what Cloak exists to prevent -- so an unrecognised protocol, an
- * oversized or malformed first packet, and (until a later task replaces
- * the stub) a failed authentication all take the same path: forward
+ * RedirAddr rather than closing the connection, wherever there is
+ * anything left to redirect. Closing tells a prober that something other
+ * than a web server is listening, which is exactly what Cloak exists to
+ * prevent -- so an unrecognised protocol, an oversized or malformed first
+ * packet, and a failed authentication all take the same path: forward
  * whatever the client already sent to the cover site and splice the two
- * sockets together. The only cases that close instead are the ones where
- * there is nothing to redirect: the peer already went away (there is no
- * one to forward to), or the redirect dial itself failed (there is
- * nowhere to forward to).
+ * sockets together.
+ *
+ * That is the common case, not the whole contract: this module closes
+ * instead of redirecting in five distinct classes of situation, and a
+ * reader who needs the exact list should not have to derive it from the
+ * source. In order of how often each is actually reached:
+ *
+ *  (a) NOTHING TO REDIRECT TO. The peer is already gone (conn_drop_peer_
+ *      gone -- read() returned 0 or an error before a first packet was
+ *      even framed), the redirect dial itself failed or could not even be
+ *      started (on_dial_done's fd < 0 case, conn_start_redirect's
+ *      cloak_dial_start failure), or the dial succeeded but the relay
+ *      itself could not be started (on_dial_done's cloak_relay_start
+ *      failure). In every one of these there is no live peer connection
+ *      left to hand bytes to, regardless of what this module does.
+ *
+ *  (b) THE COVER STORY IS ALREADY SPENT. Once dispatcher_authenticate has
+ *      succeeded, the client has (or is about to have) a genuine
+ *      ServerHello in hand -- forwarding it to the cover site after that
+ *      would be visibly incoherent (a real web server never follows a
+ *      ServerHello with a second, unrelated handshake attempt), so every
+ *      failure from that point on closes rather than redirects: a step-10
+ *      reply-write error (conn_reply_write_failed), a step-11
+ *      cloak_session_add_conn failure, and the session having already
+ *      been torn down out from under this connection by the time it
+ *      reaches hand-off (conn_handoff's re-resolve-by-(uid,session_id)
+ *      coming back NULL -- see conn_handoff's own comment in
+ *      dispatcher.c and this module's C1 finding for why a stored session
+ *      pointer cannot be trusted here instead).
+ *
+ *  (c) RESOURCES ARE ALREADY EXHAUSTED. cloak_dispatcher_accept's own cap
+ *      (deliberately closes despite somewhere to redirect existing -- see
+ *      CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own comment for why),
+ *      and every allocation/timer/registration failure at accept
+ *      (calloc, the handshake-deadline timer, cloak_reactor_add_fd) or in
+ *      the reply-write state (the reply-write deadline timer,
+ *      cloak_reactor_mod_fd switching to WRITABLE) -- all ENOMEM-class
+ *      failures where refusing to proceed is the only sound option
+ *      regardless of which state the connection is in.
+ *
+ *  (d) THE FIRST-PACKET DEADLINE. on_deadline firing for the read-side
+ *      deadline armed in cloak_dispatcher_accept matches Go's own
+ *      behaviour, not just this port's own judgement: Go's
+ *      readFirstPacket returning a read error sets redirOnErr = false,
+ *      so dispatchConnection calls conn.Close() rather than redirecting
+ *      -- this module's on_deadline->conn_drop is the same call, ported.
+ *
+ *  (e) CALLER BUGS WITH NO CONNECTION YET. cloak_dispatcher_accept's own
+ *      userdata == NULL check: there is no cloak_dispatch_conn_t to
+ *      redirect through at that point, only the bare fd the listener
+ *      handed over, so closing it is the only possible response to a
+ *      caller that wired this callback up wrong.
  *
  * A KNOWN GAP IN THAT CLOSE, worth stating explicitly since this header
  * calls out fingerprint-surface details everywhere else it can: the
@@ -71,26 +119,31 @@
  * each one is where it is. Every other connection -- wrong transport,
  * unparseable, replayed, undecryptable, unauthorised, or an unknown proxy
  * method -- is treated exactly like any other non-Cloak connection and
- * redirected, matching Go Cloak's own behaviour. The ONE exception is a
- * failure writing the post-authentication reply (step 10 in that brief):
- * by then the client has already received a ServerHello, so the cover
- * story is blown regardless, and that path closes rather than redirects
- * -- see conn_reply_write_failed's own comment in dispatcher.c.
+ * redirected, matching Go Cloak's own behaviour. The exception is class
+ * (b) above: once authentication succeeds the client has (or is about
+ * to have) a ServerHello, so the cover story is blown regardless, and
+ * every failure from that point on (step-10 reply-write, step-11
+ * cloak_session_add_conn, or the session having already been torn down
+ * from underneath this connection) closes rather than redirects -- see
+ * conn_reply_write_failed's and conn_handoff's own comments in
+ * dispatcher.c.
  *
  * TEARDOWN: cloak_dispatcher_destroy walks every connection still
  * in-flight (reading its first packet, mid-dial, mid-relay, or mid-reply-
  * write) and tears each one down -- cancelling its deadline, cancelling
  * or stopping whatever redirect machinery is live, closing a brand-new
- * session this connection created but never finished attaching to (see
- * conn_teardown's own comment in dispatcher.c), and closing whatever
- * fd(s) the connection still owns. This is the caller's own shutdown, not
- * a failure
- * path, so nothing here is reported back to whoever initiated it.
+ * session this connection created but never finished attaching to
+ * PROVIDED no other connection has since attached to it in the meantime
+ * (see conn_teardown's own comment in dispatcher.c, and this module's I1
+ * finding for why "created this session" alone is not sufficient), and
+ * closing whatever fd(s) the connection still owns. This is the caller's
+ * own shutdown, not a failure path, so nothing here is reported back to
+ * whoever initiated it.
  *
  * OWNERSHIP, stated once: a connection owns its client fd from the moment
  * cloak_dispatcher_accept takes it until the moment that ownership passes
  * elsewhere -- to cloak_relay_start (which then owns both fds until it
- * closes them) or, in Task 2, to cloak_session_add_conn. The connection
+ * closes them) or to cloak_session_add_conn. The connection
  * sets its own fd field to -1 at exactly the instant ownership leaves, so
  * that every subsequent teardown path (an error on another field,
  * cloak_dispatcher_destroy) sees -1 and knows there is nothing left for
