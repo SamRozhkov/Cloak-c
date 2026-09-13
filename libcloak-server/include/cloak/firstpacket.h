@@ -22,7 +22,22 @@
  * This layer only FRAMES the packet -- it decides where the packet ends
  * and which transport it is, nothing more. Parsing a ClientHello is
  * cloak_clienthello_parse's job, and authenticating it is
- * cloak_server_auth_decrypt's. */
+ * cloak_server_auth_decrypt's.
+ *
+ * CALLER OBLIGATION this object cannot enforce on its own: Go's
+ * readFirstPacket (internal/server/dispatcher.go) begins with
+ * conn.SetReadDeadline(time.Now().Add(15 * time.Second)) before it reads
+ * anything at all. This object has no notion of time or of the fd it is
+ * being fed from, so it cannot reproduce that deadline itself -- it is
+ * the dispatcher's job, on this project's reactor, to arm a 15-second
+ * timer (matching Go's constant) against the connection the moment it
+ * starts feeding a cloak_firstpacket_t, and to drop the connection (and
+ * free this fp) if that timer fires before cloak_firstpacket_feed returns
+ * DONE or ERROR. Skipping this is not merely a spec deviation: a client
+ * that sends its deciding byte (e.g. 0x16) and then never sends another
+ * one leaves cloak_firstpacket_want() permanently non-zero, pinning both
+ * the fd and this ~3KB struct for as long as the connection stays open --
+ * i.e. forever, absent this deadline. */
 
 /* Go Cloak's firstPacketSize. Large enough for a modern Chrome
  * ClientHello, which passed 1500 bytes when uTLS updated its
@@ -38,7 +53,15 @@ typedef enum {
 typedef enum {
     CLOAK_FIRSTPACKET_TRANSPORT_UNKNOWN = 0,
     CLOAK_FIRSTPACKET_TRANSPORT_TLS = 1,      /* first byte 0x16: a TLS record */
-    CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET = 2, /* first byte 'G': an HTTP GET */
+    /* first byte 'G': an HTTP GET. This is produced (framed correctly,
+     * all the way to the blank line ending the headers) but has NO
+     * consumer anywhere in this codebase yet -- correct for now, since
+     * the CDN/WebSocket transport module this is for does not exist yet.
+     * Until it does, the dispatcher MUST treat this transport the same as
+     * any other case it has no handler for: a redirect case (see
+     * cloak_firstpacket_redirect_on_error and RedirAddr), never wired to
+     * a half-built CDN code path. */
+    CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET = 2,
 } cloak_firstpacket_transport_t;
 
 typedef struct {
@@ -62,7 +85,11 @@ typedef struct {
 } cloak_firstpacket_t;
 
 /* Resets fp to its starting state. Must be called before any other
- * function; a cloak_firstpacket_t is not usable zero-initialized. */
+ * function; a cloak_firstpacket_t is not usable zero-initialized.
+ *
+ * NULL arguments: every function in this file tolerates fp == NULL (a
+ * no-op here; see each function's own return value below for what a NULL
+ * fp yields elsewhere) rather than crashing. */
 void cloak_firstpacket_init(cloak_firstpacket_t *fp);
 
 /* How many bytes the caller should read and feed next. Never returns more
@@ -92,7 +119,17 @@ size_t cloak_firstpacket_want(const cloak_firstpacket_t *fp);
  * never end. Those are all cases where Go forwards the connection to
  * RedirAddr rather than closing it, because closing would tell a prober
  * that something other than a web server is listening. Check
- * cloak_firstpacket_redirect_on_error rather than assuming. */
+ * cloak_firstpacket_redirect_on_error rather than assuming.
+ *
+ * NULL fp: returns CLOAK_FIRSTPACKET_ERROR without touching anything.
+ * Note the asymmetry this creates with cloak_firstpacket_redirect_on_error(NULL),
+ * which returns 0 (not redirectable) -- an error manufactured here by a
+ * NULL fp is therefore reported as non-redirectable if the caller checks
+ * redirect_on_error the same way it would for a real error. This is
+ * correct (there is no real fp to hold a redirect_on_error flag, and
+ * "drop the connection" is the safer of the two behaviours for a caller
+ * bug that should not happen in practice) but easy to be surprised by if
+ * you have not read this. */
 cloak_firstpacket_status_t cloak_firstpacket_feed(cloak_firstpacket_t *fp,
                                                    const uint8_t *data, size_t len);
 

@@ -183,6 +183,34 @@ static void test_oversized_http_headers_are_a_redirectable_error(void) {
     ASSERT_TRUE(cloak_firstpacket_len(&fp) <= CLOAK_FIRSTPACKET_MAX);
 }
 
+/* A header value containing a bare CR with no following LF -- the CRLF
+ * automaton's trickiest expression (crlf_state's "any other byte restarts
+ * it, except that a CR restarts it at 1 rather than 0" rule, per
+ * firstpacket.c's own comment) was, before this test, backed only by a
+ * hand-trace: a lone '\r' mid-value must move crlf_state to 1, and the
+ * ordinary byte immediately after it ('b', neither CR nor LF) must then
+ * reset it back to 0 -- rather than either being mistaken for progress
+ * toward the terminating blank line or corrupting the count such that the
+ * real blank line afterward is missed or matched early. */
+static void test_header_value_with_bare_cr_no_lf(void) {
+    const char *req =
+        "GET / HTTP/1.1\r\n"
+        "X-Weird: a\rb\r\n"
+        "\r\n";
+    size_t req_len = strlen(req);
+
+    cloak_firstpacket_t fp;
+    cloak_firstpacket_init(&fp);
+
+    size_t consumed = 0;
+    ASSERT_EQ_INT(CLOAK_FIRSTPACKET_DONE,
+                  feed_all(&fp, (const uint8_t *)req, req_len, &consumed));
+    ASSERT_EQ_INT((int)req_len, (int)consumed);
+    ASSERT_EQ_INT(CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET, (int)fp.transport);
+    ASSERT_EQ_INT((int)req_len, (int)cloak_firstpacket_len(&fp));
+    ASSERT_MEM_EQ(cloak_firstpacket_data(&fp), req, req_len);
+}
+
 static void test_feed_after_done_is_rejected(void) {
     uint8_t record[64];
     size_t record_len = make_tls_record(record, 8);
@@ -219,6 +247,7 @@ TEST_MAIN_BEGIN()
     test_unrecognised_first_byte_is_a_redirectable_error();
     test_oversized_tls_record_is_a_redirectable_error();
     test_oversized_http_headers_are_a_redirectable_error();
+    test_header_value_with_bare_cr_no_lf();
     test_feed_after_done_is_rejected();
     test_zero_length_tls_record_is_an_error();
 TEST_MAIN_END()
