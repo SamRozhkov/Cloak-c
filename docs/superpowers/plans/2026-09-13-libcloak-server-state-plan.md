@@ -911,6 +911,21 @@ It then owns the three obligations the stream-relay plan carried forward: stoppi
 
 Out of scope here and there: the user manager and its accounting (Go's `userpanel`/`activeuser`, which is why this registry has no per-user session cap yet), the admin API, the WebSocket/CDN transport's own handshake, and UDP.
 
+### What a paper walk of that loop already established
+
+This branch's final review walked `dispatch_conn()` end to end against the merged interfaces. Everything above composes; these are the parts worth knowing before writing it, most now stated in the headers themselves.
+
+**Confirmed, so nobody has to re-derive them:**
+- `cloak_listener_port(l)` in the accept callback gives exactly the `local_port` that `cloak_server_redir_addr` wants — per listener, so each `BindAddr` entry redirects to its own port, matching Go's `net.SplitHostPort(conn.LocalAddr())`. No `getsockname` needed.
+- The read loop must run **inside** the readable callback until `EAGAIN` or `want() == 0`. One exact-sized read per readiness edge stalls permanently on an edge-triggered reactor.
+- `cloak_reactor_remove_fd` must precede `cloak_session_add_conn`, or `cloak_conn_init`'s own registration fails and `add_conn` returns -1. Bytes already sitting in the socket are **not** lost: `EPOLL_CTL_ADD` on a ready fd enqueues an event even under `EPOLLET`. On `add_conn` failure nobody closes the fd — the dispatcher keeps ownership.
+- `CLOAK_FIRSTPACKET_DONE` on the TLS path delivers exactly the one un-fragmented record `cloak_clienthello_parse` assumes.
+
+**Gaps the dispatcher must fill itself:**
+- **No non-blocking write-then-handover primitive exists.** Go writes its ≤256-byte reply with a blocking `conn.Write` before `AddConnection`. Here the fd is non-blocking, so a partial write or `EAGAIN` on the reply has to be handled before `cloak_session_add_conn` — and neither `cloak_relay_t` (which wants to own both fds) nor `cloak_bytequeue_t` (storage, not a writer) does that job. Small, but it is hand-rolled code nobody has budgeted for.
+- **`ci.unordered` has nowhere to go.** Go sets `SessionConfig.Unordered`; `cloak_session_config_t` has no such field and nothing in `libcloak-mux` implements unordered mode. UDP is a later module, but an authenticated payload can request it today, and silently ignoring an attacker-visible flag is itself a fingerprint. Decide deliberately what to do with it.
+- **The 15-second first-packet deadline** (`firstpacket.h` states it as a caller obligation) and **treating `CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET` as a redirect case** until the CDN module exists.
+
 ## Self-review notes
 
 - **Spec coverage (§7):** the first-byte sniff and incremental first-packet buffering are Task 1; the resolved `RedirAddr`/`ProxyBook` and the authorisation inputs are Task 2; "attach the connection to a `cloak_session_t` (new or existing, keyed by UID+session ID)" is Task 3. §7's step 4, `goWeb()` itself, needs only `cloak_server_redir_addr` from this plan plus the already-merged dialer and relay, and belongs with the dispatch loop.
