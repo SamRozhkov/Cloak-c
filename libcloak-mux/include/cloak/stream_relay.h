@@ -209,6 +209,23 @@ struct cloak_stream_relay {
  * every failure (and drop streams during ordinary congestion, which is
  * precisely the condition backpressure exists to survive).
  *
+ * -2 IS THE RETRYABLE ONE, NOT THE ONLY TRANSIENT ONE, and the difference
+ * matters enough to name the exception rather than let the sentence above
+ * read as exhaustive. The reactor registration folded into -1 above can
+ * fail with ENOSPC when the process has exhausted
+ * /proc/sys/fs/epoll/max_user_watches -- a limit that is load-dependent
+ * and clears as other watches are removed, so it is genuinely transient
+ * in the same sense -2 is. It is reported as PERMANENT and callers
+ * deliberately do not retry it: unlike the pool-full case, whose whole
+ * point is that a drain is already under way on this very session, an
+ * exhausted watch table says the PROCESS is over a global limit, with
+ * nothing about this session's own progress to wait on. Retrying would
+ * hold a connected descriptor open across the whole budget -- consuming
+ * exactly the kind of resource the process has just run out of -- for a
+ * condition no amount of waiting on this stream can influence. Failing
+ * the one stream immediately, and giving its descriptor back to the
+ * process, is the better trade.
+ *
  * On any failure sr is left safe to pass to cloak_stream_relay_stop. */
 int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
                               cloak_session_t *sesh, cloak_stream_t *stream, int fd,

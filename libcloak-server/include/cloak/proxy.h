@@ -337,7 +337,10 @@ typedef struct {
      *   -1 PERMANENT (bad arguments, allocation, reactor registration).
      *      Failed immediately. Retrying cannot help, and would hold a
      *      connected upstream descriptor and this stream's context open
-     *      for the whole budget before failing anyway.
+     *      for the whole budget before failing anyway. ONE CAUSE FOLDED
+     *      IN HERE IS ARGUABLY TRANSIENT -- an epoll watch-table
+     *      exhaustion -- and is deliberately not retried anyway;
+     *      cloak/stream_relay.h names it and gives the reason.
      *
      *   -2 TRANSIENT ("the pool cannot hold one worst-case frame right
      *      now"). Retried up to max_retries, spaced retry_delay_ms
