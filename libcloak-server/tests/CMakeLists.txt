@@ -24,3 +24,9 @@ target_include_directories(test_server_state PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_server_state PRIVATE cloak-server)
 add_test(NAME test_server_state COMMAND test_server_state)
 set_tests_properties(test_server_state PROPERTIES TIMEOUT 60)
+
+add_executable(test_registry test_registry.c)
+target_include_directories(test_registry PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_registry PRIVATE cloak-server)
+add_test(NAME test_registry COMMAND test_registry)
+set_tests_properties(test_registry PROPERTIES TIMEOUT 60)
