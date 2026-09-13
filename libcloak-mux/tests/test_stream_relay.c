@@ -1221,7 +1221,10 @@ static void test_start_rejects_when_no_connection_can_ever_fit_one_frame(void) {
     int sock_fds[2];
     ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds));
 
-    ASSERT_EQ_INT(-1, cloak_stream_relay_start(&dirty, r, &a.sesh, s, sock_fds[0], 4096,
+    /* -2, not -1: this is the TRANSIENT rejection, and
+     * cloak_stream_relay_start's doc comment now separates it from every
+     * permanent failure so a caller can retry it instead of guessing. */
+    ASSERT_EQ_INT(-2, cloak_stream_relay_start(&dirty, r, &a.sesh, s, sock_fds[0], 4096,
                                                on_relay_done, NULL));
     ASSERT_EQ_INT(-1, dirty.fd);
 

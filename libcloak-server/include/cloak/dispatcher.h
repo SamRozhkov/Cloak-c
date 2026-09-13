@@ -271,6 +271,85 @@ typedef int (*cloak_dispatch_prepare_session_cb)(cloak_dispatcher_t *d,
                                                   cloak_session_config_t *config,
                                                   void *userdata);
 
+/* Fired when a session that cloak_dispatch_prepare_session_cb ALREADY
+ * PREPARED is abandoned without ever reaching a caller's
+ * cloak_registry_broken_cb -- i.e. the exact complement of that callback:
+ * prepare_session ran and returned 0, and then the session it was
+ * preparing for either was never created or was closed again before it
+ * could live. uid and session_id are the (uid, session_id) that
+ * prepare_session's own info described, and are the ONLY identifying
+ * handle this callback can offer: there is no cloak_session_t to pass at
+ * any of its sites, because at every one of them either none was ever
+ * created or the one that was is about to be destroyed without ever
+ * having been joined to anything.
+ *
+ * WHY IT EXISTS. A prepare_session that returns 0 has typically allocated
+ * and linked a per-session context of its own (it has to -- that context
+ * is what its on_new_stream/on_stream_data/on_writable userdata point
+ * at). cloak_server_registry_close and cloak_server_registry_destroy
+ * deliberately do NOT fire the registry's on_broken (cloak/registry.h:
+ * they are the owner's own action, not a failure notification), so on
+ * every path below the owner would otherwise never hear anything again
+ * about a session it had already prepared for, and that context would
+ * leak -- a small, remotely reachable, unbounded leak, one allocation per
+ * abandoned handshake. This callback is the notification that closes it.
+ *
+ * THE THREE SITES, all in dispatcher.c:
+ *
+ *  A. cloak_server_registry_get_or_create returned NULL immediately after
+ *     prepare_session returned 0 -- the registry was at
+ *     CLOAK_REGISTRY_MAX_SESSIONS, cloak_session_init failed, or an
+ *     allocation failed. No session was ever created. That prepare_session
+ *     ran for this (uid, session_id) is guaranteed here by position: the
+ *     call is three lines above.
+ *
+ *  B. cloak_server_auth_compose_reply failed after step 8 created the
+ *     session; the unwind calls cloak_server_registry_close.
+ *
+ *  C. conn_teardown's auth_created unwind: this connection created a
+ *     session, never completed hand-off to it, and no other connection
+ *     has since joined it -- a step-10 reply-write failure, a step-11
+ *     cloak_session_add_conn failure, the reply-write deadline firing, or
+ *     cloak_dispatcher_destroy running while this connection was still
+ *     mid-reply-write. Fired immediately BEFORE the
+ *     cloak_server_registry_close that unwind performs, so that anything
+ *     the callback still needs the session for is done while it is alive.
+ *
+ * At B and C the "prepare_session ran and returned 0" precondition is
+ * implied by created/auth_created being 1: a prepare_session that returns
+ * -1 makes dispatcher_authenticate return early, before any session can
+ * be created. This callback is therefore NEVER fired for a handshake
+ * prepare_session itself rejected -- nothing was prepared then, there is
+ * nothing to reclaim, and firing would hand the owner a (uid, session_id)
+ * it has no record of. It is also never fired for a session that
+ * genuinely lived and then broke: that is cloak_registry_broken_cb's job,
+ * and the two never both fire for the same session.
+ *
+ * CALLING CONTEXT, which is stricter than either callback above. Sites A
+ * and B fire from inside dispatcher_authenticate, with this connection
+ * live on the stack above, exactly like cloak_dispatch_prepare_session_cb
+ * -- everything that callback's own CALLING CONTEXT paragraph forbids is
+ * forbidden here for the same reason. Site C fires from inside
+ * conn_teardown, i.e. from this connection's own teardown, which
+ * cloak_dispatcher_destroy also drives while it is walking its connection
+ * list. So, at every site: do NOT call cloak_dispatcher_destroy, or
+ * anything else that could free or hand off a connection; do NOT call
+ * cloak_server_registry_close or cloak_server_registry_destroy (at B and
+ * C the dispatcher's own unwind is about to call close for this very
+ * (uid, session_id), and destroying the registry from underneath it frees
+ * the entry that call is about to look up); and do NOT call
+ * cloak_session_destroy on anything. DO: free your own per-session
+ * bookkeeping for this (uid, session_id), which is the entire purpose,
+ * and release/stop anything of yours bound to that session -- at every
+ * site it is either not yet created, or created, empty and still alive.
+ * Read-only accessors (cloak_server_registry_find/count,
+ * cloak_dispatcher_conn_count/pending_count) are fine.
+ *
+ * May be NULL (nothing to fire). */
+typedef void (*cloak_dispatch_session_aborted_cb)(cloak_dispatcher_t *d,
+                                                   const uint8_t uid[CLOAK_UID_LEN],
+                                                   uint32_t session_id, void *userdata);
+
 /* Fired once per authenticated connection, after cloak_session_add_conn
  * has already succeeded -- i.e. this connection is now genuinely part of
  * sesh's pool. created is 1 if this connection is what just created sesh
@@ -338,8 +417,13 @@ typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_
  * from this template; dispatcher.c's dispatcher_authenticate does exactly
  * that.
  *
- * prepare_session/prepare_session_userdata and attached/attached_userdata
- * may each be NULL independently (no-op / nothing to fire).
+ * prepare_session/prepare_session_userdata, attached/attached_userdata
+ * and session_aborted/session_aborted_userdata may each be NULL
+ * independently (no-op / nothing to fire) -- but an owner that supplies
+ * prepare_session and allocates anything in it should supply
+ * session_aborted too, or the three paths that abandon an
+ * already-prepared session leak that allocation; see
+ * cloak_dispatch_session_aborted_cb.
  *
  * The four *_ms/_cap/_conns fields each default (0 means "use the
  * default") to the CLOAK_DISPATCHER_DEFAULT_* constant above; a config
@@ -359,6 +443,8 @@ typedef struct {
     void *prepare_session_userdata;
     cloak_dispatch_attached_cb attached;
     void *attached_userdata;
+    cloak_dispatch_session_aborted_cb session_aborted;
+    void *session_aborted_userdata;
 
     uint64_t handshake_timeout_ms;
     uint64_t redirect_dial_timeout_ms;

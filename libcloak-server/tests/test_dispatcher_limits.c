@@ -10,6 +10,7 @@
 #include "cloak/server.h"
 #include "cloak/server_auth.h"
 #include "test_framework.h"
+#include "client_harness.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -31,90 +32,10 @@
  * and a fixed-seed smoke test that the first-packet/redirect state machine
  * never crashes or leaks on arbitrary bytes.
  *
- * Several helpers below (client_connect, cover_site_t and its callbacks,
- * pump_until, build_auth_payload/build_client_record) are copied verbatim
- * from test_dispatcher_redirect.c / test_dispatcher_auth.c rather than
- * shared, matching this project's own existing convention of duplicating
- * small test-only helpers across dispatcher test files instead of adding a
- * shared test-support library for them. */
-
-/* ---- bounded reactor pumping --------------------------------------------
- *
- * Every wait in this file is "poll the reactor for up to N turns of at
- * most MS each", never unbounded -- three tests on this project have hung
- * or flaked in CI, all found only by repetition. */
-
-typedef int (*pump_done_fn)(void *ctx);
-
-static int pump_until(cloak_reactor_t *r, pump_done_fn done, void *ctx, int max_iters,
-                      int per_iter_ms) {
-    for (int i = 0; i < max_iters; i++) {
-        if (done(ctx)) {
-            return 1;
-        }
-        cloak_reactor_run_once(r, per_iter_ms);
-    }
-    return done(ctx);
-}
-
-/* ---- fake cover site ----------------------------------------------------
- *
- * Note this struct's buf/len are shared across every connection the fake
- * cover site accepts: fine for test_dispatcher_redirect.c's one-connection
- * tests, and fine here too, since every use of it below either (a) expects
- * exactly one connection to reach it, or (b) (the fuzz test) only ever
- * checks accept_count, never buf content, across many connections. */
-
-typedef struct {
-    cloak_reactor_t *reactor;
-    int fd;
-    int accept_count;
-    uint8_t buf[8192];
-    size_t len;
-    int eof;
-} cover_site_t;
-
-static void cover_on_readable(cloak_reactor_t *r, int fd, uint32_t events, void *userdata) {
-    (void)r;
-    (void)events;
-    cover_site_t *cov = userdata;
-    for (;;) {
-        if (cov->len >= sizeof(cov->buf)) {
-            break;
-        }
-        ssize_t n = read(fd, cov->buf + cov->len, sizeof(cov->buf) - cov->len);
-        if (n > 0) {
-            cov->len += (size_t)n;
-            continue;
-        }
-        if (n == 0) {
-            cov->eof = 1;
-            break;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        break;
-    }
-}
-
-static void cover_on_accept(cloak_listener_t *l, int fd, void *userdata) {
-    (void)l;
-    cover_site_t *cov = userdata;
-    cov->fd = fd;
-    cov->accept_count++;
-    cloak_reactor_add_fd(cov->reactor, fd, CLOAK_REACTOR_READABLE, cover_on_readable, cov);
-}
-
-struct len_wait {
-    cover_site_t *cov;
-    size_t want;
-};
-
-static int cover_has_len(void *ctx) {
-    struct len_wait *w = ctx;
-    return w->cov->len >= w->want;
-}
+ * client_connect, cover_site_t and its callbacks, pump_until,
+ * build_auth_payload/build_client_record and the rest of the shared
+ * handshake-building helpers now live in client_harness.h (see that
+ * header's own top comment) instead of being duplicated in this file. */
 
 struct count_wait {
     const cloak_dispatcher_t *d;
@@ -124,46 +45,6 @@ struct count_wait {
 static int conn_count_is(void *ctx) {
     struct count_wait *w = ctx;
     return cloak_dispatcher_conn_count(w->d) == w->want;
-}
-
-/* ---- client helper -------------------------------------------------------
- *
- * A plain blocking socket. A receive timeout bounds every read against a
- * dispatcher that never closes the way it should. */
-
-static int client_connect(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return -1;
-    }
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        close(fd);
-        return -1;
-    }
-    struct timeval tv;
-    tv.tv_sec = 2;
-    tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    return fd;
-}
-
-/* The client's own local (ephemeral) port -- the PEER port the
- * dispatcher's accepted socket for this same connection will report via
- * getpeername(), used both to target test_write_shim.c's interposition and
- * to find a specific connection inside cloak_dispatcher_t's own conns list
- * below (see find_conn_by_peer_port). Returns -1 on failure. */
-static int client_local_port(int fd) {
-    struct sockaddr_in sa;
-    socklen_t len = sizeof(sa);
-    if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) {
-        return -1;
-    }
-    return ntohs(sa.sin_port);
 }
 
 /* Reaches directly into cloak_dispatcher_t's own (fully public, not
@@ -212,82 +93,6 @@ static int conn_reached_state(void *ctx) {
         return 0;
     }
     return 1;
-}
-
-/* ---- building a real Cloak ClientHello, and its 48-byte auth payload ----
- *
- * Copied from test_dispatcher_auth.c: see that file's own top-of-file
- * comment for why this uses the project's real crypto primitives rather
- * than a mock, and for the 48-byte payload layout server_auth.h
- * documents. */
-
-static void build_auth_payload(uint8_t out[48], const uint8_t uid[CLOAK_UID_LEN],
-                               const char *proxy_method, uint8_t encryption_method,
-                               int64_t timestamp, uint32_t session_id, int unordered) {
-    memset(out, 0, 48);
-    memcpy(out, uid, CLOAK_UID_LEN);
-
-    size_t pmlen = strlen(proxy_method);
-    if (pmlen > CLOAK_SERVER_AUTH_PROXY_METHOD_LEN) {
-        pmlen = CLOAK_SERVER_AUTH_PROXY_METHOD_LEN;
-    }
-    memcpy(out + 16, proxy_method, pmlen);
-
-    out[28] = encryption_method;
-
-    uint64_t ts = (uint64_t)timestamp;
-    for (int i = 0; i < 8; i++) {
-        out[29 + i] = (uint8_t)(ts >> (8 * (7 - i)));
-    }
-    for (int i = 0; i < 4; i++) {
-        out[37 + i] = (uint8_t)(session_id >> (8 * (3 - i)));
-    }
-    out[41] = unordered ? CLOAK_SERVER_AUTH_UNORDERED_FLAG : 0;
-}
-
-static size_t build_client_record(const uint8_t server_pub[CLOAK_X25519_KEY_LEN],
-                                  const uint8_t uid[CLOAK_UID_LEN], const char *proxy_method,
-                                  uint8_t encryption_method, int64_t timestamp,
-                                  uint32_t session_id, int unordered, uint8_t *out_record,
-                                  size_t out_cap) {
-    uint8_t eph_priv[CLOAK_X25519_KEY_LEN];
-    uint8_t eph_pub[CLOAK_X25519_KEY_LEN];
-    ASSERT_EQ_INT(0, cloak_x25519_generate_keypair(eph_priv, eph_pub));
-
-    uint8_t shared[CLOAK_AEAD_KEY_LEN];
-    ASSERT_EQ_INT(0, cloak_x25519_shared_secret(eph_priv, server_pub, shared));
-
-    uint8_t payload[48];
-    build_auth_payload(payload, uid, proxy_method, encryption_method, timestamp, session_id,
-                       unordered);
-
-    uint8_t nonce[CLOAK_AEAD_NONCE_LEN];
-    memcpy(nonce, eph_pub, CLOAK_AEAD_NONCE_LEN);
-
-    uint8_t ct[64];
-    size_t ct_len = 0;
-    ASSERT_EQ_INT(0, cloak_aead_seal(CLOAK_AEAD_AES_256_GCM, shared, nonce, NULL, 0, payload,
-                                     sizeof(payload), ct, &ct_len));
-    ASSERT_EQ_INT((int)ct_len, 64);
-
-    uint8_t handshake[CLOAK_CLIENTHELLO_MAX_BYTES];
-    long hs_len = cloak_clienthello_build(&cloak_clienthello_chrome, eph_pub, ct, ct + 32,
-                                          "www.example.com", handshake, sizeof(handshake));
-    ASSERT_TRUE(hs_len > 0);
-    if (hs_len <= 0) {
-        return 0;
-    }
-
-    size_t total = 5 + (size_t)hs_len;
-    ASSERT_TRUE(out_cap >= total);
-
-    out_record[0] = 0x16;
-    out_record[1] = 0x03;
-    out_record[2] = 0x01;
-    out_record[3] = (uint8_t)(((size_t)hs_len >> 8) & 0xff);
-    out_record[4] = (uint8_t)((size_t)hs_len & 0xff);
-    memcpy(out_record + 5, handshake, (size_t)hs_len);
-    return total;
 }
 
 /* ---- fixture --------------------------------------------------------------
@@ -666,9 +471,10 @@ static void test_teardown_first_packet_reply_write_and_relay(void) {
 
     int64_t now = (int64_t)time(NULL);
     uint8_t record_b[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t record_b_shared[CLOAK_AEAD_KEY_LEN]; /* unused: this test never decrypts a reply */
     size_t record_b_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
                                               (uint8_t)CLOAK_AEAD_AES_256_GCM, now, 4242, 0,
-                                              record_b, sizeof(record_b));
+                                              record_b, sizeof(record_b), record_b_shared);
     ASSERT_TRUE(record_b_len > 0);
     ASSERT_TRUE(write(client_b, record_b, record_b_len) == (ssize_t)record_b_len);
 
@@ -873,9 +679,10 @@ static void test_reply_write_deadline_fires(void) {
 
     int64_t now = (int64_t)time(NULL);
     uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t record_shared[CLOAK_AEAD_KEY_LEN]; /* unused: this test never decrypts a reply */
     size_t record_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
                                             (uint8_t)CLOAK_AEAD_AES_256_GCM, now, 5252, 0, record,
-                                            sizeof(record));
+                                            sizeof(record), record_shared);
     ASSERT_TRUE(record_len > 0);
     ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
 
@@ -1150,9 +957,10 @@ static void test_c1_stale_session_pointer_across_writing_reply(void) {
      * handed off, becoming a real live conn inside S's switchboard. */
     int64_t now = (int64_t)time(NULL);
     uint8_t record_x[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t record_x_shared[CLOAK_AEAD_KEY_LEN]; /* unused: this test never decrypts a reply */
     size_t record_x_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
                                               (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid, 0,
-                                              record_x, sizeof(record_x));
+                                              record_x, sizeof(record_x), record_x_shared);
     ASSERT_TRUE(record_x_len > 0);
     int client_x = client_connect(front_port(&fx));
     ASSERT_TRUE(client_x >= 0);
@@ -1199,9 +1007,10 @@ static void test_c1_stale_session_pointer_across_writing_reply(void) {
     ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_STICKY", "1", 1));
 
     uint8_t record_a[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t record_a_shared[CLOAK_AEAD_KEY_LEN]; /* unused: this test never decrypts a reply */
     size_t record_a_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
                                               (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid, 0,
-                                              record_a, sizeof(record_a));
+                                              record_a, sizeof(record_a), record_a_shared);
     ASSERT_TRUE(record_a_len > 0);
     ASSERT_TRUE(write(client_a, record_a, record_a_len) == (ssize_t)record_a_len);
 
@@ -1332,9 +1141,10 @@ static void test_i1_auth_created_unwind_spares_a_joined_session(void) {
     ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_STICKY", "1", 1));
 
     uint8_t record_a[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t record_a_shared[CLOAK_AEAD_KEY_LEN]; /* unused: this test never decrypts a reply */
     size_t record_a_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
                                               (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid, 0,
-                                              record_a, sizeof(record_a));
+                                              record_a, sizeof(record_a), record_a_shared);
     ASSERT_TRUE(record_a_len > 0);
     ASSERT_TRUE(write(client_a, record_a, record_a_len) == (ssize_t)record_a_len);
 
@@ -1358,9 +1168,10 @@ static void test_i1_auth_created_unwind_spares_a_joined_session(void) {
     int client_b = client_connect(front_port(&fx));
     ASSERT_TRUE(client_b >= 0);
     uint8_t record_b[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t record_b_shared[CLOAK_AEAD_KEY_LEN]; /* unused: this test never decrypts a reply */
     size_t record_b_len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
                                               (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid, 0,
-                                              record_b, sizeof(record_b));
+                                              record_b, sizeof(record_b), record_b_shared);
     ASSERT_TRUE(record_b_len > 0);
     ASSERT_TRUE(write(client_b, record_b, record_b_len) == (ssize_t)record_b_len);
 

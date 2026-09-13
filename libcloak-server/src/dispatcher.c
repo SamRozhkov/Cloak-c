@@ -20,6 +20,25 @@ static void on_deadline(cloak_reactor_t *r, void *userdata);
 
 /* ---- connection lifecycle helpers -------------------------------------- */
 
+/* Fires cloak_dispatcher_config_t::session_aborted for (uid, session_id).
+ *
+ * THE prepare_session != NULL GUARD IS THE CONTRACT, not defensiveness:
+ * cloak_dispatch_session_aborted_cb promises the owner that this fires
+ * only for a session its own prepare_session actually prepared, so a
+ * dispatcher configured without one must never fire it. At the two
+ * authentication-path sites the "prepare_session returned 0" half of that
+ * promise is guaranteed by position and by the `created` flag (a
+ * prepare_session that returns -1 makes dispatcher_authenticate return
+ * before anything can be created); at conn_teardown's site it is
+ * guaranteed by auth_created, which is that same flag carried forward. */
+static void conn_fire_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[CLOAK_UID_LEN],
+                                      uint32_t session_id) {
+    if (d->cfg.session_aborted == NULL || d->cfg.prepare_session == NULL) {
+        return;
+    }
+    d->cfg.session_aborted(d, uid, session_id, d->cfg.session_aborted_userdata);
+}
+
 static void conn_unlink(cloak_dispatch_conn_t *c) {
     cloak_dispatcher_t *d = c->d;
     if (c->prev != NULL) {
@@ -101,6 +120,20 @@ static void conn_teardown(cloak_dispatch_conn_t *c) {
         cloak_session_t *sesh =
             cloak_server_registry_find(c->d->cfg.registry, c->auth_uid, c->auth_session_id);
         if (sesh != NULL && sesh->sb.conns_len == 0) {
+            /* SITE C of cloak_dispatch_session_aborted_cb. Fired BEFORE
+             * the close, and only in the same branch as the close: the
+             * owner's prepare_session built per-session state for this
+             * (uid, session_id) and this is the last notification it will
+             * ever get about it, since cloak_server_registry_close does
+             * not fire on_broken (cloak/registry.h: it is the owner's own
+             * action, not a failure). Before rather than after, so that
+             * anything the owner still needs the session alive for --
+             * releasing a stream, stopping a relay -- happens while it
+             * is. The other two arms of this branch deliberately do not
+             * fire it: a session another connection has since joined is
+             * still live and still the owner's to keep, and one already
+             * gone by another path has already had its on_broken. */
+            conn_fire_session_aborted(c->d, c->auth_uid, c->auth_session_id);
             cloak_server_registry_close(c->d->cfg.registry, c->auth_uid, c->auth_session_id);
         }
         c->auth_created = 0;
@@ -292,7 +325,16 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
         if (sesh == NULL) {
             /* Resource limit or cloak_session_init/allocation failure --
              * cloak/registry.h documents *out_created as untouched here,
-             * and indeed nothing was created either way. */
+             * and indeed nothing was created either way.
+             *
+             * SITE A of cloak_dispatch_session_aborted_cb, and the one
+             * place where "prepare_session already ran and returned 0" is
+             * guaranteed purely by position: the call is three lines up,
+             * and its -1 path returned. Nothing here will ever be in the
+             * registry, so no on_broken can ever fire for it -- without
+             * this, whatever prepare_session allocated is orphaned, once
+             * per handshake, for as long as the registry stays full. */
+            conn_fire_session_aborted(d, info.uid, info.session_id);
             return -1;
         }
     }
@@ -318,6 +360,13 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
          * only correct discriminator -- see this function's own
          * top-of-task comment and cloak/registry.h. */
         if (created) {
+            /* SITE B of cloak_dispatch_session_aborted_cb, fired before
+             * the close for the same reason site C's is: this close does
+             * not fire on_broken, so this is the owner's only
+             * notification, and it wants the session still alive while it
+             * runs. `created` is what proves prepare_session ran and
+             * returned 0 -- the existing-session path never calls it. */
+            conn_fire_session_aborted(d, info.uid, info.session_id);
             cloak_server_registry_close(d->cfg.registry, info.uid, info.session_id);
         }
         return -1;

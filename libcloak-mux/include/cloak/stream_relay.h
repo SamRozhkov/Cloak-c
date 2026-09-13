@@ -92,10 +92,12 @@ typedef void (*cloak_stream_relay_done_cb)(cloak_stream_relay_t *sr, void *userd
  * failure that actually happens in practice -- see
  * cloak_session_send_min_conn_free's own doc comment).
  *
- * cloak_stream_relay_start rejects outright (returns -1) rather than
- * starting a relay that could never move a single byte: see its own doc
- * comment for the exact condition, expressed in terms of this same
- * per-connection quantity so the two can never disagree. */
+ * cloak_stream_relay_start rejects outright (returns -2, the retryable
+ * code -- this quantity is what a draining pool recovers, so the same
+ * relay may start fine a moment later) rather than starting a relay that
+ * could never move a single byte: see its own doc comment for the exact
+ * condition, expressed in terms of this same per-connection quantity so
+ * the two can never disagree. */
 
 struct cloak_stream_relay {
     cloak_reactor_t *reactor;
@@ -136,12 +138,20 @@ struct cloak_stream_relay {
     void *on_done_userdata;
 };
 
-/* Starts splicing stream and fd. Ownership of fd passes to the relay,
- * which closes it when it finishes or is stopped; on a FAILED start the
- * caller keeps it and must close it -- except in the extremely narrow
- * case documented below where the relay had already taken ownership of
- * fd before the failure occurred, in which case the relay closes it
- * itself as part of unwinding.
+/* Starts splicing stream and fd.
+ *
+ * OWNERSHIP OF fd, with no exceptions: on SUCCESS the relay owns it and
+ * closes it when it finishes or is stopped; on ANY FAILURE the caller
+ * still owns it and must close it. There is no return value, and no
+ * state on sr, that a caller has to inspect to work out which -- the
+ * rule is uniform, and every failure path inside this function is
+ * written to keep it that way, including the one that has already
+ * registered fd with the reactor by the time it fails (it deregisters
+ * before unwinding). An earlier version of this file had a single narrow
+ * exception here. It was documented, but it could not be reached from
+ * any test, and a caller that got it wrong would double-close a
+ * descriptor -- which no sanitizer detects. An interface with no
+ * exception beats a documented exception that cannot be tested.
  *
  * buf_cap sizes the stream-to-fd queue. sesh must be the session stream
  * belongs to -- it is consulted for outbound pressure, never written to
@@ -160,20 +170,63 @@ struct cloak_stream_relay {
  * ran for a while first. This still returns 0, since start genuinely did
  * succeed; the relay just also happens to already be done.
  *
- * Returns 0 on success, -1 on invalid arguments, allocation failure
- * (including the exceedingly rare case of failing to arm that deferred
- * completion timer, which forces an already-finished relay to fail start
- * outright since it would otherwise have no way left to ever report
- * completion), a reactor registration failure, or if the session's pool
- * could never hold even a single worst-case frame right now (the minimum
- * free space over the pool -- see cloak_session_send_min_conn_free -- is
- * smaller than one frame's full on-wire cost for this stream). That last
- * case is caught here rather than left to surface later as a silent
- * stall: a relay started anyway would compute a read budget of 0 on its
- * very first read, with nothing ever queued to eventually prompt a
- * drain-driven resume, and would hang forever holding an open fd with no
- * error anywhere. On failure sr is left safe to pass to
- * cloak_stream_relay_stop. */
+ * THREE RETURN VALUES, and the distinction between the two failures is
+ * the whole point:
+ *
+ *   0  Started. (Possibly already finished too -- see the
+ *      already-ended-stream paragraph above.)
+ *
+ *  -1  PERMANENT failure: invalid arguments, allocation failure
+ *      (including the exceedingly rare case of failing to arm that
+ *      deferred completion timer, which forces an already-finished relay
+ *      to fail start outright since it would otherwise have no way left
+ *      to ever report completion), or a reactor registration failure.
+ *      Nothing about the session or its pool will change to make a later
+ *      attempt with the same arguments succeed, so retrying is pure
+ *      waste: it holds a connected descriptor and the caller's own
+ *      per-stream state open for the whole retry budget and then fails
+ *      anyway.
+ *
+ *  -2  TRANSIENT rejection: the session's pool could not hold even a
+ *      single worst-case frame AT THIS MOMENT -- the minimum free space
+ *      over the pool (see cloak_session_send_min_conn_free) is smaller
+ *      than one frame's full on-wire cost for this stream. This is
+ *      caught here rather than left to surface later as a silent stall:
+ *      a relay started anyway would compute a read budget of 0 on its
+ *      very first read, with nothing ever queued to eventually prompt a
+ *      drain-driven resume, and would hang forever holding an open fd
+ *      with no error anywhere. It is EXPECTED under ordinary congestion
+ *      and says nothing is wrong: a relay already running on this
+ *      session deliberately holds min_conn_free below exactly this
+ *      threshold whenever its peer is slow to drain (see
+ *      stream_relay_fd_read_budget), so a second stream opened during a
+ *      bulk transfer sees this routinely, for as long as the congestion
+ *      lasts. A caller should wait and try again, not give up.
+ *
+ * These are separated because a caller that cannot tell them apart has
+ * only two options and both are wrong: retry every failure (and hold a
+ * descriptor open across a budget that can never succeed) or give up on
+ * every failure (and drop streams during ordinary congestion, which is
+ * precisely the condition backpressure exists to survive).
+ *
+ * -2 IS THE RETRYABLE ONE, NOT THE ONLY TRANSIENT ONE, and the difference
+ * matters enough to name the exception rather than let the sentence above
+ * read as exhaustive. The reactor registration folded into -1 above can
+ * fail with ENOSPC when the process has exhausted
+ * /proc/sys/fs/epoll/max_user_watches -- a limit that is load-dependent
+ * and clears as other watches are removed, so it is genuinely transient
+ * in the same sense -2 is. It is reported as PERMANENT and callers
+ * deliberately do not retry it: unlike the pool-full case, whose whole
+ * point is that a drain is already under way on this very session, an
+ * exhausted watch table says the PROCESS is over a global limit, with
+ * nothing about this session's own progress to wait on. Retrying would
+ * hold a connected descriptor open across the whole budget -- consuming
+ * exactly the kind of resource the process has just run out of -- for a
+ * condition no amount of waiting on this stream can influence. Failing
+ * the one stream immediately, and giving its descriptor back to the
+ * process, is the better trade.
+ *
+ * On any failure sr is left safe to pass to cloak_stream_relay_stop. */
 int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
                               cloak_session_t *sesh, cloak_stream_t *stream, int fd,
                               size_t buf_cap, cloak_stream_relay_done_cb on_done,
