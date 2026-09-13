@@ -74,6 +74,19 @@ static void registry_sweep_timer_cb(cloak_reactor_t *r, void *userdata) {
  * right after marking an entry dead, so there is always at least one
  * dead entry for the timer to find when it fires. */
 static void registry_arm_sweep(cloak_server_registry_t *reg) {
+    if (reg->destroyed) {
+        /* reg has already been (or is currently being) torn down by
+         * cloak_server_registry_destroy -- reached when that destroy was
+         * called reentrantly from within this same registry's
+         * cloak_registry_broken_cb, before this function's caller
+         * (registry_on_session_broken) got a chance to arm the sweep for
+         * the entry it just finished processing. Every entry, including
+         * that one, has already been destroyed and freed by that destroy
+         * call, so arming a timer here would either fire against a
+         * registry the caller may have already freed, or, best case, be
+         * pure waste. See the destroyed field's own comment. */
+        return;
+    }
     if (reg->sweep_timer != CLOAK_TIMER_INVALID) {
         return; /* a sweep is already on its way; it will catch this entry too */
     }
@@ -147,6 +160,19 @@ void cloak_server_registry_destroy(cloak_server_registry_t *reg) {
         return;
     }
 
+    /* Set FIRST, before touching anything else -- see the destroyed
+     * field's own comment. This is what makes it safe for
+     * registry_arm_sweep to be reached (as a no-op) after this function
+     * has already run to completion, in the one sequence that can
+     * actually produce that ordering: a session breaks ->
+     * registry_on_session_broken marks it dead and invokes the owner's
+     * on_broken -> the owner calls cloak_server_registry_destroy(reg)
+     * (permitted; see cloak_registry_broken_cb's doc comment) -> this
+     * function runs to completion and returns -> control resumes inside
+     * registry_on_session_broken, which still calls registry_arm_sweep
+     * before returning itself. */
+    reg->destroyed = 1;
+
     /* Run any pending sweep ourselves first, then cancel the timer that
      * would otherwise fire it later against a registry that may no
      * longer exist by then -- in that order, matching this function's
@@ -157,8 +183,18 @@ void cloak_server_registry_destroy(cloak_server_registry_t *reg) {
         reg->sweep_timer = CLOAK_TIMER_INVALID;
     }
 
-    /* Everything left is a live session (any dead one was just swept
-     * above) -- destroy and free every one of them. */
+    /* Destroy and free every entry still in the table, live or dead. Most
+     * of the time everything left here is live (any dead entry was just
+     * swept above via the pending timer) -- but NOT always: when this
+     * function is invoked reentrantly from within registry_on_session_broken
+     * (see above), the entry currently mid-teardown is already marked
+     * dead but its sweep was never armed (that happens AFTER the owner's
+     * callback returns, and we are still inside it), so it is still
+     * sitting in this table, dead, when we reach this loop. Destroying it
+     * here anyway is correct and safe: registry_free_entry's
+     * cloak_session_destroy on that entry's own sesh, called from within
+     * that same sesh's own on_broken, is exactly the reentrant pattern
+     * cloak_session_broken_cb's own doc comment documents as safe. */
     for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
         struct cloak_registry_entry *entry = reg->entries[i];
         if (entry != NULL) {

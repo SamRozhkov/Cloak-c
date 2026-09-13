@@ -20,10 +20,10 @@ static void make_obfuscator(cloak_obfuscator_t *o) {
     cloak_random_bytes(o->session_key, sizeof(o->session_key));
 }
 
-/* A session_id of 60000ms is generous relative to every reactor loop
- * bound below (at most ~500ms of simulated time each), so no test here
- * is ever at risk of the inactivity timer firing and confusing it with
- * the break this file triggers deliberately. */
+/* An inactivity_timeout_ms of 60000ms is generous relative to every
+ * reactor loop bound below (at most ~500ms of simulated time each), so no
+ * test here is ever at risk of the inactivity timer firing and confusing
+ * it with the break this file triggers deliberately. */
 static void base_config(cloak_session_config_t *cfg, const cloak_obfuscator_t *obfs) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->obfuscator = *obfs;
@@ -62,6 +62,12 @@ typedef struct {
     int close_from_inside;
     uint8_t close_uid[CLOAK_UID_LEN];
     uint32_t close_session_id;
+
+    /* If set, cloak_server_registry_destroy(reg) is called from inside
+     * the callback -- review finding 1: destroy must leave reg safe
+     * (specifically: must not let the sweep this on_broken call is about
+     * to arm actually get armed against an already-destroyed reg). */
+    int destroy_reg_from_inside;
 } broken_ctx_t;
 
 static void on_registry_broken(cloak_server_registry_t *reg, cloak_session_t *sesh,
@@ -81,6 +87,10 @@ static void on_registry_broken(cloak_server_registry_t *reg, cloak_session_t *se
 
     if (ctx->close_from_inside) {
         cloak_server_registry_close(reg, ctx->close_uid, ctx->close_session_id);
+    }
+
+    if (ctx->destroy_reg_from_inside) {
+        cloak_server_registry_destroy(reg);
     }
 }
 
@@ -407,6 +417,66 @@ static void test_close_from_inside_on_broken_is_noop(void) {
     cloak_reactor_destroy(r);
 }
 
+/* 4b (review finding 1). Destroying the registry from INSIDE the owner's
+ * on_broken -- reachable in practice, and dangerous specifically because
+ * registry_on_session_broken still has a registry_arm_sweep(reg) call to
+ * make after the owner's callback returns. Before the destroyed flag, that
+ * arm call would succeed against an already-destroyed reg, arming a
+ * fresh zero-delay timer with reg as userdata; if the owner went on to
+ * free reg's own storage, that timer firing later would read and write
+ * freed memory. Run under ASan: pump the reactor well past where that
+ * timer would have fired and it must not touch anything. */
+static void test_destroy_registry_from_inside_on_broken_is_safe(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    uint8_t uid_b[CLOAK_UID_LEN];
+    memset(uid_b, 0x66, sizeof(uid_b));
+
+    broken_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.destroy_reg_from_inside = 1;
+
+    cloak_server_registry_t reg;
+    ASSERT_EQ_INT(0, cloak_server_registry_init(&reg, r, on_registry_broken, &ctx));
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+    cloak_session_config_t cfg_b;
+    base_config(&cfg_b, &obfs);
+
+    int created = 0;
+    cloak_session_t *sesh_b = cloak_server_registry_get_or_create(&reg, uid_b, 1, &cfg_b, &created);
+    ASSERT_TRUE(sesh_b != NULL);
+    ASSERT_EQ_INT(1, created);
+
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(sesh_b, fds[0]));
+    close(fds[1]); /* peer vanishes -> sesh_b sees EOF and breaks */
+
+    for (int i = 0; i < 50 && ctx.broken_calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, ctx.broken_calls);
+
+    /* reg is now fully destroyed (entries freed, sweep_timer cancelled or
+     * never armed, destroyed == 1). Pump the reactor well past a
+     * zero-delay timer's fire point -- if registry_arm_sweep had armed
+     * one against this now-destroyed reg despite the fix, this is where
+     * registry_sweep_timer_cb would run and write reg->sweep_timer. */
+    for (int i = 0; i < 20; i++) {
+        cloak_reactor_run_once(r, 5);
+    }
+    ASSERT_EQ_INT(1, ctx.broken_calls);
+
+    /* A second, ordinary destroy call must still be safe and idempotent
+     * -- this is the caller's own eventual cleanup, exactly like every
+     * other test in this file, and must not double-free anything. */
+    cloak_server_registry_destroy(&reg);
+    cloak_reactor_destroy(r);
+}
+
 /* 5. cloak_server_registry_close on a live session tears it down, fires
  * nothing (it is the owner's own action, not a failure), and removes it
  * from the table. */
@@ -567,12 +637,33 @@ static void test_destroy_with_live_sessions_and_open_stream(void) {
     cloak_reactor_destroy(r);
 }
 
+/* 8 (review finding 6). cloak_server_registry_init rejects a NULL
+ * on_broken and leaves reg safe to pass to cloak_server_registry_destroy
+ * -- the ordering registry.h singles out as "the source of a real crash
+ * on this branch more than once". reg starts filled with 0xAA (never
+ * zeroed by the test itself) so the assertion can only pass if init
+ * actually memset it. */
+static void test_init_rejects_null_on_broken_and_leaves_destroy_safe(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+
+    cloak_server_registry_t reg;
+    memset(&reg, 0xAA, sizeof(reg));
+    ASSERT_EQ_INT(-1, cloak_server_registry_init(&reg, r, NULL, NULL));
+
+    cloak_server_registry_destroy(&reg); /* must not crash */
+
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_get_or_create_identity();
     test_config_fields_survive();
     test_broken_fires_once_and_session_stays_usable();
     test_close_from_inside_on_broken_is_noop();
+    test_destroy_registry_from_inside_on_broken_is_safe();
     test_close_live_session_fires_nothing();
     test_table_full_returns_null();
     test_destroy_with_live_sessions_and_open_stream();
+    test_init_rejects_null_on_broken_and_leaves_destroy_safe();
 TEST_MAIN_END()
