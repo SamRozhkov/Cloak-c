@@ -24,9 +24,7 @@
  * rather than plain `static`: a `static inline` function that is never
  * used does not trigger -Wunused-function, where a plain `static` one
  * would (verified against this project's actual -Wall -Wextra build, not
- * merely assumed).
- *
- */
+ * merely assumed). */
 
 #include "cloak/base64.h"
 #include "cloak/clienthello.h"
