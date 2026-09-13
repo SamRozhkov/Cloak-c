@@ -1227,9 +1227,6 @@ static void test_start_rejects_when_no_connection_can_ever_fit_one_frame(void) {
     ASSERT_EQ_INT(-2, cloak_stream_relay_start(&dirty, r, &a.sesh, s, sock_fds[0], 4096,
                                                on_relay_done, NULL));
     ASSERT_EQ_INT(-1, dirty.fd);
-    /* The fd-ownership discriminator the header documents: done == 0
-     * means the relay never took fd, so the caller still owns it. */
-    ASSERT_EQ_INT(0, dirty.done);
 
     /* Must not crash, and on a failed start the caller keeps fd. */
     cloak_stream_relay_stop(&dirty);

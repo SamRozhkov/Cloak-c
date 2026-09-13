@@ -151,21 +151,8 @@ static void proxy_try_start_relay(cloak_proxy_stream_t *pst) {
         return;
     }
 
-    /* WHO OWNS THE DESCRIPTOR NOW. cloak_stream_relay_start's doc comment
-     * makes sr->done the discriminator: non-zero means the relay had
-     * already taken fd and closed it while unwinding (it closed the
-     * stream too), zero means the caller still holds it. Reading it is
-     * the documented contract, not a reach into internal state -- and
-     * deliberately NOT an fd-number probe, which would only be correct
-     * while nothing between that close and the probe can allocate a
-     * descriptor, i.e. a property of today's call graph rather than of
-     * the interface, and a latent double close. */
-    if (pst->relay.done) {
-        pst->fd_pending = -1;
-        proxy_stream_teardown(pst);
-        return;
-    }
-
+    /* Either way below, fd_pending is still ours: cloak_stream_relay_start
+     * leaves the descriptor with the caller on EVERY failure. */
     if (rc != -2) {
         /* PERMANENT (-1): bad arguments, allocation failure, or a reactor
          * registration failure. Nothing about this session will change to

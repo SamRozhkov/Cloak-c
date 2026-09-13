@@ -423,7 +423,26 @@ int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
             /* Can't defer -- tear down for real right now rather than
              * leave the relay stuck "finishing" forever with no way left
              * to ever report completion. This can only happen if growing
-             * the reactor's own timer heap fails. */
+             * the reactor's own timer heap fails.
+             *
+             * Unwind WITHOUT taking the descriptor: this function's
+             * contract is that a FAILED start always leaves fd with the
+             * caller, and this is the one path that could otherwise have
+             * consumed it. Deregister it (the add_fd above succeeded),
+             * then clear sr->fd so the shared teardown below skips its
+             * whole fd block rather than closing a descriptor the caller
+             * still owns. Everything else teardown does is still wanted,
+             * which is why this defers to it instead of inlining a second
+             * unwind -- there is deliberately one teardown path in this
+             * file. An earlier version closed fd here, which made this
+             * the single exception to the ownership rule; the exception
+             * was documented but could not be reached from any test (it
+             * needs the reactor's timer-heap allocation to fail), and a
+             * caller that got it wrong would double-close a descriptor,
+             * which no sanitizer detects. Removing the exception is
+             * strictly better than documenting it. */
+            cloak_reactor_remove_fd(r, fd);
+            sr->fd = -1;
             stream_relay_teardown(sr, 0);
             return -1;
         }

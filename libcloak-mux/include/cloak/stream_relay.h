@@ -136,26 +136,20 @@ struct cloak_stream_relay {
     void *on_done_userdata;
 };
 
-/* Starts splicing stream and fd. Ownership of fd passes to the relay,
- * which closes it when it finishes or is stopped; on a FAILED start the
- * caller keeps it and must close it -- except in the extremely narrow
- * case documented below where the relay had already taken ownership of
- * fd before the failure occurred, in which case the relay closes it
- * itself as part of unwinding.
+/* Starts splicing stream and fd.
  *
- * HOW TO TELL THOSE TWO APART, since a caller that guesses wrong either
- * leaks a descriptor or double-closes one: after a failed start, read
- * sr->done. It is non-zero ONLY on that narrow path (the relay ran its
- * own stream_relay_teardown while unwinding, which is what closed fd),
- * and zero on every other failure, because this function memsets sr
- * before it validates anything at all. This is a CONTRACT, not an
- * internal invariant a caller is reaching past: struct cloak_stream_relay
- * is fully defined in this header precisely so callers can embed it, and
- * sr->done is the one field they are told to read. Do not instead probe
- * the descriptor number for validity -- that is correct only while
- * nothing between the relay's close() and the probe can allocate a
- * descriptor, which is a property of today's call graph rather than of
- * this interface, and is a latent double close the day that changes.
+ * OWNERSHIP OF fd, with no exceptions: on SUCCESS the relay owns it and
+ * closes it when it finishes or is stopped; on ANY FAILURE the caller
+ * still owns it and must close it. There is no return value, and no
+ * state on sr, that a caller has to inspect to work out which -- the
+ * rule is uniform, and every failure path inside this function is
+ * written to keep it that way, including the one that has already
+ * registered fd with the reactor by the time it fails (it deregisters
+ * before unwinding). An earlier version of this file had a single narrow
+ * exception here. It was documented, but it could not be reached from
+ * any test, and a caller that got it wrong would double-close a
+ * descriptor -- which no sanitizer detects. An interface with no
+ * exception beats a documented exception that cannot be tested.
  *
  * buf_cap sizes the stream-to-fd queue. sesh must be the session stream
  * belongs to -- it is consulted for outbound pressure, never written to
