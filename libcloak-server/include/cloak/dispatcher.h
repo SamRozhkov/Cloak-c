@@ -36,6 +36,28 @@
  * one to forward to), or the redirect dial itself failed (there is
  * nowhere to forward to).
  *
+ * A KNOWN GAP IN THAT CLOSE, worth stating explicitly since this header
+ * calls out fingerprint-surface details everywhere else it can: the
+ * dial-failure close can make the kernel send a TCP RST instead of a
+ * clean FIN. cloak_firstpacket_want() bounds every read to exactly what
+ * the parser still needs to reach a verdict, so a client that sent more
+ * than that (e.g. a full request following one junk byte) leaves the
+ * excess sitting unread in the socket's receive buffer; closing an fd
+ * with unread inbound data queued is what makes Linux emit RST rather
+ * than FIN, regardless of anything this module does deliberately. This
+ * is judged acceptable rather than fixed: it is only reachable when
+ * RedirAddr is already unreachable (an operator-visible outage, not
+ * ordinary traffic), and an ordinary web server that closes early with
+ * data still queued -- e.g. hitting a request-size or timeout limit --
+ * produces the identical RST, so it is not a signal that distinguishes
+ * this server from a real one. The mitigation NOT taken is a
+ * non-blocking drain of the client fd immediately before this close:
+ * cheap, but it has its own edge case (a client that keeps trickling
+ * bytes for the duration of the drain window can extend it indefinitely,
+ * turning a bounded close into an unbounded one) and was not worth
+ * taking on for a signal that already fails to distinguish this server
+ * from a real one.
+ *
  * AUTHENTICATION IS STUBBED IN THIS TASK: every connection that completes
  * its first packet is treated as unauthenticated and redirected. This
  * makes the server behave exactly like Go Cloak does for any non-Cloak
