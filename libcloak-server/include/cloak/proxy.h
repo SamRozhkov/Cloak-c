@@ -330,11 +330,14 @@ struct cloak_proxy_session {
     cloak_proxy_stream_t *streams;
     size_t stream_count;
 
-    /* 1 while this session is refusing streams at max_streams_per_session.
-     * State, not a statistic: it is what makes the operator log fire on
-     * the TRANSITION rather than once per refused stream -- see
-     * cloak_proxy_t::total_capped, which explains why that distinction is
-     * a security property and not a matter of taste. */
+    /* 1 while this session is inside the capped EPISODE that began when
+     * it last refused a stream at max_streams_per_session. NOT the same
+     * predicate as "is refusing right now": the episode ends at the
+     * low-water mark, an eighth of the cap below the cap, so this stays
+     * set across counts at which a new stream would in fact be admitted.
+     * That asymmetry is deliberate and is the hysteresis itself; it
+     * affects ONLY the log, never admission, which is always the plain
+     * stream_count >= cap test. See cloak_proxy_t::total_capped. */
     int capped;
 
     struct cloak_proxy_session *prev, *next;
@@ -444,16 +447,33 @@ struct cloak_proxy {
      * all, which is a worse failure than the exhaustion it prevents. */
     size_t stream_count;
 
-    /* 1 while the proxy is refusing streams at max_streams_total.
+    /* 1 while the proxy is inside the capped episode that began when it
+     * last refused a stream at max_streams_total; see
+     * cloak_proxy_session_t::capped for why that is not the same
+     * predicate as "is refusing right now".
      *
      * IT EXISTS SO THE OPERATOR LOG IS BOUNDED BY THE STATE, NOT BY THE
      * ATTACKER. An operator otherwise has no way to tell this cap from a
-     * failing upstream -- a refused stream is deliberately
-     * indistinguishable from a refused upstream to the CLIENT, which is
-     * right, but it leaves the person running the server blind. One line
-     * when a cap starts refusing and one when it stops is enough to
-     * diagnose; a line per refusal would be an amplifier, since refusals
-     * are exactly what an attacker generates in bulk.
+     * failing upstream, because to the CLIENT a refusal is
+     * indistinguishable from one IN FORM -- same close, same frame, same
+     * byte count -- which is what the refusal path is careful to preserve.
+     * IT IS NOT INDISTINGUISHABLE IN LATENCY, and that limitation is
+     * inherent rather than an oversight: a refusal is emitted in the same
+     * reactor turn that parsed the opening frame, where any real upstream
+     * failure costs at least a dial round trip and at most
+     * dial_timeout_ms. A prober holding one valid UID can therefore time
+     * stream-open-to-close and read off whether this server is at its
+     * cap -- a coarse load oracle, available only to an authenticated
+     * client, and the unavoidable price of refusing BEFORE the dial, which
+     * is the entire point (a refusal that first dialled would spend the
+     * descriptor the cap exists to protect). It is stated here rather than
+     * fixed.
+     *
+     * Either way it leaves the person running the server blind, which is
+     * what this flag addresses. One line when a cap starts refusing and
+     * one when it stops is enough to diagnose; a line per refusal would be
+     * an amplifier, since refusals are exactly what an attacker generates
+     * in bulk.
      *
      * The flag alone would still flip at the attacker's rate (close one
      * stream, open two), so recovery is HYSTERETIC: the capped state is

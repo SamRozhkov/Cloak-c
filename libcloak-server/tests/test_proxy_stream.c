@@ -58,12 +58,12 @@ const char *__asan_default_options(void) {
 /* ---- fake upstream: records everything it receives, echoes it back ---- */
 
 /* UP_MAX_CONNS is sized by the most demanding test in the file, which is
- * test_stream_cap_is_released_when_streams_end: it deliberately opens and
- * closes more streams in sequence than the total cap's worth, and every
- * one of them dials a fresh upstream connection (accept_count only ever
+ * test_cap_log_hysteresis: the hysteresis only becomes observable at a
+ * cap whose eighth is more than 1, so that test runs a 16-stream cap and
+ * every stream dials its own upstream connection (accept_count only ever
  * grows). Buffers are allocated per ACCEPTED connection, so the headroom
  * costs nothing in the tests that use one or two. */
-#define UP_MAX_CONNS 12
+#define UP_MAX_CONNS 20
 #define UP_BUF_CAP ((size_t)(1u << 20))
 
 typedef struct {
@@ -1339,7 +1339,22 @@ static void test_total_stream_cap_spans_sessions(void) {
     ASSERT_EQ_INT(2, (int)cloak_proxy_session_count(&fx.proxy));
     ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
 
+    /* THE TOTAL CAP'S OWN LOG, which is the one that matters more: it is
+     * server-wide, so it is the cap an attacker refuses against in bulk.
+     * Three refusals, one line -- the same shape test_per_session_stream_
+     * cap asserts, and asserted here because the negative assertion there
+     * ("no total-cap line") lives in a fixture where the total cap never
+     * fires and therefore cannot fail. */
+    logcap_t lc;
+    ASSERT_EQ_INT(0, logcap_open(&lc));
     expect_stream_refused(&fx, &cs_a, 2, 2);
+    expect_stream_refused(&fx, &cs_a, 2, 2);
+    expect_stream_refused(&fx, &cs_b, 2, 2);
+    ASSERT_EQ_INT(1, logcap_count(&lc, "total cap"));
+    /* Each session holds one stream against a per-session cap of 256, so
+     * nothing here may be attributed to that cap. */
+    ASSERT_EQ_INT(0, logcap_count(&lc, "per-session cap"));
+    ASSERT_EQ_INT(0, logcap_count(&lc, "no longer"));
 
     /* Neither session lost anything: both still carry bytes. */
     ASSERT_EQ_INT(2, (int)cloak_stream_write(sa, (const uint8_t *)"za", 2));
@@ -1352,6 +1367,16 @@ static void test_total_stream_cap_spans_sessions(void) {
     ASSERT_MEM_EQ(fx.up.conns[1].in, "bbbzb", 5);
     ASSERT_EQ_INT(0, cs_a.broken);
     ASSERT_EQ_INT(0, cs_b.broken);
+
+    /* And the total cap's recovery: at a cap of 2 the low-water mark is
+     * 1, so one stream ending ends the episode and emits exactly one
+     * line. */
+    ASSERT_EQ_INT(0, cloak_session_close_stream(&cs_a.sesh, sa));
+    struct count_wait cw = {&fx.proxy, 1};
+    ASSERT_TRUE(pump_until(fx.reactor, proxy_streams_eq, &cw, 600, 5));
+    ASSERT_EQ_INT(1, logcap_count(&lc, "no longer at the total stream cap"));
+    ASSERT_EQ_INT(1, logcap_count(&lc, "total cap"));
+    logcap_close(&lc);
 
     cloak_session_release_stream(&cs_a.sesh, sa);
     cloak_session_release_stream(&cs_b.sesh, sb);
@@ -1540,6 +1565,86 @@ static void test_init_validation_and_destroy_discipline(void) {
     cloak_reactor_destroy(r);
 }
 
+/* 17. THE HYSTERESIS, which nothing else reaches.
+ *
+ * Both other cap tests run a cap of 2, where the low-water mark
+ * cap - max(cap/8, 1) is 1 -- which is EXACTLY what a plain transition
+ * flag with no hysteresis at all produces. Replacing proxy_cap_low_water's
+ * body with `return cap;` therefore left the whole suite green, and the
+ * one thing bounding the operator log against an attacker-controlled rate
+ * could regress in silence. This test runs a cap of 16, where the two
+ * answers diverge: hysteresis recovers at 14, a plain flag at 15.
+ *
+ * WHAT IS ASSERTED, and why the first half is the load-bearing half: at
+ * the cap, ending ONE stream must emit NO recovery line even though the
+ * session is no longer refusing -- that gap between "would admit a
+ * stream" and "has announced recovery" IS the hysteresis. The count
+ * reaching 15 is asserted separately, so "no line" cannot pass merely
+ * because nothing happened yet. */
+#define HYST_CAP 16
+#define HYST_LOW_WATER 14 /* HYST_CAP - HYST_CAP/8, written out on purpose:
+                           * recomputing it from the implementation's own
+                           * expression would agree with any mutation of it. */
+
+static void test_cap_log_hysteresis(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 262144, 0, 0, 0, HYST_CAP, 0));
+
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 1017));
+
+    cloak_stream_t *st[HYST_CAP];
+    for (int i = 0; i < HYST_CAP; i++) {
+        char msg[8];
+        snprintf(msg, sizeof(msg), "h%d", i);
+        st[i] = open_and_confirm(&fx, &cs, i, msg);
+        ASSERT_TRUE(st[i] != NULL);
+        if (st[i] == NULL) {
+            client_session_close(&cs);
+            fixture_destroy(&fx);
+            return;
+        }
+    }
+    ASSERT_EQ_INT(HYST_CAP, (int)cloak_proxy_stream_count(&fx.proxy));
+
+    logcap_t lc;
+    ASSERT_EQ_INT(0, logcap_open(&lc));
+
+    expect_stream_refused(&fx, &cs, HYST_CAP, HYST_CAP);
+    ASSERT_EQ_INT(1, logcap_count(&lc, "per-session cap"));
+
+    /* Down to the cap minus one: admission has resumed, but the episode
+     * has NOT ended and must not have been announced. A plain transition
+     * flag emits its recovery line right here. */
+    ASSERT_EQ_INT(0, cloak_session_close_stream(&cs.sesh, st[HYST_CAP - 1]));
+    struct count_wait cw = {&fx.proxy, HYST_CAP - 1};
+    ASSERT_TRUE(pump_until(fx.reactor, proxy_streams_eq, &cw, 600, 5));
+    ASSERT_EQ_INT(HYST_CAP - 1, (int)cloak_proxy_stream_count(&fx.proxy));
+    ASSERT_EQ_INT(0, logcap_count(&lc, "no longer"));
+    cloak_session_release_stream(&cs.sesh, st[HYST_CAP - 1]);
+    up_close_conn(&fx.up, HYST_CAP - 1);
+
+    /* Ending one more reaches the low-water mark, and only now does the
+     * operator hear about it. */
+    ASSERT_EQ_INT(0, cloak_session_close_stream(&cs.sesh, st[HYST_CAP - 2]));
+    cw.want = HYST_LOW_WATER;
+    ASSERT_TRUE(pump_until(fx.reactor, proxy_streams_eq, &cw, 600, 5));
+    ASSERT_EQ_INT(HYST_LOW_WATER, (int)cloak_proxy_stream_count(&fx.proxy));
+    ASSERT_EQ_INT(1, logcap_count(&lc, "no longer at its stream cap"));
+    ASSERT_EQ_INT(1, logcap_count(&lc, "per-session cap"));
+    cloak_session_release_stream(&cs.sesh, st[HYST_CAP - 2]);
+    up_close_conn(&fx.up, HYST_CAP - 2);
+
+    logcap_close(&lc);
+    ASSERT_EQ_INT(0, cs.broken);
+
+    for (int i = 0; i < HYST_CAP - 2; i++) {
+        cloak_session_release_stream(&cs.sesh, st[i]);
+    }
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
 /* 16. THE DERIVATION ITSELF, which nothing else in this file can reach.
  *
  * The property assertions in test 12 run against whatever RLIMIT_NOFILE
@@ -1600,12 +1705,26 @@ static void test_total_cap_is_derived_from_rlimit(void) {
          * the hard limit. Nothing here opens a descriptor, so a limit of
          * 40 is survivable. */
         int rc = 0;
+        int ran = 0;
         for (size_t i = 0; i < sizeof(derive_cases) / sizeof(derive_cases[0]) && rc == 0; i++) {
             struct rlimit rl = saved;
             rl.rlim_cur = derive_cases[i].soft;
             if (rl.rlim_max != RLIM_INFINITY && rl.rlim_cur > rl.rlim_max) {
-                continue; /* a host too constrained for this case */
+                /* A SKIP MUST NOT LOOK LIKE A PASS. On a host whose hard
+                 * limit is below this case's soft limit the case cannot
+                 * run, and silently dropping it would let this test's
+                 * coverage evaporate on a different machine with nobody
+                 * the wiser -- the ceiling case is the first one and the
+                 * most likely to go. So it is announced, and the count of
+                 * cases that actually ran is checked below. */
+                fprintf(stderr,
+                        "test_total_cap_is_derived_from_rlimit: SKIPPED case %zu (soft %llu > "
+                        "hard %llu)\n",
+                        i, (unsigned long long)derive_cases[i].soft,
+                        (unsigned long long)rl.rlim_max);
+                continue;
             }
+            ran++;
             if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
                 rc = 100;
                 break;
@@ -1625,13 +1744,18 @@ static void test_total_cap_is_derived_from_rlimit(void) {
             }
             cloak_proxy_destroy(&pr);
         }
+        if (rc == 0 && ran == 0) {
+            fprintf(stderr, "test_total_cap_is_derived_from_rlimit: NO case could run\n");
+            rc = 102;
+        }
         _exit(rc);
     }
 
     int status = 0;
     ASSERT_TRUE(waitpid(pid, &status, 0) == pid);
     ASSERT_TRUE(WIFEXITED(status));
-    /* 1..N name the failing case, 100/101 a setrlimit/init failure. */
+    /* 1..N name the failing case, 100/101 a setrlimit/init failure, 102
+     * "every case was skipped" -- which is a failure, not a pass. */
     ASSERT_EQ_INT(0, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 
     /* The parent's own limit is exactly as it was. */
@@ -1657,6 +1781,7 @@ test_permanent_start_failure_is_not_retried();
 test_per_session_stream_cap();
 test_total_stream_cap_spans_sessions();
 test_stream_cap_is_released_when_streams_end();
+test_cap_log_hysteresis();
 test_total_cap_is_derived_from_rlimit();
 test_init_validation_and_destroy_discipline();
 TEST_MAIN_END()
