@@ -173,9 +173,17 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     until step 6 authorises info.uid.
  *  5. cloak_aead_method_is_valid on info.encryption_method BEFORE it is
  *     used for anything -- cloak/crypto.h requires this of any
- *     wire-sourced method byte; skipping it is how a wire byte becomes an
- *     out-of-range array index later (cloak_aead_overhead,
- *     cloak_session_config_t's obfuscator).
+ *     wire-sourced method byte. cloak_aead_overhead/cloak_aead_key_len
+ *     are switch/default, not array indexing, so an unvalidated byte
+ *     does not read out of bounds -- it silently degrades to whatever
+ *     the default case returns (CLOAK_AEAD_TAG_LEN's zero-overhead
+ *     branch aside, effectively AES-256-GCM's own sizes) instead of
+ *     being rejected as the invalid method it is. That is still wrong
+ *     enough on its own to check for explicitly: an attacker-chosen
+ *     out-of-range byte would silently pick a real cipher's parameters
+ *     for a session whose obfuscator.method field itself stores the
+ *     invalid value, later reaching cloak_frame_obfuscate/deobfuscate
+ *     with a method cloak_aead_seal/open were never validated against.
  *  6. cloak_server_is_bypass is the whole authorisation policy until a
  *     user manager exists. No logging on failure -- a prober learns
  *     nothing from a silent redirect.
@@ -392,6 +400,22 @@ static void on_dial_done(cloak_dial_t *dial, int fd, void *userdata) {
     }
 }
 
+/* MUST NEVER be reached with c->auth_created set. Every failure path in
+ * this function (redir-addr lookup, cloak_dial_start) frees c via
+ * conn_unlink+free (through conn_drop) WITHOUT going through
+ * conn_teardown's auth_created check -- unlike conn_drop's OTHER callers,
+ * which all route through conn_teardown first. This is safe today only
+ * because nothing that has already created a session (auth_created == 1
+ * is set exclusively by dispatcher_authenticate, step 8, deep inside the
+ * authenticated path) can also reach this function: dispatcher_authenticate
+ * either succeeds and this connection proceeds to reply-write/hand-off, or
+ * it fails before step 8 ever creates anything, or it fails after step 8
+ * and unwinds the session itself before returning -1 (see its own
+ * top-of-function comment). If a future change ever calls this function
+ * for a connection with auth_created == 1, the session it created leaks
+ * silently: it stays in the registry forever, with zero connections and
+ * nobody left who could ever add one, and this function's own callers
+ * would never notice. */
 static void conn_start_redirect(cloak_dispatch_conn_t *c) {
     cloak_dispatcher_t *d = c->d;
 
@@ -558,9 +582,27 @@ static void conn_continue_reply_write(cloak_dispatch_conn_t *c) {
                      * leaving writing_reply == 1 against a mask that
                      * never actually changed to WRITABLE would silently
                      * stall this connection with no further event ever
-                     * arriving for it. Handled the same way every other
-                     * failure in this state is: close, not redirect --
-                     * see conn_reply_write_failed's own comment. */
+                     * arriving for it. This is an ENOMEM-only failure
+                     * (cloak_reactor_mod_fd fails only if epoll_ctl
+                     * itself fails, which for a MOD on an fd already
+                     * known-registered means the kernel is out of
+                     * resources) -- i.e. class (c) in cloak/dispatcher.h's
+                     * top-of-file enumeration (resources already
+                     * exhausted), NOT class (b) (cover story already
+                     * spent): reply_sent can still be 0 here (the very
+                     * first write() attempt is what returned EAGAIN), so
+                     * the client may not have received any part of the
+                     * ServerHello yet. Closing anyway, rather than
+                     * redirecting, is still correct even then: this
+                     * connection may already have created a session
+                     * (auth_created), and conn_start_redirect's own
+                     * failure paths do not run conn_teardown -- routing
+                     * an authenticated connection into them would leak
+                     * that session rather than unwind it (see
+                     * conn_start_redirect's own top-of-function comment,
+                     * M2). conn_reply_write_failed (close via conn_drop,
+                     * which does run conn_teardown) is what actually
+                     * unwinds it. */
                     conn_reply_write_failed(c);
                 }
             }
@@ -635,11 +677,19 @@ static void conn_on_firstpacket_done(cloak_dispatch_conn_t *c) {
          * cloak_dispatcher_accept's own arm-failure handling documents,
          * with the same conclusion: refusing to enter an unbounded state
          * is not an option, so this connection is dropped rather than
-         * left to write its reply with nothing to bound it. Routed
-         * through conn_reply_write_failed (close, not redirect) rather
-         * than conn_start_redirect for the same reason every other
-         * failure in this state is: matches this function's own
-         * top-of-state comment above. */
+         * left to write its reply with nothing to bound it. This is
+         * class (c) in cloak/dispatcher.h's top-of-file enumeration
+         * (resources already exhausted), NOT class (b) (cover story
+         * already spent) -- conn_continue_reply_write has not even been
+         * called yet at this point, so literally none of the reply has
+         * reached the client. Routed through conn_reply_write_failed
+         * (close via conn_drop, which runs conn_teardown) rather than
+         * conn_start_redirect anyway: this connection may already have
+         * created a session (auth_created), and conn_start_redirect's
+         * own failure paths do not run conn_teardown, so redirecting an
+         * authenticated connection through them would leak that session
+         * instead of unwinding it (see conn_start_redirect's own
+         * top-of-function comment, M2). */
         conn_reply_write_failed(c);
         return;
     }
@@ -880,6 +930,10 @@ void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata) {
     }
 
     if (cloak_reactor_add_fd(d->cfg.reactor, fd, CLOAK_REACTOR_READABLE, on_readable, c) != 0) {
+        /* Cannot register this fd with the reactor at all (e.g. the
+         * reactor's own watcher table failed to grow) -- there is no way
+         * to ever read a first packet from it, so this connection can
+         * never do anything but sit here forever; drop it instead. */
         conn_drop(c);
         return;
     }

@@ -959,6 +959,48 @@ static void test_write_error_closes_not_redirect(void) {
     ASSERT_TRUE(n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK));
 
     close(client);
+    /* This test runs last in TEST_MAIN_BEGIN below, which is the only
+     * reason leaving CLOAK_TEST_FORCE_MODE=error set past this point has
+     * been harmless -- clear it explicitly anyway rather than rely on
+     * being last, so this file stays safe to reorder or extend. */
+    unsetenv("CLOAK_TEST_FORCE_MODE");
+    fixture_destroy(&fx);
+}
+
+/* 12. M4: an out-of-range encryption-method byte (step 5's
+ * cloak_aead_method_is_valid check) redirects, exactly like every other
+ * authentication failure in this file -- cloak_aead_overhead/_key_len are
+ * switch/default, not array indexing, so skipping this check would not
+ * read out of bounds, but it would silently let an attacker pick a
+ * session obfuscator.method no cloak_aead_seal/open call was ever
+ * validated against (see dispatcher.c's step-5 comment). */
+static void test_invalid_encryption_method_redirects(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+    int64_t now = (int64_t)time(NULL);
+    uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
+    /* 99 is out of range for cloak_aead_method_t (valid values are 0-3) --
+     * only the payload's own encryption-method byte, never the outer
+     * handshake AEAD (always AES-256-GCM; see build_client_record's own
+     * comment), so this reaches step 5 rather than failing to decrypt. */
+    size_t record_len = build_client_record(fx.server_pub, fx.uid_ok, "ss", 99, now, 11011, 0,
+                                            record, sizeof(record), shared_secret);
+
+    int client = client_connect(front_port(&fx));
+    ASSERT_TRUE(client >= 0);
+    ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
+
+    struct len_wait w = {&fx.cover, record_len};
+    ASSERT_TRUE(pump_until(fx.reactor, cover_has_len, &w, 200, 20));
+    ASSERT_EQ_INT((int)record_len, (int)fx.cover.len);
+    ASSERT_MEM_EQ(fx.cover.buf, record, record_len);
+
+    ASSERT_EQ_INT(0, fx.attached.calls);
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count(&fx.registry));
+
+    close(client);
     fixture_destroy(&fx);
 }
 
@@ -974,4 +1016,5 @@ TEST_MAIN_BEGIN()
     test_admin_uid_session_zero_is_recognised();
     test_write_resumes_after_eagain();
     test_write_error_closes_not_redirect();
+    test_invalid_encryption_method_redirects();
 TEST_MAIN_END()

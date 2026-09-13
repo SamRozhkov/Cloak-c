@@ -250,7 +250,22 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * RedirAddr exactly as if authentication itself had failed, and
  * cloak_server_registry_get_or_create is never called -- so nothing is
  * left in the registry. Returning 0 proceeds to create the session with
- * *config as (possibly) modified by this callback. */
+ * *config as (possibly) modified by this callback.
+ *
+ * CALLING CONTEXT: this fires synchronously from inside
+ * dispatcher_authenticate, itself called from conn_on_firstpacket_done,
+ * itself called from this connection's own on_readable -- i.e. from deep
+ * inside this SAME connection's dispatch call chain, with c (the
+ * connection this callback's own info/config describe) still live on the
+ * stack above this call, about to be touched again once this callback
+ * returns regardless of whether it returns 0 or -1. Calling
+ * cloak_dispatcher_destroy(d) from here frees that same connection out
+ * from under its own still-running call chain -- a use-after-free, not
+ * merely against the rules, on both this callback's return paths. Do not
+ * call it, or anything else that could free or hand off this connection,
+ * from within this callback; ordinary read-only accessors
+ * (cloak_server_registry_find, cloak_server_registry_count,
+ * cloak_dispatcher_conn_count/pending_count) are fine. */
 typedef int (*cloak_dispatch_prepare_session_cb)(cloak_dispatcher_t *d,
                                                   const cloak_server_clientinfo_t *info,
                                                   cloak_session_config_t *config,
@@ -267,7 +282,20 @@ typedef int (*cloak_dispatch_prepare_session_cb)(cloak_dispatcher_t *d,
  * connection's own authentication, not whatever created sesh originally,
  * so a caller wanting session-identifying data should prefer sesh's own
  * (uid, session_id) it already tracks rather than re-deriving it from
- * info on this path. */
+ * info on this path.
+ *
+ * CALLING CONTEXT: this fires from inside conn_handoff, BEFORE the
+ * connection it describes is unlinked from d's own list and freed --
+ * conn_handoff's own remaining work (cancelling its deadline, unlinking
+ * it, freeing it) still runs after this callback returns. Two
+ * consequences: calling cloak_dispatcher_destroy(d) from here walks and
+ * frees that same still-linked, not-yet-freed connection as part of
+ * destroying d, so conn_handoff's own unlink-and-free of it afterward is
+ * a double free -- do not call it from here. And cloak_dispatcher_
+ * conn_count(d)/cloak_dispatcher_pending_count(d), if read from within
+ * this callback, still include this connection (its own unlink/decrement
+ * has not happened yet) -- a caller that wants the post-hand-off count
+ * should read it after this callback returns, not from inside it. */
 typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_t *sesh,
                                             const cloak_server_clientinfo_t *info, int created,
                                             void *userdata);
@@ -488,8 +516,14 @@ int cloak_dispatcher_init(cloak_dispatcher_t *d, const cloak_dispatcher_config_t
 
 /* Tears down every connection still in flight: cancels each one's
  * deadline timer, cancels an in-progress dial or stops an in-progress
- * relay (whichever, if either, is live), and closes whatever fd(s) that
- * connection still owns. Neither cloak_dial_cancel nor cloak_relay_stop
+ * relay (whichever, if either, is live), closes a brand-new session this
+ * connection created (auth_created) but never finished attaching to --
+ * PROVIDED no other connection has since attached to it in the meantime,
+ * see conn_teardown's own comment in dispatcher.c for why "created this
+ * session" alone does not gate this -- and closes whatever fd(s) that
+ * connection still owns, including one still registered
+ * CLOAK_REACTOR_WRITABLE for a not-yet-drained post-authentication reply
+ * write (writing_reply). Neither cloak_dial_cancel nor cloak_relay_stop
  * fires its normal completion callback for a connection torn down this
  * way -- this is the caller's own shutdown, not a failure to report.
  *

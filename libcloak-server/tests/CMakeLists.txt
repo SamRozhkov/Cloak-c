@@ -81,6 +81,31 @@ if(CMAKE_C_FLAGS MATCHES "-fsanitize=[^ ]*address")
         OUTPUT_STRIP_TRAILING_WHITESPACE)
     if(_cloak_asan_rt AND EXISTS "${_cloak_asan_rt}")
         set(_cloak_ld_preload "${_cloak_asan_rt} ${_cloak_ld_preload}")
+    else()
+        # The exact silent-loss scenario the comment above warns about:
+        # -fsanitize=address is on, but this compiler's own
+        # -print-file-name=libasan.so query did not resolve to a real
+        # file (a non-GCC/Clang-with-compiler-rt toolchain, most likely).
+        # Failing the CMake configure step loudly here is strictly better
+        # than letting this silently degrade into a build that reports
+        # green while test_dispatcher_auth and test_dispatcher_limits
+        # quietly stop exercising the write-shim-dependent paths (steps
+        # 10/11's EAGAIN/error/deadline branches, and this plan's own C1
+        # regression test) under the sanitizer suite -- exactly the
+        # coverage loss a future Clang CI leg would otherwise hit with no
+        # signal at all.
+        message(FATAL_ERROR
+            "cloak-server tests: -fsanitize=address is set in CMAKE_C_FLAGS "
+            "but '${CMAKE_C_COMPILER} -print-file-name=libasan.so' did not "
+            "resolve to an existing file (got: '${_cloak_asan_rt}'). "
+            "test_write_shim.c's LD_PRELOAD interposition requires ASan's "
+            "own runtime to be preloaded first, or the sanitizer aborts at "
+            "startup with 'ASan runtime does not come first in initial "
+            "library list' -- silently continuing here would instead lose "
+            "test_dispatcher_auth/test_dispatcher_limits' shim-dependent "
+            "coverage with no build failure to flag it. This toolchain's "
+            "ASan runtime needs a different lookup (e.g. compiler-rt under "
+            "Clang) than the GCC-runtime-naming query this project uses.")
     endif()
 endif()
 set_tests_properties(test_dispatcher_auth PROPERTIES

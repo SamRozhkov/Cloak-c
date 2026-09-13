@@ -60,6 +60,17 @@ ssize_t write(int fd, const void *buf, size_t count) {
     static cloak_real_write_fn real_write = NULL;
     if (real_write == NULL) {
         real_write = (cloak_real_write_fn)dlsym(RTLD_NEXT, "write");
+        if (real_write == NULL) {
+            /* dlsym itself failed (e.g. a libc that does not export a
+             * plain "write" symbol under this name) -- there is no real
+             * write() left to fall back to, and returning without
+             * writing anything would make every caller in this process
+             * see a silent no-op rather than an honest failure. Fail
+             * loudly instead of leaving real_write NULL and crashing on
+             * the next call below. */
+            errno = ENOSYS;
+            return -1;
+        }
     }
 
     const char *port_str = getenv("CLOAK_TEST_FORCE_PEER_PORT");
