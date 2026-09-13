@@ -124,3 +124,9 @@ set_tests_properties(test_dispatcher_limits PROPERTIES TIMEOUT 60)
 # comment.
 set_tests_properties(test_dispatcher_limits PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+add_executable(test_proxy_stream test_proxy_stream.c)
+target_include_directories(test_proxy_stream PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_proxy_stream PRIVATE cloak-server)
+add_test(NAME test_proxy_stream COMMAND test_proxy_stream)
+set_tests_properties(test_proxy_stream PROPERTIES TIMEOUT 60)
