@@ -54,7 +54,13 @@ const char *__asan_default_options(void) {
 
 /* ---- fake upstream: records everything it receives, echoes it back ---- */
 
-#define UP_MAX_CONNS 4
+/* UP_MAX_CONNS is sized by the most demanding test in the file, which is
+ * test_stream_cap_is_released_when_streams_end: it deliberately opens and
+ * closes more streams in sequence than the total cap's worth, and every
+ * one of them dials a fresh upstream connection (accept_count only ever
+ * grows). Buffers are allocated per ACCEPTED connection, so the headroom
+ * costs nothing in the tests that use one or two. */
+#define UP_MAX_CONNS 12
 #define UP_BUF_CAP ((size_t)(1u << 20))
 
 typedef struct {
@@ -254,10 +260,17 @@ struct fixture {
  * and the ladder, because the transient rejection it exercises is
  * defined entirely in terms of that pool; test 11 overrides
  * relay_buf_cap, because a permanent failure is the only kind this
- * module's public surface can provoke at all. */
+ * module's public surface can provoke at all.
+ *
+ * max_streams_per_session / max_streams_total go straight into
+ * cloak_proxy_config_t too, and are left at 0 (the 256/4096 defaults) by
+ * every test but the three cap tests -- which set them to values a test
+ * can actually reach, since reaching 256 streams would mean 256 upstream
+ * connections and prove nothing extra. */
 static int fixture_init_opts(struct fixture *fx, const char *transport,
                              size_t conn_send_queue_cap, size_t relay_buf_cap,
-                             uint64_t retry_delay_ms, unsigned max_retries) {
+                             uint64_t retry_delay_ms, unsigned max_retries,
+                             size_t max_streams_per_session, size_t max_streams_total) {
     memset(fx, 0, sizeof(*fx));
     char err[256] = {0};
 
@@ -327,6 +340,8 @@ static int fixture_init_opts(struct fixture *fx, const char *transport,
     pcfg.relay_buf_cap = relay_buf_cap;
     pcfg.retry_delay_ms = retry_delay_ms;
     pcfg.max_retries = max_retries;
+    pcfg.max_streams_per_session = max_streams_per_session;
+    pcfg.max_streams_total = max_streams_total;
     ASSERT_EQ_INT(0, cloak_proxy_init(&fx->proxy, &pcfg));
     fx->proxy_ready = 1;
 
@@ -381,7 +396,7 @@ static int fixture_init_opts(struct fixture *fx, const char *transport,
 /* The ordinary fixture: a roomy server-side pool and cloak_proxy_t's own
  * defaults for everything. */
 static int fixture_init(struct fixture *fx, const char *transport) {
-    return fixture_init_opts(fx, transport, 262144, 0, 0, 0);
+    return fixture_init_opts(fx, transport, 262144, 0, 0, 0, 0, 0);
 }
 
 /* Destroy order, and why each step is where it is:
@@ -960,7 +975,7 @@ static int retry_step(void *ctx) {
 
 static void test_relay_start_rejection_retries_then_gives_up(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 16402, 0, 5, 3));
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 16402, 0, 5, 3, 0, 0));
 
     client_session_t cs;
     ASSERT_EQ_INT(0, open_client(&fx, &cs, 1010));
@@ -1066,7 +1081,7 @@ static void test_udp_proxy_book_entry_redirects(void) {
  * than leaked on a path that never armed a timer. */
 static void test_permanent_start_failure_is_not_retried(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 262144, SIZE_MAX, 5, 3));
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 262144, SIZE_MAX, 5, 3, 0, 0));
 
     client_session_t cs;
     ASSERT_EQ_INT(0, open_client(&fx, &cs, 1011));
@@ -1098,6 +1113,210 @@ static void test_permanent_start_failure_is_not_retried(void) {
     ASSERT_EQ_INT(0, cs.broken);
 
     cloak_session_release_stream(&cs.sesh, st);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* ---- the stream caps (tests 13-15) ---------------------------------------
+ *
+ * Nothing caps how many streams a client may open by itself: a stream is
+ * created by cloak_session_t for any unseen stream_id, so one frame buys
+ * an upstream descriptor, a watcher, a dial timer and a buffer. The two
+ * caps exist because running the process out of descriptors does not
+ * merely degrade service -- it breaks the DISPATCHER's cover story, since
+ * conn_start_redirect's own dial then fails and the connection is dropped
+ * instead of redirected. See cloak_proxy_config_t::max_streams_total.
+ *
+ * All three tests assert the refusal the way test 7 asserts a refused
+ * upstream: the refused stream ENDS at the client (the proxy released it,
+ * and release performs the active close), and no upstream connection is
+ * ever dialed for it. Both of those change if the cap stops firing --
+ * a refusal that only showed up as a counter would be satisfied by a
+ * proxy that dialed the upstream first and tore it down after. */
+
+/* Helper for the cap tests: opens one client stream, writes `msg` on it,
+ * and waits until the fake upstream's `idx`-th connection has the whole
+ * message. Returns the stream, or NULL if anything failed (asserted). */
+static cloak_stream_t *open_and_confirm(struct fixture *fx, client_session_t *cs, int idx,
+                                        const char *msg) {
+    cloak_stream_t *st = cloak_session_open_stream(&cs->sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        return NULL;
+    }
+    size_t len = strlen(msg);
+    ASSERT_EQ_INT((int)len, (int)cloak_stream_write(st, (const uint8_t *)msg, len));
+    struct up_wait uw = {&fx->up, idx, len};
+    ASSERT_TRUE(pump_until(fx->reactor, up_has_len, &uw, 600, 5));
+    ASSERT_EQ_INT(idx + 1, fx->up.accept_count);
+    ASSERT_MEM_EQ(fx->up.conns[idx].in, msg, len);
+    return st;
+}
+
+/* Opens one more client stream and asserts it is REFUSED: the client sees
+ * it end, no new upstream connection was dialed, and the proxy's stream
+ * count did not move. `expect_streams` is what the count must still be --
+ * passed in rather than re-read, so this cannot pass by agreeing with
+ * whatever the proxy happens to hold. */
+static void expect_stream_refused(struct fixture *fx, client_session_t *cs, int expect_accepts,
+                                  size_t expect_streams) {
+    cloak_stream_t *st = cloak_session_open_stream(&cs->sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        return;
+    }
+    ASSERT_EQ_INT(1, (int)cloak_stream_write(st, (const uint8_t *)"x", 1));
+
+    uint8_t back[16];
+    reader_t rd = {st, back, sizeof(back), 0, 0};
+    ASSERT_TRUE(pump_until(fx->reactor, reader_ended, &rd, 600, 5));
+    ASSERT_EQ_INT(1, rd.ended);
+    ASSERT_EQ_INT(0, (int)rd.len); /* refused before any upstream existed */
+    ASSERT_EQ_INT(expect_accepts, fx->up.accept_count);
+    ASSERT_EQ_INT((int)expect_streams, (int)cloak_proxy_stream_count(&fx->proxy));
+
+    cloak_session_release_stream(&cs->sesh, st);
+}
+
+/* 13. The PER-SESSION cap: the first N streams work end to end, the
+ * (N+1)th is refused, and the N are still carrying afterwards -- the last
+ * part being what distinguishes "refused the extra stream" from "broke
+ * the session". */
+static void test_per_session_stream_cap(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 262144, 0, 0, 0, 2, 0));
+
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 1013));
+
+    cloak_stream_t *s1 = open_and_confirm(&fx, &cs, 0, "one");
+    cloak_stream_t *s2 = open_and_confirm(&fx, &cs, 1, "two");
+    if (s1 == NULL || s2 == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
+
+    expect_stream_refused(&fx, &cs, 2, 2);
+
+    /* Both streams under the cap still carry bytes both ways. */
+    ASSERT_EQ_INT(4, (int)cloak_stream_write(s1, (const uint8_t *)"more", 4));
+    struct up_wait uw = {&fx.up, 0, 7};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw, 600, 5));
+    ASSERT_MEM_EQ(fx.up.conns[0].in, "onemore", 7);
+
+    uint8_t b2[16];
+    reader_t r2 = {s2, b2, sizeof(b2), 0, 0};
+    struct reader_wait rw2 = {&r2, 3};
+    ASSERT_TRUE(pump_until(fx.reactor, reader_has, &rw2, 600, 5));
+    ASSERT_MEM_EQ(r2.buf, "two", 3);
+
+    ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
+    ASSERT_EQ_INT(0, cs.broken);
+
+    cloak_session_release_stream(&cs.sesh, s1);
+    cloak_session_release_stream(&cs.sesh, s2);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* 14. The TOTAL cap, which is a different cap and not merely the same one
+ * counted twice: two sessions hold one stream each, and the session that
+ * then asks for a SECOND one is refused even though its own per-session
+ * count (1) is nowhere near the per-session cap, which this fixture
+ * leaves at the 256 default. Only the total cap can produce that
+ * refusal. */
+static void test_total_stream_cap_spans_sessions(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 262144, 0, 0, 0, 0, 2));
+
+    client_session_t cs_a;
+    client_session_t cs_b;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs_a, 1014));
+    ASSERT_EQ_INT(0, open_client(&fx, &cs_b, 1015));
+
+    cloak_stream_t *sa = open_and_confirm(&fx, &cs_a, 0, "aaa");
+    cloak_stream_t *sb = open_and_confirm(&fx, &cs_b, 1, "bbb");
+    if (sa == NULL || sb == NULL) {
+        client_session_close(&cs_a);
+        client_session_close(&cs_b);
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(2, (int)cloak_proxy_session_count(&fx.proxy));
+    ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&fx.proxy));
+
+    expect_stream_refused(&fx, &cs_a, 2, 2);
+
+    /* Neither session lost anything: both still carry bytes. */
+    ASSERT_EQ_INT(2, (int)cloak_stream_write(sa, (const uint8_t *)"za", 2));
+    ASSERT_EQ_INT(2, (int)cloak_stream_write(sb, (const uint8_t *)"zb", 2));
+    struct up_wait ua = {&fx.up, 0, 5};
+    struct up_wait ub = {&fx.up, 1, 5};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &ua, 600, 5));
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &ub, 600, 5));
+    ASSERT_MEM_EQ(fx.up.conns[0].in, "aaaza", 5);
+    ASSERT_MEM_EQ(fx.up.conns[1].in, "bbbzb", 5);
+    ASSERT_EQ_INT(0, cs_a.broken);
+    ASSERT_EQ_INT(0, cs_b.broken);
+
+    cloak_session_release_stream(&cs_a.sesh, sa);
+    cloak_session_release_stream(&cs_b.sesh, sb);
+    client_session_close(&cs_a);
+    client_session_close(&cs_b);
+    fixture_destroy(&fx);
+}
+
+/* 15. THE ONE THAT CATCHES A LEAKED COUNTER, and the reason the cap is
+ * counted off cloak_proxy_t::stream_count rather than a second tally of
+ * its own: a cap whose counter only ever rises is not a cap, it is a
+ * server-wide ban that arrives silently after N streams have ever been
+ * served, which is strictly worse than the exhaustion it was added to
+ * prevent.
+ *
+ * ROUNDS is deliberately several times the total cap, and each round
+ * asserts a BRAND-NEW upstream connection carrying that round's own
+ * bytes (accept_count only ever grows, so round i can only be satisfied
+ * by the i-th accept). A decrement missed anywhere fails the first round
+ * past the cap, not merely a count at the end.
+ *
+ * The upstream side of each round is closed once the proxy has reclaimed
+ * its context, so the reactor does not accumulate sockets sitting at EOF
+ * -- which are ready on every single turn and would let an
+ * iteration-counted pump burn its whole budget in no wall-clock time at
+ * all. */
+#define CAP_ROUNDS 6
+
+static void test_stream_cap_is_released_when_streams_end(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "tcp", 262144, 0, 0, 0, 0, 2));
+
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 1016));
+
+    for (int i = 0; i < CAP_ROUNDS; i++) {
+        char msg[16];
+        snprintf(msg, sizeof(msg), "r%d", i);
+        cloak_stream_t *st = open_and_confirm(&fx, &cs, i, msg);
+        if (st == NULL) {
+            break;
+        }
+        ASSERT_EQ_INT(1, (int)cloak_proxy_stream_count(&fx.proxy));
+
+        ASSERT_EQ_INT(0, cloak_session_close_stream(&cs.sesh, st));
+        struct count_wait cw = {&fx.proxy, 0};
+        ASSERT_TRUE(pump_until(fx.reactor, proxy_streams_eq, &cw, 600, 5));
+        ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(&fx.proxy));
+
+        cloak_session_release_stream(&cs.sesh, st);
+        up_close_conn(&fx.up, i);
+    }
+
+    ASSERT_EQ_INT(CAP_ROUNDS, fx.up.accept_count);
+    ASSERT_EQ_INT(0, cs.broken);
+    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&fx.proxy));
+
     client_session_close(&cs);
     fixture_destroy(&fx);
 }
@@ -1177,6 +1396,9 @@ static void test_init_validation_and_destroy_discipline(void) {
     ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_DIAL_TIMEOUT_MS, (int)live.cfg.dial_timeout_ms);
     ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS, (int)live.cfg.retry_delay_ms);
     ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_MAX_RETRIES, (int)live.cfg.max_retries);
+    ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_MAX_STREAMS_PER_SESSION,
+                  (int)live.cfg.max_streams_per_session);
+    ASSERT_EQ_INT((int)CLOAK_PROXY_DEFAULT_MAX_STREAMS_TOTAL, (int)live.cfg.max_streams_total);
     ASSERT_TRUE(live.sessions == NULL);
     ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&live));
     ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(&live));
@@ -1200,5 +1422,8 @@ test_unordered_redirects();
 test_udp_proxy_book_entry_redirects();
 test_relay_start_rejection_retries_then_gives_up();
 test_permanent_start_failure_is_not_retried();
+test_per_session_stream_cap();
+test_total_stream_cap_spans_sessions();
+test_stream_cap_is_released_when_streams_end();
 test_init_validation_and_destroy_discipline();
 TEST_MAIN_END()

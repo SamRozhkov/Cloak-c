@@ -170,6 +170,64 @@ typedef struct cloak_proxy_session cloak_proxy_session_t;
  * config belongs to the dispatcher, not to this module. */
 #define CLOAK_PROXY_DEFAULT_MAX_RETRIES ((unsigned)400)
 
+/* The most streams ONE authenticated session may hold contexts for at
+ * once. Over it the stream is released straight back to its session --
+ * no context, no dial, no descriptor -- and the session's other streams
+ * are untouched.
+ *
+ * THE AXIS THIS CAPS IS NOT THE ONE THE DISPATCHER CAPS. Its
+ * max_pending_conns bounds CONNECTIONS, and a connection is expensive to
+ * obtain: an attacker has to complete a handshake for each. A STREAM is
+ * bought with one frame carrying an unseen stream_id, on a connection
+ * that already exists -- cloak_session_t creates a cloak_stream_t for any
+ * such id -- and each one costs this module an upstream descriptor, a
+ * reactor watcher, a dial timer and a receive buffer. An upstream that
+ * accepts nothing holds each of those for the whole of dial_timeout_ms;
+ * worse, because cloak_stream_relay_start's -2 rejection is a
+ * SESSION-WIDE condition (cloak_session_send_min_conn_free), a client
+ * that slow-drains one bulk stream makes every later stream on the same
+ * session park a CONNECTED upstream descriptor for the full retry ladder.
+ *
+ * 256 is several times a browser's worth of concurrent connections, which
+ * is the load the one honest client behind a session actually generates
+ * (see proxy_on_stream_data on why a linear scan suffices at this scale).
+ * Much smaller and an ordinary client's own parallelism is what trips it,
+ * which the client sees as unexplained stream failures. Much larger and
+ * one UID's share stops being a share at all: the total cap below is
+ * then the only thing standing between a single authenticated client and
+ * the whole descriptor budget. */
+#define CLOAK_PROXY_DEFAULT_MAX_STREAMS_PER_SESSION ((size_t)256)
+
+/* The most streams the WHOLE proxy may hold contexts for at once, summed
+ * over every session. This is the cap that actually protects the process:
+ * cloak_server_registry_t bounds sessions (CLOAK_REGISTRY_MAX_SESSIONS),
+ * but that bound times the per-session cap above is far more than any
+ * descriptor limit a server is run with, so the per-session cap alone
+ * bounds nothing an operator cares about.
+ *
+ * IT IS SIZED TO LEAVE HEADROOM, AND THE HEADROOM IS THE POINT -- this is
+ * a cover-story property, not a capacity one. When the process is out of
+ * descriptors the DISPATCHER's own redirect breaks: conn_start_redirect
+ * calls cloak_dial_start, its socket() fails with EMFILE/ENFILE, and
+ * conn_drop runs instead (libcloak-server/src/dispatcher.c), so a prober
+ * gets an abrupt close where it should have got the cover site. One
+ * greedy or hostile UID would otherwise flip the entire server from
+ * "looks like a web server" to "closes connections", for every other user
+ * on it. Losing one client's 4097th stream is cheap; losing the cover
+ * story is the failure this whole project exists to avoid.
+ *
+ * 4096 assumes a server whose RLIMIT_NOFILE an operator has raised to the
+ * usual tens of thousands: the proxy's own upstream descriptors then stay
+ * an order of magnitude below it, leaving the accepted connections, the
+ * listeners and -- the part that matters -- the redirect dials with room.
+ * It is a ceiling on this module's share, NOT a substitute for setting
+ * that limit: a server left on a 1024-descriptor default must lower this
+ * to match, since 4096 streams cannot fit under it and the cap would then
+ * never be the thing that fired first. Much larger and it stops reserving
+ * anything; much smaller and an ordinary multi-user server refuses
+ * streams it had the descriptors for. */
+#define CLOAK_PROXY_DEFAULT_MAX_STREAMS_TOTAL ((size_t)4096)
+
 /* One accepted stream, being connected to or spliced with its upstream.
  * Heap-allocated and never moved: its address is the userdata for its own
  * dial, its own relay and its own retry timer.
@@ -284,6 +342,27 @@ typedef struct {
     uint64_t retry_delay_ms; /* 0 -> CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS */
     unsigned max_retries;    /* 0 -> CLOAK_PROXY_DEFAULT_MAX_RETRIES */
 
+    /* THE TWO STREAM CAPS, checked together before anything is allocated
+     * or dialed for a newly accepted stream. Over EITHER, the stream is
+     * handed straight back with cloak_session_release_stream (legal from
+     * on_new_stream -- cloak/session.h) and nothing else happens: no
+     * context, no dial, no descriptor, and no effect on the session or on
+     * any stream already running.
+     *
+     * THE TRADE-OFF, stated once because it is the whole reason these
+     * exist: degrade the greedy client's extra streams rather than the
+     * cover story, since a server that has run out of descriptors closes
+     * probers instead of redirecting them to the cover site and is
+     * therefore distinguishable. See the two CLOAK_PROXY_DEFAULT_MAX_
+     * STREAMS_* constants for what each bounds and why.
+     *
+     * Both count THE CONTEXTS THAT EXIST -- cloak_proxy_session_t::
+     * stream_count and cloak_proxy_t::stream_count respectively -- so a
+     * stream refused at the cap never counted against it, and a stream
+     * that ends frees its share the instant its context is freed. */
+    size_t max_streams_per_session; /* 0 -> ..._DEFAULT_MAX_STREAMS_PER_SESSION */
+    size_t max_streams_total;       /* 0 -> ..._DEFAULT_MAX_STREAMS_TOTAL */
+
     /* OPTIONAL, and the reason cloak_proxy_registry_broken can afford to
      * BE the registry's one on_broken callback rather than something the
      * owner has to remember to call: an owner with bookkeeping of its own
@@ -311,7 +390,15 @@ struct cloak_proxy {
 
     /* The sum of every session context's own stream_count, kept in step
      * with it so cloak_proxy_stream_count stays O(1) rather than walking
-     * the session list on every call. */
+     * the session list on every call.
+     *
+     * IT IS ALSO WHAT ENFORCES cfg.max_streams_total, which is why the
+     * single place it is decremented matters: exactly one function frees
+     * a cloak_proxy_stream_t, and it unlinks (and so decrements) on the
+     * way. A decrement missed on any path would not merely skew a
+     * statistic -- it would ratchet this counter upward until the cap
+     * became a permanent, server-wide refusal to accept any stream at
+     * all, which is a worse failure than the exhaustion it prevents. */
     size_t stream_count;
 };
 
@@ -322,7 +409,7 @@ struct cloak_proxy {
  * struct.
  *
  * Copies *cfg by value, substituting CLOAK_PROXY_DEFAULT_* for any of the
- * four sizing fields left at 0. cfg->reactor and cfg->srv remain borrowed
+ * six sizing fields left at 0. cfg->reactor and cfg->srv remain borrowed
  * pointers.
  *
  * Returns 0 on success, -1 if p is NULL, or cfg, cfg->reactor or

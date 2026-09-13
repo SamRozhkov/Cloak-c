@@ -307,6 +307,36 @@ static void proxy_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, v
     }
     cloak_proxy_t *p = ps->p;
 
+    /* THE CAPS, and they are checked HERE -- before a context is
+     * allocated, before a descriptor is asked for, before anything is
+     * registered with the reactor -- because a cap enforced any later
+     * would already have spent the resource it exists to protect.
+     *
+     * Both are counted off the two counters that track THE CONTEXTS THAT
+     * EXIST, so a stream refused right here never counted against them
+     * and a stream that ends gives its share back the instant its context
+     * is freed. The give-back is not conditional on which path ended it:
+     * proxy_stream_teardown is the only function that frees a
+     * cloak_proxy_stream_t, and it unlinks -- decrementing both counters
+     * -- immediately before the free, so every caller of it (the relay's
+     * done callback, dial failure, a permanent or exhausted relay start,
+     * the broken/aborted/destroy walk) decrements by construction rather
+     * than by remembering to.
+     *
+     * Releasing the stream is this module's whole response: it is legal
+     * from within on_new_stream (cloak/session.h), it performs the active
+     * close itself so the client learns immediately rather than waiting
+     * out a timeout, and it touches nothing else on the session. The
+     * client's extra streams degrade; the server's ability to dial its
+     * own cover-site redirect -- which is what an exhausted descriptor
+     * table would actually cost -- does not. See
+     * cloak_proxy_config_t::max_streams_total. */
+    if (ps->stream_count >= p->cfg.max_streams_per_session ||
+        p->stream_count >= p->cfg.max_streams_total) {
+        cloak_session_release_stream(sesh, stream);
+        return;
+    }
+
     cloak_proxy_stream_t *pst = calloc(1, sizeof(*pst));
     if (pst == NULL) {
         /* cloak/session.h:26-32 explicitly permits releasing the stream
@@ -441,6 +471,12 @@ int cloak_proxy_init(cloak_proxy_t *p, const cloak_proxy_config_t *cfg) {
     }
     if (p->cfg.max_retries == 0) {
         p->cfg.max_retries = CLOAK_PROXY_DEFAULT_MAX_RETRIES;
+    }
+    if (p->cfg.max_streams_per_session == 0) {
+        p->cfg.max_streams_per_session = CLOAK_PROXY_DEFAULT_MAX_STREAMS_PER_SESSION;
+    }
+    if (p->cfg.max_streams_total == 0) {
+        p->cfg.max_streams_total = CLOAK_PROXY_DEFAULT_MAX_STREAMS_TOTAL;
     }
     return 0;
 }
