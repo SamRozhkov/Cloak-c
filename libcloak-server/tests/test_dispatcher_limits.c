@@ -957,7 +957,7 @@ static void test_slow_loris_all_reaped_by_deadline(void) {
  * it has no coverage feedback, no corpus, and a fixed iteration count.
  *
  * The seed is fixed so any failure this ever finds reproduces exactly.
- * Every odd-indexed connection is fed CLOAK_FIRSTPACKET_MAX random bytes
+ * Every even-indexed connection is fed CLOAK_FIRSTPACKET_MAX random bytes
  * in one write(): tracing cloak_firstpacket_feed (firstpacket.c) shows
  * that this ALWAYS reaches a terminal DONE or ERROR without ever needing
  * the handshake deadline --
@@ -974,7 +974,7 @@ static void test_slow_loris_all_reaped_by_deadline(void) {
  *     check fails it.
  * So these connections always redirect (dispatcher_authenticate cannot
  * succeed against random bytes) and this test does not need to wait on a
- * deadline for them. Every even-indexed connection instead sends a random
+ * deadline for them. Every odd-indexed connection instead sends a random
  * SHORT prefix and then closes immediately, exercising the "peer already
  * gone" drop path instead -- so both terminal outcomes the brief calls out
  * ("redirects or drops") are genuinely exercised, not just one of them by
@@ -991,6 +991,7 @@ static void test_fuzz_first_packets_never_crash_or_leak(void) {
     ASSERT_EQ_INT(0, fixture_init(&fx, &opts));
 
     uint8_t buf[CLOAK_FIRSTPACKET_MAX];
+    int redirect_fds[FUZZ_CONNS];
     int redirect_leaning = 0, drop_leaning = 0;
 
     for (int i = 0; i < FUZZ_CONNS; i++) {
@@ -1006,12 +1007,15 @@ static void test_fuzz_first_packets_never_crash_or_leak(void) {
             }
             ssize_t n = write(fd, buf, sizeof(buf));
             ASSERT_TRUE(n == (ssize_t)sizeof(buf));
+            /* Kept open (client side) and closed explicitly after the
+             * settle loop below: this is the TEST's own fd, distinct
+             * from the dispatcher's server-side connection for the same
+             * TCP pair, which fixture_destroy tears down. Leaving THIS
+             * one open too would leak it for the rest of the process's
+             * life -- fixture_destroy has no way to reach a fd it never
+             * owned. */
+            redirect_fds[redirect_leaning] = fd;
             redirect_leaning++;
-            /* Left open: this connection is expected to end up relaying,
-             * torn down later by fixture_destroy along with anything
-             * else still in flight -- itself extra teardown-under-load
-             * coverage, with many connections in various post-first-
-             * packet states at once. */
         } else {
             size_t len = 1 + (size_t)(rand_r(&seed) % (CLOAK_FIRSTPACKET_MAX - 1));
             for (size_t j = 0; j < len; j++) {
@@ -1056,6 +1060,13 @@ static void test_fuzz_first_packets_never_crash_or_leak(void) {
     cloak_dispatcher_destroy(&fx.d);
     fx.d_ready = 0;
     ASSERT_EQ_INT(0, (int)cloak_dispatcher_conn_count(&fx.d));
+
+    /* This test's own client-side fds for the "redirect-leaning" half --
+     * fixture_destroy tears down the dispatcher's SERVER-side halves of
+     * these same TCP connections, but never touches these. */
+    for (int i = 0; i < redirect_leaning; i++) {
+        close(redirect_fds[i]);
+    }
 
     fixture_destroy(&fx);
 }

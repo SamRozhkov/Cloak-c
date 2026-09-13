@@ -157,7 +157,21 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * the cover story itself would be self-defeating (refusing to redirect
  * is precisely the behaviour that would distinguish this server from a
  * real one to anyone watching). See cloak_dispatcher_accept's own
- * comment for where pending_count is incremented and decremented. */
+ * comment for where pending_count is incremented and decremented.
+ *
+ * A KNOWN, UNAVOIDABLE RESIDUAL: this cap is necessarily indiscriminate.
+ * Before a connection's first packet is even read, the dispatcher cannot
+ * know whether it will turn out to be a redirect (using a pending slot
+ * only briefly), a brand-new authenticated session, or an additional
+ * connection to a session that ALREADY exists (attaching in effectively
+ * no time once its ClientHello arrives) -- so a cap sized correctly for
+ * legitimate load can still, in principle, turn away a legitimate client
+ * that arrives while the cap is saturated by other pending connections,
+ * regardless of what any of them eventually turn out to be. There is no
+ * way to distinguish "legitimate" from "attacker-controlled" pending
+ * connections before authentication succeeds, which is the whole reason
+ * this cap -- an indiscriminate one -- exists at all; this is a
+ * structural trade-off, not an oversight. */
 #define CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS ((size_t)512)
 
 /* Invoked exactly once per authenticated connection, ONLY when that
@@ -452,7 +466,13 @@ void cloak_dispatcher_destroy(cloak_dispatcher_t *d);
  *
  * pending_count is incremented here, unconditionally, for every
  * connection that gets past the cap check (see c->pending's own comment
- * in cloak/dispatcher.h for exactly where it is later decremented). */
+ * in cloak/dispatcher.h for exactly where it is later decremented). This
+ * check is necessarily indiscriminate -- see
+ * CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own "KNOWN, UNAVOIDABLE
+ * RESIDUAL" paragraph -- and can turn away a legitimate client purely
+ * because the cap happens to be saturated by other pending connections at
+ * that instant, since nothing is knowable about a connection's
+ * legitimacy before its first packet is even read. */
 void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata);
 
 /* The number of connections currently in flight (reading their first
