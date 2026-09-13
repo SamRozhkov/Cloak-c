@@ -445,3 +445,48 @@ The server is functionally complete for the direct-TLS, ordered case with bypass
 - **Type consistency:** `cloak_proxy_stream_t`/`cloak_proxy_session_t`/`cloak_proxy_config_t` are defined once in Task 2 and used under those names in Tasks 3 and 4. `cloak_proxy_registry_broken` is produced in Task 3 and consumed in Task 4. `client_session_open`/`client_session_close` are produced in Task 1 and consumed in Tasks 2, 3 and 4. Test counts chain 36 → 36 → 37 → 38 → 39.
 - **The riskiest thing here** is Task 3's ordering: stop the relay, then release the stream, and do both from the registry's broken callback rather than anywhere else. Every other bug in this module degrades a connection; that one is a use-after-free in the ordinary case of a client disconnecting mid-transfer.
 - **The most valuable thing here** is Task 4's case 2. If the hand-off reasoning is wrong, every session whose client is quick off the mark loses its first frame — silently, since the frame is simply never delivered and nothing anywhere reports an error.
+
+---
+
+## What this branch's execution left for the next ones
+
+Written at merge time from the execution ledger, so it survives the workspace. Each item names the module that owns it.
+
+### For the user manager (the next module)
+
+**Per-UID stream accounting.** This branch capped streams per *session* (256) and per *proxy* (derived from `RLIMIT_NOFILE`, soft/2 clamped to [64, 4096]). Nothing clamps the per-session cap against the derived total, and nothing binds a UID: on a 1024-fd host the total is 512 while the per-session cap is 256, so two sessions under one UID consume the whole proxy and refuse every other user's streams. The *security* property the caps were added for is intact — the dispatcher's redirect descriptors stay reserved, so the cover story survives under load — but the *fairness* property is not. A UID becomes a first-class object with its own accounting in that module, which is where the bound belongs; building half of it here would have meant a second place to keep in sync.
+
+**The registry has no per-user session cap either.** Noted two branches ago and still true.
+
+### For `ck-server` (module 7)
+
+**Destruction is NOT the reverse of construction, and nothing enforces it.** The proxy must be destroyed *before* the registry: `cloak_server_registry_destroy` frees every session without firing `on_broken`, so the wrong order leaves every relay holding a dangling `cloak_stream_t *`, and `cloak_proxy_destroy` then writes a stream close through freed memory — silently, and only on the next upstream byte. Task 4's report contains a working prototype (`fixture_init` / `fixture_shutdown_server`, ~27 lines of construction with one forced edge, 6 of destruction) and recommends a `cloak_server_stack_t` construct/teardown helper. **Take that helper as the only supported way to wire the stack** — containment by construction, since documentation is the wrong containment for a hazard whose symptom is a silent use-after-free on the next byte.
+
+The final review proposed instead having `cloak_server_registry_destroy` fire `on_broken` per live entry, making the order irrelevant. That is not the free win it appears to be: the proxy *is* the `on_broken` owner, so firing it from `registry_destroy` makes the *other* order — proxy destroyed first, which is the currently-correct one — a call into freed memory. It swaps one hazard for its mirror image unless the owner can also deregister its callback, and there is no API for that. Any registry change here must come with one.
+
+**Three of the proxy's five wirings look optional and are jointly mandatory** (`prepare_session`, `session_aborted`, and the registry's `on_broken`). The helper is what should make that non-optional.
+
+**`RLIMIT_NOFILE` belongs in `main`.** The derived cap protects the fd table only as well as the limit allows; raising it is the binary's job, not the library's.
+
+### Still unsolved, deliberately
+
+**Obligation 3: per-relay read budgets do not coordinate.** Each relay budgets independently against `cloak_session_send_min_conn_free`, so N concurrent relays can each believe they have room only one of them has. Commented at the one place in `proxy.c` where the lack of coordination is visible. A fix needs either a session-level budget the relays draw from or an explicit scheduler, and the right time to design that is when there is a multi-stream workload to measure it against.
+
+**The retry ceiling should be re-derived now that streams are capped.** The 20 s ladder was sized to bound "a condition transient in shape but permanent in fact" (a `conn_send_queue_cap` smaller than one worst-case frame). It is also an amplifier: each parked stream holds a *connected* upstream fd for its duration. With a stream cap now in place the trade-off has changed and the number deserves re-deriving rather than inheriting.
+
+**A refused stream is indistinguishable in form but not in latency.** Same close, same frame, same byte count as an upstream failure — but emitted in the same reactor turn the opening frame is parsed, while a real upstream failure costs at least a dial RTT. A prober holding one valid UID can time stream-open→close and read off whether the server is at its cap: a coarse load oracle. Inherent to refusing before the dial, which is the whole point of the cap; documented in `proxy.h` rather than fixed, because removing it means spending the descriptor the cap exists to protect.
+
+**Site B of the orphaned-context callback is unverified, not confirmed untestable.** Every `cloak_server_auth_compose_reply` failure return is an internal invariant with no external seam, so the `session_aborted` firing there is covered by inspection and by structural identity with site C. The final reviewer declined to attack the claim; treat it as unverified.
+
+### One process result worth carrying
+
+Six test-coverage defects were found on this branch. **Every one was found by measuring or mutating; none by reading.** Their shapes, because they recur:
+
+1. A wall-clock bound whose iteration cap bound first — a pump whose comments claimed 400 ms measured 84 ms, because an EOF-ready socket is ready every turn.
+2. An assertion that could not fail — a count asserted zero on an upstream the test never dialed.
+3. A precondition asserted before the code under test ran, not at it.
+4. A buffer sized for the average case when the protocol pads randomly — failed 1 run in 15, caught only by a repeat loop.
+5. A "mid-flight" assertion with nothing in flight — an unpaced writer had already pushed all 2 MiB before the first reactor turn.
+6. A constant chosen so the mechanism under test and its absence produce the same number — both cap tests used `cap == 2`, where the hysteresis low-water mark equals the no-hysteresis one.
+
+The two disciplines that caught them: before writing an assertion, ask what change to the implementation would make it fail, and if the answer is "none", it is not coverage; and write an expected value as a literal, never recomputed from the implementation's own expression, which would agree with any mutation of it.
