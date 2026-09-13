@@ -23,6 +23,24 @@ static int set_err(char *err, size_t err_cap, const char *fmt, ...) {
     return -1;
 }
 
+/* True when addr is a bare (unbracketed) IPv6 literal, e.g. "::1" or
+ * "fe80::1". cloak_net_split_hostport rejects any unbracketed address with
+ * more than one colon as an ambiguous bare IPv6 literal rather than a
+ * host:port pair -- this recognizes exactly that same shape so the
+ * portless-RedirAddr placeholder below can bracket it before adding a
+ * port, instead of producing "::1:443", which is just as ambiguous and
+ * would fail to resolve. A single colon (ordinary "host:port") or none
+ * (a plain host or an IPv4 literal) is not this case -- and would in any
+ * event already have taken the has-a-port branch above when there is
+ * exactly one. */
+static int is_bare_ipv6_literal(const char *addr) {
+    const char *first_colon = strchr(addr, ':');
+    if (first_colon == NULL) {
+        return 0;
+    }
+    return strchr(first_colon + 1, ':') != NULL;
+}
+
 int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
                       size_t replay_cache_capacity, char *err, size_t err_cap) {
     if (srv == NULL) {
@@ -57,9 +75,21 @@ int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
          * (possibly blocking) DNS lookup still happens exactly once, at
          * startup; the placeholder port itself is never used, since
          * redir_has_port is 0 and cloak_server_redir_addr always patches
-         * it in per connection. */
+         * it in per connection.
+         *
+         * A bare IPv6 literal must be bracketed before ":443" is appended
+         * -- "::1:443" is exactly as ambiguous as "::1" was, and
+         * cloak_net_split_hostport/cloak_net_resolve would reject it for
+         * the same reason. An address already written bracketed (e.g.
+         * "[::1]", an operator's natural way to write a portless IPv6
+         * RedirAddr) is left alone; ":443" alone completes it. */
         char placeholder[CLOAK_MAX_HOST_LEN + 8];
-        int n = snprintf(placeholder, sizeof(placeholder), "%s:443", cfg->redir_addr);
+        int n;
+        if (cfg->redir_addr[0] != '[' && is_bare_ipv6_literal(cfg->redir_addr)) {
+            n = snprintf(placeholder, sizeof(placeholder), "[%s]:443", cfg->redir_addr);
+        } else {
+            n = snprintf(placeholder, sizeof(placeholder), "%s:443", cfg->redir_addr);
+        }
         if (n < 0 || (size_t)n >= sizeof(placeholder)) {
             return set_err(err, err_cap, "server: RedirAddr \"%s\" is too long",
                           cfg->redir_addr);

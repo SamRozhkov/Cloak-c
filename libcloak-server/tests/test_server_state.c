@@ -270,6 +270,46 @@ static void test_destroy_is_idempotent_on_zeroed_struct(void) {
     cloak_server_destroy(&srv);
 }
 
+/* 8 (review fix, finding 1). A bare IPv6 RedirAddr -- unbracketed, no
+ * port, e.g. "::1" -- must still start the server: Go's parseRedirAddr
+ * has an explicit "ipv6 without port" branch for exactly this shape.
+ * Also covers the bracketed-but-portless spelling ("[::1]") an operator
+ * who knows IPv6 is likely to write instead. Both must resolve to an
+ * AF_INET6 address with the per-connection port patched in -- this is
+ * also what makes the IPv6 branch of cloak_server_redir_addr reachable
+ * through the real cloak_server_init path, closing that coverage gap. */
+static void test_bare_ipv6_redir_addr_starts_and_patches_port(void) {
+    const char *redir_addrs[] = {"::1", "[::1]"};
+    for (size_t i = 0; i < sizeof(redir_addrs) / sizeof(redir_addrs[0]); i++) {
+        char json[1024];
+        snprintf(json, sizeof(json),
+                 "{\"ProxyBook\":{\"ss\":[\"tcp\",\"127.0.0.1:1\"]},"
+                 "\"BindAddr\":[\":443\"],\"RedirAddr\":\"%s\","
+                 "\"PrivateKey\":\"%s\"}",
+                 redir_addrs[i], PRIV_B64);
+
+        cloak_server_config_t cfg;
+        parse_or_die(json, &cfg);
+
+        cloak_server_t srv;
+        char err[256] = {0};
+        int rc = cloak_server_init(&srv, &cfg, 16, err, sizeof(err));
+        if (rc != 0) {
+            fprintf(stderr, "test failure detail (RedirAddr=\"%s\"): %s\n",
+                    redir_addrs[i], err);
+        }
+        ASSERT_EQ_INT(0, rc);
+
+        cloak_addr_t out;
+        memset(&out, 0, sizeof(out));
+        ASSERT_EQ_INT(0, cloak_server_redir_addr(&srv, 12345, &out));
+        ASSERT_EQ_INT(AF_INET6, ((const struct sockaddr *)&out.ss)->sa_family);
+        ASSERT_EQ_INT(12345, (int)sockaddr_port(&out));
+
+        cloak_server_destroy(&srv);
+    }
+}
+
 TEST_MAIN_BEGIN()
     test_admin_uid_is_added_to_bypass_set();
     test_no_admin_uid_leaves_bypass_set_untouched();
@@ -278,4 +318,5 @@ TEST_MAIN_BEGIN()
     test_replay_wiring();
     test_init_rejects_unresolvable_redir_addr();
     test_destroy_is_idempotent_on_zeroed_struct();
+    test_bare_ipv6_redir_addr_starts_and_patches_port();
 TEST_MAIN_END()
