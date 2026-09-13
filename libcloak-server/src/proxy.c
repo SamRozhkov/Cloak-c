@@ -60,12 +60,13 @@ static void proxy_stream_unlink(cloak_proxy_session_t *ps, cloak_proxy_stream_t 
 
 /* ---- teardown ------------------------------------------------------------
  *
- * THE ONE COPY. A later task adds a registry-broken entry point that has
- * to perform exactly this walk before the session's storage goes away,
- * differing only in what it does afterwards. Two copies of the most
+ * THE ONE COPY. Three public entry points have to perform exactly this
+ * walk -- cloak_proxy_destroy (the owner's shutdown),
+ * cloak_proxy_registry_broken (the session died under us) and
+ * cloak_proxy_session_aborted (the session never came to exist) -- and
+ * they differ only in what they do afterwards. Two copies of the most
  * lifetime-sensitive code in this module drifting apart is the worst
- * outcome available here, so there is deliberately one: both
- * cloak_proxy_destroy and that future entry point call these. */
+ * outcome available here, so there is deliberately one. */
 
 /* Releases every resource one stream context holds, releases the stream
  * itself back to its session, unlinks the context and FREES IT. pst must
@@ -86,9 +87,19 @@ static void proxy_stream_teardown(cloak_proxy_stream_t *pst) {
         cloak_dial_cancel(&pst->dial);
     }
     if (pst->relaying) {
-        /* Closes the stream and the relay's fd; deliberately does NOT
-         * fire on_done, and deliberately does NOT release the stream --
-         * cloak/stream_relay.h is explicit that releasing is ours. */
+        /* THE ORDER OF THESE TWO STEPS -- stop the relay HERE, release
+         * the stream BELOW -- is the whole of this module's teardown
+         * correctness, and it is stated at this site and not only in the
+         * header because this is where it is easy to get backwards.
+         *
+         * cloak_stream_relay_stop closes the stream (so the peer
+         * actually learns the stream ended) and the relay's own fd; it
+         * deliberately does NOT fire on_done, and deliberately does NOT
+         * release the stream -- cloak/stream_relay.h is explicit that
+         * releasing is ours. Releasing FIRST would free the
+         * cloak_stream_t while the relay still holds it as a raw pointer
+         * it cannot validate, and the stop below would then write a
+         * close through freed memory. */
         pst->relaying = 0;
         cloak_stream_relay_stop(&pst->relay);
     }
@@ -117,8 +128,54 @@ static void proxy_session_teardown(cloak_proxy_session_t *ps) {
     while (ps->streams != NULL) {
         proxy_stream_teardown(ps->streams);
     }
+
+    /* THIS IS THE INSTANT ps->sesh STOPS BEING VALID, and clearing it
+     * here is what makes the rule cloak/proxy.h states about that field
+     * ("must never be dereferenced once the session has broken") true of
+     * the code rather than only of the comment. It has to happen HERE:
+     * after the walk above, because proxy_stream_teardown legitimately
+     * needs a live session to call cloak_session_release_stream on (this
+     * function's most important caller, cloak_proxy_registry_broken,
+     * runs in the one window where that is still possible), and before
+     * anything else can run, because on the broken path the session is
+     * gone the moment the callback that led here returns. The free below
+     * makes the store dead in this particular ordering; it is written
+     * anyway so that the invariant survives any future path that keeps a
+     * context alive past its session. */
+    ps->sesh = NULL;
+
     proxy_session_unlink(ps->p, ps);
     free(ps);
+}
+
+/* The session context for (uid, session_id), or NULL if this proxy has
+ * none.
+ *
+ * A LINEAR SCAN IS THE RIGHT STRUCTURE HERE, for the same reason the
+ * per-stream scan in proxy_on_stream_data gives: this list holds one
+ * entry per live session, it is walked once per session teardown (not
+ * per frame), and a second structure to keep in step with it during
+ * teardown -- the exact place this module is most fragile -- would buy
+ * nothing.
+ *
+ * KEYED ON (uid, session_id), NOT ON THE cloak_session_t POINTER. That
+ * pair is recorded by cloak_proxy_prepare_session, which is the only
+ * place a context is ever created, so it is valid for the whole of a
+ * context's life -- including the window before ps->sesh is ever set,
+ * which is exactly the window cloak_proxy_session_aborted has to search
+ * in. A scan on ps->sesh would find nothing at any of its three sites,
+ * and would also miss a session that was created but whose context never
+ * learned its pointer (cloak_proxy_attached only fires with created == 1
+ * for the connection that created it). */
+static cloak_proxy_session_t *proxy_find_session(cloak_proxy_t *p,
+                                                 const uint8_t uid[CLOAK_UID_LEN],
+                                                 uint32_t session_id) {
+    for (cloak_proxy_session_t *ps = p->sessions; ps != NULL; ps = ps->next) {
+        if (ps->session_id == session_id && memcmp(ps->uid, uid, CLOAK_UID_LEN) == 0) {
+            return ps;
+        }
+    }
+    return NULL;
 }
 
 /* ---- relay start, with the retry the interface forces on us ------------- */
@@ -439,6 +496,11 @@ int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_client
     ps->p = p;
     ps->sesh = NULL; /* cloak_proxy_attached joins the two */
     ps->upstream = upstream;
+    /* The only handle this context can be found by until -- and, on
+     * every path that abandons the handshake, ever. See
+     * proxy_find_session. */
+    memcpy(ps->uid, info->uid, CLOAK_UID_LEN);
+    ps->session_id = info->session_id;
     proxy_session_link(p, ps);
 
     config->on_new_stream = proxy_on_new_stream;
@@ -482,6 +544,69 @@ void cloak_proxy_attached(cloak_dispatcher_t *d, cloak_session_t *sesh,
     }
     if (ps->sesh == NULL) {
         ps->sesh = sesh;
+    }
+}
+
+void cloak_proxy_registry_broken(cloak_server_registry_t *reg, cloak_session_t *sesh,
+                                 const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
+                                 void *userdata) {
+    cloak_proxy_t *p = userdata;
+    if (p == NULL) {
+        /* Not this module's callback at all; there is not even a chain to
+         * reach from here. */
+        return;
+    }
+
+    /* OBLIGATION 1, and the only window in which it can be met: sesh is
+     * still fully usable right now, and every stream still active when
+     * this returns is destroyed and freed by the session itself. So the
+     * whole walk -- stop the relay, THEN release the stream, for every
+     * stream on this session -- happens before anything else, including
+     * before the chain. proxy_session_teardown is that walk; see
+     * proxy_stream_teardown for why the two steps are in that order and
+     * nowhere else in this module for a second copy of it. */
+    if (uid != NULL) {
+        cloak_proxy_session_t *ps = proxy_find_session(p, uid, session_id);
+        if (ps != NULL) {
+            proxy_session_teardown(ps);
+        }
+        /* No context is not an error: this session was created by
+         * something other than cloak_proxy_prepare_session, or that
+         * callback returned -1 and nothing was ever prepared. Fall
+         * through to the chain. */
+    }
+
+    /* AFTER the cleanup, never before. cloak/registry.h permits a
+     * callback in this position to call cloak_server_registry_destroy --
+     * including on the registry that is mid-teardown -- which destroys
+     * every session still in the table. If any relay of ours were still
+     * running at that point it would outlive its session by exactly one
+     * callback. */
+    if (p->cfg.chain != NULL) {
+        p->cfg.chain(reg, sesh, uid, session_id, p->cfg.chain_userdata);
+    }
+}
+
+void cloak_proxy_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[CLOAK_UID_LEN],
+                                 uint32_t session_id, void *userdata) {
+    (void)d;
+    cloak_proxy_t *p = userdata;
+    if (p == NULL || uid == NULL) {
+        return;
+    }
+
+    /* The handshake that prepared this context never produced a session
+     * that will ever break, so this is the only notification that will
+     * ever arrive for it and the context leaks without it. At all three
+     * of the dispatcher's sites ps->sesh is NULL and ps holds no streams,
+     * so the shared walk degenerates to an unlink and a free -- it is
+     * still the shared walk, deliberately: a second, "simpler" copy of
+     * the teardown here is exactly how the two would drift apart if a
+     * later change ever made one of those sites reachable with a stream
+     * in flight. */
+    cloak_proxy_session_t *ps = proxy_find_session(p, uid, session_id);
+    if (ps != NULL) {
+        proxy_session_teardown(ps);
     }
 }
 

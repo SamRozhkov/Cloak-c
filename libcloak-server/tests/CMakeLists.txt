@@ -130,3 +130,17 @@ target_include_directories(test_proxy_stream PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_proxy_stream PRIVATE cloak-server)
 add_test(NAME test_proxy_stream COMMAND test_proxy_stream)
 set_tests_properties(test_proxy_stream PROPERTIES TIMEOUT 60)
+
+add_executable(test_proxy_teardown test_proxy_teardown.c)
+target_include_directories(test_proxy_teardown PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_proxy_teardown PRIVATE cloak-server)
+add_test(NAME test_proxy_teardown COMMAND test_proxy_teardown)
+set_tests_properties(test_proxy_teardown PROPERTIES TIMEOUT 60)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for the same reason test_dispatcher_limits does:
+# this file's site-C case needs the dispatcher's step-10 reply write to
+# fail deterministically, and the reply is far smaller than any socket
+# buffer floor, so genuine backpressure cannot produce that failure.
+set_tests_properties(test_proxy_teardown PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")

@@ -7,6 +7,7 @@
 #include "cloak/dispatcher.h"
 #include "cloak/net.h"
 #include "cloak/reactor.h"
+#include "cloak/registry.h"
 #include "cloak/server.h"
 #include "cloak/server_auth.h"
 #include "cloak/session.h"
@@ -27,11 +28,27 @@
  *     dcfg.prepare_session_userdata = &proxy;
  *     dcfg.attached                 = cloak_proxy_attached;
  *     dcfg.attached_userdata        = &proxy;
+ *     dcfg.session_aborted          = cloak_proxy_session_aborted;
+ *     dcfg.session_aborted_userdata = &proxy;
  *
  * -- and, through the first of those, installs three of the session's own
  * four callbacks (on_new_stream, on_stream_data, on_writable) into every
  * session it prepares. The fourth, on_broken, belongs to the registry and
  * is NOT this module's to set; see cloak_proxy_prepare_session.
+ *
+ * It is ALSO the registry's own broken callback, which is not optional
+ * either:
+ *
+ *     cloak_server_registry_init(&reg, reactor, cloak_proxy_registry_broken,
+ *                                &proxy);
+ *
+ * Those two extra wirings are what make this module correct when sessions
+ * DIE rather than only while they live: cloak_proxy_registry_broken stops
+ * every relay in the one window in which that is still possible, and
+ * cloak_proxy_session_aborted reclaims the contexts of handshakes that
+ * never produced a session at all. Read both of their doc comments before
+ * wiring this module in; an owner that installs only the first two
+ * callbacks above has a use-after-free and a leak, not a working server.
  *
  * LIFETIME: the proxy holds a heap-allocated context for every session it
  * ever prepared, and each of those holds a heap-allocated context for
@@ -57,8 +74,11 @@
  * A STREAM IS RELEASED IN EXACTLY TWO PLACES, and nowhere else:
  * cloak_stream_relay_t's done callback (the ordinary end of a stream's
  * life -- either side finished) and the shared teardown walk that
- * cloak_proxy_destroy drives (and that the registry-broken path added in
- * a later task drives too). cloak/session.h requires exactly one
+ * cloak_proxy_destroy, cloak_proxy_registry_broken and
+ * cloak_proxy_session_aborted all drive -- ONE walk, driven by three
+ * entry points, deliberately: two copies of the most lifetime-sensitive
+ * code in this module drifting apart is the worst outcome available
+ * here. cloak/session.h requires exactly one
  * cloak_session_release_stream per stream this module is handed, or the
  * stream's memory leaks for the life of the process. */
 typedef struct cloak_proxy cloak_proxy_t;
@@ -185,19 +205,38 @@ typedef struct cloak_proxy_stream {
 /* One authenticated session's proxy state. Allocated by
  * cloak_proxy_prepare_session -- i.e. BEFORE the cloak_session_t it
  * describes exists, since it has to go into that session's config -- and
- * freed by cloak_proxy_destroy (and, from a later task, by the registry's
- * broken callback, which is what lets it be freed while the server keeps
- * running).
+ * freed by cloak_proxy_destroy, by cloak_proxy_registry_broken (which is
+ * what lets it be freed while the server keeps running) or by
+ * cloak_proxy_session_aborted (the handshake that was preparing it never
+ * produced a session at all).
  *
  * sesh is NULL until cloak_proxy_attached joins the two, and must never
- * be dereferenced once the session has broken. upstream is resolved once,
- * at prepare time, and points into the cloak_server_t's own ProxyBook
- * table -- which is why cloak_proxy_config_t::srv must outlive the
- * proxy. */
+ * be dereferenced once the session has broken -- cloak_proxy_registry_
+ * broken clears it to NULL the instant the last stream has been released,
+ * so that rule is enforced by the code and not merely stated here.
+ * upstream is resolved once, at prepare time, and points into the
+ * cloak_server_t's own ProxyBook table -- which is why
+ * cloak_proxy_config_t::srv must outlive the proxy.
+ *
+ * (uid, session_id) IS THE ONLY HANDLE THIS MODULE CAN LOOK A CONTEXT UP
+ * BY, and that is why it is recorded here rather than derived when
+ * needed. It is set by cloak_proxy_prepare_session -- the one and only
+ * place a context is ever created -- so it is valid for the whole of a
+ * context's life, including the entire window before sesh exists. Both
+ * paths that have to find a context from the outside (the registry's
+ * broken callback and the dispatcher's session-aborted callback) are
+ * handed exactly that pair and nothing else; at all three abort sites
+ * sesh is still NULL, so a scan keyed on the session pointer would find
+ * nothing there. At most one live context exists per key: a context is
+ * only ever created when cloak_server_registry_find reported no session
+ * for that key, and every path that retires a session tears its context
+ * down before that key can be reused. */
 struct cloak_proxy_session {
     cloak_proxy_t *p;
     cloak_session_t *sesh;
     const cloak_addr_t *upstream;
+    uint8_t uid[CLOAK_UID_LEN];
+    uint32_t session_id;
     cloak_proxy_stream_t *streams;
     size_t stream_count;
     struct cloak_proxy_session *prev, *next;
@@ -244,6 +283,22 @@ typedef struct {
      * budget is actually protecting against, which is not congestion. */
     uint64_t retry_delay_ms; /* 0 -> CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS */
     unsigned max_retries;    /* 0 -> CLOAK_PROXY_DEFAULT_MAX_RETRIES */
+
+    /* OPTIONAL, and the reason cloak_proxy_registry_broken can afford to
+     * BE the registry's one on_broken callback rather than something the
+     * owner has to remember to call: an owner with bookkeeping of its own
+     * installs it here and gets it invoked with its own userdata AFTER
+     * this module's cleanup for that session has completed. NULL (the
+     * default) simply means there is nothing to chain.
+     *
+     * THE ORDERING IS NOT NEGOTIABLE, and it is this way round because a
+     * chained callback is explicitly permitted (cloak/registry.h) to call
+     * cloak_server_registry_destroy -- including for the registry that is
+     * mid-teardown -- which destroys every session still in the table.
+     * By the time the chain can do that, every relay this proxy held must
+     * already be stopped. See cloak_proxy_registry_broken. */
+    cloak_registry_broken_cb chain;
+    void *chain_userdata;
 } cloak_proxy_config_t;
 
 struct cloak_proxy {
@@ -359,6 +414,93 @@ int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_client
  * here makes conn_handoff's own later free a double free. */
 void cloak_proxy_attached(cloak_dispatcher_t *d, cloak_session_t *sesh,
                           const cloak_server_clientinfo_t *info, int created, void *userdata);
+
+/* A cloak_registry_broken_cb (userdata: the cloak_proxy_t). Pass it, with
+ * the proxy as its userdata, to cloak_server_registry_init:
+ *
+ *     cloak_server_registry_init(&reg, reactor, cloak_proxy_registry_broken,
+ *                                &proxy);
+ *
+ * THIS IS OBLIGATION 1 AND IT IS THE REASON THIS MODULE IS EITHER CORRECT
+ * OR NOT. cloak_session_broken_cb's contract (cloak/session.h) is that
+ * immediately after on_broken returns, every still-active stream the
+ * session owns is destroyed and freed. A cloak_stream_relay_t holds its
+ * stream and its session as raw pointers it can never validate and has no
+ * third notification through which it could learn either died -- so a
+ * relay left running past that point still has its fd registered with the
+ * reactor, and the next byte that arrives on it runs cloak_stream_write
+ * on freed memory. THE REGISTRY'S BROKEN CALLBACK IS THE ONLY WINDOW in
+ * which those relays can still be stopped: it fires while sesh is still
+ * fully usable, and cloak_server_registry_close/destroy deliberately do
+ * not fire it at all.
+ *
+ * WHY THIS IS THE CALLBACK ITSELF rather than a cloak_proxy_on_session_
+ * broken() the owner calls from its own: cloak_server_registry_init takes
+ * exactly one on_broken for the whole registry, so this module cannot
+ * install a second one beside the owner's. Exporting a function for the
+ * owner to remember to call would make every user of this module
+ * responsible for the one mistake cloak/registry.h names as the single
+ * most likely a caller wiring up all four session callbacks can make.
+ * Being the callback makes the cleanup the default and the owner's own
+ * bookkeeping the addition -- see cloak_proxy_config_t::chain.
+ *
+ * For the session context matching (uid, session_id) -- looked up by that
+ * pair, not by sesh, because it is the one handle valid at every site
+ * that needs it -- this tears down every stream context, releases every
+ * stream back to sesh, clears the now-dead sesh pointer and frees the
+ * session context; then invokes cfg.chain, if any, with cfg.chain_
+ * userdata. A session this proxy has no context for (one created by
+ * something else, or one whose cloak_proxy_prepare_session returned -1 so
+ * that no context was ever made) is not an error: it skips straight to
+ * the chain. So does a NULL uid (which the registry never passes): there
+ * is no key to look a context up by, but the chain is the owner's own and
+ * is forwarded to regardless -- this function never swallows a broken
+ * notification. A NULL userdata is the one case where nothing happens at
+ * all, since the chain itself lives on the proxy.
+ *
+ * CALLING CONTEXT is exactly cloak_registry_broken_cb's own, which is in
+ * turn exactly cloak_session_broken_cb's: outside any cloak_session_t/
+ * cloak_conn_t/cloak_switchboard_t callback's call stack. Everything this
+ * does inside that window -- cloak_stream_relay_stop,
+ * cloak_dial_cancel, cancelling a timer, cloak_session_release_stream --
+ * is permitted there; cloak_session_destroy is not called, and must not
+ * be, from here. */
+void cloak_proxy_registry_broken(cloak_server_registry_t *reg, cloak_session_t *sesh,
+                                 const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
+                                 void *userdata);
+
+/* A cloak_dispatch_session_aborted_cb (userdata: the cloak_proxy_t).
+ * Install it as cloak_dispatcher_config_t::session_aborted:
+ *
+ *     dcfg.session_aborted          = cloak_proxy_session_aborted;
+ *     dcfg.session_aborted_userdata = &proxy;
+ *
+ * WIRING IT IS NOT OPTIONAL FOR A CALLER THAT USES cloak_proxy_prepare_
+ * session. That callback allocates and links a session context before the
+ * cloak_session_t exists; if the session then never comes to exist (the
+ * registry was at its cap, an allocation failed, or the handshake unwound
+ * after creating one), the registry's broken callback never fires for it
+ * -- cloak_server_registry_close deliberately does not fire on_broken --
+ * and nothing else would ever free that context. That is a small, remotely
+ * reachable, unbounded leak: one context per abandoned handshake.
+ *
+ * Tears down and frees the context for (uid, session_id) if this proxy
+ * has one, and does nothing at all if it does not (the dispatcher fires
+ * this for a session it created, which is not necessarily one this proxy
+ * prepared). At every site the dispatcher fires it from, that context's
+ * sesh is still NULL and it holds no streams, so this is ordinarily just
+ * an unlink and a free -- it goes through the same teardown walk as every
+ * other path anyway, because a second copy of that walk is the one thing
+ * this module cannot afford.
+ *
+ * CALLING CONTEXT: see cloak_dispatch_session_aborted_cb in
+ * cloak/dispatcher.h, which is stricter than either of this module's
+ * other dispatcher callbacks -- one of its three sites runs during
+ * connection teardown, including from inside cloak_dispatcher_destroy.
+ * Nothing this function does touches the dispatcher or the registry, so
+ * it is safe at all three. */
+void cloak_proxy_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[CLOAK_UID_LEN],
+                                 uint32_t session_id, void *userdata);
 
 /* Session contexts currently held, and the total number of stream
  * contexts across all of them. Diagnostics and tests; both are O(1).
