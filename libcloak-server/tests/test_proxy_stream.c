@@ -361,9 +361,6 @@ static int fixture_init_opts(struct fixture *fx, const char *transport,
 
     dcfg.prepare_session = cloak_proxy_prepare_session;
     dcfg.prepare_session_userdata = &fx->proxy;
-    dcfg.attached = cloak_proxy_attached;
-    dcfg.attached_userdata = &fx->proxy;
-
     ASSERT_EQ_INT(0, cloak_dispatcher_init(&fx->d, &dcfg));
     fx->d_ready = 1;
 

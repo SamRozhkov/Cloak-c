@@ -21,13 +21,11 @@
  * of the goroutine Go Cloak's dispatchConnection spawns per accepted
  * stream (internal/server/dispatcher.go's proxy-book dial + Copy loop).
  *
- * WIRING: one cloak_proxy_t serves a whole server. It supplies the
- * dispatcher's two session callbacks --
+ * WIRING: one cloak_proxy_t serves a whole server. It supplies two of the
+ * dispatcher's session callbacks --
  *
  *     dcfg.prepare_session          = cloak_proxy_prepare_session;
  *     dcfg.prepare_session_userdata = &proxy;
- *     dcfg.attached                 = cloak_proxy_attached;
- *     dcfg.attached_userdata        = &proxy;
  *     dcfg.session_aborted          = cloak_proxy_session_aborted;
  *     dcfg.session_aborted_userdata = &proxy;
  *
@@ -42,13 +40,24 @@
  *     cloak_server_registry_init(&reg, reactor, cloak_proxy_registry_broken,
  *                                &proxy);
  *
- * Those two extra wirings are what make this module correct when sessions
- * DIE rather than only while they live: cloak_proxy_registry_broken stops
- * every relay in the one window in which that is still possible, and
- * cloak_proxy_session_aborted reclaims the contexts of handshakes that
- * never produced a session at all. Read both of their doc comments before
- * wiring this module in; an owner that installs only the first two
- * callbacks above has a use-after-free and a leak, not a working server.
+ * NOTHING IS WIRED INTO dcfg.attached, and that is deliberate: this
+ * module used to install a callback there whose only effect was to record
+ * the cloak_session_t on the context prepare_session had already built,
+ * and proxy_on_new_stream records it anyway from the callback that hands
+ * over the session's first stream -- which is the earliest moment the
+ * pointer is of any use, since a context with no streams never
+ * dereferences it. Deleting the callback rather than keeping an inert one
+ * that looks load-bearing is the whole change; dcfg.attached remains free
+ * for an owner's own bookkeeping.
+ *
+ * The last two wirings above are what make this module correct when
+ * sessions DIE rather than only while they live: cloak_proxy_registry_
+ * broken stops every relay in the one window in which that is still
+ * possible, and cloak_proxy_session_aborted reclaims the contexts of
+ * handshakes that never produced a session at all. Read both of their doc
+ * comments before wiring this module in; an owner that installs only
+ * prepare_session has a use-after-free and a leak, not a working
+ * server.
  *
  * LIFETIME: the proxy holds a heap-allocated context for every session it
  * ever prepared, and each of those holds a heap-allocated context for
@@ -268,10 +277,14 @@ typedef struct cloak_proxy_stream {
  * cloak_proxy_session_aborted (the handshake that was preparing it never
  * produced a session at all).
  *
- * sesh is NULL until cloak_proxy_attached joins the two, and must never
- * be dereferenced once the session has broken -- cloak_proxy_registry_
- * broken clears it to NULL the instant the last stream has been released,
- * so that rule is enforced by the code and not merely stated here.
+ * sesh is NULL until this session's FIRST STREAM arrives -- proxy_on_new_
+ * stream records it from the callback that hands the stream over, which
+ * is both the earliest moment the pointer can be of any use and the only
+ * moment it is needed, since a context holding no streams never
+ * dereferences it. It must never be dereferenced once the session has
+ * broken either: cloak_proxy_registry_broken clears it to NULL the
+ * instant the last stream has been released, so that rule is enforced by
+ * the code and not merely stated here.
  * upstream is resolved once, at prepare time, and points into the
  * cloak_server_t's own ProxyBook table -- which is why
  * cloak_proxy_config_t::srv must outlive the proxy.
@@ -484,23 +497,6 @@ void cloak_proxy_destroy(cloak_proxy_t *p);
  * Returns 0 otherwise. */
 int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_clientinfo_t *info,
                                  cloak_session_config_t *config, void *userdata);
-
-/* A cloak_dispatch_attached_cb (userdata: the cloak_proxy_t). Install it
- * as cloak_dispatcher_config_t::attached.
- *
- * Joins the session context cloak_proxy_prepare_session already built to
- * the cloak_session_t that was created from it -- the context necessarily
- * exists first, since it had to go into that session's config, so this is
- * the one place the two can meet. On the created == 0 path there is
- * nothing to do: the context already has its session.
- *
- * Like cloak_proxy_prepare_session, this MUST NOT call
- * cloak_dispatcher_destroy or otherwise free the connection it describes
- * -- cloak_dispatch_attached_cb's own doc comment notes it fires BEFORE
- * that connection is unlinked and freed, so destroying the dispatcher
- * here makes conn_handoff's own later free a double free. */
-void cloak_proxy_attached(cloak_dispatcher_t *d, cloak_session_t *sesh,
-                          const cloak_server_clientinfo_t *info, int created, void *userdata);
 
 /* A cloak_registry_broken_cb (userdata: the cloak_proxy_t). Pass it, with
  * the proxy as its userdata, to cloak_server_registry_init:

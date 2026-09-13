@@ -480,8 +480,6 @@ static int fixture_init_opts(struct fixture *fx, size_t conn_send_queue_cap,
 
     dcfg.prepare_session = fx_prepare_session;
     dcfg.prepare_session_userdata = fx;
-    dcfg.attached = cloak_proxy_attached;
-    dcfg.attached_userdata = &fx->proxy;
     dcfg.session_aborted = fx_session_aborted;
     dcfg.session_aborted_userdata = fx;
 

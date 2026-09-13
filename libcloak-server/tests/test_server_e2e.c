@@ -283,12 +283,19 @@ struct fixture {
     int attached_created;
 };
 
+/* PURELY THE TEST'S OWN PROBE: cloak_proxy_t wires nothing into
+ * dcfg.attached (see cloak/proxy.h), so this counts the DISPATCHER's
+ * attach notifications and nothing else -- which is exactly what
+ * test_pipelined_frame_survives_handoff needs to assert that the hand-off
+ * for a given connection has not happened yet. */
 static void fx_attached(cloak_dispatcher_t *d, cloak_session_t *sesh,
                         const cloak_server_clientinfo_t *info, int created, void *userdata) {
+    (void)d;
+    (void)sesh;
+    (void)info;
     struct fixture *fx = userdata;
     fx->attached_calls++;
     fx->attached_created += created ? 1 : 0;
-    cloak_proxy_attached(d, sesh, info, created, &fx->proxy);
 }
 
 static int fixture_init(struct fixture *fx) {
@@ -374,8 +381,9 @@ static int fixture_init(struct fixture *fx) {
                                                 cloak_proxy_registry_broken, &fx->proxy));
     fx->registry_ready = 1;
 
-    /* ---- 5. the dispatcher, with all three of the proxy's dispatcher
-     * callbacks (prepare_session, attached, session_aborted). */
+    /* ---- 5. the dispatcher, with both of the proxy's dispatcher
+     * callbacks (prepare_session, session_aborted) -- it has no third:
+     * cloak/proxy.h explains why dcfg.attached is the owner's to use. */
     cloak_dispatcher_config_t dcfg;
     memset(&dcfg, 0, sizeof(dcfg));
     dcfg.reactor = fx->reactor;
@@ -390,7 +398,7 @@ static int fixture_init(struct fixture *fx) {
 
     dcfg.prepare_session = cloak_proxy_prepare_session;
     dcfg.prepare_session_userdata = &fx->proxy;
-    dcfg.attached = fx_attached; /* counts, then forwards to cloak_proxy_attached */
+    dcfg.attached = fx_attached; /* the test's own hand-off probe */
     dcfg.attached_userdata = fx;
     dcfg.session_aborted = cloak_proxy_session_aborted;
     dcfg.session_aborted_userdata = &fx->proxy;

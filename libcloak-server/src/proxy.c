@@ -165,8 +165,8 @@ static void proxy_session_teardown(cloak_proxy_session_t *ps) {
  * which is exactly the window cloak_proxy_session_aborted has to search
  * in. A scan on ps->sesh would find nothing at any of its three sites,
  * and would also miss a session that was created but whose context never
- * learned its pointer (cloak_proxy_attached only fires with created == 1
- * for the connection that created it). */
+ * learned its pointer (which is every session that has not yet carried a
+ * stream: proxy_on_new_stream is what records it). */
 static cloak_proxy_session_t *proxy_find_session(cloak_proxy_t *p,
                                                  const uint8_t uid[CLOAK_UID_LEN],
                                                  uint32_t session_id) {
@@ -300,9 +300,11 @@ static void proxy_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, v
         return;
     }
     if (ps->sesh == NULL) {
-        /* cloak_proxy_attached normally gets here first, but taking the
-         * session from the callback that is handing us one of its streams
-         * costs nothing and removes the ordering assumption entirely. */
+        /* THE ONLY PLACE ps->sesh IS EVER SET. Taking the session from
+         * the callback that is handing over one of its streams needs no
+         * ordering assumption and no second callback: this fires strictly
+         * before anything in this module could want the pointer, because
+         * everything that wants it wants it for a stream. */
         ps->sesh = sesh;
     }
     cloak_proxy_t *p = ps->p;
@@ -530,7 +532,7 @@ int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_client
         return -1;
     }
     ps->p = p;
-    ps->sesh = NULL; /* cloak_proxy_attached joins the two */
+    ps->sesh = NULL; /* proxy_on_new_stream records it with the first stream */
     ps->upstream = upstream;
     /* The only handle this context can be found by until -- and, on
      * every path that abandons the handshake, ever. See
@@ -548,39 +550,6 @@ int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_client
     /* on_broken and on_broken_userdata are deliberately untouched --
      * cloak_server_registry_get_or_create overwrites both regardless. */
     return 0;
-}
-
-void cloak_proxy_attached(cloak_dispatcher_t *d, cloak_session_t *sesh,
-                          const cloak_server_clientinfo_t *info, int created, void *userdata) {
-    (void)d;
-    (void)info;
-    cloak_proxy_t *p = userdata;
-    if (p == NULL || sesh == NULL || !created) {
-        /* created == 0 means this connection merely joined a session that
-         * already exists -- its context already has its session, and
-         * there is nothing to prepare or record. */
-        return;
-    }
-
-    /* Recover the context cloak_proxy_prepare_session allocated for THIS
-     * session. cloak/registry.h guarantees on_new_stream and its userdata
-     * are passed through to cloak_session_init untouched, so the session
-     * itself is the record of which context it was built from -- exact,
-     * where scanning p->sessions for "the one without a session yet"
-     * would be ambiguous whenever two creations are in flight at once (a
-     * reply write that hit EAGAIN defers hand-off across reactor turns).
-     * The callback identity is checked too, so a session someone else
-     * configured can never be mistaken for one of ours. */
-    if (sesh->on_new_stream != proxy_on_new_stream) {
-        return;
-    }
-    cloak_proxy_session_t *ps = sesh->on_new_stream_userdata;
-    if (ps == NULL || ps->p != p) {
-        return;
-    }
-    if (ps->sesh == NULL) {
-        ps->sesh = sesh;
-    }
 }
 
 void cloak_proxy_registry_broken(cloak_server_registry_t *reg, cloak_session_t *sesh,
