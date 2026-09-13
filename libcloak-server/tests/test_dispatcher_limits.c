@@ -543,6 +543,83 @@ static void test_cap_closes_immediately_and_recovers(void) {
     fixture_destroy(&fx);
 }
 
+/* ---- test 1b: relaying connections must NOT count against the cap ------
+ *
+ * The regression this exists for: an earlier version of this cap counted
+ * every in-flight connection (cloak_dispatcher_conn_count/d->conn_count)
+ * against max_pending_conns, including ones that had already been
+ * redirected and were happily relaying. A relaying connection's lifetime
+ * is controlled entirely by whoever it is relaying to -- so an attacker
+ * who opens max_pending_conns connections, lets each one redirect, and
+ * then simply holds every one of them open (trivial: this test's own fake
+ * cover site already never closes anything) would have starved every
+ * legitimate client of a slot, permanently. That is a remotely
+ * triggerable denial of service strictly worse than the memory exhaustion
+ * the cap exists to prevent in the first place.
+ *
+ * This test fills the cap with connections that get redirected and are
+ * then held open by the cover site, and asserts a SUBSEQUENT legitimate
+ * connection is still accepted -- against the pre-fix code (max_pending_
+ * conns checked against conn_count instead of pending_count), this test
+ * fails: see this task's report for the exact failure observed when this
+ * was confirmed empirically by temporarily reverting the fix. */
+static void test_cap_does_not_count_relaying_connections(void) {
+    enum { CAP = 3 };
+    fixture_opts_t opts = {0};
+    opts.max_pending_conns = CAP;
+    opts.handshake_timeout_ms = 60000;
+
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, &opts));
+
+    /* Fill the cap: CAP connections, each redirected to the (live, but
+     * never-closing) fake cover site and pumped all the way to relaying. */
+    int clients[CAP];
+    const char *msg = "HELLO\n";
+    for (int i = 0; i < CAP; i++) {
+        clients[i] = client_connect(front_port(&fx));
+        ASSERT_TRUE(clients[i] >= 0);
+        ASSERT_TRUE(write(clients[i], msg, strlen(msg)) == (ssize_t)strlen(msg));
+    }
+
+    struct len_wait lw = {&fx.cover, strlen(msg) * CAP};
+    ASSERT_TRUE(pump_until(fx.reactor, cover_has_len, &lw, 300, 20));
+    ASSERT_EQ_INT(CAP, fx.cover.accept_count);
+    /* One extra turn so every one of them finishes wiring up its relay
+     * (both fds registered) -- same technique test 2a uses. */
+    cloak_reactor_run_once(fx.reactor, 10);
+
+    /* All CAP connections are still tracked (for teardown)... */
+    ASSERT_EQ_INT(CAP, (int)cloak_dispatcher_conn_count(&fx.d));
+    /* ...but NONE of them count against the cap any more: they are
+     * relaying, held open by the cover site exactly like an attacker
+     * would hold them open, and this is the assertion that would have
+     * failed against the pre-fix code (which had no pending_count
+     * distinct from conn_count at all). */
+    ASSERT_EQ_INT(0, (int)cloak_dispatcher_pending_count(&fx.d));
+
+    /* A legitimate client arriving now must still be accepted -- the cap
+     * has room, because pending_count (not conn_count) is what it checks. */
+    int legit = client_connect(front_port(&fx));
+    ASSERT_TRUE(legit >= 0);
+    for (int i = 0; i < 20; i++) {
+        cloak_reactor_run_once(fx.reactor, 5);
+    }
+    ASSERT_EQ_INT(1, (int)cloak_dispatcher_pending_count(&fx.d));
+    ASSERT_EQ_INT(CAP + 1, (int)cloak_dispatcher_conn_count(&fx.d));
+    char c;
+    ssize_t n = recv(legit, &c, 1, MSG_DONTWAIT);
+    /* NOT closed: EAGAIN (still open, waiting on its own first packet),
+     * not 0/an error the way test 1's capped-out extra connection was. */
+    ASSERT_TRUE(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    close(legit);
+    for (int i = 0; i < CAP; i++) {
+        close(clients[i]);
+    }
+    fixture_destroy(&fx);
+}
+
 /* ---- test 2a: teardown of mid-first-packet, mid-reply-write and
  * mid-relay, all torn down by the SAME cloak_dispatcher_destroy call ------
  *
@@ -985,6 +1062,7 @@ static void test_fuzz_first_packets_never_crash_or_leak(void) {
 
 TEST_MAIN_BEGIN()
     test_cap_closes_immediately_and_recovers();
+    test_cap_does_not_count_relaying_connections();
     test_teardown_first_packet_reply_write_and_relay();
     test_teardown_mid_dial();
     test_reply_write_deadline_fires();

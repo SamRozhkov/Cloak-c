@@ -31,6 +31,20 @@ static void conn_unlink(cloak_dispatch_conn_t *c) {
         c->next->prev = c->prev;
     }
     d->conn_count--;
+    /* pending is cleared here for every path that removes a connection
+     * from the list while it is still "pending" (mid first-packet,
+     * mid-dial, mid-reply-write) -- peer-gone, a dial that never started,
+     * a redirect/auth failure, a hand-off failure, or a successful
+     * hand-off (conn_handoff's own success path unlinks immediately, so
+     * this is also where THAT decrement happens). A connection that
+     * already transitioned to relaying (see conn_start_redirect's own
+     * comment on on_dial_done) already cleared pending there, so this is
+     * a no-op for it -- guarded, not unconditional, specifically so this
+     * can never double-decrement. */
+    if (c->pending) {
+        c->pending = 0;
+        d->pending_count--;
+    }
 }
 
 /* Cancels whatever this connection still has live (its deadline, an
@@ -337,6 +351,25 @@ static void on_dial_done(cloak_dial_t *dial, int fd, void *userdata) {
         return;
     }
     c->relaying = 1;
+    /* THE CAP'S OTHER HALF: this connection now has a live relay, and a
+     * live relay is bounded the same way a real web server's own
+     * connections are -- two descriptors and the relay's own buffers,
+     * against the process's descriptor limit -- not by max_pending_conns.
+     * It stops counting against the cap HERE, while it stays linked in
+     * d->conns (for teardown -- see cloak/dispatcher.h's own OWNERSHIP
+     * comment) for as long as the relay runs. See
+     * CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own comment in
+     * cloak/dispatcher.h for why counting relaying connections against
+     * this cap would itself be a remotely triggerable denial of service:
+     * an attacker who gets max_pending_conns connections redirected and
+     * then holds every one of them open (trivial: control the peer that
+     * receives the relay) would otherwise permanently starve every
+     * legitimate client of a slot, which is a strictly worse failure than
+     * the memory exhaustion this cap exists to prevent. */
+    if (c->pending) {
+        c->pending = 0;
+        c->d->pending_count--;
+    }
 }
 
 static void conn_start_redirect(cloak_dispatch_conn_t *c) {
@@ -693,6 +726,7 @@ int cloak_dispatcher_init(cloak_dispatcher_t *d, const cloak_dispatcher_config_t
 
     d->conns = NULL;
     d->conn_count = 0;
+    d->pending_count = 0;
     return 0;
 }
 
@@ -709,6 +743,13 @@ void cloak_dispatcher_destroy(cloak_dispatcher_t *d) {
     }
     d->conns = NULL;
     d->conn_count = 0;
+    /* Reset directly, exactly like conn_count above, rather than via
+     * conn_unlink: this loop frees every connection in one pass without
+     * unlinking them one at a time (see this function's own doc comment),
+     * so nothing else clears pending_count for connections still pending
+     * at destroy time. Correct regardless of each connection's own
+     * pending state -- destroying the dispatcher ends everything. */
+    d->pending_count = 0;
 }
 
 void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata) {
@@ -730,8 +771,15 @@ void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata) {
      * exhausted. Every other close-instead-of-redirect path in this
      * module fires because there is nowhere to redirect TO; this is the
      * only one that closes despite somewhere to redirect existing, so a
-     * future reader should not "fix" this into a redirect. */
-    if (d->conn_count >= d->cfg.max_pending_conns) {
+     * future reader should not "fix" this into a redirect.
+     *
+     * pending_count, NOT conn_count: a relaying connection's own
+     * lifetime is controlled by whoever it is relaying to, not by this
+     * module, so counting it against this cap would let an attacker who
+     * simply holds max_pending_conns redirected connections open starve
+     * every legitimate client permanently -- see on_dial_done's own
+     * comment at the point a connection stops being pending. */
+    if (d->pending_count >= d->cfg.max_pending_conns) {
         close(fd);
         return;
     }
@@ -753,6 +801,7 @@ void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata) {
     c->deadline = CLOAK_TIMER_INVALID;
     c->dialing = 0;
     c->relaying = 0;
+    c->pending = 1;
     c->prev = NULL;
     c->next = NULL;
 
@@ -765,6 +814,7 @@ void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata) {
     }
     d->conns = c;
     d->conn_count++;
+    d->pending_count++;
 
     c->deadline =
         cloak_reactor_add_timer(d->cfg.reactor, d->cfg.handshake_timeout_ms, on_deadline, c);
@@ -786,4 +836,8 @@ void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata) {
 
 size_t cloak_dispatcher_conn_count(const cloak_dispatcher_t *d) {
     return d == NULL ? 0 : d->conn_count;
+}
+
+size_t cloak_dispatcher_pending_count(const cloak_dispatcher_t *d) {
+    return d == NULL ? 0 : d->pending_count;
 }

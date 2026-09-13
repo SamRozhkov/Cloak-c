@@ -134,10 +134,30 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * top-of-file comment opens with. Without a cap, an attacker who simply
  * opens connections and sends nothing grows that allocation without
  * bound, long before any per-connection deadline would reclaim it.
- * max_pending_conns bounds d->conn_count instead: see
- * cloak_dispatcher_accept's own comment for what happens, and why closing
- * rather than redirecting is the one place in this module where that is
- * the right call, at the cap. */
+ *
+ * max_pending_conns bounds d->pending_count, NOT d->conn_count -- a
+ * connection counts against it from accept until it either enters the
+ * relaying state or is handed off to a session, and stops counting the
+ * moment either happens, even though it stays on d->conns (for teardown)
+ * for as long as it lives after that. This distinction is load-bearing,
+ * not cosmetic: a relaying connection's lifetime is controlled by
+ * whoever it is relaying to, not by this module, so counting it against
+ * this cap would let an attacker who simply opens max_pending_conns
+ * connections, lets each one redirect, and then holds every one of them
+ * open (trivial: control the peer on the other end of the relay) starve
+ * every legitimate client of a slot -- permanently, since nothing here
+ * would ever reclaim it. That is a remotely triggerable denial of
+ * service strictly worse than the memory-exhaustion failure this cap
+ * exists to prevent: unbounded-but-degrading traded for a hard, cheap,
+ * permanent one. Once a connection IS relaying, the two descriptors and
+ * the relay's own buffers it holds are bounded the same way a real web
+ * server's own connections are: by the process's descriptor limit, not
+ * by this cap -- and that analogy is exactly right, because at that
+ * point this server genuinely IS proxying to a web server, and capping
+ * the cover story itself would be self-defeating (refusing to redirect
+ * is precisely the behaviour that would distinguish this server from a
+ * real one to anyone watching). See cloak_dispatcher_accept's own
+ * comment for where pending_count is incremented and decremented. */
 #define CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS ((size_t)512)
 
 /* Invoked exactly once per authenticated connection, ONLY when that
@@ -250,9 +270,14 @@ typedef struct {
     size_t relay_buf_cap;
 
     /* See CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own comment for
-     * why this exists at all. Checked in cloak_dispatcher_accept against
-     * cloak_dispatcher_conn_count (the same counter that accessor
-     * reports) BEFORE any allocation happens for the new fd. */
+     * why this exists at all, and for why it bounds PENDING connections
+     * only (mid first-packet, mid-dial, mid-reply-write) rather than
+     * every connection this dispatcher is tracking -- a relaying
+     * connection does not count against it. Checked in
+     * cloak_dispatcher_accept against cloak_dispatcher_pending_count
+     * (the same counter that accessor reports, distinct from
+     * cloak_dispatcher_conn_count) BEFORE any allocation happens for the
+     * new fd. */
     size_t max_pending_conns;
 } cloak_dispatcher_config_t;
 
@@ -284,13 +309,25 @@ typedef struct cloak_dispatch_conn cloak_dispatch_conn_t;
  * is THE unwind discriminator conn_teardown uses: see its own comment in
  * dispatcher.c and cloak/registry.h's own "created == 1" guidance on
  * cloak_server_registry_close for why closing unconditionally instead
- * would be wrong. */
+ * would be wrong.
+ *
+ * pending is 1 from cloak_dispatcher_accept until this connection either
+ * starts relaying or is handed off to a session, and 0 for the rest of
+ * its life after that -- see CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's
+ * own comment for why the cap must stop counting a connection at exactly
+ * that point. It governs d->pending_count the same way this struct being
+ * linked into d->conns at all governs d->conn_count: cleared (with the
+ * matching decrement) in conn_unlink for every path that removes this
+ * connection while still pending, and cleared separately, in
+ * on_dial_done, for the one path (entering the relaying state) that does
+ * NOT remove it from d->conns at that moment. */
 struct cloak_dispatch_conn {
     cloak_dispatcher_t *d;
     int fd;
     uint16_t local_port;
     cloak_firstpacket_t fp;
     cloak_timer_id_t deadline;
+    int pending;
 
     /* Redirect state. Only one of dialing/relaying/writing_reply is live
      * at a time. */
@@ -332,6 +369,15 @@ struct cloak_dispatcher {
      * this list is exactly "still in flight", never a history. */
     cloak_dispatch_conn_t *conns;
     size_t conn_count;
+
+    /* Everything conn_count counts EXCEPT a connection that has started
+     * relaying -- see CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own
+     * comment for why relaying connections must not count against
+     * max_pending_conns, and cloak_dispatch_conn_t's own "pending" field
+     * comment for exactly where this is kept in step with conn_count.
+     * Always <= conn_count. This is what cloak_dispatcher_accept checks
+     * against the cap, NOT conn_count. */
+    size_t pending_count;
 };
 
 /* Zeroes d and validates the rest -- in that order, so that ANY failure
@@ -384,10 +430,14 @@ void cloak_dispatcher_destroy(cloak_dispatcher_t *d);
  * of fd passes here, unconditionally -- every path through this function
  * either keeps it (linking a new connection into d) or closes it.
  *
- * THE CAP: if cloak_dispatcher_conn_count(d) is already at
+ * THE CAP: if cloak_dispatcher_pending_count(d) -- NOT
+ * cloak_dispatcher_conn_count(d); see cloak_dispatcher_t's own
+ * pending_count comment for why they differ -- is already at
  * cfg.max_pending_conns, fd is closed immediately and nothing is
  * allocated -- see CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own
- * comment for why a C dispatcher needs this where Go's does not. This is
+ * comment for why a C dispatcher needs this where Go's does not, and for
+ * why a relaying connection must not count against it (counting it would
+ * itself be a remotely triggerable, permanent denial of service). This is
  * the one place in this module where closing, not redirecting, is
  * correct: every other close-instead-of-redirect path in this file is a
  * case with nowhere to redirect TO (the peer is already gone, or the
@@ -398,12 +448,25 @@ void cloak_dispatcher_destroy(cloak_dispatcher_t *d);
  * because they are already exhausted. Spending them to keep up the cover
  * story at the exact moment resources ran out would defeat the cap
  * entirely, so this is not the bug it looks like next to every other
- * rule in this file. */
+ * rule in this file.
+ *
+ * pending_count is incremented here, unconditionally, for every
+ * connection that gets past the cap check (see c->pending's own comment
+ * in cloak/dispatcher.h for exactly where it is later decremented). */
 void cloak_dispatcher_accept(cloak_listener_t *l, int fd, void *userdata);
 
 /* The number of connections currently in flight (reading their first
  * packet, dialing, being relayed, or draining a post-authentication reply
- * write). NULL d returns 0. */
+ * write). NULL d returns 0. This is NOT what the cap is checked against
+ * -- see cloak_dispatcher_pending_count for that. */
 size_t cloak_dispatcher_conn_count(const cloak_dispatcher_t *d);
+
+/* The number of connections currently counting against max_pending_conns
+ * -- every connection cloak_dispatcher_conn_count would also count,
+ * EXCEPT one that has already started relaying (see
+ * CLOAK_DISPATCHER_DEFAULT_MAX_PENDING_CONNS's own comment for why that
+ * exclusion exists). Always <= cloak_dispatcher_conn_count(d). NULL d
+ * returns 0. */
+size_t cloak_dispatcher_pending_count(const cloak_dispatcher_t *d);
 
 #endif
