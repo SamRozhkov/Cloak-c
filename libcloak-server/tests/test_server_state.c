@@ -270,6 +270,21 @@ static void test_destroy_is_idempotent_on_zeroed_struct(void) {
     cloak_server_destroy(&srv);
 }
 
+/* 7b (review finding 6). cloak_server_init rejects a NULL cfg and leaves
+ * srv safe to pass to cloak_server_destroy -- the same rejected-
+ * constructor-then-destroy ordering cloak/registry.h calls out as "the
+ * source of a real crash on this branch more than once", now pinned for
+ * this constructor too. srv starts filled with 0xAA (never zeroed by the
+ * test itself) so the assertion can only pass if init actually memset it. */
+static void test_init_rejects_null_cfg_and_leaves_destroy_safe(void) {
+    cloak_server_t srv;
+    memset(&srv, 0xAA, sizeof(srv));
+    char err[256] = {0};
+    ASSERT_EQ_INT(-1, cloak_server_init(&srv, NULL, 16, err, sizeof(err)));
+
+    cloak_server_destroy(&srv); /* must not crash */
+}
+
 /* 8 (review fix, finding 1). A bare IPv6 RedirAddr -- unbracketed, no
  * port, e.g. "::1" -- must still start the server: Go's parseRedirAddr
  * has an explicit "ipv6 without port" branch for exactly this shape.
@@ -343,6 +358,54 @@ static void test_redir_addr_patches_ipv6_port_directly(void) {
     cloak_server_destroy(&srv);
 }
 
+/* 10 (review finding 4). A hand-built cfg with num_proxy_entries or
+ * num_bypass_uid past its array's real capacity is rejected with a real
+ * error, not trusted -- cloak/config.h documents every config struct as a
+ * fixed-size POD a caller can build on the stack, and cloak_server_init
+ * used to enforce the bypass half of this with assert() alone, which a
+ * Release (-DNDEBUG) build compiles out entirely. A normal parse always
+ * produces an in-range count, so this corrupts the field by hand after a
+ * successful parse to exercise the path a hand-built cfg could reach for
+ * real. Each case also checks srv is left destroy-safe. */
+static void test_init_rejects_out_of_range_counts(void) {
+    char json[1024];
+    snprintf(json, sizeof(json),
+             "{\"ProxyBook\":{\"ss\":[\"tcp\",\"127.0.0.1:1\"]},"
+             "\"BindAddr\":[\":443\"],\"RedirAddr\":\"127.0.0.1:8443\","
+             "\"PrivateKey\":\"%s\"}",
+             PRIV_B64);
+
+    /* num_proxy_entries past CLOAK_MAX_PROXY_BOOK. */
+    {
+        cloak_server_config_t cfg;
+        parse_or_die(json, &cfg);
+        cfg.num_proxy_entries = CLOAK_MAX_PROXY_BOOK + 1;
+
+        cloak_server_t srv;
+        memset(&srv, 0xAA, sizeof(srv));
+        char err[256] = {0};
+        ASSERT_EQ_INT(-1, cloak_server_init(&srv, &cfg, 16, err, sizeof(err)));
+        ASSERT_TRUE(err[0] != '\0');
+        ASSERT_TRUE(strstr(err, "num_proxy_entries") != NULL);
+        cloak_server_destroy(&srv); /* must not crash */
+    }
+
+    /* num_bypass_uid past CLOAK_MAX_BYPASS_UID. */
+    {
+        cloak_server_config_t cfg;
+        parse_or_die(json, &cfg);
+        cfg.num_bypass_uid = CLOAK_MAX_BYPASS_UID + 1;
+
+        cloak_server_t srv;
+        memset(&srv, 0xAA, sizeof(srv));
+        char err[256] = {0};
+        ASSERT_EQ_INT(-1, cloak_server_init(&srv, &cfg, 16, err, sizeof(err)));
+        ASSERT_TRUE(err[0] != '\0');
+        ASSERT_TRUE(strstr(err, "num_bypass_uid") != NULL);
+        cloak_server_destroy(&srv); /* must not crash */
+    }
+}
+
 TEST_MAIN_BEGIN()
     test_admin_uid_is_added_to_bypass_set();
     test_no_admin_uid_leaves_bypass_set_untouched();
@@ -351,6 +414,8 @@ TEST_MAIN_BEGIN()
     test_replay_wiring();
     test_init_rejects_unresolvable_redir_addr();
     test_destroy_is_idempotent_on_zeroed_struct();
+    test_init_rejects_null_cfg_and_leaves_destroy_safe();
     test_bare_ipv6_redir_addr_starts_and_patches_port();
     test_redir_addr_patches_ipv6_port_directly();
+    test_init_rejects_out_of_range_counts();
 TEST_MAIN_END()

@@ -42,8 +42,13 @@ typedef struct {
  * lookup. Allocates the replay cache with replay_cache_capacity slots.
  *
  * Returns 0 on success, -1 with the reason in err on an unresolvable
- * address or an allocation failure. On failure srv is left safe to pass
- * to cloak_server_destroy. */
+ * address, an allocation failure, cfg being NULL, or cfg->num_proxy_entries
+ * / cfg->num_bypass_uid exceeding CLOAK_MAX_PROXY_BOOK /
+ * CLOAK_MAX_BYPASS_UID respectively (a real, checked error, not an
+ * assert() -- cloak/config.h's structs are PODs a caller can build by
+ * hand, so an out-of-range count from a hand-built cfg is realistic, not
+ * merely a violated invariant from a trusted parser). On failure srv is
+ * left safe to pass to cloak_server_destroy. */
 int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
                       size_t replay_cache_capacity, char *err, size_t err_cap);
 
@@ -52,18 +57,19 @@ int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
 void cloak_server_destroy(cloak_server_t *srv);
 
 /* 1 if uid is exempt from credit and bandwidth accounting. The admin UID
- * always is. */
+ * always is. srv == NULL or uid == NULL returns 0. */
 int cloak_server_is_bypass(const cloak_server_t *srv, const uint8_t uid[CLOAK_UID_LEN]);
 
 /* 1 if uid is the configured admin UID. Go gates its admin API on this
- * together with session id 0. */
+ * together with session id 0. srv == NULL or uid == NULL returns 0. */
 int cloak_server_is_admin(const cloak_server_t *srv, const uint8_t uid[CLOAK_UID_LEN]);
 
 /* The resolved upstream for a proxy method, or NULL if the ProxyBook has
  * no such entry. proxy_method arrives from an authenticated but
  * attacker-chosen payload: the comparison is case-insensitive (the config
  * parser lower-cases its keys) and bounded, and a name that is merely a
- * prefix of a configured one does not match. */
+ * prefix of a configured one does not match. srv == NULL or
+ * proxy_method == NULL returns NULL, the same as a genuine no-match. */
 const cloak_addr_t *cloak_server_lookup_proxy(const cloak_server_t *srv,
                                                const char *proxy_method);
 
@@ -81,8 +87,12 @@ int cloak_server_redir_addr(const cloak_server_t *srv, uint16_t local_port,
  * cloak/server_auth.h requires; call it BEFORE decrypting, matching Go's
  * AuthFirstPacket, which checks replay against the raw not-yet-
  * authenticated random. srv or random NULL returns 0 (fails open, i.e.
- * "not a replay") rather than crashing -- consistent with the replay
- * cache's own zero-capacity behaviour (see cloak/replay_cache.h). */
+ * "not a replay") rather than crashing -- consistent with
+ * cloak_replay_cache_check_and_insert's own fail-open behaviour when the
+ * cache's capacity is 0. (cloak/replay_cache.h itself requires capacity >
+ * 0 for cloak_replay_cache_init and says nothing about capacity == 0 at
+ * check-and-insert time; that behaviour is documented where it's
+ * implemented, in replay_cache.c, not in the header.) */
 int cloak_server_check_replay(cloak_server_t *srv, const uint8_t random[32],
                                int64_t now_unix);
 

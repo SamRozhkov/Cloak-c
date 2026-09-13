@@ -3,7 +3,6 @@
 
 #include "cloak/server_auth.h"
 
-#include <assert.h>
 #include <netinet/in.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -106,9 +105,20 @@ int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
         srv->redir_has_port = 0;
     }
 
-    /* Resolve every ProxyBook entry. cfg->num_proxy_entries is bounded by
-     * CLOAK_MAX_PROXY_BOOK by construction (a successful parse enforces
-     * it), matching srv->proxy's size. */
+    /* Resolve every ProxyBook entry. A successful parse enforces
+     * cfg->num_proxy_entries <= CLOAK_MAX_PROXY_BOOK (matching
+     * srv->proxy's size), but cfg is caller-supplied -- cloak/config.h
+     * advertises every config struct as a fixed-size POD a caller can
+     * build by hand on the stack, so a hand-built cfg with an
+     * out-of-range count is realistic, not merely hypothetical. Checked
+     * for real, with an error return, rather than trusted: an unchecked
+     * loop here would read cfg->proxy_book and write srv->proxy out of
+     * bounds. */
+    if (cfg->num_proxy_entries > CLOAK_MAX_PROXY_BOOK) {
+        return set_err(err, err_cap,
+                       "server: cfg->num_proxy_entries (%zu) exceeds CLOAK_MAX_PROXY_BOOK (%d)",
+                       cfg->num_proxy_entries, CLOAK_MAX_PROXY_BOOK);
+    }
     for (size_t i = 0; i < cfg->num_proxy_entries; i++) {
         const cloak_proxy_entry_t *entry = &cfg->proxy_book[i];
         char reason[CLOAK_CONFIG_ERR_LEN];
@@ -123,12 +133,21 @@ int cloak_server_init(cloak_server_t *srv, const cloak_server_config_t *cfg,
     /* The bypass union Go performs in InitState: cfg->bypass_uid
      * deliberately excludes admin_uid (see cloak/config.h), so this is
      * the one place that folds it back in. srv->bypass is sized
-     * CLOAK_MAX_BYPASS_UID + 1 precisely so this cannot overflow, but the
-     * count is asserted rather than trusted -- cfg is caller-supplied and
-     * this project would rather trap on a violated invariant than write
-     * past the array. */
+     * CLOAK_MAX_BYPASS_UID + 1 precisely so this cannot overflow PROVIDED
+     * n is actually within CLOAK_MAX_BYPASS_UID -- checked here with a
+     * real error return rather than assert(), which a Release build (-DNDEBUG)
+     * compiles out entirely, silently turning this into an unbounded
+     * memcpy into a fixed-size array. cfg is caller-supplied (see the
+     * proxy book bound check above for why that is not merely
+     * hypothetical), so this project would rather reject a violated
+     * invariant through the normal err path than either trap only in
+     * debug builds or overflow in release ones. */
     size_t n = cfg->num_bypass_uid;
-    assert(n <= CLOAK_MAX_BYPASS_UID);
+    if (n > CLOAK_MAX_BYPASS_UID) {
+        return set_err(err, err_cap,
+                       "server: cfg->num_bypass_uid (%zu) exceeds CLOAK_MAX_BYPASS_UID (%d)",
+                       n, CLOAK_MAX_BYPASS_UID);
+    }
     memcpy(srv->bypass, cfg->bypass_uid, n * CLOAK_UID_LEN);
     if (cfg->has_admin_uid) {
         memcpy(srv->bypass[n], cfg->admin_uid, CLOAK_UID_LEN);
