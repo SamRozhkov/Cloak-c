@@ -290,6 +290,13 @@ The proxy path: `on_new_stream` dials the upstream from `cloak_server_lookup_pro
 
 Then, in the order the user set: the SQLite user manager and accounting, the admin API over session 0, the client, the binaries, CDN/WebSocket, and UDP.
 
+### What this branch's review left for the next one
+
+- **Nothing yet proves that bytes already in the socket survive the hand-off.** The dispatcher does `cloak_reactor_remove_fd` then `cloak_session_add_conn`, and the re-registration is what re-arms the edge and picks up anything the kernel already buffered. That reasoning was verified on paper, but no test asserts it, because until the proxy path exists nothing consumes session bytes. The first test that drives real traffic through an attached session should assert it — a client that pipelines its first frame immediately behind its ClientHello is the case that would break.
+- **`ci.unordered` still has nowhere to go.** The authenticated payload can request unordered mode, `cloak_session_config_t` has no such field, and nothing in `libcloak-mux` implements it. UDP is a later module, but silently ignoring an attacker-visible flag is itself a fingerprint — decide deliberately rather than by omission.
+- **`on_deadline` is dual-purpose** (the first-packet deadline and the reply-write one) and the header's close-class enumeration names only the first. A stalled reply-write timing out is conceptually the "cover story already spent" class. Cosmetic, but the enumeration is the module's contract and should be exact.
+- **A few task-relative comment phrases survive in `dispatcher.c`** outside the rewritten header paragraph. This is one module now, not three tasks.
+
 ## Self-review notes
 
 - **Spec coverage (§7):** step 1 (sniff and buffer) is Task 1 via `cloak_firstpacket_t`; step 2 (authenticate) and step 3's attach are Task 2; step 4 (`goWeb`) is Task 1, built first on purpose so it is the tested failure path for everything Task 2 adds. Step 3's "start relaying to the configured ProxyBook target" is the next plan, and this plan's Task 2 still validates the proxy method so an unknown one is rejected before a session exists, as Go does.
