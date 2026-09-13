@@ -30,3 +30,9 @@ target_include_directories(test_registry PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-co
 target_link_libraries(test_registry PRIVATE cloak-server)
 add_test(NAME test_registry COMMAND test_registry)
 set_tests_properties(test_registry PROPERTIES TIMEOUT 60)
+
+add_executable(test_dispatcher_redirect test_dispatcher_redirect.c)
+target_include_directories(test_dispatcher_redirect PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_redirect PRIVATE cloak-server)
+add_test(NAME test_dispatcher_redirect COMMAND test_dispatcher_redirect)
+set_tests_properties(test_dispatcher_redirect PROPERTIES TIMEOUT 60)

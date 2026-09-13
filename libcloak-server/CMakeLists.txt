@@ -5,6 +5,7 @@ add_library(cloak-server STATIC
     src/firstpacket.c
     src/server.c
     src/registry.c
+    src/dispatcher.c
 )
 
 target_include_directories(cloak-server PUBLIC include)
