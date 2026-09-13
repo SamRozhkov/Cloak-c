@@ -1,5 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cloak/dispatcher.h"
+#include "cloak/firstpacket.h"
+#include "cloak/net.h"
+#include "cloak/reactor.h"
 #include "cloak/server.h"
 #include "test_framework.h"
 
@@ -515,6 +518,59 @@ static void test_destroy_tears_down_inflight_connections(void) {
     fixture_destroy(&fx);
 }
 
+/* 9. cloak_dispatcher_init rejects a relay_buf_cap too small to ever hold
+ * a preload -- a config typo that would otherwise silently turn every
+ * redirect into a close (cloak_relay_start failing on preload_len >
+ * buf_cap, which this module correctly treats as close-not-redirect). */
+static void test_init_rejects_undersized_relay_buf_cap(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"BindAddr\":[\":443\"],\"RedirAddr\":\"127.0.0.1:1\","
+             "\"PrivateKey\":\"%s\"}",
+             PRIV_B64);
+    cloak_server_config_t cfg;
+    char err[256] = {0};
+    ASSERT_EQ_INT(0, cloak_server_config_parse_json(json, &cfg, err, sizeof(err)));
+
+    cloak_server_t srv;
+    err[0] = '\0';
+    ASSERT_EQ_INT(0, cloak_server_init(&srv, &cfg, 16, err, sizeof(err)));
+
+    cloak_dispatcher_config_t dcfg;
+    memset(&dcfg, 0, sizeof(dcfg));
+    dcfg.reactor = r;
+    dcfg.srv = &srv;
+    /* Below CLOAK_FIRSTPACKET_MAX: cloak_relay_start would reject any
+     * preload longer than this on every single redirect. */
+    dcfg.relay_buf_cap = CLOAK_FIRSTPACKET_MAX / 2;
+
+    /* Dirtied first, the pattern this project's net.h/relay.h tests use:
+     * a freshly zeroed struct would pass this test whether or not
+     * cloak_dispatcher_init actually re-initializes it on a rejection
+     * path, not only on the one that reaches the end successfully. */
+    cloak_dispatcher_t dirty;
+    memset(&dirty, 0xAA, sizeof(dirty));
+    ASSERT_EQ_INT(-1, cloak_dispatcher_init(&dirty, &dcfg));
+
+    /* init-before-validate: even on this rejection, d comes back zeroed,
+     * not left holding the 0xAA fill. */
+    ASSERT_TRUE(dirty.conns == NULL);
+    ASSERT_EQ_INT(0, (int)dirty.conn_count);
+
+    /* destroy must still be safe on a struct left this way. */
+    cloak_dispatcher_destroy(&dirty);
+    ASSERT_EQ_INT(0, (int)cloak_dispatcher_conn_count(&dirty));
+
+    cloak_server_destroy(&srv);
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_junk_first_byte_is_forwarded();
     test_tls_record_is_forwarded_whole();
@@ -524,4 +580,5 @@ TEST_MAIN_BEGIN()
     test_peer_close_mid_packet_drops_without_redirect();
     test_dial_failure_closes_client();
     test_destroy_tears_down_inflight_connections();
+    test_init_rejects_undersized_relay_buf_cap();
 TEST_MAIN_END()

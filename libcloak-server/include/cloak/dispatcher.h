@@ -186,8 +186,19 @@ struct cloak_dispatcher {
  * cfg->srv are themselves still borrowed pointers -- see
  * cloak_dispatcher_config_t's own doc comment.
  *
- * Returns 0 on success, -1 if d is NULL, or cfg, cfg->reactor or cfg->srv
- * is NULL. */
+ * A non-zero relay_buf_cap smaller than CLOAK_FIRSTPACKET_MAX is REJECTED
+ * here rather than accepted and left to fail later: cloak_relay_start
+ * requires preload_len <= buf_cap, so such a value would make every
+ * single redirect's cloak_relay_start call fail -- which this module
+ * correctly treats as close-not-redirect, but that silently defeats the
+ * "every failure redirects" property this whole module exists for, from
+ * nothing worse than a config typo. Rejecting it loudly here, where a
+ * caller is checking a return value, is the only place that failure mode
+ * can be caught before it is indistinguishable from working.
+ *
+ * Returns 0 on success, -1 if d is NULL, cfg, cfg->reactor or cfg->srv is
+ * NULL, or cfg->relay_buf_cap is non-zero and smaller than
+ * CLOAK_FIRSTPACKET_MAX. */
 int cloak_dispatcher_init(cloak_dispatcher_t *d, const cloak_dispatcher_config_t *cfg);
 
 /* Tears down every connection still in flight: cancels each one's

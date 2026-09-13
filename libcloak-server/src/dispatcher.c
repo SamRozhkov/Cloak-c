@@ -276,6 +276,15 @@ int cloak_dispatcher_init(cloak_dispatcher_t *d, const cloak_dispatcher_config_t
     if (cfg == NULL || cfg->reactor == NULL || cfg->srv == NULL) {
         return -1;
     }
+    /* A non-zero relay_buf_cap smaller than CLOAK_FIRSTPACKET_MAX would
+     * make cloak_relay_start fail (preload_len > buf_cap) on every single
+     * redirect -- silently turning "every failure redirects" into "every
+     * connection closes" from nothing worse than a config typo. Reject it
+     * here, loudly, rather than let it surface later as connections that
+     * merely fail to redirect. */
+    if (cfg->relay_buf_cap != 0 && cfg->relay_buf_cap < CLOAK_FIRSTPACKET_MAX) {
+        return -1;
+    }
 
     d->cfg = *cfg;
     if (d->cfg.handshake_timeout_ms == 0) {
