@@ -578,6 +578,19 @@ static void panel_reap_sessionless(cloak_userpanel_t *p) {
         if (panel_has_queued_usage(p, u->uid)) {
             continue;
         }
+        if (cloak_valve_rx(&u->valve) != 0 || cloak_valve_tx(&u->valve) != 0) {
+            /* NOT "nothing queued" -- "nothing to lose". At the queue cap
+             * the drain above deliberately leaves a user's bytes in its
+             * valve and creates no queue entry, so "no queued usage" is
+             * ALSO true of a user carrying a full interval of unbilled
+             * traffic. Reaping that user would free the valve, and the
+             * terminate doing it runs with in_cycle set, so the forced
+             * flush that would otherwise rescue the bytes is skipped and
+             * they are dropped with a warning: traffic billed to nobody.
+             * Leaving such a user active costs one table slot until room
+             * appears, which is what happened before the reaper existed. */
+            continue;
+        }
         /* Frees p->active[i] and clears that slot; no other slot moves,
          * so continuing the scan from here is safe. */
         cloak_userpanel_terminate(p, u, "no sessions left (reaped)");

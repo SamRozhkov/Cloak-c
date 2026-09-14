@@ -302,6 +302,19 @@ void cloak_userpanel_close(cloak_userpanel_t *p);
  * _NO_UP_CREDIT, _NO_DOWN_CREDIT, _EXPIRED, _VOID, _DB) or
  * CLOAK_USERPANEL_ERR_FULL / _ALLOC.
  *
+ * THE CALLER OWES THIS USER A SESSION IN THE SAME REACTOR TURN. The
+ * upload cycle reaps an active, non-bypass user that holds no sessions,
+ * has nothing queued and has an empty valve (see
+ * cloak_userpanel_upload_now step 4), because that is indistinguishable
+ * from an entry whose session went away by a route that told the panel
+ * nothing -- which is most of the dispatcher's unwind routes. The
+ * dispatcher satisfies this by construction: authorisation and
+ * cloak_server_registry_get_or_create happen in one straight-line
+ * dispatch chain with no return to the reactor between them. A future
+ * caller that wants to PRE-AUTHORISE a user and attach its sessions on a
+ * later turn must hold something else to keep it alive, or it will find
+ * its users reaped out from under it and its connections dropped.
+ *
  * AT THE CAP THIS REFUSES THE NEWEST USER rather than evicting an older
  * one, and that is a security decision, not an arbitrary tie-break.
  * Refusing to track a user is refusing to bill them: an eviction policy
@@ -351,6 +364,15 @@ size_t cloak_userpanel_active_count(const cloak_userpanel_t *p);
  * usage queue (so the bytes it moved are still billed), closes EVERY
  * session it holds through cloak_server_registry_close_all_for_uid, then
  * removes the entry from the active table and FREES IT.
+ *
+ * SO MAY ANY OTHER cloak_userpanel_user_t * THE CALLER HOLDS. When the
+ * usage queue is at its cap this runs a whole upload cycle (see
+ * cloak_userpanel_upload_now) to make room, which performs a synchronous
+ * SQLite transaction and can terminate -- and therefore free -- any OTHER
+ * active user the database says has run out. A caller holding two user
+ * pointers across this call must re-resolve the second with
+ * cloak_userpanel_find; the panel's own loops re-resolve on every
+ * iteration for exactly this reason.
  *
  * user IS INVALID WHEN THIS RETURNS. So is the valve any session was
  * given -- which is safe only because every such session was destroyed by
@@ -460,8 +482,13 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
  *     manager's own reason string.
  *
  *  4. REAP. Every active, non-bypass user that currently holds ZERO
- *     sessions in the registry and has no outstanding queued usage is
- *     terminated too.
+ *     sessions in the registry, has no outstanding queued usage, AND has
+ *     an empty valve is terminated too. All three, because the third is
+ *     not implied by the second: at the queue cap the drain leaves a
+ *     user's bytes in its valve and creates no queue entry, so a user
+ *     carrying a whole interval of unbilled traffic also has "no queued
+ *     usage" -- and reaping it would free that valve inside a cycle,
+ *     where the forced flush is suppressed, dropping the bytes.
  *
  * WHY STEP 4 EXISTS, since it looks redundant next to
  * cloak_userpanel_notify_session_closed. It is not redundant, it is the

@@ -446,6 +446,16 @@ static void test_bypass_user_never_touches_the_manager(void) {
      * manager here and get CLOAK_USER_ERR_VOID back. */
     ASSERT_EQ_INT(0, cloak_userpanel_upload_now(panel));
 
+    /* THE BYPASS EXEMPTION FROM THE REAPER. This user has no sessions,
+     * nothing queued and an empty valve -- every condition the reaper
+     * tests -- and must survive anyway, because a bypass entry is never
+     * metered and its UID comes from a bounded config list. Without the
+     * exemption a bypass user would be terminated on the first tick
+     * after its sessions went, which is a documented design decision and
+     * would otherwise be deletable in silence. */
+    ASSERT_TRUE(cloak_userpanel_find(panel, uid) != NULL);
+    ASSERT_EQ_INT(1, (int)cloak_userpanel_active_count(panel));
+
     cloak_server_registry_destroy(&reg);
     cloak_userpanel_close(panel);
     cloak_usermanager_close(m);
@@ -539,6 +549,15 @@ static void test_usage_reaches_the_database_on_the_timer(void) {
     struct credit_wait w = {m, 0x11, 10000000};
     uint64_t elapsed = 0;
     ASSERT_TRUE(pump_until_ms(r, up_credit_changed, &w, 5000, &elapsed));
+
+    /* THE REAPER'S NEGATIVE DIRECTION, which is the half whose failure
+     * is "every user is disconnected once per upload interval": this
+     * user has a live session, so a cycle must leave it exactly where it
+     * is. Asserted BEFORE the valve is read below, because a reaped user
+     * is a freed valve. */
+    ASSERT_TRUE(cloak_userpanel_find(panel, uid) != NULL);
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count_for_uid(&reg, uid));
+    ASSERT_EQ_INT(1, (int)cloak_userpanel_active_count(panel));
 
     /* The timer honoured its interval: measured wall time since the panel
      * was opened is at least one full interval. An implementation that
@@ -1554,7 +1573,7 @@ static void test_queue_full_forces_an_upload(void) {
     ASSERT_EQ_INT(0, cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)));
 
     /* 2*Q_ROUND filler UIDs plus one for the terminating user. */
-    for (unsigned i = 0; i < 2 * Q_ROUND + 1; i++) {
+    for (unsigned i = 0; i < 2 * Q_ROUND + 2; i++) {
         cloak_user_info_t info;
         memset(&info, 0, sizeof(info));
         mk_uid_n(info.uid, i);
@@ -1642,6 +1661,31 @@ static void test_queue_full_forces_an_upload(void) {
     ASSERT_EQ_INT(0, cloak_usermanager_get(m, marker, &marker_row));
     ASSERT_EQ_INT(10000000, marker_row.up_credit);
 
+    /* --- a sessionless user whose bytes are in its VALVE, not the queue -
+     *
+     * With the queue at its cap the drain deliberately leaves this user's
+     * traffic in its valve and creates no queue entry for it. It then has
+     * zero sessions AND no queued usage -- two of the three reap
+     * conditions -- and reaping it would free the valve from inside a
+     * cycle, where the forced flush is suppressed, so the bytes would be
+     * dropped with a warning and billed to nobody. */
+    uint8_t vid[CLOAK_UID_LEN];
+    mk_uid_n(vid, 2 * Q_ROUND + 1);
+    cloak_userpanel_user_t *vu = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, vid, &vu));
+    link_t LV;
+    link_open(&LV, r, &reg, &obfs, vid, 83, cloak_userpanel_user_valve(vu));
+    drive_client_to_server(&LV, r, 256);
+    int64_t vrx = cloak_valve_rx(&vu->valve);
+    ASSERT_TRUE(vrx > 0);
+    cloak_server_registry_close(&reg, vid, 83);
+    link_destroy_peer(&LV);
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count_for_uid(&reg, vid));
+
+    ASSERT_TRUE(cloak_userpanel_upload_now(panel) != 0); /* still locked; queue still full */
+    ASSERT_TRUE(cloak_userpanel_find(panel, vid) != NULL);
+    ASSERT_EQ_INT(vrx, cloak_valve_rx(&vu->valve)); /* the bytes are still in the valve */
+
     /* --- the terminating user, with the queue at its cap ------------- */
     ASSERT_EQ_INT(SQLITE_OK, sqlite3_exec(other, "ROLLBACK", NULL, NULL, NULL));
     ASSERT_EQ_INT(SQLITE_OK, sqlite3_close(other));
@@ -1658,6 +1702,11 @@ static void test_queue_full_forces_an_upload(void) {
 
     cloak_userpanel_terminate(panel, lu, "test");
 
+    /* The forced flush emptied the queue, but the valve-carrying user is
+     * still not reapable at the moment the reap inside that cycle ran --
+     * its bytes had not been drained yet. */
+    ASSERT_TRUE(cloak_userpanel_find(panel, vid) != NULL);
+
     /* THE DISCRIMINATING OBSERVATION, and it is made BEFORE any further
      * upload_now: the marker's usage -- queued two intervals ago and
      * never settled -- is now in the database. Only the forced upload
@@ -1673,6 +1722,14 @@ static void test_queue_full_forces_an_upload(void) {
     cloak_user_info_t last_row;
     ASSERT_EQ_INT(0, cloak_usermanager_get(m, last, &last_row));
     ASSERT_EQ_INT(10000000 - last_rx, last_row.up_credit);
+
+    /* And the bytes that spent two intervals sitting in a valve because
+     * the queue had no room for them are billed too, rather than having
+     * been freed along with a prematurely reaped entry. */
+    cloak_user_info_t v_row;
+    ASSERT_EQ_INT(0, cloak_usermanager_get(m, vid, &v_row));
+    ASSERT_EQ_INT(10000000 - vrx, v_row.up_credit);
+    ASSERT_TRUE(cloak_userpanel_find(panel, vid) == NULL); /* now settled, so now reaped */
 
     link_destroy_peer(&L2);
     cloak_server_registry_destroy(&reg);
