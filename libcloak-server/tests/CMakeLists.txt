@@ -216,3 +216,9 @@ set_tests_properties(test_dispatcher_users PROPERTIES TIMEOUT 60)
 # produce that failure. See test_write_shim.c's own top-of-file comment.
 set_tests_properties(test_dispatcher_users PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+add_executable(test_http_parse test_http_parse.c)
+target_include_directories(test_http_parse PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_http_parse PRIVATE cloak-server)
+add_test(NAME test_http_parse COMMAND test_http_parse)
+set_tests_properties(test_http_parse PROPERTIES TIMEOUT 60)

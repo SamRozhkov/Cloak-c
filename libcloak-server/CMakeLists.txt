@@ -21,3 +21,9 @@ target_link_libraries(cloak-server PUBLIC cloak-common cloak-mux)
 target_link_libraries(cloak-server PRIVATE sqlite3)
 
 add_subdirectory(tests)
+
+# The admin API's HTTP/1.1 request parser. Appended rather than folded
+# into the add_library list above so this file's existing content stays
+# byte-identical; CMake resolves the path against this directory and
+# applies it to the already-declared target either way.
+target_sources(cloak-server PRIVATE src/http.c)
