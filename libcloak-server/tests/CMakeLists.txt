@@ -205,3 +205,14 @@ target_include_directories(test_dispatcher_users PRIVATE ${CMAKE_SOURCE_DIR}/lib
 target_link_libraries(test_dispatcher_users PRIVATE cloak-server sqlite3)
 add_test(NAME test_dispatcher_users COMMAND test_dispatcher_users)
 set_tests_properties(test_dispatcher_users PROPERTIES TIMEOUT 60)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for the same reason test_dispatcher_limits,
+# test_proxy_teardown and test_server_e2e do: this file's
+# test_reply_write_failure_releases_the_user needs the dispatcher's
+# step-10 reply write to fail deterministically, which is the only way to
+# reach conn_teardown's auth_created unwind -- and the reply is far
+# smaller than any socket buffer floor, so genuine backpressure cannot
+# produce that failure. See test_write_shim.c's own top-of-file comment.
+set_tests_properties(test_dispatcher_users PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")

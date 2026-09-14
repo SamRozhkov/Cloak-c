@@ -301,7 +301,25 @@ struct fixture {
 
     uint8_t server_pub[CLOAK_X25519_KEY_LEN];
     uint8_t uid_bypass[CLOAK_UID_LEN];
+
+    /* Counts cloak_dispatch_session_aborted_cb firings. PURELY A PROBE,
+     * and the evidence that a given test reached conn_teardown's
+     * auth_created unwind (site C) rather than failing earlier: that site
+     * fires this immediately before the close it performs. */
+    int aborted_calls;
 };
+
+/* Counts, then does exactly what the dispatcher would have called
+ * directly (cloak/proxy.h's own wiring). Wrapping rather than replacing:
+ * the proxy's context for an abandoned session must still be reclaimed,
+ * and a test that dropped that to get a counter would be testing a
+ * configuration no binary will ever run. */
+static void fx_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[CLOAK_UID_LEN],
+                               uint32_t session_id, void *userdata) {
+    struct fixture *fx = userdata;
+    fx->aborted_calls++;
+    cloak_proxy_session_aborted(d, uid, session_id, &fx->proxy);
+}
 
 /* THE TRAMPOLINE cloak/userpanel.h's WIRING block names, and the single
  * most dangerous line in this file to get wrong.
@@ -325,11 +343,28 @@ static void fx_session_closing(const uint8_t uid[CLOAK_UID_LEN], uint32_t sessio
     cloak_proxy_session_aborted(NULL, uid, session_id, userdata);
 }
 
-/* with_panel == 0 builds the pre-user-manager server: no panel at all, so
- * cloak_server_is_bypass is the whole policy. void_manager == 1 opens the
- * manager with no database file (cloak/usermanager.h's VOID manager), so
- * every non-bypass authentication fails with CLOAK_USER_ERR_VOID. */
-static int fixture_init(struct fixture *fx, int with_panel, int void_manager) {
+typedef struct {
+    /* 0 builds the pre-user-manager server: no panel at all, so
+     * cloak_server_is_bypass is the whole policy. */
+    int with_panel;
+    /* Opens the manager with no database file (cloak/usermanager.h's VOID
+     * manager), so every non-bypass authentication fails with
+     * CLOAK_USER_ERR_VOID. */
+    int void_manager;
+    /* Hands the DISPATCHER a NULL registry while the panel keeps the real
+     * one. cloak/dispatcher.h documents a NULL registry as supported and
+     * says what it does: every find reports "not found" and every
+     * get_or_create reports "cannot create", so an otherwise perfect
+     * handshake fails at exactly one place -- which is the only way to
+     * reach dispatcher_authenticate's get_or_create == NULL unwind
+     * without filling the registry with CLOAK_REGISTRY_MAX_SESSIONS live
+     * sessions first. */
+    int detach_registry;
+} fixture_opts_t;
+
+static int fixture_init_opts(struct fixture *fx, const fixture_opts_t *o) {
+    int with_panel = o->with_panel;
+    int void_manager = o->void_manager;
     memset(fx, 0, sizeof(*fx));
     char err[256] = {0};
 
@@ -450,7 +485,7 @@ static int fixture_init(struct fixture *fx, int with_panel, int void_manager) {
     memset(&dcfg, 0, sizeof(dcfg));
     dcfg.reactor = fx->reactor;
     dcfg.srv = &fx->srv;
-    dcfg.registry = &fx->registry;
+    dcfg.registry = o->detach_registry ? NULL : &fx->registry;
     dcfg.panel = fx->panel; /* NULL in the no-panel fixture */
 
     dcfg.session_config_template.max_on_wire_size = 16401;
@@ -461,8 +496,8 @@ static int fixture_init(struct fixture *fx, int with_panel, int void_manager) {
 
     dcfg.prepare_session = cloak_proxy_prepare_session;
     dcfg.prepare_session_userdata = &fx->proxy;
-    dcfg.session_aborted = cloak_proxy_session_aborted;
-    dcfg.session_aborted_userdata = &fx->proxy;
+    dcfg.session_aborted = fx_session_aborted; /* counts, then forwards */
+    dcfg.session_aborted_userdata = fx;
 
     ASSERT_EQ_INT(0, cloak_dispatcher_init(&fx->d, &dcfg));
     fx->d_ready = 1;
@@ -534,6 +569,12 @@ static void fixture_destroy(struct fixture *fx) {
     if (fx->db_path[0] != '\0') {
         du_unlink(fx->db_path);
     }
+}
+
+static int fixture_init(struct fixture *fx, int with_panel, int void_manager,
+                        int detach_registry) {
+    fixture_opts_t o = {with_panel, void_manager, detach_registry};
+    return fixture_init_opts(fx, &o);
 }
 
 static int front_port(struct fixture *fx) {
@@ -689,7 +730,7 @@ static int uid_count_is(void *ctx) {
  * would still hold. */
 static void test_database_user_authenticates_and_is_metered(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0));
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
 
     uint8_t uid[CLOAK_UID_LEN];
     mk_uid(uid, 0x21);
@@ -761,7 +802,7 @@ static void test_database_user_authenticates_and_is_metered(void) {
 
 static void test_every_refusal_is_the_same_redirect(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0));
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
 
     uint8_t uid_expired[CLOAK_UID_LEN], uid_nocredit[CLOAK_UID_LEN], uid_capped[CLOAK_UID_LEN];
     uint8_t uid_unknown[CLOAK_UID_LEN];
@@ -875,7 +916,7 @@ static void test_every_refusal_is_the_same_redirect(void) {
 
 static void test_cap_reads_live_registry_state(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0));
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
 
     uint8_t uid[CLOAK_UID_LEN];
     mk_uid(uid, 0x41);
@@ -920,7 +961,7 @@ static void test_cap_reads_live_registry_state(void) {
 
 static void test_bypass_uid_works_with_a_void_manager(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 1)); /* panel over a VOID manager */
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 1, 0)); /* panel over a VOID manager */
 
     /* The bypass UID is served, is active, and is NOT metered
      * (cloak_userpanel_user_valve returns NULL for it, which is
@@ -973,7 +1014,7 @@ static void test_bypass_uid_works_with_a_void_manager(void) {
  * dispatcher was never given. */
 static void test_no_panel_keeps_bypass_only_policy(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init(&fx, 0, 0)); /* manager opened, panel NOT wired */
+    ASSERT_EQ_INT(0, fixture_init(&fx, 0, 0, 0)); /* manager opened, panel NOT wired */
     ASSERT_TRUE(fx.panel == NULL);
 
     uint8_t uid_db[CLOAK_UID_LEN];
@@ -1015,7 +1056,7 @@ static void test_no_panel_keeps_bypass_only_policy(void) {
  * on_session_closing and setting no_relays -- see the task report. */
 static void test_terminated_user_stops_its_relays(void) {
     struct fixture fx;
-    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0));
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
 
     uint8_t uid[CLOAK_UID_LEN];
     mk_uid(uid, 0x71);
@@ -1080,6 +1121,228 @@ static void test_terminated_user_stops_its_relays(void) {
     fixture_destroy(&fx);
 }
 
+/* ------------------------------------------------------------------ */
+/* 7. Every unwind site releases the user it made active                */
+/* ------------------------------------------------------------------ */
+
+/* WHY THIS TEST EXISTS AS FOUR CASES AND NOT ONE ASSERTION.
+ * dispatcher_release_user has SIX call sites, and a mutation of the
+ * HELPER kills all six at once -- which is exactly the trap that let five
+ * of them ship unmeasured: one covered site made the whole helper look
+ * verified. Each case below is written to fail when ONE named site is
+ * deleted, and each was mutation-checked that way, one site at a time.
+ *
+ * The sites and where each is covered:
+ *   step 7   (proxy method unknown)      -- case 2(d), above
+ *   step 8a  (sessions cap)              -- (a) here
+ *   step 8c  (prepare_session returned -1) -- (b) here
+ *   step 8c  (get_or_create returned NULL) -- (c) here
+ *   conn_teardown site C (reply write failed after create) -- test 8
+ *   step 9   (compose_reply failed)      -- UNREACHABLE; see test 8's
+ *                                           closing comment.
+ *
+ * What every case asserts is the same pair: the refusal is still the
+ * ordinary redirect, AND the panel's active table is empty again
+ * IMMEDIATELY -- not one upload interval later when the reaper would have
+ * got there. */
+
+/* (a) THE SESSIONS CAP AT ZERO, which is an ordinary suspended account
+ * and not a contrived value: cloak_usermanager_authorise_new_session
+ * refuses when num_existing_sessions >= sessions_cap, so cap 0 refuses at
+ * zero existing sessions. That is the one cap refusal where the user is
+ * left active holding NOTHING -- the at-cap case in test 2 still has its
+ * live session, so its release is correctly a no-op and cannot measure
+ * this site. */
+static void test_cap_zero_refusal_releases_the_user(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    mk_uid(uid, 0x81);
+    put_user(fx.mgr, uid, 0, START_CREDIT, START_CREDIT, T_EXPIRY); /* cap 0 */
+
+    uint8_t rec[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t got[128];
+    size_t rec_len = make_record(&fx, uid, 10001, rec, sizeof(rec));
+    ASSERT_TRUE(rec_len > 0);
+    size_t n = probe_response(&fx, rec, rec_len, got, sizeof(got));
+    ASSERT_EQ_INT((int)DU_BANNER_LEN, (int)n);
+    ASSERT_MEM_EQ(got, DU_BANNER, DU_BANNER_LEN);
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count_for_uid(&fx.registry, uid));
+
+    /* Step 6 made this user active; step 8a then refused it. Without the
+     * release at that site it stays active with no session, pinning one
+     * of CLOAK_USERPANEL_MAX_ACTIVE_USERS slots per probe until the next
+     * upload cycle reaps it. */
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(fx.panel));
+
+    fixture_destroy(&fx);
+}
+
+/* (b) prepare_session REFUSES. cloak_proxy_prepare_session returns -1 for
+ * a client that asked for an UNORDERED (datagram) session, which this
+ * server has no data path for -- one flag in the client's own
+ * authenticated payload, so no server-side seam is needed to provoke it.
+ * The user is fully authorised by then; only the session is refused. */
+static void test_prepare_session_refusal_releases_the_user(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    mk_uid(uid, 0x82);
+    put_user(fx.mgr, uid, 4, START_CREDIT, START_CREDIT, T_EXPIRY);
+
+    uint8_t rec[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    size_t rec_len = build_client_record(fx.server_pub, uid, "ss",
+                                         (uint8_t)CLOAK_AEAD_AES_256_GCM, (int64_t)time(NULL),
+                                         10002, 1 /* unordered */, rec, sizeof(rec), shared);
+    ASSERT_TRUE(rec_len > 0);
+
+    uint8_t got[128];
+    size_t n = probe_response(&fx, rec, rec_len, got, sizeof(got));
+    ASSERT_EQ_INT((int)DU_BANNER_LEN, (int)n);
+    ASSERT_MEM_EQ(got, DU_BANNER, DU_BANNER_LEN);
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count_for_uid(&fx.registry, uid));
+    /* prepare_session returned -1, so nothing was created and
+     * session_aborted must NOT have fired (cloak/dispatcher.h: it is
+     * never fired for a handshake prepare_session itself rejected). */
+    ASSERT_EQ_INT(0, fx.aborted_calls);
+    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&fx.proxy));
+
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(fx.panel));
+
+    fixture_destroy(&fx);
+}
+
+/* (c) get_or_create RETURNS NULL, reached through the dispatcher's
+ * documented NULL-registry mode rather than by filling a real registry
+ * with 256 live sessions. prepare_session has already run and returned 0
+ * by then, so this is also the one case that asserts the two
+ * notifications fire together: the owner's session_aborted (which
+ * reclaims the proxy context prepare_session just built) and the panel's
+ * release. */
+static void test_get_or_create_failure_releases_the_user(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 1)); /* dispatcher registry == NULL */
+
+    uint8_t uid[CLOAK_UID_LEN];
+    mk_uid(uid, 0x83);
+    put_user(fx.mgr, uid, 4, START_CREDIT, START_CREDIT, T_EXPIRY);
+
+    uint8_t rec[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t got[128];
+    size_t rec_len = make_record(&fx, uid, 10003, rec, sizeof(rec));
+    ASSERT_TRUE(rec_len > 0);
+    size_t n = probe_response(&fx, rec, rec_len, got, sizeof(got));
+    ASSERT_EQ_INT((int)DU_BANNER_LEN, (int)n);
+    ASSERT_MEM_EQ(got, DU_BANNER, DU_BANNER_LEN);
+
+    /* Site A of cloak_dispatch_session_aborted_cb fired, which is what
+     * proves this probe got all the way past prepare_session -- i.e. that
+     * it really is the get_or_create unwind being measured and not an
+     * earlier refusal. */
+    ASSERT_EQ_INT(1, fx.aborted_calls);
+    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&fx.proxy));
+
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(fx.panel));
+
+    fixture_destroy(&fx);
+}
+
+/* ------------------------------------------------------------------ */
+/* 8. conn_teardown's site C releases the user too                      */
+/* ------------------------------------------------------------------ */
+
+/* THE ONE UNWIND THAT HAPPENS AFTER A SESSION REALLY EXISTED. The
+ * handshake succeeds, step 8 creates the session, and then the step-10
+ * reply write fails -- so conn_drop -> conn_teardown finds auth_created
+ * set, fires session_aborted, closes the session, and (this task's
+ * addition) releases the user.
+ *
+ * It needs test_write_shim.c: cloak_server_auth_compose_reply's output is
+ * ~206 bytes and no ordinary socket buffer can refuse it, so the write
+ * failure has to be interposed. The shim is already wired into this test
+ * through _cloak_ld_preload in tests/CMakeLists.txt, exactly as it is for
+ * test_dispatcher_auth, test_dispatcher_limits, test_proxy_teardown and
+ * test_server_e2e; "error" mode makes the first write to the matching
+ * peer fail with ECONNRESET and then unsets itself. */
+static void test_reply_write_failure_releases_the_user(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    mk_uid(uid, 0x84);
+    put_user(fx.mgr, uid, 4, START_CREDIT, START_CREDIT, T_EXPIRY);
+
+    int fd = client_connect(front_port(&fx));
+    ASSERT_TRUE(fd >= 0);
+    if (fd < 0) {
+        fixture_destroy(&fx);
+        return;
+    }
+    int port = client_local_port(fd);
+    ASSERT_TRUE(port > 0);
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_PEER_PORT", port_str, 1));
+    ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_MODE", "error", 1));
+    unsetenv("CLOAK_TEST_FORCE_STICKY");
+
+    uint8_t rec[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    size_t rec_len = make_record(&fx, uid, 10004, rec, sizeof(rec));
+    ASSERT_TRUE(rec_len > 0);
+    ASSERT_TRUE(write(fd, rec, rec_len) == (ssize_t)rec_len);
+
+    for (int i = 0; i < 60; i++) {
+        cloak_reactor_run_once(fx.reactor, 5);
+    }
+    unsetenv("CLOAK_TEST_FORCE_PEER_PORT");
+    unsetenv("CLOAK_TEST_FORCE_MODE");
+    close(fd);
+    for (int i = 0; i < 20; i++) {
+        cloak_reactor_run_once(fx.reactor, 2);
+    }
+
+    /* THE PROOF THAT SITE C IS WHAT RAN, and not some earlier refusal:
+     * session_aborted fires at site C and nowhere else on this path, and
+     * it only fires at all for a connection that actually created a
+     * session. If the LD_PRELOAD shim were not loaded this would be 0
+     * (the write would have succeeded and the connection handed off), so
+     * this assertion also fails loudly on a misconfigured run rather than
+     * passing vacuously. */
+    ASSERT_EQ_INT(1, fx.aborted_calls);
+    ASSERT_EQ_INT(0, (int)cloak_dispatcher_conn_count(&fx.d));
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count(&fx.registry));
+    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&fx.proxy));
+
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(fx.panel));
+
+    fixture_destroy(&fx);
+}
+
+/* THE SIXTH SITE HAS NO TEST, AND THAT IS A FINDING RATHER THAN A GAP IN
+ * THIS FILE. dispatcher_authenticate's step-9 unwind runs when
+ * cloak_server_auth_compose_reply returns <= 0, and that call cannot fail
+ * as the dispatcher makes it: compose_reply rejects only a cert length
+ * outside cloak_server_auth_cert_lens (the dispatcher picks uniformly
+ * FROM that table), an out_cap below the composed size (206 bytes at the
+ * largest cert length, against a fixed 256-byte c->reply), or an
+ * AES-256-GCM seal failure on a 32-byte input with a valid key and nonce.
+ * There is no input a client controls that reaches any of the three, and
+ * no seam this project already owns that can force one -- the write shim
+ * interposes write(2), which happens a step later.
+ *
+ * The release call stays there anyway, for the same reason the
+ * session_aborted fire beside it does: the branch exists, and a future
+ * change to the cert-length table or to c->reply's size would make it
+ * live. It is recorded here as UNCOVERED rather than left looking tested,
+ * which is what the rest of this file would otherwise imply. */
+
 TEST_MAIN_BEGIN()
 test_database_user_authenticates_and_is_metered();
 test_every_refusal_is_the_same_redirect();
@@ -1087,4 +1350,8 @@ test_cap_reads_live_registry_state();
 test_bypass_uid_works_with_a_void_manager();
 test_no_panel_keeps_bypass_only_policy();
 test_terminated_user_stops_its_relays();
+test_cap_zero_refusal_releases_the_user();
+test_prepare_session_refusal_releases_the_user();
+test_get_or_create_failure_releases_the_user();
+test_reply_write_failure_releases_the_user();
 TEST_MAIN_END()
