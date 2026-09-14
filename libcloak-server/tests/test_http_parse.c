@@ -557,6 +557,61 @@ static void build_count_and_body_cases(void) {
                  "POST /x HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n",
                  413);
     (void)c;
+
+    /* CONTENT-LENGTH: 0 -- A DECLARED EMPTY BODY. This is what a POST
+     * with nothing to say sends, and what Go's http.Client emits for an
+     * empty body; nothing else in this file declares a zero length (the
+     * only other ": 0" here is a conflicting-duplicate 400 case), so the
+     * clause in finish_headers that completes the request AT THE BLANK
+     * LINE when content_length is 0 was pinned by nothing.
+     *
+     * WHAT ITS ABSENCE COSTS, which is why this is a request-shape case
+     * and not a curiosity: without it the parser enters the body phase
+     * and the completion test only ever runs inside the feed loop over
+     * the bytes it was given -- so a request whose last byte is the blank
+     * line's LF stays INCOMPLETE FOREVER. Over the admin API that is a
+     * stream that receives no response at all until its deadline closes
+     * it fifteen seconds later.
+     *
+     * Registered in the case table rather than written as a one-off so
+     * that all three drivers cover it. The byte-at-a-time driver is the
+     * one that matters: it is the only one that proves the parser needs
+     * no trailing byte to notice it has finished. */
+    c = ok_case("Content-Length: 0 completes at the blank line",
+                "POST /x HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                CLOAK_HTTP_METHOD_POST, "/x");
+    c->have_cl = 1;
+    c->content_length = 0;
+
+    /* A zero length on a method that would not ordinarily carry a body
+     * is the same answer: the parser routes on nothing, so DELETE must
+     * not take a different path through the same clause. */
+    c = ok_case("Content-Length: 0 on DELETE", "DELETE /x HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+                CLOAK_HTTP_METHOD_DELETE, "/x");
+    c->have_cl = 1;
+    c->content_length = 0;
+}
+
+/* A declared empty body must allocate NOTHING. The case table above pins
+ * the state, the method, the path and the zero body_len; only
+ * cloak_http_parser_body_allocated can say that the parser did not take
+ * a 0-byte allocation on the way there, which is the observable
+ * cloak/http.h exposes precisely so "bounds before allocation" is a
+ * checkable property rather than a comment. */
+static void test_zero_length_body_allocates_nothing(void) {
+    static const char req[] = "POST /x HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    cloak_http_parser_t p;
+    cloak_http_parser_init(&p);
+    size_t consumed = 0;
+    ASSERT_EQ_INT(CLOAK_HTTP_DONE, (int)cloak_http_parser_feed(&p, (const uint8_t *)req,
+                                                               sizeof(req) - 1, &consumed));
+    ASSERT_EQ_INT((int)(sizeof(req) - 1), (int)consumed);
+    ASSERT_EQ_INT(0, (int)cloak_http_parser_body_allocated(&p));
+    const cloak_http_request_t *r = cloak_http_parser_request(&p);
+    ASSERT_EQ_INT(1, r->have_content_length);
+    ASSERT_EQ_INT(0, (int)r->content_length);
+    ASSERT_EQ_INT(0, (int)r->body_len);
+    cloak_http_parser_destroy(&p);
 }
 
 /* ---------------------------------------------------------------- */
@@ -946,6 +1001,7 @@ TEST_MAIN_BEGIN()
     test_cap_values_are_what_the_header_claims();
     test_short_body_never_completes();
     test_refusal_precedes_allocation();
+    test_zero_length_body_allocates_nothing();
     test_terminal_states_and_lifecycle();
     test_fuzz_smoke();
     free_cases();

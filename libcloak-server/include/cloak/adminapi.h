@@ -88,6 +88,26 @@
  * enforced before the allocation it bounds, and every refusal returns
  * without performing the operation it refused.
  *
+ * WHERE BYTE-FIDELITY WITH GO STOPS, and it is one place. This API is a
+ * faithful port of api_router.go's wire format -- the field names, their
+ * order, the status codes and the header set are Go's, and a real
+ * `ck-client -a` parses what this emits. The asymmetry is in the NUMBERS,
+ * and it is cloak/user_json.h's deliberate one: the encoder emits any
+ * int64 exactly, because a row already holding one must be reportable,
+ * while the decoder refuses any magnitude above 2^53 - 1, because cJSON
+ * stores every parsed number as a double and cannot recover more than
+ * that without silently truncating it. The visible consequence AT THIS
+ * LAYER is that a read-modify-write round trip is not closed for every
+ * document this API can produce: GET a user whose credit exceeds about 9
+ * petabytes and POST the same document back, and the POST is a 400. No
+ * value this API can WRITE can reach that range -- the decoder is the
+ * only way in -- so such a row can only have been created by an operator
+ * with a direct SQLite tool, and the credit saturation in cloak/
+ * usermanager.h is the only other thing that produces one. It is
+ * therefore not reachable through this interface; it is written down
+ * because "byte-for-byte what Go emits" invites the assumption that
+ * anything this API prints, it will also accept.
+ *
  * WHAT THIS MODULE DOES NOT BOUND, stated because the memory arithmetic
  * above invites the opposite reading. SESSION contexts are uncapped here:
  * one is created per cloak_adminapi_prepare_session and the only limits

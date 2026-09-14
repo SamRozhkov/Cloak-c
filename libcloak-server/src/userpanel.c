@@ -627,7 +627,25 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
          * deduction gets backwards. Saved and restored around the call
          * because a broken notification can nest (an owner's
          * on_session_closing may close further sessions), and an inner
-         * one must not answer the outer one's question. */
+         * one must not answer the outer one's question.
+         *
+         * THE PAIR IS RESTORED AS A PAIR, AND THAT IS ONLY SAFE WHILE THE
+         * NESTING STAYS SHALLOW IN ONE PARTICULAR WAY. If an INNER
+         * notification's bookkeeping destroyed the OUTER session, the
+         * outer frame would restore prev_destroyed -- a 0 recorded before
+         * the inner call -- and go on to forward a freed sesh to its own
+         * chain. That is unreachable today and by construction, not by
+         * luck: the only route from here into another session's teardown
+         * is cloak_userpanel_terminate, which closes sessions through
+         * cloak_server_registry_close_all_for_uid, and that function
+         * fires no on_broken at all -- so no second cloak_userpanel_
+         * registry_broken frame can exist above this one, and the restore
+         * can only ever put back the NULL/0 of a non-nested call. Stated
+         * here rather than defended in code because a defence would be
+         * dead: the thing it guards against has no path. A future change
+         * that makes any session-closing route fire on_broken re-enables
+         * this, and the fix is then to propagate an inner destruction of
+         * the outer sesh rather than to restore over it. */
         const cloak_session_t *prev_sesh = p->breaking_sesh;
         int prev_destroyed = p->breaking_sesh_destroyed;
         p->breaking_sesh = sesh;

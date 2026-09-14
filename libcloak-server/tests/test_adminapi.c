@@ -1351,6 +1351,270 @@ static void test_deadline_bounds_the_write_half(void) {
     fixture_destroy(&fx);
 }
 
+/* ---- 12c. Bytes after a complete request must not restart the response ---
+ *
+ * adminapi_drain's `if (ast->resp != NULL) return;` IS NOT ONE OF THIS
+ * MODULE'S TWO ANNOTATED RE-ENTRANCY GUARDS -- it does real work, and
+ * nothing pinned it. Without it, a byte arriving after a complete request
+ * is fed to a parser whose DONE state is sticky, so the feed consumes
+ * nothing and returns DONE, the router runs a SECOND time, and
+ * adminapi_respond frees the response buffer and resets resp_sent to 0.
+ *
+ * WHAT THAT IS, in the only vocabulary that matters: a client that has
+ * already had half a listing written to it gets the other half replaced
+ * by a fresh copy of the whole thing from byte 0 -- corrupt HTTP on the
+ * wire -- and one byte per frame from an authenticated client
+ * recomposes and re-queues a quarter-megabyte body every time. Work
+ * amplification with no bound, bought for one byte.
+ *
+ * The stalled-server construction from case 12 is what makes it
+ * observable: with the pump budget-bound, resp_sent is frozen, so a
+ * regression in it can only have come from the restart. */
+
+static void test_late_bytes_do_not_restart_the_response(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "latebytes", 20000, 0, 0, 0));
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 19));
+
+    int rcvbuf = 8192;
+    (void)setsockopt(cs.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    ASSERT_EQ_INT(0, cloak_reactor_remove_fd(fx.reactor, cs.fd));
+
+    seed_many_users(&fx);
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    const char *req = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n";
+    ASSERT_EQ_INT((int)strlen(req),
+                  (int)cloak_stream_write(st, (const uint8_t *)req, strlen(req)));
+
+    for (int i = 0; i < 300; i++) {
+        cloak_reactor_run_once(fx.reactor, 2);
+    }
+    ASSERT_EQ_INT(1, server_mid_response(&fx));
+    ASSERT_TRUE(fx.api.sessions != NULL && fx.api.sessions->streams != NULL);
+    if (fx.api.sessions == NULL || fx.api.sessions->streams == NULL) {
+        cloak_session_release_stream(&cs.sesh, st);
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    size_t sent_before = fx.api.sessions->streams->resp_sent;
+    size_t len_before = fx.api.sessions->streams->resp_len;
+    const char *resp_before = fx.api.sessions->streams->resp;
+    ASSERT_TRUE(sent_before > 0);
+
+    /* One stray byte, in its own frame, after a request the server has
+     * already answered. A real client would not send it; an attacker
+     * sends nothing else. */
+    ASSERT_EQ_INT(1, (int)cloak_stream_write(st, (const uint8_t *)"X", 1));
+    for (int i = 0; i < 100; i++) {
+        cloak_reactor_run_once(fx.reactor, 2);
+    }
+
+    ASSERT_EQ_INT(1, (int)cloak_adminapi_stream_count(&fx.api));
+    ASSERT_TRUE(fx.api.sessions != NULL && fx.api.sessions->streams != NULL);
+    if (fx.api.sessions != NULL && fx.api.sessions->streams != NULL) {
+        /* resp_sent NEVER GOES BACKWARDS -- the whole property, in one
+         * assertion. The buffer is the same one and the same length too,
+         * so a restart cannot hide behind an identical recomposition. */
+        ASSERT_TRUE(fx.api.sessions->streams->resp_sent >= sent_before);
+        ASSERT_EQ_INT((int)len_before, (int)fx.api.sessions->streams->resp_len);
+        ASSERT_TRUE(fx.api.sessions->streams->resp == resp_before);
+    }
+
+    cloak_session_release_stream(&cs.sesh, st);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* ---- 12d. The listing cap AT ITS SHIPPED DEFAULT -------------------------
+ *
+ * Every other listing-cap assertion in this file passes an explicit small
+ * cap, so raising CLOAK_ADMINAPI_DEFAULT_MAX_LIST_USERS to SIZE_MAX left
+ * the whole suite green -- and that constant is this module's PRIMARY
+ * documented memory bound, the one the header's 256 KiB arithmetic rests
+ * on. This case leaves max_list_users at 0 so the default applies, and
+ * pins both sides of it: exactly the cap lists, one past it refuses.
+ *
+ * The 1024-row response really is composed and delivered here (a
+ * 263,171-byte buffer at the header's own worst case), so this also
+ * exercises the shipped bound end to end rather than only its
+ * comparison. */
+
+/* THE SHIPPED CAP, WRITTEN OUT AS A LITERAL, and the literal is the
+ * whole point. An earlier draft of this case used
+ * CLOAK_ADMINAPI_DEFAULT_MAX_LIST_USERS itself as the seeding loop's
+ * bound, which made the test FOLLOW the number it is supposed to be
+ * pinning: raising the default to SIZE_MAX -- the exact mutation this
+ * case exists to catch -- turned the loop into an infinite one and the
+ * case hung instead of failing. A test that moves with the constant
+ * cannot pin it. The equality asserted first is what ties this literal to
+ * the shipped value, so changing the default fails here, loudly, on the
+ * first assertion. */
+#define LIST_CAP_ROWS ((size_t)1024)
+
+static void test_listing_cap_at_the_default(void) {
+    struct fixture fx;
+    /* conn_send_queue_cap roomy, everything else left at 0 -> the
+     * module's own defaults, which is the entire point of the case. */
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "listcapdefault", 262144, 0, 0, 0));
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 20));
+
+    ASSERT_TRUE(CLOAK_ADMINAPI_DEFAULT_MAX_LIST_USERS == LIST_CAP_ROWS);
+
+    for (size_t i = 0; i < LIST_CAP_ROWS; i++) {
+        cloak_user_info_t u;
+        memset(&u, 0, sizeof(u));
+        u.uid[0] = (uint8_t)(i & 0xff);
+        u.uid[1] = (uint8_t)((i >> 8) & 0xff);
+        ASSERT_EQ_INT(0, cloak_usermanager_write(fx.manager, &u, CLOAK_USER_FIELD_ALL));
+    }
+    size_t n = 0;
+    ASSERT_EQ_INT(0, cloak_usermanager_list(fx.manager, NULL, 0, &n));
+    ASSERT_EQ_INT((int)LIST_CAP_ROWS, (int)n);
+
+    /* EXACTLY at the default cap: listed, and every row present. */
+    resp_t r;
+    cloak_stream_t *st = request(&fx, &cs, "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n", &r);
+    ASSERT_EQ_INT(200, resp_status(&r));
+    size_t blen = 0;
+    const char *body = resp_body(&r, &blen);
+    int objects = 0;
+    for (size_t i = 0; i < blen; i++) {
+        if (body[i] == '{') {
+            objects++;
+        }
+    }
+    ASSERT_EQ_INT((int)LIST_CAP_ROWS, objects);
+    finish(&fx, &cs, st, &r);
+
+    /* ONE past it: refused, not truncated. */
+    cloak_user_info_t extra;
+    memset(&extra, 0, sizeof(extra));
+    extra.uid[0] = 0xEE;
+    extra.uid[1] = 0xEE;
+    extra.uid[2] = 0xEE;
+    ASSERT_EQ_INT(0, cloak_usermanager_write(fx.manager, &extra, CLOAK_USER_FIELD_ALL));
+
+    resp_t r2;
+    cloak_stream_t *st2 =
+        request(&fx, &cs, "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n", &r2);
+    ASSERT_EQ_INT(500, resp_status(&r2));
+    finish(&fx, &cs, st2, &r2);
+
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* ---- 12e. A POST with a declared EMPTY body ------------------------------
+ *
+ * The seam between cloak_http_parser_t and cloak_user_json_decode at
+ * content_length 0, which nothing above the unit level asserted. The
+ * parser must reach DONE at the blank line (see test_http_parse.c's own
+ * Content-Length: 0 cases -- without that clause this request never
+ * completes and the stream is answered only by its deadline), and the
+ * decoder must refuse an empty document, so the correct answer is a
+ * prompt 400 and NO row. */
+
+static void test_post_with_empty_body(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, "emptybody"));
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 21));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    make_uid(uid, 0xC1);
+    char up[64];
+    uid_url(uid, up, sizeof(up));
+    char reqbuf[256];
+    snprintf(reqbuf, sizeof(reqbuf),
+             "POST /admin/users/%s HTTP/1.1\r\nHost: admin\r\nContent-Length: 0\r\n\r\n", up);
+
+    resp_t r;
+    cloak_stream_t *st = request(&fx, &cs, reqbuf, &r);
+    ASSERT_EQ_INT(400, resp_status(&r));
+    finish(&fx, &cs, st, &r);
+
+    cloak_user_info_t got;
+    ASSERT_EQ_INT(CLOAK_USER_ERR_NOT_FOUND, cloak_usermanager_get(fx.manager, uid, &got));
+
+    /* A POST with NO Content-Length at all takes the same path by a
+     * different route: the parser reports no body rather than an empty
+     * one, and the router must not tell the two apart. */
+    snprintf(reqbuf, sizeof(reqbuf), "POST /admin/users/%s HTTP/1.1\r\nHost: admin\r\n\r\n", up);
+    resp_t r2;
+    cloak_stream_t *st2 = request(&fx, &cs, reqbuf, &r2);
+    ASSERT_EQ_INT(400, resp_status(&r2));
+    finish(&fx, &cs, st2, &r2);
+    ASSERT_EQ_INT(CLOAK_USER_ERR_NOT_FOUND, cloak_usermanager_get(fx.manager, uid, &got));
+
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* ---- 12f. A query string is stripped before routing ----------------------
+ *
+ * Go's gorilla/mux matches on r.URL.Path, which excludes the query, so a
+ * router that matched the raw target would answer 404 for
+ * /admin/users?x=1 and 400 for /admin/users/<uid>?x=1 -- two divergences
+ * from upstream, neither visible to any other case here. */
+
+static void test_query_string_is_stripped(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, "query"));
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 22));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    make_uid(uid, 0xD1);
+    cloak_user_info_t seed;
+    memset(&seed, 0, sizeof(seed));
+    memcpy(seed.uid, uid, CLOAK_UID_LEN);
+    seed.sessions_cap = 6;
+    ASSERT_EQ_INT(0, cloak_usermanager_write(fx.manager, &seed, CLOAK_USER_FIELD_ALL));
+
+    resp_t r;
+    cloak_stream_t *st =
+        request(&fx, &cs, "GET /admin/users?limit=1&x=2 HTTP/1.1\r\nHost: admin\r\n\r\n", &r);
+    ASSERT_EQ_INT(200, resp_status(&r));
+    finish(&fx, &cs, st, &r);
+
+    char up[64], reqbuf[256];
+    uid_url(uid, up, sizeof(up));
+    snprintf(reqbuf, sizeof(reqbuf), "GET /admin/users/%s?x=1 HTTP/1.1\r\nHost: admin\r\n\r\n",
+             up);
+    resp_t r2;
+    cloak_stream_t *st2 = request(&fx, &cs, reqbuf, &r2);
+    ASSERT_EQ_INT(200, resp_status(&r2));
+    /* The UID really was decoded from the path and not from the path plus
+     * the query: this is the stored row, not a 404. */
+    size_t blen = 0;
+    const char *body = resp_body(&r2, &blen);
+    ASSERT_TRUE(blen > 0 && body != NULL);
+    finish(&fx, &cs, st2, &r2);
+
+    /* A bare "?" is an empty query, and the path still ends at it. */
+    snprintf(reqbuf, sizeof(reqbuf), "DELETE /admin/users/%s? HTTP/1.1\r\nHost: admin\r\n\r\n",
+             up);
+    resp_t r3;
+    cloak_stream_t *st3 = request(&fx, &cs, reqbuf, &r3);
+    ASSERT_EQ_INT(200, resp_status(&r3));
+    finish(&fx, &cs, st3, &r3);
+    cloak_user_info_t gone;
+    ASSERT_EQ_INT(CLOAK_USER_ERR_NOT_FOUND, cloak_usermanager_get(fx.manager, uid, &gone));
+
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
 /* ---- 13. Parser errors become response statuses --------------------------
  *
  * The router does not re-derive these; it forwards what the parser
@@ -1635,6 +1899,10 @@ TEST_MAIN_BEGIN()
     test_abandoned_stream_hits_its_deadline();
     test_session_broken_mid_response();
     test_deadline_bounds_the_write_half();
+    test_late_bytes_do_not_restart_the_response();
+    test_listing_cap_at_the_default();
+    test_post_with_empty_body();
+    test_query_string_is_stripped();
     test_parser_errors_are_forwarded();
     test_stream_cap();
     test_listing_cap_refuses();
