@@ -398,6 +398,112 @@ static void test_get_user_activates_and_returns_rates(void) {
 /* 2. get_bypass_user never consults the manager -- proven by running    */
 /*    the whole panel over a VOID one, where any consultation fails.     */
 /* ------------------------------------------------------------------ */
+/* A valve clock that never advances -- see its one use below. */
+static uint64_t frozen_valve_clock(void *userdata) {
+    return *(const uint64_t *)userdata;
+}
+
+/* THE up/down -> rx/tx CONVERSION, on the way IN.
+ *
+ * cloak/valve.h fixes the vocabulary in writing because getting it wrong
+ * is silent: a user's UPLOAD is the server's RX, a user's DOWNLOAD is the
+ * server's TX, and there are exactly two places in this tree where the
+ * two vocabularies meet -- panel_drain_user reading OUT of a valve, and
+ * cloak_userpanel_get_user's cloak_valve_set_rates writing IN. This case
+ * pins the second one. Nothing else can: transposing those two arguments
+ * throttles every user's download against their upload allowance, raises
+ * no error anywhere, and passed all 45 tests of this suite before this
+ * case existed.
+ *
+ * ASYMMETRIC BY CONSTRUCTION, in both directions. Each user has exactly
+ * one rate set and the other at 0 (unlimited), and the two users are
+ * mirror images -- so a transposition cannot produce the same numbers by
+ * accident in either half, and neither half can pass on its own. The
+ * expected values are literals, not recomputed from the row. */
+static void test_rates_reach_the_valve_in_the_right_direction(void) {
+    char path[512];
+    char err[256];
+    int64_t now = T_NOW;
+    up_tmp_path(path, sizeof(path), "ratedir");
+    up_unlink(path);
+
+    cloak_usermanager_t *m = NULL;
+    ASSERT_EQ_INT(0, cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)));
+    /*                 cap  up_rate  down_rate  up_credit  down_credit */
+    put_user(m, 0x21, 4, 7000, 0, 1000000, 2000000);  /* upload-limited only   */
+    put_user(m, 0x22, 4, 0, 9000, 1000000, 2000000);  /* download-limited only */
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    chain_ctx_t chain = {NULL, 0};
+    cloak_server_registry_t reg;
+    ASSERT_EQ_INT(0, cloak_server_registry_init(&reg, r, on_registry_broken, &chain));
+
+    cloak_userpanel_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.manager = m;
+    pcfg.registry = &reg;
+    pcfg.reactor = r;
+    pcfg.upload_interval_ms = 60000; /* long: nothing here wants a tick */
+    pcfg.now_fn = fake_now;
+    pcfg.now_userdata = &now;
+    pcfg.no_relays = 1;
+
+    cloak_userpanel_t *panel = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
+    chain.panel = panel;
+
+    uint8_t uid_up[CLOAK_UID_LEN], uid_down[CLOAK_UID_LEN];
+    mk_uid(uid_up, 0x21);
+    mk_uid(uid_down, 0x22);
+
+    /* up_rate 7000, down_rate 0. A user's upload is the server's RX, so
+     * rx is the throttled direction: the bucket starts full and its
+     * capacity is one second of the rate, hence exactly 7000. tx has no
+     * rate at all and grants whatever is asked for. */
+    cloak_userpanel_user_t *u_up = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, uid_up, &u_up));
+    ASSERT_TRUE(u_up != NULL);
+    cloak_valve_t *v_up = cloak_userpanel_user_valve(u_up);
+    ASSERT_TRUE(v_up != NULL);
+    ASSERT_EQ_INT(7000, cloak_valve_take_rx(v_up, 1000000));
+    ASSERT_EQ_INT(1000000, cloak_valve_take_tx(v_up, 1000000));
+
+    /* The mirror: up_rate 0, down_rate 9000. A user's download is the
+     * server's TX, so now tx is the throttled direction and rx is the
+     * free one -- every assertion above flips, which is what a single
+     * transposed pair of arguments cannot survive. */
+    cloak_userpanel_user_t *u_down = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, uid_down, &u_down));
+    ASSERT_TRUE(u_down != NULL);
+    cloak_valve_t *v_down = cloak_userpanel_user_valve(u_down);
+    ASSERT_TRUE(v_down != NULL);
+    ASSERT_EQ_INT(9000, cloak_valve_take_tx(v_down, 1000000));
+    ASSERT_EQ_INT(1000000, cloak_valve_take_rx(v_down, 1000000));
+
+    /* The two are separate buckets on separate users, not one shared
+     * one: spending the first user's rx leaves the second's alone.
+     *
+     * The clock is frozen first. The panel gives its valves the real
+     * CLOCK_MONOTONIC, which is correct in production and wrong for an
+     * exact assertion about an emptied bucket -- a millisecond of SQLite
+     * work between the spend and the read refills it by a few bytes, and
+     * this assertion read 7 instead of 0 on roughly one ASan run in
+     * twenty before the freeze. Nothing above it needs the freeze: a
+     * full bucket is capped at its capacity however long has passed. */
+    uint64_t frozen = 9000000;
+    cloak_valve_set_clock(v_up, frozen_valve_clock, &frozen);
+    cloak_valve_add_rx(v_up, 7000);
+    ASSERT_EQ_INT(0, cloak_valve_take_rx(v_up, 1000000));
+    ASSERT_EQ_INT(1000000, cloak_valve_take_rx(v_down, 1000000));
+
+    cloak_server_registry_destroy(&reg);
+    cloak_userpanel_close(panel);
+    cloak_usermanager_close(m);
+    cloak_reactor_destroy(r);
+    up_unlink(path);
+}
+
 static void test_bypass_user_never_touches_the_manager(void) {
     char err[256];
     int64_t now = T_NOW;
@@ -1741,6 +1847,7 @@ static void test_queue_full_forces_an_upload(void) {
 
 TEST_MAIN_BEGIN()
 test_get_user_activates_and_returns_rates();
+test_rates_reach_the_valve_in_the_right_direction();
 test_bypass_user_never_touches_the_manager();
 test_usage_reaches_the_database_on_the_timer();
 test_user_out_of_credit_is_terminated();

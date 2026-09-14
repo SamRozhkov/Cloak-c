@@ -378,14 +378,23 @@ int cloak_userpanel_get_user(cloak_userpanel_t *p, const uint8_t uid[CLOAK_UID_L
     u->up_rate = up_rate;
     u->down_rate = down_rate;
 
-    /* THE SECOND (AND LAST) up/down -> rx/tx CONVERSION SITE, the other
-     * being panel_drain_user above. A user's UPLOAD is the server's RX;
-     * a user's DOWNLOAD is the server's TX -- so up_rate paces rx and
+    /* THIS IS THE SINGLE POINT AT WHICH A USER'S up/down BECOMES THE
+     * SERVER'S rx/tx ON THE WAY IN -- the only other conversion in this
+     * tree is panel_drain_user above, which does the same conversion in
+     * the same direction on the way OUT. A user's UPLOAD is the server's
+     * RX; a user's DOWNLOAD is the server's TX. So up_rate paces rx and
      * down_rate paces tx, and transposing them would throttle every
      * user's download against their upload allowance with no error
-     * raised anywhere. cloak/valve.h states the rule and forbids a
-     * third site; the two that exist are the same conversion in the same
-     * direction, one reading out of the valve and this one writing in.
+     * raised anywhere. cloak/valve.h states the rule and forbids a third
+     * site.
+     *
+     * THE TEST THAT PINS THIS LINE is
+     * test_rates_reach_the_valve_in_the_right_direction, in
+     * libcloak-server/tests/test_userpanel.c. It gives one user an
+     * up_rate and no down_rate and another the mirror image, so a
+     * transposition cannot produce the same numbers in either half.
+     * Nothing else in the suite catches it: before that case existed,
+     * swapping these two arguments left all 45 tests green.
      *
      * A rate of 0 (unthrottled, and what every row that never set one
      * holds) leaves the bucket doing no arithmetic at all, which is why
