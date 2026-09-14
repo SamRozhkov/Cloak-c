@@ -567,17 +567,51 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
          * reach from here. */
         return;
     }
+    /* THE UID IS COPIED BEFORE ANY BOOKKEEPING RUNS, and this is a
+     * use-after-free fix, not tidiness. `uid` points INTO the registry
+     * entry that is breaking (registry.c passes entry->uid), and the
+     * bookkeeping below can reach cloak_userpanel_terminate, which calls
+     * cloak_server_registry_close_all_for_uid -- a function that
+     * deliberately does not skip dead entries and therefore frees THIS
+     * one, uid storage and session both, synchronously. Forwarding the
+     * caller's pointer to the chain after that hands the owner's link a
+     * dangling 16 bytes; the obvious thing an owner does with it (log it,
+     * key its own bookkeeping by it) then reads freed memory. Found by
+     * test_dispatcher_admin.c's chain case under ASan -- the first test
+     * to assemble all four links and actually READ what the last one is
+     * handed. */
+    uint8_t uid_copy[CLOAK_UID_LEN];
+    const uint8_t *chain_uid = NULL;
+    int destroyed_the_session = 0;
     if (uid != NULL) {
+        memcpy(uid_copy, uid, CLOAK_UID_LEN);
+        chain_uid = uid_copy;
+        /* Was this user still active before, and gone after? Then the
+         * termination above ran, and with it the close_all_for_uid that
+         * destroyed and freed the very session `sesh` points at. */
+        int was_active = cloak_userpanel_find(p, uid) != NULL;
         cloak_userpanel_notify_session_closed(p, uid);
+        destroyed_the_session = was_active && cloak_userpanel_find(p, uid_copy) == NULL;
     }
 
     /* AFTER this module's own bookkeeping, and unconditionally -- a NULL
      * uid included. This is the last module-level link of the chain
      * described at the top of cloak/userpanel.h, and an owner's own
      * notification must not be swallowed just because THIS module had
-     * nothing to do for that session. */
+     * nothing to do for that session.
+     *
+     * sesh is NULL when the bookkeeping above destroyed it. The registry
+     * promises a cloak_registry_broken_cb that sesh stays usable for the
+     * whole of the callback and is freed only on a later turn (cloak/
+     * registry.h) -- a promise THIS module is the one thing in the chain
+     * that can break, and it cannot keep it for a user it just
+     * terminated. Handing the owner NULL says so in the type instead of
+     * leaving a live-looking pointer to a destroyed session, which is
+     * this project's usual preference where an obligation can be made
+     * structural. */
     if (p->cfg.chain != NULL) {
-        p->cfg.chain(reg, sesh, uid, session_id, p->cfg.chain_userdata);
+        p->cfg.chain(reg, destroyed_the_session ? NULL : sesh, chain_uid, session_id,
+                     p->cfg.chain_userdata);
     }
 }
 

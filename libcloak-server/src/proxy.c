@@ -613,10 +613,22 @@ int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_client
 
     const cloak_addr_t *upstream = cloak_server_lookup_proxy(p->cfg.srv, info->proxy_method);
     if (upstream == NULL) {
-        /* A caller bug, not an attacker: the dispatcher already rejected
-         * unknown proxy methods before reaching here, so this means this
-         * proxy and that dispatcher were handed different cloak_server_t
-         * instances. Degrade to a redirect rather than dereference NULL. */
+        /* TWO WAYS TO GET HERE, and neither may dereference NULL.
+         *
+         * 1. AN ADMIN SESSION ROUTED TO THE PROXY. dispatcher.c's step 7
+         *    deliberately does NOT check the proxy method of an admin
+         *    session (its step 6a explains why: a real `ck-client -a`
+         *    sends whatever method its config names), so an owner with no
+         *    cloak_adminapi_t -- every caller written before that module
+         *    existed -- hands such a connection here with a method this
+         *    server may well not offer. Refusing it is the right answer
+         *    and the pre-existing one: the -1 redirects the connection to
+         *    the cover site exactly as the dispatcher's own check did
+         *    before.
+         * 2. A caller bug: this proxy and that dispatcher were handed
+         *    different cloak_server_t instances.
+         *
+         * Either way, degrade to a redirect. */
         return -1;
     }
     if (upstream->socktype != SOCK_STREAM) {

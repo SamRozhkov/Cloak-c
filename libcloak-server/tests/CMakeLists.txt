@@ -240,3 +240,15 @@ target_include_directories(test_adminapi PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-co
 target_link_libraries(test_adminapi PRIVATE cloak-server sqlite3)
 add_test(NAME test_adminapi COMMAND test_adminapi)
 set_tests_properties(test_adminapi PROPERTIES TIMEOUT 60)
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_dispatcher_users.c and
+# test_adminapi.c do: this file seeds and reads user rows through
+# cloak_usermanager_write/get to assert that an admin session leaves the
+# database untouched, and cloak-server's PRIVATE sqlite3 link deliberately
+# does not propagate the include path its implementation uses.
+add_executable(test_dispatcher_admin test_dispatcher_admin.c)
+target_include_directories(test_dispatcher_admin PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_admin PRIVATE cloak-server sqlite3)
+add_test(NAME test_dispatcher_admin COMMAND test_dispatcher_admin)
+set_tests_properties(test_dispatcher_admin PROPERTIES TIMEOUT 60)

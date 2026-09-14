@@ -277,7 +277,27 @@ typedef struct {
      * earlier link passes on when it has no key of its own) and for a uid
      * this panel has no active user for: this function never swallows a
      * broken notification. The one case where nothing happens at all is a
-     * NULL panel, since the chain itself lives on the panel. */
+     * NULL panel, since the chain itself lives on the panel.
+     *
+     * TWO ARGUMENTS ARE NOT WHAT THE EARLIER LINKS SAW, because this
+     * module's own bookkeeping can invalidate them both before this link
+     * runs -- a broken session that was its user's LAST one terminates
+     * that user, and cloak_userpanel_terminate closes its sessions
+     * through cloak_server_registry_close_all_for_uid, which frees the
+     * breaking registry entry outright:
+     *
+     *   - uid points at a COPY this module took before that could happen,
+     *     not at the registry entry the earlier links were handed. It is
+     *     valid for the duration of this call and no longer.
+     *   - sesh is NULL whenever that termination destroyed the session
+     *     (and unchanged otherwise). cloak/registry.h promises a broken
+     *     callback that sesh survives the whole callback; this module is
+     *     the only link that can break that promise, and it says so with
+     *     a NULL rather than with a pointer to freed memory.
+     *
+     * An owner's link must therefore key its bookkeeping off uid and
+     * session_id, and must treat a non-NULL sesh as usable only for the
+     * duration of the call. */
     cloak_registry_broken_cb chain;
     void *chain_userdata;
 } cloak_userpanel_config_t;

@@ -91,6 +91,14 @@ int cloak_server_auth_decrypt(const uint8_t random[32],
     out->encryption_method = plaintext[28];
     out->session_id = load_be32(plaintext + 37);
     out->unordered = (plaintext[41] & CLOAK_SERVER_AUTH_UNORDERED_FLAG) != 0;
+    /* NOT a wire field: there is no admin bit in the payload and there
+     * must not be one -- an attacker would set it. It is the dispatcher's
+     * verdict about the UID this function just decrypted, and it is
+     * written here only so that no caller can ever read it uninitialized:
+     * this function assigns every other field rather than zeroing *out,
+     * so an unassigned field would be whatever the caller's stack held.
+     * See cloak/server_auth.h's own comment on the field. */
+    out->is_admin = 0;
 
     memcpy(out_shared_secret, shared_secret, CLOAK_AEAD_KEY_LEN);
     return 0;
