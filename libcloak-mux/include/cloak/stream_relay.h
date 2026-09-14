@@ -110,9 +110,11 @@ struct cloak_stream_relay {
      * is given, so the fd is only read while the session has room. */
     cloak_bytequeue_t to_fd;
 
-    /* 1 while read interest on fd is deregistered because the session's
-     * outbound pool currently has no room at all (see
-     * stream_relay_fd_read_budget in stream_relay.c). */
+    /* 1 while read interest on fd is deregistered, for either of the two
+     * reasons stream_relay_fd_read_budget can report no room: the
+     * session's outbound pool has no space for a whole frame, or the
+     * user's tx token bucket is empty. The two are resumed by completely
+     * different things -- see rate_timer. */
     int fd_read_paused;
     uint32_t interest;
     int stream_ended;
@@ -133,6 +135,26 @@ struct cloak_stream_relay {
      * actually runs. cloak_stream_relay_stop cancels it if the caller
      * stops the relay before it fires. */
     cloak_timer_id_t finish_timer;
+
+    /* Non-CLOAK_TIMER_INVALID while a resume is pending for a read
+     * paused by an EMPTY TX TOKEN BUCKET, as opposed to a full pool.
+     *
+     * The distinction is the whole reason this field exists rather than
+     * reusing the pool's resume path. A pool-bound pause is resumed by
+     * the session's own drained notification, an event that is certain
+     * to arrive because something is queued and will be written. A
+     * rate-bound pause is resumed by nothing whatsoever: no queue
+     * drains, the upstream fd's readiness edge is already spent, and the
+     * peer has no reason to act. Only the clock changes. A rate-bound
+     * pause that returned without arming this is a relay that holds an
+     * open fd and a live stream and never moves another byte, which is
+     * indistinguishable from a working one until someone notices the
+     * transfer stopped -- and this project has already shipped that
+     * exact defect once (see cloak_stream_relay_start's -2 return).
+     *
+     * Cancelled by stream_relay_teardown, so it can never fire against a
+     * relay that is gone. */
+    cloak_timer_id_t rate_timer;
 
     cloak_stream_relay_done_cb on_done;
     void *on_done_userdata;

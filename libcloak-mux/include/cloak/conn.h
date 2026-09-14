@@ -73,6 +73,16 @@ struct cloak_conn {
 
     int broken;
     int want_writable; /* whether EPOLLWRITABLE is currently part of our registered interest */
+
+    /* 1 while READABLE has been dropped from the registered interest
+     * because the valve's rx token bucket is empty. Unlike every other
+     * pause in this codebase, nothing in the system will resume this one
+     * -- only the clock will -- so it is never set without
+     * rx_resume_timer being armed in the same breath. */
+    int read_paused;
+    cloak_timer_id_t rx_resume_timer; /* CLOAK_TIMER_INVALID when none is pending */
+
+    uint32_t interest; /* the mask currently registered with the reactor */
 };
 
 /* max_frame_len is the largest single frame's on-wire byte length this

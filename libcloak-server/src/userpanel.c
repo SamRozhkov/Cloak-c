@@ -378,6 +378,20 @@ int cloak_userpanel_get_user(cloak_userpanel_t *p, const uint8_t uid[CLOAK_UID_L
     u->up_rate = up_rate;
     u->down_rate = down_rate;
 
+    /* THE SECOND (AND LAST) up/down -> rx/tx CONVERSION SITE, the other
+     * being panel_drain_user above. A user's UPLOAD is the server's RX;
+     * a user's DOWNLOAD is the server's TX -- so up_rate paces rx and
+     * down_rate paces tx, and transposing them would throttle every
+     * user's download against their upload allowance with no error
+     * raised anywhere. cloak/valve.h states the rule and forbids a
+     * third site; the two that exist are the same conversion in the same
+     * direction, one reading out of the valve and this one writing in.
+     *
+     * A rate of 0 (unthrottled, and what every row that never set one
+     * holds) leaves the bucket doing no arithmetic at all, which is why
+     * this is unconditional rather than guarded. */
+    cloak_valve_set_rates(&u->valve, /* rx = */ up_rate, /* tx = */ down_rate);
+
     char b64[33];
     panel_uid_str(uid, b64);
     CLOAK_LOGI("userpanel: new active user %s", b64);

@@ -322,4 +322,15 @@ size_t cloak_session_send_capacity(const cloak_session_t *sesh);
  * (see stream_relay.c's own rationale). */
 size_t cloak_session_send_min_conn_free(const cloak_session_t *sesh);
 
+/* The valve this session was configured with (NULL for an unmetered
+ * session -- cloak/valve.h). Borrowed, never to be freed here.
+ *
+ * Exposed for cloak_stream_relay_t, which has to consult the user's tx
+ * token bucket to size its reads and holds a cloak_session_t * but no
+ * valve of its own: the valve is per-USER and a relay is per-STREAM, so
+ * routing it through the session is what keeps every stream of every
+ * session of one user paced against one bucket. NULL sesh reports
+ * NULL. */
+cloak_valve_t *cloak_session_valve(const cloak_session_t *sesh);
+
 #endif

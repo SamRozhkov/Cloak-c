@@ -583,3 +583,14 @@ size_t cloak_session_send_min_conn_free(const cloak_session_t *sesh) {
     }
     return cloak_switchboard_send_min_conn_free(&sesh->sb);
 }
+
+cloak_valve_t *cloak_session_valve(const cloak_session_t *sesh) {
+    if (sesh == NULL) {
+        return NULL;
+    }
+    /* Read back from the switchboard rather than stored a second time on
+     * the session: cloak_switchboard_set_valve is what every connection
+     * in the pool is actually metered against, so a separate copy here
+     * could disagree with the thing doing the counting. */
+    return sesh->sb.valve;
+}

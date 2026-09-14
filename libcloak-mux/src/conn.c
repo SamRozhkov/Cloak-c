@@ -6,13 +6,45 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* The interest mask this connection wants right now.
+ *
+ * READABLE is dropped for exactly one reason: the user's rx token bucket
+ * is empty and the connection has been told to stop pulling bytes off
+ * the wire until it refills (see conn_pause_read_for_rate). There is no
+ * other recv-side backpressure here and there never was -- recv_acc is
+ * sized so it cannot fill (cloak_conn_init). */
+static uint32_t conn_desired_interest(const cloak_conn_t *c) {
+    uint32_t events = 0;
+    if (!c->read_paused) {
+        events |= CLOAK_REACTOR_READABLE;
+    }
+    if (c->want_writable) {
+        events |= CLOAK_REACTOR_WRITABLE;
+    }
+    return events;
+}
+
+/* Re-issues the registered mask whenever it differs from what is already
+ * registered. The unequal test also means that resuming a paused read
+ * takes the mask from (possibly) 0 back to READABLE, and that transition
+ * is what RE-ARMS an edge-triggered fd: without it, bytes that arrived
+ * while the read was paused would already be past their edge and would
+ * never be reported again. */
+static void conn_sync_interest(cloak_conn_t *c) {
+    uint32_t events = conn_desired_interest(c);
+    if (events == c->interest) {
+        return;
+    }
+    c->interest = events;
+    cloak_reactor_mod_fd(c->reactor, c->fd, events);
+}
+
 static void conn_set_want_writable(cloak_conn_t *c, int want) {
     if (c->want_writable == want) {
         return;
     }
     c->want_writable = want;
-    uint32_t events = CLOAK_REACTOR_READABLE | (want ? CLOAK_REACTOR_WRITABLE : 0);
-    cloak_reactor_mod_fd(c->reactor, c->fd, events);
+    conn_sync_interest(c);
 }
 
 static void conn_mark_broken(cloak_conn_t *c) {
@@ -20,6 +52,12 @@ static void conn_mark_broken(cloak_conn_t *c) {
         return; /* idempotent -- already reported */
     }
     c->broken = 1;
+    /* Cancelled here as well as in cloak_conn_destroy: the owner is free
+     * to destroy and free this connection from within on_closed, and a
+     * still-pending resume timer holding c as userdata would then fire
+     * on freed memory. */
+    cloak_reactor_cancel_timer(c->reactor, c->rx_resume_timer);
+    c->rx_resume_timer = CLOAK_TIMER_INVALID;
     cloak_reactor_remove_fd(c->reactor, c->fd);
     if (c->on_closed) {
         c->on_closed(c, c->on_closed_userdata);
@@ -113,6 +151,64 @@ static void conn_extract_and_dispatch(cloak_conn_t *c) {
     }
 }
 
+static void conn_rx_resume_cb(cloak_reactor_t *r, void *userdata);
+
+/* Stops pulling bytes off this socket until the user's rx bucket has
+ * something to give, and ARMS THE TIMER THAT WILL UNDO THAT before it
+ * returns.
+ *
+ * The arming is not optional and is not a nicety. Every other pause in
+ * this codebase is resumed by an event that is already guaranteed to
+ * happen (a queue drains, a peer writes). This one is resumed by nothing
+ * at all: the bytes are already sitting in the socket, their readiness
+ * edge has been consumed, the peer has no reason to send more, and the
+ * only thing that will ever change is the clock. A pause here that
+ * returned without a timer would be a connection that looks healthy,
+ * holds an open fd and a live session, and never moves another byte --
+ * see cloak_valve_take_rx's own contract in cloak/valve.h. */
+static void conn_pause_read_for_rate(cloak_conn_t *c) {
+    if (c->rx_resume_timer == CLOAK_TIMER_INVALID) {
+        uint64_t delay = cloak_valve_rx_resume_delay_ms(c->valve);
+        if (delay == 0) {
+            delay = 1; /* unreachable: the take that brought us here
+                        * returned 0, so the bucket owes at least 1 ms.
+                        * A zero-delay timer would spin, so it is floored
+                        * rather than trusted. */
+        }
+        c->rx_resume_timer = cloak_reactor_add_timer(c->reactor, delay, conn_rx_resume_cb, c);
+        if (c->rx_resume_timer == CLOAK_TIMER_INVALID) {
+            /* The timer heap could not grow. Pausing now would be the
+             * permanent stall described above, so the connection is
+             * broken instead: a reported failure the owner can act on
+             * beats a silent hang it cannot even detect. */
+            conn_mark_broken(c);
+            return;
+        }
+    }
+    c->read_paused = 1;
+    conn_sync_interest(c);
+}
+
+static void conn_handle_readable(cloak_conn_t *c);
+
+static void conn_rx_resume_cb(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    cloak_conn_t *c = (cloak_conn_t *)userdata;
+    c->rx_resume_timer = CLOAK_TIMER_INVALID;
+    if (c->broken) {
+        return;
+    }
+    c->read_paused = 0;
+    conn_sync_interest(c);
+    /* Pull now as well as re-arming the mask. The re-arm alone would be
+     * enough on Linux (an EPOLL_CTL_MOD re-reports an edge-triggered fd
+     * that is still ready), but this call makes the resume independent
+     * of that: if the bucket refilled, the bytes move on this turn, and
+     * the one thing this whole mechanism must never do is depend on a
+     * second event to finish what a timer started. */
+    conn_handle_readable(c);
+}
+
 static void conn_handle_readable(cloak_conn_t *c) {
     for (;;) {
         size_t room = cloak_bytequeue_free_space(&c->recv_acc);
@@ -121,6 +217,28 @@ static void conn_handle_readable(cloak_conn_t *c) {
         }
         uint8_t tmp[4096];
         size_t want = room < sizeof(tmp) ? room : sizeof(tmp);
+        /* RATE LIMITING POINT, rx half. Go's LimitedValve.rxWait, which
+         * BLOCKS the deplexing goroutine until the bucket has n tokens.
+         * Nothing here may block, so the shape is inverted: ask how many
+         * bytes may move, read at most that many, and when the answer is
+         * zero stop reading and let a timer bring us back.
+         *
+         * Here, on the raw socket read, for the same reason the counter
+         * on the next-but-one line is here: these are the bytes the peer
+         * makes this host receive, and the only way not to receive them
+         * is not to ask for them. There is no point further in that
+         * could refuse anything -- by then they are already in.
+         *
+         * rx/tx here are the SERVER's directions, NOT the user manager's
+         * up/down -- see cloak/valve.h before touching this line. */
+        int64_t allowed = cloak_valve_take_rx(c->valve, (int64_t)want);
+        if (allowed <= 0) {
+            conn_pause_read_for_rate(c);
+            return;
+        }
+        if ((size_t)allowed < want) {
+            want = (size_t)allowed;
+        }
         ssize_t n = read(c->fd, tmp, want);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -218,11 +336,18 @@ int cloak_conn_init(cloak_conn_t *c, int fd, cloak_reactor_t *reactor,
         cloak_bytequeue_destroy(&c->send_q);
         return -1;
     }
+    /* Mirror what was just registered, so conn_sync_interest's
+     * "unchanged mask" test starts out telling the truth. */
+    c->interest = CLOAK_REACTOR_READABLE;
     return 0;
 }
 
 void cloak_conn_destroy(cloak_conn_t *c) {
     if (c->reactor != NULL) {
+        /* Before the memset below wipes the id: a resume timer that
+         * outlived its connection fires with a dangling userdata. */
+        cloak_reactor_cancel_timer(c->reactor, c->rx_resume_timer);
+        c->rx_resume_timer = CLOAK_TIMER_INVALID;
         cloak_reactor_remove_fd(c->reactor, c->fd); /* no-op-with-error-return if already removed */
     }
     free(c->recv_scratch);

@@ -74,17 +74,62 @@ static size_t stream_relay_frame_cost(const cloak_stream_relay_t *sr) {
  * actually binds is one connection's own cap. Budgeting off the minimum
  * instead guarantees the number of frames this call permits will fit
  * REGARDLESS of which connection cloak_switchboard_send's next random
- * pick lands on -- the guarantee this object actually needs to make. */
-static size_t stream_relay_fd_read_budget(const cloak_stream_relay_t *sr) {
+ * pick lands on -- the guarantee this object actually needs to make.
+ *
+ * THE SECOND CONSTRAINT, folded into the same minimum: the user's tx
+ * token bucket. Go limits this direction with LimitedValve.txWait, which
+ * BLOCKS a goroutine until the bucket has enough; this reactor has no
+ * thread to block, so the limit is applied by READING LESS instead. The
+ * bytes are never pulled off the upstream socket in the first place,
+ * which is why the limit lands here and not on the send side:
+ * cloak_stream_write deliberately cannot fail on a full queue (see
+ * cloak/stream_relay.h), so a frame the switchboard declined would have
+ * nowhere to go and no way to be retried.
+ *
+ * *out_rate_delay_ms IS THE DIFFERENCE BETWEEN THE TWO ZEROES, and
+ * getting it wrong is the stall this file has already shipped once. A
+ * zero from the pool above is resumed by the pool draining, which is an
+ * event that will happen and which cloak_stream_relay_notify_writable
+ * already handles. A zero from the bucket is resumed by NOTHING: no
+ * queue drains, no peer acts, only time passes. So this reports, in
+ * milliseconds, how long the caller must arm a timer for -- non-zero if
+ * and only if the bucket is the reason the answer was 0, and the caller
+ * must arm it before it pauses. */
+static size_t stream_relay_fd_read_budget(cloak_stream_relay_t *sr, uint64_t *out_rate_delay_ms) {
+    *out_rate_delay_ms = 0;
+
     size_t min_free = cloak_session_send_min_conn_free(sr->sesh);
     size_t frame_cost = stream_relay_frame_cost(sr);
     size_t frames = min_free / frame_cost;
     if (frames == 0) {
-        return 0;
+        return 0; /* pool-bound: the session's drained path owns this resume */
     }
     size_t budget = frames * sr->stream->max_payload_per_frame;
-    return budget < STREAM_RELAY_CHUNK ? budget : STREAM_RELAY_CHUNK;
+    if (budget > STREAM_RELAY_CHUNK) {
+        budget = STREAM_RELAY_CHUNK;
+    }
+
+    /* rx/tx here are the SERVER's directions, NOT the user manager's
+     * up/down -- see cloak/valve.h before touching this line. A relay
+     * pulling from its fd and pushing into the stream is producing
+     * server-to-client traffic, i.e. tx. */
+    cloak_valve_t *valve = cloak_session_valve(sr->sesh);
+    int64_t allowed = cloak_valve_take_tx(valve, (int64_t)budget);
+    if (allowed <= 0) {
+        *out_rate_delay_ms = cloak_valve_tx_resume_delay_ms(valve);
+        return 0;
+    }
+    /* cloak_valve_take_tx never returns more than it was asked for, so
+     * this is already within the pool-derived bound computed above. */
+    return (size_t)allowed;
 }
+
+/* Arms the timer that resumes a read paused by an empty tx bucket.
+ * Leaves an already-pending one alone: it will fire, find the bucket
+ * still empty, and re-arm itself, so replacing it could only move the
+ * deadline, never fix anything. Returns -1 if the timer could not be
+ * armed at all, which is the one outcome the caller must not ignore. */
+static int stream_relay_arm_rate_timer(cloak_stream_relay_t *sr, uint64_t delay_ms);
 
 /* True once the relay has finished, or has already decided to finish and
  * is only waiting for its deferred zero-delay timer to run the actual
@@ -250,15 +295,28 @@ static int pump_stream_to_fd(cloak_stream_relay_t *sr) {
     return 0;
 }
 
-/* Reads the fd into the stream while the session has room, never asking
- * for more than stream_relay_fd_read_budget currently allows. Returns 0
- * to continue, -1 if the relay should tear down. */
+/* Reads the fd into the stream while the session has room and the user's
+ * tx bucket has tokens, never asking for more than
+ * stream_relay_fd_read_budget currently allows. Returns 0 to continue,
+ * -1 if the relay should tear down. */
 static int pump_fd_to_stream(cloak_stream_relay_t *sr) {
     uint8_t buf[STREAM_RELAY_CHUNK];
     for (;;) {
-        size_t budget = stream_relay_fd_read_budget(sr);
+        uint64_t rate_delay = 0;
+        size_t budget = stream_relay_fd_read_budget(sr, &rate_delay);
         if (budget == 0) {
-            /* Stop reading; cloak_stream_relay_notify_writable re-arms. */
+            /* A pool-bound pause is re-armed by
+             * cloak_stream_relay_notify_writable when the pool drains. A
+             * rate-bound pause has no such event behind it and MUST arm
+             * its own timer before returning -- see
+             * stream_relay_fd_read_budget. */
+            if (rate_delay > 0 && stream_relay_arm_rate_timer(sr, rate_delay) != 0) {
+                /* Could not arm. Pausing anyway is the permanent stall
+                 * this whole mechanism exists to be incapable of, so the
+                 * relay finishes instead: a closed stream the owner sees
+                 * beats a live one that never moves again. */
+                return -1;
+            }
             sr->fd_read_paused = 1;
             return 0;
         }
@@ -319,6 +377,13 @@ static void stream_relay_teardown(cloak_stream_relay_t *sr, int fire_done) {
         cloak_reactor_cancel_timer(sr->reactor, sr->finish_timer);
         sr->finish_timer = CLOAK_TIMER_INVALID;
     }
+    if (sr->rate_timer != CLOAK_TIMER_INVALID) {
+        /* A resume timer that outlived its relay fires with a dangling
+         * userdata. Cancelled unconditionally here, which is the one
+         * teardown path this file has. */
+        cloak_reactor_cancel_timer(sr->reactor, sr->rate_timer);
+        sr->rate_timer = CLOAK_TIMER_INVALID;
+    }
 
     if (sr->fd >= 0) {
         cloak_reactor_remove_fd(sr->reactor, sr->fd);
@@ -337,6 +402,58 @@ static void stream_relay_teardown(cloak_stream_relay_t *sr, int fire_done) {
     if (fire_done && sr->on_done != NULL) {
         sr->on_done(sr, sr->on_done_userdata);
     }
+}
+
+/* Resumes a read paused by an empty tx bucket. The only thing that
+ * brought us here is the clock.
+ *
+ * Re-evaluates rather than assuming: the bucket may still be empty (the
+ * delay was a lower bound, and other streams on the same user's valve
+ * may have spent what it refilled), in which case this re-arms; or the
+ * POOL may have filled up while this relay was paused, in which case the
+ * pause is now pool-bound and cloak_stream_relay_notify_writable owns
+ * the resume -- and this must NOT re-arm, or it would spin a timer
+ * against a condition that a timer cannot fix. */
+static void stream_relay_on_rate_timer(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    cloak_stream_relay_t *sr = (cloak_stream_relay_t *)userdata;
+    sr->rate_timer = CLOAK_TIMER_INVALID;
+    if (stream_relay_is_finishing(sr) || !sr->fd_read_paused) {
+        return;
+    }
+    uint64_t rate_delay = 0;
+    if (stream_relay_fd_read_budget(sr, &rate_delay) == 0) {
+        if (rate_delay > 0 && stream_relay_arm_rate_timer(sr, rate_delay) != 0) {
+            stream_relay_teardown(sr, 1);
+        }
+        return;
+    }
+    sr->fd_read_paused = 0;
+    sync_interest(sr);
+    /* Pull now, not just re-arm the mask: the bytes waiting on the fd
+     * are past their readiness edge, and while sync_interest's mask
+     * change does re-report them on Linux, this mechanism must not
+     * depend on a second event to finish what the timer started. */
+    if (pump_fd_to_stream(sr) != 0) {
+        (void)pump_stream_to_fd(sr);
+        stream_relay_teardown(sr, 1);
+        return;
+    }
+    sync_interest(sr);
+}
+
+static int stream_relay_arm_rate_timer(cloak_stream_relay_t *sr, uint64_t delay_ms) {
+    if (sr->rate_timer != CLOAK_TIMER_INVALID) {
+        return 0;
+    }
+    if (delay_ms == 0) {
+        delay_ms = 1; /* unreachable -- the budget only reports a delay
+                       * when the bucket owes at least 1 ms -- but a
+                       * zero-delay timer would spin, so it is floored
+                       * rather than trusted. */
+    }
+    sr->rate_timer = cloak_reactor_add_timer(sr->reactor, delay_ms, stream_relay_on_rate_timer, sr);
+    return sr->rate_timer == CLOAK_TIMER_INVALID ? -1 : 0;
 }
 
 /* Fires the deferred teardown for a relay that was already finished by
@@ -364,6 +481,7 @@ int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
     memset(sr, 0, sizeof(*sr));
     sr->fd = -1;
     sr->finish_timer = CLOAK_TIMER_INVALID;
+    sr->rate_timer = CLOAK_TIMER_INVALID;
 
     if (r == NULL || sesh == NULL || stream == NULL || fd < 0 || buf_cap == 0) {
         return -1;
@@ -467,7 +585,18 @@ void cloak_stream_relay_notify_writable(cloak_stream_relay_t *sr) {
     if (sr == NULL || stream_relay_is_finishing(sr) || !sr->fd_read_paused) {
         return;
     }
-    if (stream_relay_fd_read_budget(sr) == 0) {
+    uint64_t rate_delay = 0;
+    if (stream_relay_fd_read_budget(sr, &rate_delay) == 0) {
+        /* THE HANDOVER, and it is a stall if it is missed. A relay
+         * paused because the pool was full is resumed from here -- but
+         * if, by the time the pool actually drains, the user's tx bucket
+         * has ALSO run dry, then this is the last notification the pool
+         * will ever send (it is empty now; nothing more will drain) and
+         * the relay would stay paused forever with no timer behind it.
+         * The pause is re-attributed to the bucket here, and armed. */
+        if (rate_delay > 0 && stream_relay_arm_rate_timer(sr, rate_delay) != 0) {
+            stream_relay_teardown(sr, 1);
+        }
         return; /* drained some, but still nothing safe to read yet */
     }
     sr->fd_read_paused = 0;
