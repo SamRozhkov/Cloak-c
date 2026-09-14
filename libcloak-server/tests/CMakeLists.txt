@@ -160,3 +160,14 @@ set_tests_properties(test_server_e2e PROPERTIES TIMEOUT 60)
 # produce that EAGAIN. See test_write_shim.c's own top-of-file comment.
 set_tests_properties(test_server_e2e PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides: case 12 opens a second sqlite3 handle of its own to
+# prove the schema refuses a wrong-length UID no matter who writes it,
+# and that needs sqlite3.h on the include path, which cloak-server's
+# PRIVATE link deliberately does not propagate.
+add_executable(test_usermanager test_usermanager.c)
+target_include_directories(test_usermanager PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_usermanager PRIVATE cloak-server sqlite3)
+add_test(NAME test_usermanager COMMAND test_usermanager)
+set_tests_properties(test_usermanager PROPERTIES TIMEOUT 60)
