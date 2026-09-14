@@ -85,11 +85,41 @@
 #define CLOAK_USER_ERR_VOID           (-6) /* manager has no database at all */
 #define CLOAK_USER_ERR_DB             (-7) /* SQLite said no */
 #define CLOAK_USER_ERR_ARG            (-8) /* NULL or otherwise invalid argument */
+/* The file opened is a users database whose CONTENTS violate an invariant
+ * this module requires -- distinct from _DB, which is SQLite reporting a
+ * failure, because the operator's remedy is completely different. Only
+ * cloak_usermanager_open returns it. */
+#define CLOAK_USER_ERR_SCHEMA         (-9)
+/* A transaction from an earlier failed batch could not be rolled back,
+ * and the connection is therefore stuck inside it. Distinct from _DB
+ * because it is PERMANENT for this manager: retrying will never succeed,
+ * and the caller should stop metering and tell the operator rather than
+ * loop. Only cloak_usermanager_upload_status returns it. */
+#define CLOAK_USER_ERR_WEDGED         (-10)
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
 /* ------------------------------------------------------------------ */
 
+/* THE ACCEPTED CREDIT RANGE, since the admin API will pass these values
+ * through from the wire: the whole of int64 is accepted and stored
+ * verbatim. Nothing is rejected and nothing is rescaled. INT64_MAX is the
+ * idiomatic "effectively unlimited" and works as one -- metering can
+ * subtract from it for longer than the universe has existed.
+ *
+ * What the range does NOT include is wrapping. Every credit adjustment in
+ * cloak_usermanager_upload_status SATURATES: it clamps at INT64_MIN and
+ * INT64_MAX instead of overflowing, which in C would be undefined
+ * behaviour and in practice would flip an unlimited user into maximal
+ * debt (a permanent lockout) or a maximally indebted user into unlimited
+ * credit (a silent free pass). Both directions have been reproduced; see
+ * cloak_usermanager_upload_status.
+ *
+ * The one thing an operator should know is that a credit clamped to
+ * INT64_MIN is a permanent lockout no amount of further metering can
+ * deepen, and only a cloak_usermanager_write can lift. That is a
+ * consequence of saturating rather than wrapping, and it is the right
+ * direction to fail in. */
 typedef struct {
     uint8_t uid[CLOAK_UID_LEN];
     int32_t sessions_cap;
@@ -124,6 +154,13 @@ typedef enum {
  * place that conversion happens is the panel's queue drain, and it says
  * so there; nothing in this file ever sees rx/tx. Getting this backwards
  * meters the wrong direction against the wrong limit and is silent.
+ *
+ * Both usages are byte COUNTS and must be >= 0. The accounting module
+ * that fills these in is expected never to produce a negative one; if it
+ * does, cloak_usermanager_upload_status clamps it to 0 and logs, rather
+ * than subtracting it. That is a boundary check, not a supported input:
+ * a negative usage would CREDIT a user for traffic they did not send,
+ * which is a way to obtain free service and not merely untidy.
  *
  * num_session, active and timestamp are carried for parity with Go's
  * StatusUpdate and for the admin API's reporting. localManager ignores
@@ -180,6 +217,18 @@ typedef struct cloak_usermanager cloak_usermanager_t;
  * legitimate and common deployment.
  *
  * Blocks. See the top of this file for why that is correct here.
+ *
+ * VALIDATES THE EXISTING CONTENTS: a row whose uid is not exactly
+ * CLOAK_UID_LEN bytes fails the open with CLOAK_USER_ERR_SCHEMA and a
+ * message naming how many such rows there are. The current schema's CHECK
+ * constraint makes such a row impossible to create, so this can only fire
+ * on a database written before that constraint existed (or by another
+ * tool). It is a hard failure rather than a warning because such a row is
+ * unreachable through this entire API -- list skips it, and get and
+ * delete take a fixed 16-byte UID whose lookup can never match it -- so
+ * an operator could neither see nor remove a user that is nonetheless in
+ * their database. A loud startup failure they can act on beats an
+ * invisible user they cannot.
  *
  * Returns 0 and writes *out on success. On failure returns a negative
  * CLOAK_USER_ERR_*, sets *out to NULL (whatever it held before), and, if
@@ -242,6 +291,28 @@ int cloak_usermanager_authorise_new_session(cloak_usermanager_t *m,
  * next connection attempt, rather than letting them reconnect at zero and
  * overdraw again.
  *
+ * THE SUBTRACTION SATURATES rather than overflowing. Signed overflow is
+ * undefined behaviour, and both directions of it are reachable from
+ * values an operator would plausibly store: a user at INT64_MAX ("give
+ * them everything") wraps to INT64_MIN on the first drain that carries a
+ * negative usage, locking them out permanently; a user at INT64_MIN wraps
+ * to INT64_MAX on any positive drain, silently handing maximal debt an
+ * unlimited allowance and emitting no terminate. Credits therefore clamp
+ * at INT64_MIN/INT64_MAX, and a usage below 0 is clamped to 0 and logged
+ * at WARN before it is ever subtracted.
+ *
+ * A clamped usage does NOT fail the batch: one malformed entry must not
+ * cost every other user in the drain their billing. It is logged and that
+ * one entry contributes nothing.
+ *
+ * SELF-HEALING: if an earlier batch left a transaction open (only
+ * possible if its rollback also failed), this attempts to roll it back
+ * before beginning. If that cannot be done the manager is permanently
+ * unusable for metering and this returns CLOAK_USER_ERR_WEDGED, which is
+ * deliberately NOT the same code as a transient CLOAK_USER_ERR_DB -- a
+ * caller must be able to tell "retry next drain" from "stop and tell the
+ * operator", or it will retry against a dead connection forever.
+ *
  * A terminate is emitted when a new credit is <= 0, or when the user has
  * expired (`now > expiry_time`, the same boundary authenticate uses).
  *
@@ -287,8 +358,11 @@ int cloak_usermanager_upload_status(cloak_usermanager_t *m,
  * out_n is required.
  *
  * Rows whose stored uid is not exactly CLOAK_UID_LEN bytes are skipped
- * and not counted -- see cloak_usermanager_write on why such a row can
- * only come from a database this module did not create. */
+ * and not counted. cloak_usermanager_open refuses to open a database that
+ * already contains one, so this can only be reached by a row another
+ * process wrote into an already-open database -- the check stays because
+ * copying CLOAK_UID_LEN bytes out of a shorter blob would be an
+ * over-read, which is a memory-safety guard and not a migration path. */
 int cloak_usermanager_list(cloak_usermanager_t *m, cloak_user_info_t *out,
                            size_t out_cap, size_t *out_n);
 

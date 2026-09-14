@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cloak/usermanager.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -886,6 +887,341 @@ static void case_uid_length_enforced(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Credit arithmetic at the int64 extremes.                             */
+/* ------------------------------------------------------------------ */
+/* `credit - usage` is signed arithmetic on values an operator can set
+ * directly through the admin API, so both overflow directions are
+ * reachable from realistic inputs, are undefined behaviour, and in
+ * practice wrap. Each case below asserts BOTH the stored value and the
+ * terminate count, because the wrap corrupts the two independently: a
+ * wrapped credit tests as positive, so the user is silently not
+ * terminated as well as silently given the wrong balance. */
+static void case_credit_extremes(void) {
+    char path[512];
+    char err[256];
+    int64_t now = T_NOW;
+    cloak_usermanager_t *m = NULL;
+    cloak_user_info_t u, got;
+    cloak_user_status_t st[2];
+    cloak_user_terminate_t term[8];
+    size_t n = 999;
+
+    um_tmp_path(path, sizeof(path), "extremes");
+    um_unlink(path);
+    ASSERT_EQ_INT(cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)), 0);
+
+    /* (1) Maximal debt, ordinary drain. Unsaturated this wraps to
+     * INT64_MAX -- maximal debt silently becomes unlimited credit, and
+     * because the wrapped value is positive NO terminate is emitted
+     * either. Both halves are asserted. */
+    u = mk_info(1, 5, 111, 222, INT64_MIN, INT64_MIN, T_NOW + 100);
+    ASSERT_EQ_INT(cloak_usermanager_write(m, &u, CLOAK_USER_FIELD_ALL), 0);
+    st[0] = mk_status(1, 1, 1);
+    n = 999;
+    memset(term, 0, sizeof(term));
+    ASSERT_EQ_INT(cloak_usermanager_upload_status(m, st, 1, term, 8, &n), 0);
+    ASSERT_EQ_INT(n, 1);
+    ASSERT_TRUE(reason_is(term[0].reason, CLOAK_USER_TERMINATE_NO_DOWN_CREDIT));
+    ASSERT_EQ_INT(cloak_usermanager_get(m, u.uid, &got), 0);
+    ASSERT_EQ_INT(got.up_credit, INT64_MIN);
+    ASSERT_EQ_INT(got.down_credit, INT64_MIN);
+
+    /* (2) The realistic mirror, and the worse one: INT64_MAX is the
+     * obvious operator idiom for "unlimited", and a single negative usage
+     * wraps it to INT64_MIN -- a permanent lockout. Two defences have to
+     * hold here: the usage is clamped to 0, and the subtraction saturates.
+     * The credit must come back EXACTLY unchanged. */
+    u = mk_info(2, 5, 111, 222, INT64_MAX, INT64_MAX, T_NOW + 100);
+    ASSERT_EQ_INT(cloak_usermanager_write(m, &u, CLOAK_USER_FIELD_ALL), 0);
+    st[0] = mk_status(2, -1000, -1);
+    n = 999;
+    memset(term, 0, sizeof(term));
+    ASSERT_EQ_INT(cloak_usermanager_upload_status(m, st, 1, term, 8, &n), 0);
+    ASSERT_EQ_INT(n, 0);
+    ASSERT_EQ_INT(cloak_usermanager_get(m, u.uid, &got), 0);
+    ASSERT_EQ_INT(got.up_credit, INT64_MAX);
+    ASSERT_EQ_INT(got.down_credit, INT64_MAX);
+
+    /* (3) The same clamp at an ordinary balance, where no overflow is
+     * involved at all and only the security property is under test: a
+     * negative usage must not PAY the user. 1000, not 1500. */
+    u = mk_info(3, 5, 111, 222, 1000, 2000, T_NOW + 100);
+    ASSERT_EQ_INT(cloak_usermanager_write(m, &u, CLOAK_USER_FIELD_ALL), 0);
+    st[0] = mk_status(3, -500, -500);
+    n = 999;
+    memset(term, 0, sizeof(term));
+    ASSERT_EQ_INT(cloak_usermanager_upload_status(m, st, 1, term, 8, &n), 0);
+    ASSERT_EQ_INT(n, 0);
+    ASSERT_EQ_INT(cloak_usermanager_get(m, u.uid, &got), 0);
+    ASSERT_EQ_INT(got.up_credit, 1000);
+    ASSERT_EQ_INT(got.down_credit, 2000);
+
+    /* (4) A legitimate drain at the top of the range still computes the
+     * right answer rather than being clamped defensively: INT64_MAX minus
+     * INT64_MAX is exactly 0 (which terminates, being <= 0), and the
+     * untouched direction loses exactly one byte. This is what stops the
+     * saturation from being implemented as "anything extreme -> clamp". */
+    u = mk_info(4, 5, 111, 222, INT64_MAX, INT64_MAX, T_NOW + 100);
+    ASSERT_EQ_INT(cloak_usermanager_write(m, &u, CLOAK_USER_FIELD_ALL), 0);
+    st[0] = mk_status(4, INT64_MAX, 1);
+    n = 999;
+    memset(term, 0, sizeof(term));
+    ASSERT_EQ_INT(cloak_usermanager_upload_status(m, st, 1, term, 8, &n), 0);
+    ASSERT_EQ_INT(n, 1);
+    ASSERT_TRUE(reason_is(term[0].reason, CLOAK_USER_TERMINATE_NO_UP_CREDIT));
+    ASSERT_EQ_INT(cloak_usermanager_get(m, u.uid, &got), 0);
+    ASSERT_EQ_INT(got.up_credit, 0);
+    ASSERT_EQ_INT(got.down_credit, INT64_MAX - 1);
+
+    /* (5) One malformed entry must not cost the OTHER users in the same
+     * drain their billing -- which is why a negative usage is clamped and
+     * logged rather than failing the batch. */
+    u = mk_info(5, 5, 111, 222, 100000, 100000, T_NOW + 100);
+    ASSERT_EQ_INT(cloak_usermanager_write(m, &u, CLOAK_USER_FIELD_ALL), 0);
+    u = mk_info(6, 5, 111, 222, 100000, 100000, T_NOW + 100);
+    ASSERT_EQ_INT(cloak_usermanager_write(m, &u, CLOAK_USER_FIELD_ALL), 0);
+    st[0] = mk_status(5, -7, -7);
+    st[1] = mk_status(6, 30, 40);
+    n = 999;
+    memset(term, 0, sizeof(term));
+    ASSERT_EQ_INT(cloak_usermanager_upload_status(m, st, 2, term, 8, &n), 0);
+    ASSERT_EQ_INT(n, 0);
+    mk_uid(u.uid, 5);
+    ASSERT_EQ_INT(cloak_usermanager_get(m, u.uid, &got), 0);
+    ASSERT_EQ_INT(got.up_credit, 100000);
+    mk_uid(u.uid, 6);
+    ASSERT_EQ_INT(cloak_usermanager_get(m, u.uid, &got), 0);
+    ASSERT_EQ_INT(got.up_credit, 100000 - 30);
+    ASSERT_EQ_INT(got.down_credit, 100000 - 40);
+
+    cloak_usermanager_close(m);
+    um_unlink(path);
+}
+
+/* ------------------------------------------------------------------ */
+/* A mid-batch disk failure rolls the whole batch back.                 */
+/* ------------------------------------------------------------------ */
+/* The all-or-nothing transaction is the one property whose regression is
+ * silent AND unequal -- some users billed, others not -- so asserting it
+ * is not enough; it has to be driven. Nothing a caller can legitimately
+ * do makes an sqlite3_step fail partway, so this uses the project's
+ * existing LD_PRELOAD interposer (test_write_shim.c) to fail every
+ * write(2)/pwrite(2) against this test's own database file, which turns
+ * the batch's commit into a real SQLITE_IOERR. See the shim's own
+ * top-of-file comment for the protocol and tests/CMakeLists.txt for the
+ * ASan-runtime-ordering requirement that comes with preloading it. */
+/* How many writes to the database are allowed to land before the shim
+ * starts failing them, and how many users are in the batch. Both are
+ * measured, not guessed -- see the comment in the case below. */
+#ifndef UM_FAIL_AFTER
+#define UM_FAIL_AFTER 8
+#endif
+#define UM_ROLLBACK_USERS 225
+
+static void case_rollback_on_io_error(void) {
+    char path[512];
+    char err[256];
+    char nbuf[32];
+    const char *base;
+    int64_t now = T_NOW;
+    cloak_usermanager_t *m = NULL;
+    cloak_user_info_t u, got;
+    cloak_user_status_t *st;
+    cloak_user_terminate_t term[8];
+    sqlite3 *raw = NULL;
+    size_t n = 999;
+    int i;
+    int rc;
+
+    um_tmp_path(path, sizeof(path), "rollback");
+    um_unlink(path);
+
+    /* Create the file with a SMALL page size before the manager opens it.
+     * This is the whole reason the case can tell a batched writer from an
+     * unbatched one: at the default 4KiB page every user's row lands on
+     * the same page, so one transaction over N users and N transactions
+     * over one user each cost indistinguishably few writes, and no
+     * failure point separates them (measured: a 6-user batch commits in
+     * two writes). At 512 bytes the users span ~25 pages, so a single
+     * transaction's commit is a long run of frames terminated by one
+     * commit record, while per-user commits are ~225 independently
+     * durable ones. */
+    ASSERT_EQ_INT(sqlite3_open(path, &raw), SQLITE_OK);
+    ASSERT_EQ_INT(sqlite3_exec(raw,
+                               "PRAGMA page_size = 512;"
+                               "CREATE TABLE seed (x);"
+                               "DROP TABLE seed;",
+                               NULL, NULL, NULL),
+                  SQLITE_OK);
+    sqlite3_close(raw);
+
+    ASSERT_EQ_INT(cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)), 0);
+
+    /* Match on the bare filename: the shim resolves each fd through
+     * /proc/self/fd, and matching the name rather than the full path also
+     * catches SQLite's `-wal` and `-shm` sidecars, which in WAL mode are
+     * where a COMMIT's pages actually land. */
+    base = strrchr(path, '/');
+    base = (base != NULL) ? base + 1 : path;
+
+    st = calloc(UM_ROLLBACK_USERS, sizeof(*st));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        cloak_usermanager_close(m);
+        return;
+    }
+
+    /* Credits derived from the index, so a partial application is
+     * identifiable per user rather than only in aggregate. The UIDs are
+     * spread across the whole blob so the rows are distributed over the
+     * btree rather than clustered into one page. */
+    for (i = 0; i < UM_ROLLBACK_USERS; i++) {
+        u = mk_info(0, 5, 111, 222, 100000 + i, 200000 + i, T_NOW + 100);
+        u.uid[0] = (uint8_t)(i & 0xff);
+        u.uid[1] = (uint8_t)(i >> 8);
+        ASSERT_EQ_INT(cloak_usermanager_write(m, &u, CLOAK_USER_FIELD_ALL), 0);
+        memcpy(st[i].uid, u.uid, CLOAK_UID_LEN);
+        st[i].up_usage = 10 + i;
+        st[i].down_usage = 20 + i;
+    }
+
+    /* Let the first few writes LAND before failing the rest. Failing from
+     * the very first write proves nothing about batching: nothing reaches
+     * the disk whether the code used one transaction or 225, so the two
+     * are indistinguishable. Allowing a handful through is what makes an
+     * unbatched writer leave its early users durably charged and the rest
+     * not -- precisely the silent, unequal corruption the single
+     * transaction exists to prevent, and what the per-user assertions
+     * below catch. UM_FAIL_AFTER was chosen by sweeping it and confirming
+     * that removing BEGIN/COMMIT from upload_status makes this case fail;
+     * it sits in the middle of a wide range, not on a knife edge. */
+    snprintf(nbuf, sizeof(nbuf), "%d", UM_FAIL_AFTER);
+    setenv("CLOAK_TEST_FAIL_WRITE_AFTER", nbuf, 1);
+    setenv("CLOAK_TEST_FAIL_WRITE_PATH", base, 1);
+    n = 999;
+    memset(term, 0, sizeof(term));
+    rc = cloak_usermanager_upload_status(m, st, UM_ROLLBACK_USERS, term, 8, &n);
+    unsetenv("CLOAK_TEST_FAIL_WRITE_PATH");
+    unsetenv("CLOAK_TEST_FAIL_WRITE_AFTER");
+
+    /* The batch reports failure rather than partial success... */
+    ASSERT_EQ_INT(rc, CLOAK_USER_ERR_DB);
+    /* ...and NOT ONE user in it was charged, including the many the loop
+     * had already metered before the failure. */
+    for (i = 0; i < UM_ROLLBACK_USERS; i++) {
+        ASSERT_EQ_INT(cloak_usermanager_get(m, st[i].uid, &got), 0);
+        ASSERT_EQ_INT(got.up_credit, 100000 + i);
+        ASSERT_EQ_INT(got.down_credit, 200000 + i);
+    }
+
+    /* And the manager is still usable afterwards: the next drain commits
+     * normally and charges everyone exactly once. A transaction left open
+     * would fail here at BEGIN IMMEDIATE, and keep failing forever. */
+    n = 999;
+    memset(term, 0, sizeof(term));
+    ASSERT_EQ_INT(cloak_usermanager_upload_status(m, st, UM_ROLLBACK_USERS, term,
+                                                  8, &n),
+                  0);
+    ASSERT_EQ_INT(n, 0);
+    for (i = 0; i < UM_ROLLBACK_USERS; i++) {
+        ASSERT_EQ_INT(cloak_usermanager_get(m, st[i].uid, &got), 0);
+        ASSERT_EQ_INT(got.up_credit, 100000 + i - (10 + i));
+        ASSERT_EQ_INT(got.down_credit, 200000 + i - (20 + i));
+    }
+
+    free(st);
+    cloak_usermanager_close(m);
+    um_unlink(path);
+}
+
+/* ------------------------------------------------------------------ */
+/* open refuses a database holding wrong-length UIDs.                   */
+/* ------------------------------------------------------------------ */
+/* Such a row is unreachable through the whole API -- list skips it, and
+ * get/delete bind a fixed 16-byte blob that can never match it -- so an
+ * operator would have a user they can neither see nor remove. The current
+ * schema's CHECK makes one impossible to create, so this builds the
+ * legacy shape deliberately: the same table WITHOUT the constraint, which
+ * CREATE TABLE IF NOT EXISTS then leaves untouched. */
+static void case_open_rejects_bad_uid_rows(void) {
+    char path[512];
+    char err[256];
+    int64_t now = T_NOW;
+    cloak_usermanager_t *m = NULL;
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *ins = NULL;
+    uint8_t bad[CLOAK_UID_LEN + 1];
+    static const int bad_lens[] = {1, CLOAK_UID_LEN - 1, CLOAK_UID_LEN + 1};
+    size_t i;
+    size_t n = 999;
+    cloak_user_info_t listed[8];
+
+    um_tmp_path(path, sizeof(path), "legacy");
+    um_unlink(path);
+
+    ASSERT_EQ_INT(sqlite3_open(path, &raw), SQLITE_OK);
+    ASSERT_EQ_INT(sqlite3_exec(raw,
+                               "CREATE TABLE users ("
+                               " uid BLOB PRIMARY KEY NOT NULL,"
+                               " sessions_cap INTEGER NOT NULL,"
+                               " up_rate INTEGER NOT NULL,"
+                               " down_rate INTEGER NOT NULL,"
+                               " up_credit INTEGER NOT NULL,"
+                               " down_credit INTEGER NOT NULL,"
+                               " expiry_time INTEGER NOT NULL"
+                               ") WITHOUT ROWID;",
+                               NULL, NULL, NULL),
+                  SQLITE_OK);
+    ASSERT_EQ_INT(sqlite3_prepare_v2(raw,
+                                     "INSERT INTO users VALUES (?1,1,1,1,1,1,1)",
+                                     -1, &ins, NULL),
+                  SQLITE_OK);
+    memset(bad, 0x5A, sizeof(bad));
+    for (i = 0; i < sizeof(bad_lens) / sizeof(bad_lens[0]); i++) {
+        sqlite3_reset(ins);
+        ASSERT_EQ_INT(sqlite3_bind_blob(ins, 1, bad, bad_lens[i], SQLITE_TRANSIENT),
+                      SQLITE_OK);
+        ASSERT_EQ_INT(sqlite3_step(ins), SQLITE_DONE);
+    }
+    /* One well-formed row alongside them, so the failure below is about
+     * the bad rows and not about the table being unusable. */
+    sqlite3_reset(ins);
+    mk_uid(bad, 7);
+    ASSERT_EQ_INT(sqlite3_bind_blob(ins, 1, bad, CLOAK_UID_LEN, SQLITE_TRANSIENT),
+                  SQLITE_OK);
+    ASSERT_EQ_INT(sqlite3_step(ins), SQLITE_DONE);
+    sqlite3_finalize(ins);
+    sqlite3_close(raw);
+
+    err[0] = '\0';
+    m = (cloak_usermanager_t *)(void *)&n;
+    ASSERT_EQ_INT(cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)),
+                  CLOAK_USER_ERR_SCHEMA);
+    ASSERT_TRUE(m == NULL);
+    /* The message names the COUNT, which is what makes it actionable --
+     * an operator has to know how many rows they are looking for. */
+    ASSERT_TRUE(strstr(err, "3 user row(s)") != NULL);
+
+    /* Remove exactly the offending rows and the same file opens, with the
+     * well-formed user intact. This is what proves the refusal was about
+     * those three rows specifically. */
+    ASSERT_EQ_INT(sqlite3_open(path, &raw), SQLITE_OK);
+    ASSERT_EQ_INT(sqlite3_exec(raw, "DELETE FROM users WHERE length(uid) <> 16",
+                               NULL, NULL, NULL),
+                  SQLITE_OK);
+    sqlite3_close(raw);
+
+    ASSERT_EQ_INT(cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)), 0);
+    n = 999;
+    ASSERT_EQ_INT(cloak_usermanager_list(m, listed, 8, &n), 0);
+    ASSERT_EQ_INT(n, 1);
+    ASSERT_EQ_INT(listed[0].uid[0], 7);
+
+    cloak_usermanager_close(m);
+    um_unlink(path);
+}
+
+/* ------------------------------------------------------------------ */
 /* Argument checking: NULL pointers are refused, not dereferenced.      */
 /* ------------------------------------------------------------------ */
 static void case_bad_args(void) {
@@ -954,5 +1290,8 @@ case_upload_batch();
 case_delete();
 case_list_truncated();
 case_uid_length_enforced();
+case_credit_extremes();
+case_rollback_on_io_error();
+case_open_rejects_bad_uid_rows();
 case_bad_args();
 TEST_MAIN_END()

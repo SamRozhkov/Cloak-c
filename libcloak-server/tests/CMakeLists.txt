@@ -171,3 +171,13 @@ target_include_directories(test_usermanager PRIVATE ${CMAKE_SOURCE_DIR}/libcloak
 target_link_libraries(test_usermanager PRIVATE cloak-server sqlite3)
 add_test(NAME test_usermanager COMMAND test_usermanager)
 set_tests_properties(test_usermanager PROPERTIES TIMEOUT 60)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for a different one of the shim's two protocols:
+# this file's rollback case needs a genuine mid-batch SQLITE_IOERR, and no
+# legitimate use of the database can make an sqlite3_step fail partway.
+# The shim fails write(2)/pwrite(2) against the one temp database that
+# case names. Preloading also brings the ASan-runtime-first ordering
+# requirement the block above handles.
+set_tests_properties(test_usermanager PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")

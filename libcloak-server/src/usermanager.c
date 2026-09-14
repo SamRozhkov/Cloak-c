@@ -2,6 +2,7 @@
 #include "cloak/usermanager.h"
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -200,6 +201,61 @@ static int um_load(cloak_usermanager_t *m, const uint8_t *uid,
     return CLOAK_USER_ERR_DB;
 }
 
+/* credit - usage, saturating at INT64_MIN instead of overflowing.
+ * PRECONDITION: usage >= 0, which the caller guarantees by passing this
+ * the result of um_clamp_usage and nothing else.
+ *
+ * Signed overflow is undefined behaviour, so this is not a tidiness
+ * question: `credit - usage` on values an operator would plausibly store
+ * is reachable UB, and on every compiler this project uses it wraps.
+ * Both wraps are catastrophic and silent. A user at INT64_MIN wraps to
+ * INT64_MAX on any ordinary positive drain, which hands maximal debt an
+ * unlimited allowance AND emits no terminate, because the wrapped value
+ * tests as positive. A user parked at INT64_MAX -- the obvious idiom for
+ * "unlimited" -- wraps to INT64_MIN on the first drain carrying a
+ * negative usage, and is locked out forever.
+ *
+ * Only the LOWER bound is clamped here, and that is a consequence of the
+ * usage clamp rather than an assumption about the caller: with usage >= 0
+ * the result can only move toward INT64_MIN, so the upper bound cannot be
+ * crossed at all. The second wrap above is prevented by um_clamp_usage,
+ * not by a branch here. Writing it as two clamps in one general-purpose
+ * helper was the first attempt, and its upper branch turned out to be
+ * unreachable code that no mutation of it could be made to fail a test --
+ * so the defence lives where it is actually exercised instead.
+ *
+ * The limit is computed by moving INT64_MIN toward zero by usage, which
+ * cannot itself overflow for usage >= 0. Saturating is the right
+ * behaviour rather than, say, refusing the update: a credit pinned at
+ * INT64_MIN is a lockout further metering cannot deepen and only
+ * cloak_usermanager_write can lift, which fails in the safe direction. */
+static int64_t um_sub_nonneg_sat(int64_t credit, int64_t usage) {
+    if (credit < INT64_MIN + usage) {
+        return INT64_MIN;
+    }
+    return credit - usage;
+}
+
+/* Usages are byte counts and a negative one is meaningless. It is also
+ * not merely untidy: subtracting it would ADD credit, i.e. pay a user for
+ * traffic they never sent, which is a route to free service. The
+ * accounting module is expected never to produce one -- this is a
+ * boundary check on an input this module does not trust, not a supported
+ * encoding -- so it is clamped to 0 and logged rather than honoured.
+ *
+ * Clamping rather than failing the batch is deliberate: one malformed
+ * entry must not cost every other user in the same drain their billing. */
+static int64_t um_clamp_usage(const uint8_t *uid, int64_t usage,
+                              const char *direction) {
+    if (usage < 0) {
+        CLOAK_LOGW("usermanager: negative %s usage %lld for uid %02x%02x..., "
+                   "clamped to 0",
+                   direction, (long long)usage, uid[0], uid[1]);
+        return 0;
+    }
+    return usage;
+}
+
 /* The three authorisation gates common to authenticate and
  * authorise_new_session, in Go's order -- which is observable: a user who
  * is both out of credit and expired is reported as out of credit.
@@ -305,6 +361,48 @@ int cloak_usermanager_open(cloak_usermanager_t **out, const char *db_path,
         sqlite3_free(sqlite_err);
         cloak_usermanager_close(m);
         return CLOAK_USER_ERR_DB;
+    }
+
+    /* Validate what is already in the file. A row whose uid is the wrong
+     * length is UNREACHABLE through this entire API -- list skips it, and
+     * get and delete bind a fixed CLOAK_UID_LEN blob whose `uid = ?1` can
+     * never match it -- so an operator would have a user in their
+     * database that they can neither see nor delete. The schema's CHECK
+     * makes such a row impossible to create now, so this only fires on a
+     * database written before that constraint existed, or by another
+     * tool; refusing to open loudly, with the count, is something an
+     * operator can act on, whereas an invisible user is not.
+     *
+     * Prepared ad hoc and finalized immediately rather than joining the
+     * cache: it runs exactly once per process, and a cached statement
+     * would cost a slot in a table whose whole point is the hot path. */
+    {
+        sqlite3_stmt *check = NULL;
+        rc = sqlite3_prepare_v2(
+            m->db, "SELECT count(*) FROM users WHERE length(uid) <> ?1", -1,
+            &check, NULL);
+        if (rc == SQLITE_OK &&
+            sqlite3_bind_int(check, 1, CLOAK_UID_LEN) == SQLITE_OK &&
+            sqlite3_step(check) == SQLITE_ROW) {
+            sqlite3_int64 bad = sqlite3_column_int64(check, 0);
+            sqlite3_finalize(check);
+            if (bad > 0) {
+                um_set_err(err, err_cap,
+                           "usermanager: '%s' contains %lld user row(s) whose "
+                           "uid is not %d bytes; such rows are unreachable "
+                           "through this API and must be removed before the "
+                           "database can be used",
+                           db_path, (long long)bad, CLOAK_UID_LEN);
+                cloak_usermanager_close(m);
+                return CLOAK_USER_ERR_SCHEMA;
+            }
+        } else {
+            um_set_err(err, err_cap, "usermanager: cannot validate '%s': %s",
+                       db_path, sqlite3_errmsg(m->db));
+            sqlite3_finalize(check);
+            cloak_usermanager_close(m);
+            return CLOAK_USER_ERR_DB;
+        }
     }
 
     for (i = 0; i < UM_ST_COUNT; i++) {
@@ -441,6 +539,35 @@ int cloak_usermanager_upload_status(cloak_usermanager_t *m,
         return 0;
     }
 
+    /* SELF-HEAL. An earlier batch whose rollback ALSO failed leaves this
+     * connection inside a transaction, and every BEGIN IMMEDIATE from
+     * then on fails with "cannot start a transaction within a
+     * transaction" -- forever, while returning an error a caller would
+     * reasonably read as transient and retry against for the lifetime of
+     * the process. Try once more to clear it here, and if it still cannot
+     * be cleared say so with a code that means "stop", not "try again".
+     *
+     * NOT COVERED BY A TEST, and deliberately kept anyway. Measured:
+     * SQLite abandons the transaction by itself for every failure this
+     * statement set can actually produce -- both SQLITE_IOERR and
+     * SQLITE_FULL injected into a commit leave sqlite3_get_autocommit()
+     * already 1 by the time the fail path below runs -- so no test can
+     * reach this branch. It guards the classes that do NOT auto-roll-back
+     * (SQLITE_CONSTRAINT, SQLITE_BUSY out of a COMMIT), which today's
+     * schema and statements cannot raise but a future one might. Do not
+     * delete it on the grounds that nothing exercises it. */
+    if (sqlite3_get_autocommit(m->db) == 0) {
+        CLOAK_LOGW("usermanager: a previous batch left a transaction open; "
+                   "rolling it back before starting a new one");
+        (void)um_run(m, UM_ST_ROLLBACK);
+        if (sqlite3_get_autocommit(m->db) == 0) {
+            CLOAK_LOGE("usermanager: cannot clear the open transaction (%s); "
+                       "this manager can no longer meter",
+                       sqlite3_errmsg(m->db));
+            return CLOAK_USER_ERR_WEDGED;
+        }
+    }
+
     meter = m->st[UM_ST_METER];
 
     /* ONE transaction for the whole batch: one commit for N users rather
@@ -470,8 +597,17 @@ int cloak_usermanager_upload_status(cloak_usermanager_t *m,
             goto fail;
         }
 
-        new_up = u.up_credit - s->up_usage;
-        new_down = u.down_credit - s->down_usage;
+        /* Clamp the untrusted usage FIRST, then saturate the subtraction.
+         * The order is load-bearing, not stylistic: the clamp is what
+         * establishes um_sub_nonneg_sat's precondition, and between them
+         * the two cover both directions of a wrap. Neither may be
+         * skipped -- they defend against different things (a usage that
+         * pays the user, and an arithmetic wrap that either frees or
+         * bricks them). */
+        new_up = um_sub_nonneg_sat(u.up_credit,
+                                   um_clamp_usage(s->uid, s->up_usage, "upload"));
+        new_down = um_sub_nonneg_sat(
+            u.down_credit, um_clamp_usage(s->uid, s->down_usage, "download"));
 
         /* The new value is written back EVEN WHEN NON-POSITIVE. The debt
          * is the point: it is what keeps cloak_usermanager_authenticate
@@ -532,10 +668,24 @@ int cloak_usermanager_upload_status(cloak_usermanager_t *m,
     return 0;
 
 fail:
-    /* Best effort: if the rollback itself fails there is nothing further
-     * this layer can do, and the caller is already being told the batch
-     * did not apply. */
+    /* The batch is all-or-nothing, so a failure anywhere means no user in
+     * it is charged. If the rollback itself fails there is nothing more
+     * this call can do -- but it must not leave that silent, because the
+     * connection is then stuck in a transaction and the NEXT call is the
+     * one that has to notice (see the self-heal above).
+     *
+     * Same caveat as the self-heal: removing this ROLLBACK does not fail
+     * any test, because SQLite has already abandoned the transaction
+     * itself for every error a test can inject here. What IS covered is
+     * the property the transaction exists for -- a batch that fails
+     * partway charges nobody -- which test_usermanager's
+     * case_rollback_on_io_error drives with a real commit-time I/O
+     * failure, and which deleting BEGIN/COMMIT does fail. */
     (void)um_run(m, UM_ST_ROLLBACK);
+    if (sqlite3_get_autocommit(m->db) == 0) {
+        CLOAK_LOGE("usermanager: rollback failed, transaction still open: %s",
+                   sqlite3_errmsg(m->db));
+    }
     return rc;
 }
 
