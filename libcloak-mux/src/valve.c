@@ -112,15 +112,40 @@ static void bucket_spend(cloak_valve_bucket_t *b, int64_t n) {
     b->tokens -= cost;
 }
 
-/* Milliseconds until the bucket holds one whole byte. Only called when
- * it does not, so the result is always >= 1 -- a zero-delay resume timer
- * would fire immediately, find the bucket still empty, and spin. */
+/* Milliseconds a caller must wait before this bucket has a whole byte.
+ * NEVER 0. Callers distinguish "not rate-limited at all" from "wait this
+ * long" by the 0, and only the rate == 0 short circuits above may
+ * produce it -- see cloak_valve_rx_resume_delay_ms in cloak/valve.h.
+ *
+ * THE FLOOR IS THE CONTRACT, not a rounding detail, and an earlier
+ * version of this function did not have it. It returned 0 whenever the
+ * bucket already held a byte, and the comment above it asserted that
+ * could not happen because the function "is only called when it does
+ * not". That reasoning was wrong: this call and the take that preceded
+ * it read the clock INDEPENDENTLY (see valve_now_ms), so a bucket a
+ * fraction of a byte short at the take can hold a whole one a few
+ * microseconds later. Every consumer read the 0 back as "the valve is
+ * not the binding constraint" and armed nothing, which left a relay
+ * paused with a full bucket and no timer -- a permanent stall, hit about
+ * once in two hundred ASan runs of libcloak-mux/tests/test_valve_rate.c.
+ *
+ * Fixed HERE, at the producer, rather than by flooring at each call
+ * site: the consumers were doing that and it made the header's promise
+ * true only for the callers who already knew it was false. A fourth
+ * pause site written against that header -- an RX relay, the planned UDP
+ * path -- would have armed the raw value and stalled the same way, with
+ * nothing to warn it. */
 static uint64_t bucket_delay_ms(cloak_valve_bucket_t *b, uint64_t now) {
     bucket_refill(b, now);
-    if (b->tokens >= VALVE_MILLI) {
-        return 0;
+    int64_t need = VALVE_MILLI - b->tokens;
+    if (need <= 0) {
+        /* The byte arrived between the caller's take and this call. One
+         * millisecond, not zero: the caller is about to pause on a
+         * refusal it has already decided to act on, and the worst this
+         * costs is a wake-up a millisecond from now that finds the byte
+         * and resumes immediately. */
+        return 1;
     }
-    int64_t need = VALVE_MILLI - b->tokens; /* > 0 */
     /* Ceiling division: a delay that rounded DOWN would wake to a bucket
      * that still has nothing, which is a spin rather than a resume. */
     int64_t ms = (need + b->rate - 1) / b->rate;

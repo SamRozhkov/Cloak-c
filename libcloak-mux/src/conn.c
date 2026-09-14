@@ -173,22 +173,14 @@ static void conn_rx_resume_cb(cloak_reactor_t *r, void *userdata);
  * see cloak_valve_take_rx's own contract in cloak/valve.h. */
 static void conn_pause_read_for_rate(cloak_conn_t *c) {
     if (c->rx_resume_timer == CLOAK_TIMER_INVALID) {
+        /* Armed verbatim, with no floor of its own. This is only
+         * reached after cloak_valve_take_rx refused a want of at least
+         * one byte, which means the valve is non-NULL with a non-zero
+         * rate -- and cloak/valve.h guarantees a rate-limited direction
+         * never reports 0. The floor that used to be here has moved into
+         * bucket_delay_ms; re-adding it would mask the producer's and
+         * leave nothing to notice if the producer's were lost. */
         uint64_t delay = cloak_valve_rx_resume_delay_ms(c->valve);
-        if (delay == 0) {
-            /* REACHABLE, and load-bearing -- an earlier version of this
-             * comment claimed otherwise. This call and the take that
-             * brought us here read the clock independently, so a bucket
-             * that was a fraction of a byte short at the take can hold a
-             * whole byte by the time this runs; the delay is then 0 and
-             * arming on it would be a zero-delay timer that fires
-             * immediately, finds the byte, and resumes -- harmless here
-             * only because the pause is still armed. The same race on
-             * the tx side, where a zero was read as "not rate-bound" and
-             * armed nothing at all, was a permanent stall observed about
-             * once in two hundred ASan runs (see
-             * stream_relay_fd_read_budget). */
-            delay = 1;
-        }
         c->rx_resume_timer = cloak_reactor_add_timer(c->reactor, delay, conn_rx_resume_cb, c);
         if (c->rx_resume_timer == CLOAK_TIMER_INVALID) {
             /* The timer heap could not grow. Pausing now would be the

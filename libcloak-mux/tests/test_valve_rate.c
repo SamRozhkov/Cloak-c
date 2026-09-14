@@ -125,7 +125,24 @@ static void test_token_arithmetic(void) {
     ASSERT_EQ_INT((long long)cloak_valve_rx_resume_delay_ms(&v), 1);
     fake_ms += 1;
     ASSERT_EQ_INT(cloak_valve_take_rx(&v, 500), 1);
-    ASSERT_EQ_INT((long long)cloak_valve_rx_resume_delay_ms(&v), 0);
+    /* THE CONTRACT, and it is the opposite of what this line used to
+     * assert. A rate-limited direction NEVER reports 0, not even with a
+     * byte in hand: 0 is reserved for "this direction is not limited at
+     * all". The old 0 here was the header's false promise, and a caller
+     * arming on it armed nothing -- see cloak/valve.h and the stall it
+     * describes. Removing the floor in bucket_delay_ms turns this 1 back
+     * into a 0 and fails here, at the producer, without needing the
+     * relay. */
+    ASSERT_EQ_INT((long long)cloak_valve_rx_resume_delay_ms(&v), 1);
+    /* ...while a direction with no rate at all still reports 0, so the
+     * two meanings stay distinguishable. v's tx rate is 4000, so this
+     * uses a separate unlimited direction rather than v's own. */
+    cloak_valve_t unlimited_dir;
+    memset(&unlimited_dir, 0, sizeof(unlimited_dir));
+    cloak_valve_set_clock(&unlimited_dir, fake_clock, NULL);
+    cloak_valve_set_rates(&unlimited_dir, 0, 5000);
+    ASSERT_EQ_INT((long long)cloak_valve_rx_resume_delay_ms(&unlimited_dir), 0);
+    ASSERT_EQ_INT((long long)cloak_valve_tx_resume_delay_ms(&unlimited_dir), 1);
 
     /* SUB-MILLIBYTE PRECISION. A rate of 100 B/s gains a tenth of a byte
      * per millisecond. Stepping 5 ms at a time, the whole bytes available
@@ -172,7 +189,8 @@ static void test_token_arithmetic(void) {
     cloak_valve_set_clock(&huge, fake_clock, NULL);
     cloak_valve_set_rates(&huge, INT64_MAX, INT64_MAX);
     ASSERT_EQ_INT(cloak_valve_take_rx(&huge, 1 << 20), 1 << 20);
-    ASSERT_EQ_INT((long long)cloak_valve_rx_resume_delay_ms(&huge), 0);
+    /* 1, not 0: clamped is still LIMITED, however large the rate. */
+    ASSERT_EQ_INT((long long)cloak_valve_rx_resume_delay_ms(&huge), 1);
 
     /* A NEGATIVE rate is malformed input and means unlimited, not
      * "blocked forever". */

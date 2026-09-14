@@ -116,31 +116,20 @@ static size_t stream_relay_fd_read_budget(cloak_stream_relay_t *sr, uint64_t *ou
     cloak_valve_t *valve = cloak_session_valve(sr->sesh);
     int64_t allowed = cloak_valve_take_tx(valve, (int64_t)budget);
     if (allowed <= 0) {
-        /* FLOORED AT 1, and this is not defensive tidiness -- a zero here
-         * is a permanent stall, and it was observed.
+        /* Taken verbatim, with no floor of its own. cloak/valve.h
+         * guarantees this is >= 1 for a rate-limited direction, so a
+         * non-zero value here means precisely "the valve refused" --
+         * which is what every caller of this function assumes, and what
+         * the budget's own doc comment above promises them.
          *
-         * The take above and this call read the clock independently, and
-         * a bucket that had 999 milli-bytes when the take refused can
-         * hold a whole byte a few microseconds later: at 200 kB/s that
-         * window is about five microseconds wide, and an ASan build hits
-         * it roughly once in two hundred runs. The delay then comes back
-         * 0, meaning "nothing to wait for", and every caller below reads
-         * that as "the valve is not the binding constraint" and arms
-         * nothing -- leaving the relay paused, with a full bucket, an
-         * empty pool and no event anywhere in the system that could ever
-         * wake it. Exactly the failure this module is built to be
-         * incapable of, reached through the one line that decides which
-         * of the two zeroes this is.
-         *
-         * With the floor, a non-zero *out_rate_delay_ms means precisely
-         * "the valve refused" -- which is what every caller assumes --
-         * and the worst case of the race is one wasted wake-up a
-         * millisecond later that finds the byte and resumes.
-         *
-         * conn.c's conn_pause_read_for_rate has the identical floor and
-         * is safe for the identical reason. */
-        uint64_t delay = cloak_valve_tx_resume_delay_ms(valve);
-        *out_rate_delay_ms = delay == 0 ? 1 : delay;
+         * The floor USED to be applied here instead, and that was the
+         * bug: it made the header's promise true only for the callers
+         * who already knew it was false. It now lives in
+         * bucket_delay_ms, where it is the one thing a new pause site
+         * inherits for free. Do not re-add it here -- it would mask the
+         * producer's, and nothing would then notice if the producer's
+         * were lost. */
+        *out_rate_delay_ms = cloak_valve_tx_resume_delay_ms(valve);
         return 0;
     }
     /* cloak_valve_take_tx never returns more than it was asked for, so
@@ -468,14 +457,39 @@ static void stream_relay_on_rate_timer(cloak_reactor_t *r, void *userdata) {
 
 static int stream_relay_arm_rate_timer(cloak_stream_relay_t *sr, uint64_t delay_ms) {
     if (sr->rate_timer != CLOAK_TIMER_INVALID) {
+        /* UNCOVERED AND UNREACHABLE TODAY -- deliberately kept, and this
+         * comment is here so that the next mutation battery does not
+         * read its survival as a coverage hole.
+         *
+         * Instrumentation over a full run of test_valve_rate: 685 calls
+         * to this function, 0 of which found a timer already pending. No
+         * current caller can: the three that exist all arm only from a
+         * pause, and every path that pauses has just had its own timer
+         * fire (clearing rate_timer) or has none.
+         *
+         * Kept rather than deleted because the unreachability is
+         * CONTINGENT, not structural -- the same ruling this project made
+         * for cloak_usermanager's ROLLBACK guard, and the opposite of the
+         * one it made for conn_mark_broken's cancel, which was dead
+         * because every conn free routes through a single function that
+         * cancels first and could only be revived by adding a second
+         * free path. Here a fourth pause site makes it live immediately:
+         * an RX-side relay, the planned UDP path, or a second stream
+         * direction, any of which could arm while a previously armed
+         * timer is still pending. Without this guard that becomes a
+         * leaked timer id and a relay whose resume fires twice.
+         *
+         * Leaving an already-pending timer alone is correct rather than
+         * merely cheap: it will fire, find the bucket still empty, and
+         * re-arm itself at the then-current delay, so replacing it could
+         * only move the deadline, never fix anything. */
         return 0;
     }
-    if (delay_ms == 0) {
-        delay_ms = 1; /* unreachable -- the budget only reports a delay
-                       * when the bucket owes at least 1 ms -- but a
-                       * zero-delay timer would spin, so it is floored
-                       * rather than trusted. */
-    }
+    /* delay_ms is taken verbatim: cloak/valve.h guarantees a
+     * rate-limited direction never reports 0, and every caller here has
+     * already tested it against 0 to decide the pause is rate-bound. A
+     * floor of this function's own used to sit here and is gone for the
+     * same reason the call sites' floors are -- see bucket_delay_ms. */
     sr->rate_timer = cloak_reactor_add_timer(sr->reactor, delay_ms, stream_relay_on_rate_timer, sr);
     return sr->rate_timer == CLOAK_TIMER_INVALID ? -1 : 0;
 }

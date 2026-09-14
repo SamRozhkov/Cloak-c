@@ -266,18 +266,36 @@ void cloak_valve_set_rates(cloak_valve_t *v, int64_t rx_rate, int64_t tx_rate);
 int64_t cloak_valve_take_rx(cloak_valve_t *v, int64_t want);
 int64_t cloak_valve_take_tx(cloak_valve_t *v, int64_t want);
 
-/* Milliseconds until at least one whole byte is available in that
+/* How long to wait before at least one whole byte is available in that
  * direction -- what to pass to cloak_reactor_add_timer after a take
- * returned 0. Never returns 0 when the corresponding take would return
- * 0, so a caller can arm it verbatim without ever producing a
- * zero-delay timer that would spin.
+ * returned 0.
  *
- * Returns 0 (meaning "nothing to wait for") for a NULL valve, for an
- * unlimited direction, and for a direction that already has a byte to
- * give. Bounded above by the bucket's own debt floor at
- * 1000 + ceil(1000/rate) ms -- i.e. never more than two seconds, and
- * about one second for any rate worth configuring. See
- * cloak_valve_bucket_t. */
+ * A RETURN OF 0 MEANS "THIS DIRECTION IS NOT RATE-LIMITED", and nothing
+ * else: a NULL valve, or a rate of 0. For a rate-limited direction the
+ * answer is ALWAYS >= 1 -- including when the bucket already holds a
+ * byte, which is reported as 1 rather than 0. So a caller may both arm
+ * the result verbatim, with no risk of a zero-delay timer that spins,
+ * and test it against 0 to ask "is this direction limited at all".
+ *
+ * THE >= 1 FLOOR EXISTS BECAUSE ITS ABSENCE WAS A PERMANENT STALL, and
+ * the shape of it is worth a paragraph because any future pause site
+ * will meet it. This function and cloak_valve_take_rx/_tx read the clock
+ * INDEPENDENTLY. A bucket a fraction of a byte short when the take
+ * refused can hold a whole byte a few microseconds later, so an earlier
+ * version of this function answered 0 -- truthfully, for the instant it
+ * was asked. Every caller read that 0 back as "the valve is not the
+ * binding constraint" and armed no timer at all, leaving a relay paused
+ * with a full bucket, an empty queue and no event anywhere in the system
+ * that could wake it. At 200 kB/s the window is about five microseconds
+ * wide and it was reached roughly once in two hundred ASan runs.
+ *
+ * DO NOT re-derive "the bucket must still be empty, we were just
+ * refused" and re-introduce the 0. It is not true, it cannot be made
+ * true, and the cost of the floor is one wake-up a millisecond early.
+ *
+ * Bounded above by the bucket's own debt floor at 1000 + ceil(1000/rate)
+ * ms -- i.e. never more than two seconds, and about one second for any
+ * rate worth configuring. See cloak_valve_bucket_t. */
 uint64_t cloak_valve_rx_resume_delay_ms(cloak_valve_t *v);
 uint64_t cloak_valve_tx_resume_delay_ms(cloak_valve_t *v);
 
