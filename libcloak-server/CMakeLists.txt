@@ -27,3 +27,12 @@ add_subdirectory(tests)
 # byte-identical; CMake resolves the path against this directory and
 # applies it to the already-declared target either way.
 target_sources(cloak-server PRIVATE src/http.c)
+
+# The admin API's JSON codec for one user record. Appended for the same
+# reason src/http.c is -- this file's existing content stays
+# byte-identical -- and it needs the vendored cJSON, which cloak-common
+# links PRIVATE and therefore does not propagate. PRIVATE again here: no
+# consumer of cloak/user_json.h ever sees cJSON.h, exactly as no consumer
+# of cloak/usermanager.h sees sqlite3.h.
+target_sources(cloak-server PRIVATE src/user_json.c)
+target_link_libraries(cloak-server PRIVATE cjson)

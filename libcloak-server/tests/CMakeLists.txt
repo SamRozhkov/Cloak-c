@@ -222,3 +222,9 @@ target_include_directories(test_http_parse PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-
 target_link_libraries(test_http_parse PRIVATE cloak-server)
 add_test(NAME test_http_parse COMMAND test_http_parse)
 set_tests_properties(test_http_parse PROPERTIES TIMEOUT 60)
+
+add_executable(test_user_json test_user_json.c)
+target_include_directories(test_user_json PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_user_json PRIVATE cloak-server)
+add_test(NAME test_user_json COMMAND test_user_json)
+set_tests_properties(test_user_json PROPERTIES TIMEOUT 60)
