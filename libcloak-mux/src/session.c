@@ -433,6 +433,9 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
         return -1;
     }
     cloak_switchboard_set_drained_cb(&sesh->sb, session_switchboard_drained_adapter, sesh);
+    /* NULL for an unmetered session; the pool forwards it to every
+     * connection this session ever adds. */
+    cloak_switchboard_set_valve(&sesh->sb, config->valve);
 
     session_reschedule_inactivity_timer(sesh);
     return 0;

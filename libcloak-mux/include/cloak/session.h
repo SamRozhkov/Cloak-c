@@ -9,6 +9,7 @@
 #include "cloak/strmtab.h"
 #include "cloak/stream.h"
 #include "cloak/switchboard.h"
+#include "cloak/valve.h"
 
 typedef struct cloak_session cloak_session_t;
 
@@ -147,6 +148,15 @@ typedef struct {
     void *on_writable_userdata;
     cloak_session_stream_data_cb on_stream_data;
     void *on_stream_data_userdata;
+    /* The user-level byte meter this session's traffic is counted into,
+     * or NULL for an unmetered session -- which is what a zeroed config
+     * already gives, so every existing caller keeps its current
+     * behaviour. Borrowed: the valve is owned by whoever created it (the
+     * panel), is typically SHARED with the user's other sessions, and is
+     * never freed by this session. See cloak/valve.h, in particular
+     * before assuming rx/tx mean the user manager's up/down -- they do
+     * not. */
+    cloak_valve_t *valve;
 } cloak_session_config_t;
 
 struct cloak_session {

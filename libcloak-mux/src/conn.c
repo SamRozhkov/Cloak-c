@@ -133,6 +133,29 @@ static void conn_handle_readable(cloak_conn_t *c) {
             conn_mark_broken(c); /* peer EOF */
             return;
         }
+        /* RX counting point. Go's switchboard.go:153 -- sb.valve.AddRx(int64(n))
+         * in deplex, immediately after conn.Read returns, before the
+         * bytes are handed to the session and before the error check (so
+         * a read that returned data AND an error still bills that data).
+         *
+         * Deliberately here, on the raw socket read, and not on the
+         * extracted envelope in conn_extract_and_dispatch: these are the
+         * bytes the peer actually made this host receive. A peer that
+         * streams megabytes which never assemble into a valid frame, or
+         * that stalls mid-envelope forever, would be metered as zero by
+         * an envelope-level counter -- unmetered traffic is not a
+         * cosmetic accounting difference when the counter's purpose is
+         * to charge a user's credit. It also means partial frames are
+         * counted when they arrive rather than when they complete, which
+         * is what Go does too.
+         *
+         * Wire bytes: this includes each envelope's
+         * CLOAK_CONN_LEN_PREFIX_LEN prefix, matching what the sending
+         * peer's TX side counted for the same envelope.
+         *
+         * rx/tx here are the SERVER's directions, NOT the user manager's
+         * up/down -- see cloak/valve.h before touching this line. */
+        cloak_valve_add_rx(c->valve, (int64_t)n);
         cloak_bytequeue_write(&c->recv_acc, tmp, (size_t)n); /* always fits: n <= room */
         conn_extract_and_dispatch(c);
         if (c->broken) {
@@ -256,6 +279,13 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
      * project's recurring UAF class) that happened to also exercise this
      * return-value path for the first time. */
     return c->broken ? -1 : 0;
+}
+
+void cloak_conn_set_valve(cloak_conn_t *c, cloak_valve_t *v) {
+    if (c == NULL) {
+        return;
+    }
+    c->valve = v;
 }
 
 void cloak_conn_set_drained_cb(cloak_conn_t *c, cloak_conn_drained_cb cb, void *userdata) {
