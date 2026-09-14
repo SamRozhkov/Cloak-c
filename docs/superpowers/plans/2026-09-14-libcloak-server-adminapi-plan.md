@@ -396,3 +396,56 @@ And the newest: **a false invariant can propagate into a test.** Correcting one 
 - **D7 was found by reading the vendored `cJSON.c` while writing this plan**, not by an implementer hitting it mid-task. It changes both directions of Task 3 and would otherwise have surfaced as either a silently truncated credit or a client that rejects our JSON at the one-terabyte mark.
 - **The riskiest thing here** is Task 2. It is the only hand-rolled parser in this project that reads attacker-controlled input *after* authentication, so a bug in it is worth more to an attacker than anything else in this module.
 - **The most consequential thing here** is D4's second bullet. Go's `writeUserInfoHlr` performs the write after detecting a UID mismatch, which means its path component does not constrain which user is modified. Reproducing that faithfully would be porting a bug into a security boundary.
+
+---
+
+## What this branch's execution left for the next ones
+
+Written at merge time from the execution ledger.
+
+### For `ck-server` (module 7) — the scouting report
+
+Assembling this server now takes **about 129 lines** (68 construction, 34 teardown, 27 trampolines), and that is before argv parsing, the config file, logging, signals and the `BindAddr` loop. Nine objects; three `chain` assignments plus the registry's own callback; three trampolines; and a destruction order with two inversions of the construction order.
+
+**Nine forced edges, all silent, and exactly one enforced anywhere** — `cloak_userpanel_open` refuses to start without `on_session_closing`. Every other ordering mistake compiles, starts, serves traffic, and fails later as a use-after-free under load.
+
+The `cloak_server_stack_t` helper the proxy branch recommended is **strengthened** by this module's experience, and its scope is now clear: it should own the four-link chain, both trampolines, the teardown order, one shared clock, and the `BindAddr` loop. Make it the only supported way to wire the stack — containment by construction, because documentation has now been tried for two modules running and the edges are still silent.
+
+Two operator-facing facts for its documentation: **only one admin session can ever exist**, since the admin path requires session id 0; and there is **no request rate limit** on the admin API, so an admin-UID holder can drive continuous full-table scans. That is acceptable — the same party can delete every user — but it should be stated rather than discovered.
+
+### Security notes
+
+The admin decision sits after the X25519 decrypt and after ordinary authorisation, so **nothing in this module changes what an unauthenticated prober sees**; every refusal arm returns identically into the same redirect. `is_admin` is derived, has exactly one write on the success path and one at the decision, and is reachable only by possession of the 16-byte admin UID.
+
+One admin session costs at most 16 streams × (64 KiB parser body + ~257 KiB response) ≈ 5 MB, one timer per stream, for at most the 15-second deadline. Session *contexts* are not capped by this module — that bound lives in the registry and the user's sessions cap.
+
+**Where byte-fidelity with Go stops:** the encoder emits any `int64`, while the decoder refuses magnitudes above 2^53−1, because cJSON carries every number as a `double` and there is no raw-token access. A read-modify-write round-trip of a user whose credit exceeded ~9 PB would therefore 400. Unreachable through this API, and the bound has a second benefit: it means this surface can no longer feed `INT64_MIN`/`INT64_MAX` into the manager's saturating credit arithmetic.
+
+### Go interoperability — verified, not argued
+
+Two checks were run against the real toolchain (Go 1.25.6) rather than reasoned about:
+
+- `encoding/json` on the equivalent `UserInfo` struct produces this module's exact document, byte for byte; a one-terabyte credit marshals as `1000000000000`; unset fields marshal as `null`; and `json.Unmarshal` of `1e+12` into an `*int64` field fails outright — which is why the encoder goes through `cJSON_CreateRaw` rather than `cJSON_CreateNumber`.
+- `http.ReadResponse` parses this module's exact wire bytes for 200-with-body, 201, 404, 405 and OPTIONS, with correct status, a `Content-Length` matching the body it then reads in full, `Connection: close` consumed, and the `Allow` and CORS headers surfaced.
+
+Note that full client interoperability is **out of scope by spec** — the key-decisions table records "Wire compatibility: None — independent protocol" as a deliberate choice, so the real Go `ck-client` cannot talk to this server. The HTTP-layer checks above are what remain meaningful.
+
+### A correction this branch made to a previous one
+
+Module 3's merged plan claimed that the admin API, as a second SQLite writer, makes `SQLITE_BUSY` on `COMMIT` a live class and that this justifies `usermanager.c`'s annotated `ROLLBACK` and self-heal branches. **That is wrong**, and the end-to-end test showed why: an external `BEGIN IMMEDIATE` holds the write lock for its whole life, so the manager's own `BEGIN IMMEDIATE` never succeeds and no transaction exists for a `COMMIT` to fail out of. The branches still stay — their original justification, the error classes that do not auto-abandon a transaction, stands alone. Module 3's plan has been corrected in place.
+
+## The test-defect tally, updated
+
+**Seven coverage defects on this branch**, on top of eleven from the previous two. Every one found by measuring or mutating; none by reading. Six now share the one shape — *a test whose green comes from a path other than the one it names*. This branch's instances:
+
+1. A tab-trimming case that used a header whose value is **discarded**, so it passed whether or not the tab was trimmed.
+2. A UID constant that encodes **identically under both base64 alphabets**, so swapping the alphabet passed.
+3. A backpressure case whose loopback buffers swallowed the whole response, so the pause it tested never happened.
+4. A teardown case that asserted the **client** held a partial response, which says nothing about the server.
+5. A deadline case that covered only the **read** half of the property its header spent eleven lines arguing.
+6. An admin-refusal case that asserted every counter **except** the one that mattered.
+7. A cap case whose seeding loop was bounded by **the constant under test**, so it moved with the mutation instead of pinning it.
+
+The last of these is a new variant worth naming: **a test written against the symbol it is testing cannot pin that symbol.** Pin the value with a literal, assert the symbol equals it, and derive nothing else from the symbol.
+
+And the standing pair, both re-earned here: mutate the call sites rather than the helper — a mutation of `dispatcher_release_user`'s body was killed by one covered site while five others were not — and treat an intermittent failure as a bug rather than noise.
