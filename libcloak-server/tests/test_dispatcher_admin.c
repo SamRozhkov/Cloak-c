@@ -1370,6 +1370,20 @@ static void test_no_adminapi_owner_still_refuses_unknown_method(void) {
     ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&fx.proxy));
     ASSERT_EQ_INT(0, (int)cloak_server_registry_count_for_uid(&fx.registry, fx.uid_admin));
 
+    /* AND THE PANEL IS BACK TO EMPTY, which is the assertion this case
+     * exists for and the only counter the others do not already cover.
+     * Step 6 made this UID an ACTIVE user before step 7 was skipped and
+     * the owner refused it, so the failure path owes
+     * dispatcher_release_user -- for an admin session exactly as for any
+     * other. Without this pair, an edit that released only non-admin
+     * sessions (`if (!info.is_admin) dispatcher_release_user(...)`) leaves
+     * every assertion above green while leaking one slot of the
+     * 256-entry active table per distinct admin-refused UID; at the cap
+     * every later user is refused with no log line saying why. Verified
+     * by exactly that mutation -- see the task report. */
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(fx.panel));
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, fx.uid_admin) == NULL);
+
     /* An offered method through the same owner is unaffected. */
     client_session_t cs;
     ASSERT_EQ_INT(0, open_client_pm(&fx, &cs, fx.uid_admin, "ss", 0));

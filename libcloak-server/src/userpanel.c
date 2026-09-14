@@ -48,6 +48,32 @@ struct cloak_userpanel {
      * would rewrite underneath the first. See cloak_userpanel_upload_now's
      * doc comment. */
     int in_cycle;
+
+    /* THE SESSION cloak_userpanel_registry_broken IS CURRENTLY FORWARDING
+     * A NOTIFICATION ABOUT, and whether this module's own bookkeeping has
+     * been seen destroying it. Both are meaningless outside that
+     * function's call, which saves and restores them around its one
+     * bookkeeping call so a nested broken notification cannot corrupt an
+     * outer one's answer.
+     *
+     * IT IS AN OBSERVATION, NOT AN INFERENCE, and that distinction is the
+     * whole reason these two fields exist rather than a test of the
+     * active table before and after. panel_on_session_closing is invoked
+     * by cloak_server_registry_close_all_for_uid with the exact
+     * cloak_session_t * it is about to free, so pointer identity against
+     * breaking_sesh answers "was THIS session destroyed?" directly.
+     * Deducing it from "the user left the active table" is wrong in at
+     * least two reachable ways, both of which cloak_userpanel_terminate's
+     * own comments name: a re-entrant get_user during the close can
+     * legitimately install a SECOND active entry for the same UID (the
+     * lookup afterwards then finds one and the deduction says "not
+     * destroyed" about a session that was), and panel_find skips a
+     * terminating entry (so a notification arriving mid-termination reads
+     * as "was not active" and again deduces the opposite of the truth).
+     * A lifetime fact that is deduced is how the use-after-free this pair
+     * closes got in; deducing it a second way would leave the same hole. */
+    const cloak_session_t *breaking_sesh;
+    int breaking_sesh_destroyed;
 };
 
 static int panel_run_cycle(cloak_userpanel_t *p);
@@ -472,8 +498,16 @@ static void panel_on_session_closing(cloak_server_registry_t *reg, cloak_session
                                      const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
                                      void *userdata) {
     (void)reg;
-    (void)sesh;
     cloak_userpanel_t *p = userdata;
+    /* THE DIRECT SIGNAL cloak_userpanel_registry_broken needs: this is the
+     * one place in this module that sees a specific cloak_session_t going
+     * away, and the registry is about to free it the moment this returns.
+     * Pointer identity, not (uid, session_id): the pair could in principle
+     * name a session that came and went, while the pointer is what the
+     * chain is about to be handed. See cloak_userpanel_t::breaking_sesh. */
+    if (p->breaking_sesh != NULL && sesh == p->breaking_sesh) {
+        p->breaking_sesh_destroyed = 1;
+    }
     if (p->cfg.on_session_closing != NULL) {
         p->cfg.on_session_closing(uid, session_id, p->cfg.on_session_closing_userdata);
     }
@@ -586,12 +620,24 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
     if (uid != NULL) {
         memcpy(uid_copy, uid, CLOAK_UID_LEN);
         chain_uid = uid_copy;
-        /* Was this user still active before, and gone after? Then the
-         * termination above ran, and with it the close_all_for_uid that
-         * destroyed and freed the very session `sesh` points at. */
-        int was_active = cloak_userpanel_find(p, uid) != NULL;
+
+        /* Ask to be TOLD whether this session gets destroyed, rather than
+         * deducing it afterwards from the active table -- see
+         * cloak_userpanel_t::breaking_sesh for the two reachable cases a
+         * deduction gets backwards. Saved and restored around the call
+         * because a broken notification can nest (an owner's
+         * on_session_closing may close further sessions), and an inner
+         * one must not answer the outer one's question. */
+        const cloak_session_t *prev_sesh = p->breaking_sesh;
+        int prev_destroyed = p->breaking_sesh_destroyed;
+        p->breaking_sesh = sesh;
+        p->breaking_sesh_destroyed = 0;
+
         cloak_userpanel_notify_session_closed(p, uid);
-        destroyed_the_session = was_active && cloak_userpanel_find(p, uid_copy) == NULL;
+
+        destroyed_the_session = p->breaking_sesh_destroyed;
+        p->breaking_sesh = prev_sesh;
+        p->breaking_sesh_destroyed = prev_destroyed;
     }
 
     /* AFTER this module's own bookkeeping, and unconditionally -- a NULL

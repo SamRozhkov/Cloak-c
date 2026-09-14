@@ -293,7 +293,11 @@ typedef struct {
      *     (and unchanged otherwise). cloak/registry.h promises a broken
      *     callback that sesh survives the whole callback; this module is
      *     the only link that can break that promise, and it says so with
-     *     a NULL rather than with a pointer to freed memory.
+     *     a NULL rather than with a pointer to freed memory. The
+     *     destruction is OBSERVED -- the registry names each session it is
+     *     about to free as it frees it -- not deduced from this panel's
+     *     own table afterwards, which is wrong in both directions when a
+     *     termination is re-entered.
      *
      * An owner's link must therefore key its bookkeeping off uid and
      * session_id, and must treat a non-NULL sesh as usable only for the
