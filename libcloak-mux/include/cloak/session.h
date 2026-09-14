@@ -9,6 +9,7 @@
 #include "cloak/strmtab.h"
 #include "cloak/stream.h"
 #include "cloak/switchboard.h"
+#include "cloak/valve.h"
 
 typedef struct cloak_session cloak_session_t;
 
@@ -147,6 +148,15 @@ typedef struct {
     void *on_writable_userdata;
     cloak_session_stream_data_cb on_stream_data;
     void *on_stream_data_userdata;
+    /* The user-level byte meter this session's traffic is counted into,
+     * or NULL for an unmetered session -- which is what a zeroed config
+     * already gives, so every existing caller keeps its current
+     * behaviour. Borrowed: the valve is owned by whoever created it (the
+     * panel), is typically SHARED with the user's other sessions, and is
+     * never freed by this session. See cloak/valve.h, in particular
+     * before assuming rx/tx mean the user manager's up/down -- they do
+     * not. */
+    cloak_valve_t *valve;
 } cloak_session_config_t;
 
 struct cloak_session {
@@ -311,5 +321,16 @@ size_t cloak_session_send_capacity(const cloak_session_t *sesh);
  * picks, and is what cloak_stream_relay_t now budgets fd reads against
  * (see stream_relay.c's own rationale). */
 size_t cloak_session_send_min_conn_free(const cloak_session_t *sesh);
+
+/* The valve this session was configured with (NULL for an unmetered
+ * session -- cloak/valve.h). Borrowed, never to be freed here.
+ *
+ * Exposed for cloak_stream_relay_t, which has to consult the user's tx
+ * token bucket to size its reads and holds a cloak_session_t * but no
+ * valve of its own: the valve is per-USER and a relay is per-STREAM, so
+ * routing it through the session is what keeps every stream of every
+ * session of one user paced against one bucket. NULL sesh reports
+ * NULL. */
+cloak_valve_t *cloak_session_valve(const cloak_session_t *sesh);
 
 #endif

@@ -477,3 +477,49 @@ Two disciplines catch them: before writing an assertion, ask what change to the 
 - **Type consistency:** `cloak_user_info_t`, `cloak_user_status_t`, `cloak_user_terminate_t` and `cloak_valve_t` are defined once and used under those names throughout. Test counts chain 39 → 40 → 41 → 42 → 43 → 44 → 45.
 - **The riskiest thing here** is D2, the rx/tx versus up/down inversion. It is silent, it is plausible in both directions, and a test that exercises both directions symmetrically passes either way. Task 3's step 5 mutation exists solely to catch it.
 - **The most consequential thing here** is D4. Go's rate limiter blocks a goroutine; this reactor has no thread to block. Every other difference between the Go original and this port in this module is mechanical.
+
+---
+
+## What this branch's execution left for the next ones
+
+Written at merge time from the execution ledger, so it survives the workspace.
+
+### For the admin API (the next module)
+
+- **`cloak_usermanager_t`'s surface is ready for wire input**, and that was verified rather than assumed: unknown mask bits refused, all seven parameters bound on every call, saturating credit arithmetic whose clamp establishes its own precondition, and `typeof(uid) = 'blob' AND length(uid) = 16` in both the schema CHECK and the open-time scan. That predicate matters: `length(cast(uid AS BLOB)) = 16` does **not** close the hole, because a 16-byte ASCII TEXT uid casts to a 16-byte blob and passes while `get`/`delete` bind a BLOB that never compares equal to TEXT. Only pinning the storage class works.
+- **`list` has no offset or cursor.** The header says callers page through it; in practice that is count-then-allocate-all. If the admin API needs real paging, that is a change to `cloak_usermanager_list`, not something to build around.
+- **`delete`, or zeroing a credit, does not evict a currently active user** until the next upload cycle — up to one full interval of free service. If the admin API is expected to cut a user off immediately, it must call `cloak_userpanel_terminate` itself.
+- **The admin API is the second SQLite writer**, and that is the reason `usermanager.c` keeps its annotated-but-unreachable `ROLLBACK` and self-heal branches: `SQLITE_BUSY` on `COMMIT` stops being hypothetical the moment this module exists. `busy_timeout` is deliberately 0 — a second writer costs one drain of metering, never an authorisation outage and never a reactor stall — so the panel retries rather than discarding, and the admin API should expect an occasional lost drain rather than an error.
+
+### For `ck-server` (module 7)
+
+- **The binary must write the `on_session_closing` trampoline itself.** It lives in a test fixture today. `cloak_userpanel_open` refuses a NULL hook, so the mistake cannot be silent — but a binary that sets `no_relays` to get past that error reproduces the use-after-free exactly: closing sessions by UID fires no `on_broken`, and `on_broken` is the only window in which a `cloak_stream_relay_t` may be stopped.
+- This is in addition to the proxy branch's own obligation: destruction is not the reverse of construction, and the recommended `cloak_server_stack_t` helper should be the only supported wiring.
+
+### For UDP / unordered (module 9)
+
+Adding a pause site means writing against `cloak/valve.h`. Two things changed here that matter to that code: the delay function's contract is now **true** — 0 means "this direction is not rate-limited" and nothing else, a limited direction always answers at least 1 — and the consumer-side floors were removed so there is exactly one guard in one place. Do not re-add a local floor; it would mask the real one, which is how the original stall survived. A new pause site is also the most likely thing to make `stream_relay_arm_rate_timer`'s already-pending guard live for the first time; it is kept and annotated for exactly that reason.
+
+### Still owed
+
+- **A per-UID stream cap.** The proxy branch capped streams per session (256) and per proxy (derived from `RLIMIT_NOFILE`), and recorded that neither binds a *user*: one UID holding several session ids gets several times the per-session cap. The panel now exists, so the bound finally has a home.
+- **The registry has no per-user session cap** independent of the user's own `sessions_cap`. Noted three branches running.
+
+### Security notes to carry into the eventual threat model
+
+The four authorisation refusals — unknown UID, expired, out of credit, at the sessions cap — all leave through one `return -1` into the same `conn_start_redirect` an unparseable packet takes, asserted byte-for-byte against a real cover-site baseline, with four separate mutations failing that comparison.
+
+The residual is a timing difference, and it was tested rather than inherited: reaching the SQLite lookup at all requires a first packet that is a well-formed TLS record, parses as a Cloak ClientHello, survives the replay check **and decrypts under the server's X25519 private key**. A censor bulk-scanning unknown addresses holds no such key; every packet it can construct dies before the database and sees only the cover site. An attacker who does hold the key can already confirm the server by completing a handshake, so what the timing adds is a distinction *between users of a server already known to be Cloak*. One notch finer, worth recording: the panel's active-user lookup short-circuits before the manager, so such an attacker can also distinguish "this UID is currently active on this server" from "not active". Go pays the same cost on the same path, and a constant-time floor would itself be a signature.
+
+## A methodological result worth more than the code
+
+This branch produced five test-coverage defects on its own, on top of six from the previous one. Every single one was found by measuring or mutating; none by reading. Three were the same shape — **a test whose green comes from a path other than the one it names** — and that shape survived a dedicated reviewer's first pass twice.
+
+The new one, and the reason it deserves its own paragraph: the branch's last real bug was a **permanent stall in production code**, and no mutation could have found it. Every mutation this project has run tests whether a *deleted* guard is noticed. This defect lived in a guard that was present and looked right — a delay function that read the clock twice, so a bucket one thousandth of a byte short at the first read could be full at the second, returning "nothing to wait for" and arming nothing at all. It surfaced as a 1-in-200 intermittent under ASan and was found only because the engineer treated the flakiness as a bug rather than as noise. A 250-run soak showed three failures before the fix and none after.
+
+Two disciplines follow, and both are cheap:
+
+1. **Mutate the call sites, not the helper.** On two separate tasks a mutation of a helper's body was killed by one covered site while five others were uncovered — and in each case the report claimed the whole mechanism verified.
+2. **Treat an intermittent failure in a timing-sensitive test as a stall until proven otherwise, and soak rather than re-run.** A single green run is not evidence in this area; a 100-run soak under the sanitizer is the floor.
+
+And one thing to watch for in the next branch, because it has now appeared twice: a false invariant that has propagated *into a test*. Fixing the producer's contract here required inverting an existing assertion that had encoded the false guarantee as fact.

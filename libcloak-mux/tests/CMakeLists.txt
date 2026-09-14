@@ -48,3 +48,15 @@ target_include_directories(test_stream_relay PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_stream_relay PRIVATE cloak-mux)
 add_test(NAME test_stream_relay COMMAND test_stream_relay)
 set_tests_properties(test_stream_relay PROPERTIES TIMEOUT 60)
+
+add_executable(test_valve test_valve.c)
+target_include_directories(test_valve PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_valve PRIVATE cloak-mux)
+add_test(NAME test_valve COMMAND test_valve)
+set_tests_properties(test_valve PROPERTIES TIMEOUT 60)
+
+add_executable(test_valve_rate test_valve_rate.c)
+target_include_directories(test_valve_rate PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_valve_rate PRIVATE cloak-mux)
+add_test(NAME test_valve_rate COMMAND test_valve_rate)
+set_tests_properties(test_valve_rate PROPERTIES TIMEOUT 60)

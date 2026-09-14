@@ -320,4 +320,101 @@ void cloak_server_registry_close(cloak_server_registry_t *reg, const uint8_t uid
  * NULL arguments: reg == NULL returns 0. */
 size_t cloak_server_registry_count(const cloak_server_registry_t *reg);
 
+/* The number of live sessions this UID currently holds (dead entries
+ * awaiting their sweep do not count, exactly as in
+ * cloak_server_registry_count -- which is what makes this usable from
+ * inside a cloak_registry_broken_cb to ask "were there any OTHER sessions
+ * besides the one that just broke?", since the breaking entry is marked
+ * dead before that callback runs).
+ *
+ * A LINEAR SCAN over the whole table, like every other lookup in this
+ * file and like cloak_proxy_t's own scans: CLOAK_REGISTRY_MAX_SESSIONS is
+ * small, the scan costs nothing at that size, and an index keyed on UID
+ * would be a second structure that could disagree with the table -- which
+ * is the failure this module is least able to afford, since the table is
+ * the only record of what is still alive.
+ *
+ * NULL arguments: reg == NULL or uid == NULL returns 0. */
+size_t cloak_server_registry_count_for_uid(const cloak_server_registry_t *reg,
+                                           const uint8_t uid[CLOAK_UID_LEN]);
+
+/* Fired by cloak_server_registry_close_all_for_uid once per session it is
+ * about to close, while that session is STILL ALIVE and before anything
+ * about it is torn down. This is the only window that function offers,
+ * and it exists because that function -- like cloak_server_registry_close,
+ * whose contract it shares -- does not fire on_broken: see
+ * cloak_server_registry_close_all_for_uid itself.
+ *
+ * The entry has ALREADY been removed from the table when this fires, so a
+ * cloak_server_registry_close or a nested
+ * cloak_server_registry_close_all_for_uid for this same session from here
+ * is a no-op rather than a double teardown, and
+ * cloak_server_registry_count_for_uid no longer counts it. sesh is valid
+ * for the duration of this call and is destroyed the moment it
+ * returns. */
+typedef void (*cloak_registry_closing_cb)(cloak_server_registry_t *reg, cloak_session_t *sesh,
+                                          const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
+                                          void *userdata);
+
+/* Closes every session belonging to uid, each exactly as
+ * cloak_server_registry_close would: via cloak_session_destroy,
+ * immediately, not deferred, and WITHOUT firing on_broken. Returns how
+ * many sessions it closed.
+ *
+ * "EVERY" INCLUDES AN ENTRY THAT IS ALREADY DEAD -- one whose on_broken
+ * has fired and whose deferred sweep has not yet run -- AND THAT IS THE
+ * ONE PLACE THIS DIVERGES FROM cloak_server_registry_close, which skips
+ * such an entry as a no-op. The divergence is deliberate and is the whole
+ * reason to close by UID: the caller closing by UID is, by construction,
+ * about to invalidate something every session of that UID holds a
+ * borrowed pointer to -- for cloak_userpanel_t it is the user's
+ * cloak_valve_t, which the panel frees the instant this returns. A dead
+ * entry is NOT harmless in that window: its cloak_session_t is still
+ * fully constructed and its remaining connections are still registered
+ * with the reactor until the sweep runs a turn later, so a byte arriving
+ * on one of them meters into freed memory. Skipping dead entries here
+ * would therefore reintroduce, one reactor turn later, precisely the
+ * use-after-free class this registry was restructured to prevent.
+ * Destroying a dead entry (including the one whose on_broken is on the
+ * stack right now) is safe for exactly the reason
+ * cloak_server_registry_destroy -- which also destroys dead entries, from
+ * that same context -- is safe; the entry is unlinked first, so the
+ * pending sweep simply finds nothing where it was.
+ *
+ * Every other word of cloak_server_registry_close's own doc comment
+ * applies, and the two that matter most are repeated because getting them
+ * wrong is a use-after-free rather than a bug:
+ *
+ *  - Because on_broken does NOT fire, this is NOT a safe place to stop a
+ *    relay from -- by the time cloak_session_destroy runs, the session's
+ *    on_broken window (the last moment a bound cloak_stream_relay_t may
+ *    be stopped; see cloak_registry_broken_cb above and
+ *    cloak/stream_relay.h) has passed without firing. The caller MUST
+ *    stop every relay bound to every session of this uid itself. THAT IS
+ *    WHAT on_closing IS FOR: it fires per session, with that session's
+ *    id, while the session is still alive, which is exactly the window a
+ *    caller needs and cannot otherwise get -- a caller that closes by uid
+ *    has no other way to learn which session ids it is about to destroy.
+ *    on_closing may be NULL only when the caller genuinely has nothing
+ *    bound to these sessions.
+ *
+ *  - This is a synchronous cloak_session_destroy and carries that
+ *    function's calling-context restriction (cloak/session.h): NOT from
+ *    within on_new_stream, and NOT from within any cloak_conn_t/
+ *    cloak_switchboard_t callback. From within a cloak_registry_broken_cb
+ *    it IS safe -- that is the same context in which
+ *    cloak_server_registry_destroy (which destroys every session in the
+ *    table) is already documented as permitted.
+ *
+ * A LINEAR SCAN, for the reason given on
+ * cloak_server_registry_count_for_uid. The scan reads each slot once and
+ * unlinks the entry BEFORE invoking on_closing, so an on_closing that
+ * reenters this module cannot see, close, or free the same entry twice.
+ *
+ * NULL arguments: reg == NULL or uid == NULL returns 0. */
+size_t cloak_server_registry_close_all_for_uid(cloak_server_registry_t *reg,
+                                               const uint8_t uid[CLOAK_UID_LEN],
+                                               cloak_registry_closing_cb on_closing,
+                                               void *userdata);
+
 #endif

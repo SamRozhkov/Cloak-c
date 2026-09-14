@@ -100,6 +100,7 @@ int cloak_switchboard_add_conn(cloak_switchboard_t *sb, int fd) {
         return -1;
     }
     cloak_conn_set_drained_cb(c, switchboard_conn_drained_adapter, sb);
+    cloak_conn_set_valve(c, sb->valve); /* NULL if this pool is unmetered */
     sb->conns[sb->conns_len++] = c;
     return 0;
 }
@@ -109,7 +110,36 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
         return -1;
     }
     size_t idx = xorshift32(&sb->rng_state) % sb->conns_len;
-    return cloak_conn_send(sb->conns[idx], frame_bytes, frame_len);
+    int rc = cloak_conn_send(sb->conns[idx], frame_bytes, frame_len);
+    if (rc == 0) {
+        /* TX counting point. Go's switchboard.go:106 -- sb.valve.AddTx(int64(n))
+         * as the last statement of switchboard.send, reached only on the
+         * success path (Go returns from the error branches BEFORE it, so
+         * a write that failed is never billed; the same is true here,
+         * hence the rc == 0 guard rather than counting unconditionally).
+         *
+         * Here rather than inside cloak_conn_send's own drain loop: Go
+         * counts what a successful conn.Write accepted, and this port's
+         * equivalent of "the write was accepted" is cloak_conn_send
+         * returning 0. Counting bytes as the kernel actually swallows
+         * them would move the count into conn_try_drain_send, which runs
+         * again later from reactor dispatch and would bill the same
+         * frame's tail at an arbitrarily later moment -- a needless
+         * divergence from Go, and one that loses the bytes of a frame
+         * still queued when a connection dies.
+         *
+         * CLOAK_CONN_LEN_PREFIX_LEN is included because cloak_conn_send
+         * adds that prefix to every frame, so it genuinely crosses the
+         * socket: the count is the whole on-wire envelope, which is also
+         * exactly what the peer's RX side counts for the same frame. In
+         * Go the equivalent framing lives inside the transport conn
+         * (a TLS record header), below the point either counter sees.
+         *
+         * rx/tx here are the SERVER's directions, NOT the user manager's
+         * up/down -- see cloak/valve.h before touching this line. */
+        cloak_valve_add_tx(sb->valve, (int64_t)(CLOAK_CONN_LEN_PREFIX_LEN + frame_len));
+    }
+    return rc;
 }
 
 void cloak_switchboard_close_all(cloak_switchboard_t *sb) {
@@ -133,6 +163,20 @@ void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard
     }
     sb->on_drained = cb;
     sb->on_drained_userdata = userdata;
+}
+
+void cloak_switchboard_set_valve(cloak_switchboard_t *sb, cloak_valve_t *v) {
+    if (sb == NULL) {
+        return;
+    }
+    sb->valve = v;
+    /* Connections added before this call would otherwise keep metering
+     * into whatever they were given at add time (usually nothing), which
+     * would silently under-count a user whose valve is installed after
+     * their first connection. */
+    for (size_t i = 0; i < sb->conns_len; i++) {
+        cloak_conn_set_valve(sb->conns[i], v);
+    }
 }
 
 size_t cloak_switchboard_send_queued(const cloak_switchboard_t *sb) {

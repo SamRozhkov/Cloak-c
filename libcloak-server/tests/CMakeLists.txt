@@ -160,3 +160,59 @@ set_tests_properties(test_server_e2e PROPERTIES TIMEOUT 60)
 # produce that EAGAIN. See test_write_shim.c's own top-of-file comment.
 set_tests_properties(test_server_e2e PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides: case 12 opens a second sqlite3 handle of its own to
+# prove the schema refuses a wrong-length UID no matter who writes it,
+# and that needs sqlite3.h on the include path, which cloak-server's
+# PRIVATE link deliberately does not propagate.
+add_executable(test_usermanager test_usermanager.c)
+target_include_directories(test_usermanager PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_usermanager PRIVATE cloak-server sqlite3)
+add_test(NAME test_usermanager COMMAND test_usermanager)
+set_tests_properties(test_usermanager PROPERTIES TIMEOUT 60)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for a different one of the shim's two protocols:
+# this file's rollback case needs a genuine mid-batch SQLITE_IOERR, and no
+# legitimate use of the database can make an sqlite3_step fail partway.
+# The shim fails write(2)/pwrite(2) against the one temp database that
+# case names. Preloading also brings the ASan-runtime-first ordering
+# requirement the block above handles.
+set_tests_properties(test_usermanager PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_usermanager does: the
+# retry-on-failed-upload case opens a second sqlite3 connection of its own
+# and holds a BEGIN IMMEDIATE write lock, which is the only way to make
+# cloak_usermanager_upload_status fail the way a real second writer makes
+# it fail (busy_timeout is 0 by design).
+add_executable(test_userpanel test_userpanel.c)
+target_include_directories(test_userpanel PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_userpanel PRIVATE cloak-server sqlite3)
+add_test(NAME test_userpanel COMMAND test_userpanel)
+set_tests_properties(test_userpanel PROPERTIES TIMEOUT 60)
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_usermanager.c and
+# test_userpanel.c do: this file writes user rows and reads credits back
+# through cloak_usermanager_write/get, which needs cloak/usermanager.h's
+# own types -- and cloak-server's PRIVATE sqlite3 link deliberately does
+# not propagate the include path its implementation uses.
+add_executable(test_dispatcher_users test_dispatcher_users.c)
+target_include_directories(test_dispatcher_users PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_users PRIVATE cloak-server sqlite3)
+add_test(NAME test_dispatcher_users COMMAND test_dispatcher_users)
+set_tests_properties(test_dispatcher_users PROPERTIES TIMEOUT 60)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for the same reason test_dispatcher_limits,
+# test_proxy_teardown and test_server_e2e do: this file's
+# test_reply_write_failure_releases_the_user needs the dispatcher's
+# step-10 reply write to fail deterministically, which is the only way to
+# reach conn_teardown's auth_created unwind -- and the reply is far
+# smaller than any socket buffer floor, so genuine backpressure cannot
+# produce that failure. See test_write_shim.c's own top-of-file comment.
+set_tests_properties(test_dispatcher_users PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")

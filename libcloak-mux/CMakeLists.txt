@@ -6,6 +6,7 @@ add_library(cloak-mux STATIC
     src/switchboard.c
     src/session.c
     src/stream_relay.c
+    src/valve.c
 )
 
 target_include_directories(cloak-mux PUBLIC include)

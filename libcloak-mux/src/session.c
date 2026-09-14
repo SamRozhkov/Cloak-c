@@ -433,6 +433,9 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
         return -1;
     }
     cloak_switchboard_set_drained_cb(&sesh->sb, session_switchboard_drained_adapter, sesh);
+    /* NULL for an unmetered session; the pool forwards it to every
+     * connection this session ever adds. */
+    cloak_switchboard_set_valve(&sesh->sb, config->valve);
 
     session_reschedule_inactivity_timer(sesh);
     return 0;
@@ -579,4 +582,15 @@ size_t cloak_session_send_min_conn_free(const cloak_session_t *sesh) {
         return 0;
     }
     return cloak_switchboard_send_min_conn_free(&sesh->sb);
+}
+
+cloak_valve_t *cloak_session_valve(const cloak_session_t *sesh) {
+    if (sesh == NULL) {
+        return NULL;
+    }
+    /* Read back from the switchboard rather than stored a second time on
+     * the session: cloak_switchboard_set_valve is what every connection
+     * in the pool is actually metered against, so a separate copy here
+     * could disagree with the thing doing the counting. */
+    return sesh->sb.valve;
 }

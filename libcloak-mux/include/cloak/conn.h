@@ -6,6 +6,7 @@
 
 #include "cloak/bytequeue.h"
 #include "cloak/reactor.h"
+#include "cloak/valve.h"
 
 /* Number of bytes in the length prefix this module adds around every
  * frame on the wire -- see this project's plan/design notes on why: in
@@ -66,8 +67,22 @@ struct cloak_conn {
     cloak_conn_drained_cb on_drained;
     void *on_drained_userdata;
 
+    /* Borrowed, may be NULL ("this connection is not metered"). Owned by
+     * the panel, never by this connection -- see cloak/valve.h. */
+    cloak_valve_t *valve;
+
     int broken;
     int want_writable; /* whether EPOLLWRITABLE is currently part of our registered interest */
+
+    /* 1 while READABLE has been dropped from the registered interest
+     * because the valve's rx token bucket is empty. Unlike every other
+     * pause in this codebase, nothing in the system will resume this one
+     * -- only the clock will -- so it is never set without
+     * rx_resume_timer being armed in the same breath. */
+    int read_paused;
+    cloak_timer_id_t rx_resume_timer; /* CLOAK_TIMER_INVALID when none is pending */
+
+    uint32_t interest; /* the mask currently registered with the reactor */
 };
 
 /* max_frame_len is the largest single frame's on-wire byte length this
@@ -117,6 +132,16 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
 /* Installs (or, with cb == NULL, removes) the drained notification.
  * Separate from cloak_conn_init so existing callers keep compiling. */
 void cloak_conn_set_drained_cb(cloak_conn_t *c, cloak_conn_drained_cb cb, void *userdata);
+
+/* Points this connection at the valve that meters the user it belongs to
+ * (v == NULL, the default, means unmetered). This connection counts only
+ * the RX half there -- every byte it reads off its socket, framing
+ * included -- because this is where those bytes first exist; the TX half
+ * is counted by cloak_switchboard_send, which is where an outbound frame
+ * is handed off. See cloak/valve.h for the direction convention and for
+ * why the valve's lifetime is never this connection's to manage. Not
+ * passed to cloak_conn_init so existing callers keep compiling. */
+void cloak_conn_set_valve(cloak_conn_t *c, cloak_valve_t *v);
 
 /* Bytes currently buffered for transmission, and the hard cap given to
  * cloak_conn_init. A producer should treat queued approaching capacity as

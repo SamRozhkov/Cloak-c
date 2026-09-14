@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "cloak/reactor.h"
+#include "cloak/valve.h"
 
 typedef struct cloak_switchboard cloak_switchboard_t;
 typedef struct cloak_conn cloak_conn_t;
@@ -53,6 +54,10 @@ struct cloak_switchboard {
     void *on_broken_userdata;
     cloak_switchboard_drained_cb on_drained;
     void *on_drained_userdata;
+
+    /* Borrowed, may be NULL ("this pool is not metered"). Forwarded to
+     * every cloak_conn_t this pool creates -- see cloak/valve.h. */
+    cloak_valve_t *valve;
 };
 
 /* max_frame_len/conn_send_queue_cap are forwarded unchanged to every
@@ -96,6 +101,19 @@ size_t cloak_switchboard_conn_count(const cloak_switchboard_t *sb);
 
 void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard_drained_cb cb,
                                        void *userdata);
+
+/* Points this pool, and every connection in it (now and in future), at
+ * the valve that meters the user it belongs to; v == NULL, the default a
+ * zeroed/just-initialised switchboard already has, means unmetered.
+ * Applies to connections added before this call as well as after, so the
+ * order of set_valve and cloak_switchboard_add_conn does not matter.
+ *
+ * This pool counts the TX half itself (in cloak_switchboard_send, the
+ * direct analogue of Go's switchboard.send calling AddTx after a
+ * successful write); each connection counts the RX half as it reads. See
+ * cloak/valve.h before touching either -- rx and tx are from the SERVER's
+ * perspective and are NOT the user manager's up/down. */
+void cloak_switchboard_set_valve(cloak_switchboard_t *sb, cloak_valve_t *v);
 
 /* Summed over every connection in the pool. An empty pool reports 0 for
  * both -- a producer must therefore treat capacity == 0 as "cannot send
