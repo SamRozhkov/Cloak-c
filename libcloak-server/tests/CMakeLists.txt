@@ -228,3 +228,15 @@ target_include_directories(test_user_json PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-c
 target_link_libraries(test_user_json PRIVATE cloak-server)
 add_test(NAME test_user_json COMMAND test_user_json)
 set_tests_properties(test_user_json PROPERTIES TIMEOUT 60)
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_usermanager.c and
+# test_userpanel.c do: every case here asserts the DATABASE and not just
+# the status code, through cloak_usermanager_write/get/list, and
+# cloak-server's PRIVATE sqlite3 link deliberately does not propagate the
+# include path its implementation uses.
+add_executable(test_adminapi test_adminapi.c)
+target_include_directories(test_adminapi PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_adminapi PRIVATE cloak-server sqlite3)
+add_test(NAME test_adminapi COMMAND test_adminapi)
+set_tests_properties(test_adminapi PROPERTIES TIMEOUT 60)

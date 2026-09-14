@@ -36,3 +36,10 @@ target_sources(cloak-server PRIVATE src/http.c)
 # of cloak/usermanager.h sees sqlite3.h.
 target_sources(cloak-server PRIVATE src/user_json.c)
 target_link_libraries(cloak-server PRIVATE cjson)
+
+# The admin API's router over a session's streams. Appended for the same
+# reason src/http.c and src/user_json.c are -- this file's existing
+# content stays byte-identical -- and it needs no new link dependency:
+# it consumes cloak/http.h, cloak/user_json.h, cloak/base64.h and
+# cloak/usermanager.h, all of which this target already provides.
+target_sources(cloak-server PRIVATE src/adminapi.c)

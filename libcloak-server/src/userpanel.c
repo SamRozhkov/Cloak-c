@@ -561,13 +561,24 @@ void cloak_userpanel_notify_session_closed(cloak_userpanel_t *p,
 void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session_t *sesh,
                                      const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
                                      void *userdata) {
-    (void)reg;
-    (void)sesh;
-    (void)session_id;
-    if (userdata == NULL || uid == NULL) {
+    cloak_userpanel_t *p = userdata;
+    if (p == NULL) {
+        /* Not this module's callback at all; there is not even a chain to
+         * reach from here. */
         return;
     }
-    cloak_userpanel_notify_session_closed(userdata, uid);
+    if (uid != NULL) {
+        cloak_userpanel_notify_session_closed(p, uid);
+    }
+
+    /* AFTER this module's own bookkeeping, and unconditionally -- a NULL
+     * uid included. This is the last module-level link of the chain
+     * described at the top of cloak/userpanel.h, and an owner's own
+     * notification must not be swallowed just because THIS module had
+     * nothing to do for that session. */
+    if (p->cfg.chain != NULL) {
+        p->cfg.chain(reg, sesh, uid, session_id, p->cfg.chain_userdata);
+    }
 }
 
 /* ------------------------------------------------------------------ */
