@@ -92,6 +92,15 @@ static int reason_is(const char *actual, const char *expected) {
     return actual != NULL && strcmp(actual, expected) == 0;
 }
 
+/* Sixteen CHARACTERS of two-byte UTF-8: 32 bytes. SQL length() reports
+ * 16 for it as TEXT, so a length-only uid constraint admits it. */
+#define UM_TEXT_UID_16CH "\xc3\x80\xc3\x81\xc3\x82\xc3\x83\xc3\x84\xc3\x85" \
+                         "\xc3\x86\xc3\x87\xc3\x88\xc3\x89\xc3\x8a\xc3\x8b" \
+                         "\xc3\x8c\xc3\x8d\xc3\x8e\xc3\x8f"
+/* Sixteen BYTES of ascii TEXT: passes a cast-to-blob length test too, and
+ * is still unmatchable by a BLOB-binding get or delete. */
+#define UM_TEXT_UID_16B "0123456789abcdef"
+
 /* A time far from zero and from every credit/cap constant used below, so
  * an implementation that confused a timestamp with a credit, or that
  * defaulted a clock to 0, could not accidentally produce a passing
@@ -858,6 +867,31 @@ static void case_uid_length_enforced(void) {
         /* SQLITE_CONSTRAINT, not SQLITE_DONE: the row was refused. */
         ASSERT_EQ_INT(rc & 0xff, SQLITE_CONSTRAINT);
     }
+
+    /* TEXT uids, which a length-only constraint cannot see. SQL length()
+     * counts CHARACTERS for TEXT and BYTES for a BLOB, and a BLOB-declared
+     * column does not convert what is bound to it -- so UM_TEXT_UID_16CH
+     * below is 16 characters and 32 bytes and satisfies `length(uid) = 16`
+     * outright. Such a row is invisible to list (which measures bytes) and
+     * unmatchable by get and delete (which bind a BLOB, and a BLOB never
+     * compares equal to TEXT), i.e. precisely the user an operator can
+     * neither see nor remove.
+     *
+     * UM_TEXT_UID_16B is the case that rules out the other obvious repair:
+     * it is 16 BYTES of ascii TEXT, so `length(cast(uid AS BLOB)) = 16`
+     * would admit it while get and delete still could not touch it. Only
+     * pinning the storage class rejects both. */
+    {
+        static const char *const text_uids[] = {UM_TEXT_UID_16CH, UM_TEXT_UID_16B};
+        for (i = 0; i < sizeof(text_uids) / sizeof(text_uids[0]); i++) {
+            sqlite3_reset(ins);
+            ASSERT_EQ_INT(sqlite3_bind_text(ins, 1, text_uids[i], -1,
+                                            SQLITE_TRANSIENT),
+                          SQLITE_OK);
+            rc = sqlite3_step(ins);
+            ASSERT_EQ_INT(rc & 0xff, SQLITE_CONSTRAINT);
+        }
+    }
     sqlite3_finalize(ins);
     sqlite3_close(raw);
 
@@ -1183,6 +1217,26 @@ static void case_open_rejects_bad_uid_rows(void) {
                       SQLITE_OK);
         ASSERT_EQ_INT(sqlite3_step(ins), SQLITE_DONE);
     }
+    /* The two TEXT shapes as well. These are the ones a length-only
+     * predicate cannot count: the 16-character multi-byte value satisfies
+     * SQL `length(uid) = 16` while occupying 32 bytes, and the 16-byte
+     * ascii one survives a cast-to-blob length test. Both are unreachable
+     * through the API for the same reason as the wrong-length blobs, so
+     * open has to refuse on them too -- this legacy table has no CHECK at
+     * all, which is exactly the database an older build would have left
+     * behind. */
+    {
+        static const char *const text_uids[] = {UM_TEXT_UID_16CH, UM_TEXT_UID_16B};
+        size_t k;
+        for (k = 0; k < sizeof(text_uids) / sizeof(text_uids[0]); k++) {
+            sqlite3_reset(ins);
+            ASSERT_EQ_INT(sqlite3_bind_text(ins, 1, text_uids[k], -1,
+                                            SQLITE_TRANSIENT),
+                          SQLITE_OK);
+            ASSERT_EQ_INT(sqlite3_step(ins), SQLITE_DONE);
+        }
+    }
+
     /* One well-formed row alongside them, so the failure below is about
      * the bad rows and not about the table being unusable. */
     sqlite3_reset(ins);
@@ -1200,13 +1254,15 @@ static void case_open_rejects_bad_uid_rows(void) {
     ASSERT_TRUE(m == NULL);
     /* The message names the COUNT, which is what makes it actionable --
      * an operator has to know how many rows they are looking for. */
-    ASSERT_TRUE(strstr(err, "3 user row(s)") != NULL);
+    ASSERT_TRUE(strstr(err, "5 user row(s)") != NULL);
 
     /* Remove exactly the offending rows and the same file opens, with the
      * well-formed user intact. This is what proves the refusal was about
      * those three rows specifically. */
     ASSERT_EQ_INT(sqlite3_open(path, &raw), SQLITE_OK);
-    ASSERT_EQ_INT(sqlite3_exec(raw, "DELETE FROM users WHERE length(uid) <> 16",
+    ASSERT_EQ_INT(sqlite3_exec(raw,
+                               "DELETE FROM users"
+                               " WHERE typeof(uid) <> 'blob' OR length(uid) <> 16",
                                NULL, NULL, NULL),
                   SQLITE_OK);
     sqlite3_close(raw);

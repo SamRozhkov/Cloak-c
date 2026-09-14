@@ -25,17 +25,35 @@
  * here is by uid. Dropping the indirection removes an index, a level of
  * seeking per lookup, and the rowid column itself.
  *
- * The CHECK on the uid length is the only place a wrong-length UID can be
- * stopped for good. This module's own C signatures take a fixed-size
- * array, so no in-process caller can even express one -- but the admin
- * API decodes UIDs off the wire, and nothing stops a future caller (or a
- * separate tool) from binding a blob of its own length to this table.
- * Putting the invariant in the schema means the database refuses, not
- * some argument check that a new code path forgets to repeat. */
+ * The CHECK on the uid is the only place a malformed UID can be stopped
+ * for good. This module's own C signatures take a fixed-size array, so no
+ * in-process caller can even express one -- but the admin API decodes
+ * UIDs off the wire, and nothing stops a future caller (or a separate
+ * tool) from binding a value of its own shape to this table. Putting the
+ * invariant in the schema means the database refuses, not some argument
+ * check that a new code path forgets to repeat.
+ *
+ * THE typeof() HALF IS NOT DECORATION. A BLOB-declared column has BLOB
+ * affinity, which means NO conversion: a TEXT value bound here stays
+ * TEXT. And SQL length() counts CHARACTERS for TEXT but BYTES for a BLOB,
+ * so a 16-character UTF-8 string occupying 32 bytes satisfies
+ * `length(uid) = 16` and slides straight through a length-only check
+ * (verified against this engine, not assumed). Such a row is then
+ * invisible AND undeletable: cloak_usermanager_list measures it with
+ * sqlite3_column_bytes and skips it at 32 bytes, while get and delete
+ * bind a BLOB, and in SQLite a BLOB never compares equal to TEXT, so
+ * their `uid = ?1` matches nothing. Exactly the user an operator can
+ * neither see nor remove that this constraint exists to prevent.
+ *
+ * `length(cast(uid AS BLOB)) = 16` is the other obvious repair and it is
+ * NOT sufficient: a 16-BYTE ascii TEXT value casts to a 16-byte blob and
+ * passes, while get and delete still cannot match it. Only pinning the
+ * storage class closes it. */
 static const char UM_SCHEMA[] =
     "CREATE TABLE IF NOT EXISTS users ("
     "    uid          BLOB PRIMARY KEY NOT NULL"
-    "                 CHECK(length(uid) = " UM_STR(CLOAK_UID_LEN) "),"
+    "                 CHECK(typeof(uid) = 'blob' AND"
+    "                       length(uid) = " UM_STR(CLOAK_UID_LEN) "),"
     "    sessions_cap INTEGER NOT NULL,"
     "    up_rate      INTEGER NOT NULL," /* bytes/sec, 0 = unlimited */
     "    down_rate    INTEGER NOT NULL,"
@@ -363,24 +381,35 @@ int cloak_usermanager_open(cloak_usermanager_t **out, const char *db_path,
         return CLOAK_USER_ERR_DB;
     }
 
-    /* Validate what is already in the file. A row whose uid is the wrong
-     * length is UNREACHABLE through this entire API -- list skips it, and
-     * get and delete bind a fixed CLOAK_UID_LEN blob whose `uid = ?1` can
-     * never match it -- so an operator would have a user in their
-     * database that they can neither see nor delete. The schema's CHECK
-     * makes such a row impossible to create now, so this only fires on a
-     * database written before that constraint existed, or by another
-     * tool; refusing to open loudly, with the count, is something an
-     * operator can act on, whereas an invisible user is not.
+    /* Validate what is already in the file. A row whose uid is not a
+     * CLOAK_UID_LEN-byte BLOB is UNREACHABLE through this entire API --
+     * list skips it, and get and delete bind a fixed-size blob whose
+     * `uid = ?1` can never match it -- so an operator would have a user
+     * in their database that they can neither see nor delete. Refusing to
+     * open loudly, with the count, is something they can act on; an
+     * invisible user is not.
+     *
+     * THIS IS NOT REDUNDANT WITH THE SCHEMA'S CHECK, and the division of
+     * labour is the whole reason it exists. CREATE TABLE IF NOT EXISTS
+     * does not alter a table that is already there, so a database created
+     * by an earlier build keeps whatever constraint it was created with.
+     * The CHECK protects databases created from now on; this query is
+     * what catches what an older, weaker CHECK already let in. The
+     * predicate must therefore be at least as strict as the CHECK and is
+     * kept deliberately identical to it -- including the typeof() half,
+     * without which a 16-character multi-byte TEXT uid counts as zero bad
+     * rows (SQL length() counts characters for TEXT, bytes for a BLOB).
      *
      * Prepared ad hoc and finalized immediately rather than joining the
      * cache: it runs exactly once per process, and a cached statement
      * would cost a slot in a table whose whole point is the hot path. */
     {
         sqlite3_stmt *check = NULL;
-        rc = sqlite3_prepare_v2(
-            m->db, "SELECT count(*) FROM users WHERE length(uid) <> ?1", -1,
-            &check, NULL);
+        rc = sqlite3_prepare_v2(m->db,
+                                "SELECT count(*) FROM users"
+                                " WHERE typeof(uid) <> 'blob'"
+                                "    OR length(uid) <> ?1",
+                                -1, &check, NULL);
         if (rc == SQLITE_OK &&
             sqlite3_bind_int(check, 1, CLOAK_UID_LEN) == SQLITE_OK &&
             sqlite3_step(check) == SQLITE_ROW) {
@@ -389,9 +418,9 @@ int cloak_usermanager_open(cloak_usermanager_t **out, const char *db_path,
             if (bad > 0) {
                 um_set_err(err, err_cap,
                            "usermanager: '%s' contains %lld user row(s) whose "
-                           "uid is not %d bytes; such rows are unreachable "
-                           "through this API and must be removed before the "
-                           "database can be used",
+                           "uid is not a %d-byte blob; such rows are "
+                           "unreachable through this API and must be removed "
+                           "before the database can be used",
                            db_path, (long long)bad, CLOAK_UID_LEN);
                 cloak_usermanager_close(m);
                 return CLOAK_USER_ERR_SCHEMA;
@@ -534,10 +563,6 @@ int cloak_usermanager_upload_status(cloak_usermanager_t *m,
     }
 
     *out_n = 0;
-    /* Matches Go's early return: an empty batch opens no transaction. */
-    if (n_updates == 0) {
-        return 0;
-    }
 
     /* SELF-HEAL. An earlier batch whose rollback ALSO failed leaves this
      * connection inside a transaction, and every BEGIN IMMEDIATE from
@@ -566,6 +591,17 @@ int cloak_usermanager_upload_status(cloak_usermanager_t *m,
                        sqlite3_errmsg(m->db));
             return CLOAK_USER_ERR_WEDGED;
         }
+    }
+
+    /* Matches Go's early return: an empty batch opens no transaction.
+     * Placed AFTER the self-heal on purpose -- an empty probe on a wedged
+     * manager must report the wedge, not success. Reporting 0 terminates
+     * and 0 errors would tell a caller polling with an empty drain that
+     * everything is fine while nothing can be written. The heal does not
+     * open a transaction, so the "no transaction for an empty batch"
+     * property this preserves is untouched. */
+    if (n_updates == 0) {
+        return 0;
     }
 
     meter = m->st[UM_ST_METER];

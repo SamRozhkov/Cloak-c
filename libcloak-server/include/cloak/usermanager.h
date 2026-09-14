@@ -91,10 +91,22 @@
  * cloak_usermanager_open returns it. */
 #define CLOAK_USER_ERR_SCHEMA         (-9)
 /* A transaction from an earlier failed batch could not be rolled back,
- * and the connection is therefore stuck inside it. Distinct from _DB
- * because it is PERMANENT for this manager: retrying will never succeed,
- * and the caller should stop metering and tell the operator rather than
- * loop. Only cloak_usermanager_upload_status returns it. */
+ * and the connection is therefore stuck inside it, so nothing can be
+ * written. Distinct from _DB because the remedy is different: a _DB
+ * failure is one batch going wrong, whereas this says the connection
+ * itself is in a state no further metering can get past on its own.
+ *
+ * It is NOT latched, and the distinction matters to a caller. Every
+ * subsequent cloak_usermanager_upload_status re-attempts the rollback
+ * before doing anything else, so a rollback that failed for a transient
+ * reason heals on the next drain and metering resumes by itself. Treat
+ * this as "escalate to an operator", not as "this manager is dead" --
+ * latching a permanent flag would have made the wording simpler and the
+ * behaviour worse, by refusing to recover from something that had already
+ * cleared. A caller that keeps seeing it across drains has a real
+ * problem; one that sees it once may well not.
+ *
+ * Only cloak_usermanager_upload_status returns it. */
 #define CLOAK_USER_ERR_WEDGED         (-10)
 
 /* ------------------------------------------------------------------ */
@@ -107,13 +119,18 @@
  * idiomatic "effectively unlimited" and works as one -- metering can
  * subtract from it for longer than the universe has existed.
  *
- * What the range does NOT include is wrapping. Every credit adjustment in
- * cloak_usermanager_upload_status SATURATES: it clamps at INT64_MIN and
- * INT64_MAX instead of overflowing, which in C would be undefined
- * behaviour and in practice would flip an unlimited user into maximal
- * debt (a permanent lockout) or a maximally indebted user into unlimited
- * credit (a silent free pass). Both directions have been reproduced; see
- * cloak_usermanager_upload_status.
+ * What the range does NOT include is wrapping. No credit adjustment in
+ * cloak_usermanager_upload_status can overflow in either direction, which
+ * in C would be undefined behaviour and in practice would flip an
+ * unlimited user into maximal debt (a permanent lockout) or a maximally
+ * indebted user into unlimited credit (a silent free pass). Both
+ * directions have been reproduced; see cloak_usermanager_upload_status.
+ *
+ * Do not go looking for two clamps in the implementation: there is one.
+ * Usages are clamped to >= 0 BEFORE the subtraction, so a credit can only
+ * ever move down, and a single saturation at INT64_MIN is then enough to
+ * cover both cases. An upper clamp would be unreachable code. The two
+ * defences are the usage clamp and the lower saturation, in that order.
  *
  * The one thing an operator should know is that a credit clamped to
  * INT64_MIN is a permanent lockout no amount of further metering can
@@ -218,17 +235,31 @@ typedef struct cloak_usermanager cloak_usermanager_t;
  *
  * Blocks. See the top of this file for why that is correct here.
  *
- * VALIDATES THE EXISTING CONTENTS: a row whose uid is not exactly
- * CLOAK_UID_LEN bytes fails the open with CLOAK_USER_ERR_SCHEMA and a
- * message naming how many such rows there are. The current schema's CHECK
- * constraint makes such a row impossible to create, so this can only fire
- * on a database written before that constraint existed (or by another
- * tool). It is a hard failure rather than a warning because such a row is
- * unreachable through this entire API -- list skips it, and get and
- * delete take a fixed 16-byte UID whose lookup can never match it -- so
- * an operator could neither see nor remove a user that is nonetheless in
- * their database. A loud startup failure they can act on beats an
- * invisible user they cannot.
+ * VALIDATES THE EXISTING CONTENTS: a row whose uid is not exactly a
+ * CLOAK_UID_LEN-byte BLOB fails the open with CLOAK_USER_ERR_SCHEMA and a
+ * message naming how many such rows there are. It is a hard failure
+ * rather than a warning because such a row is unreachable through this
+ * entire API -- list skips it, and get and delete bind a fixed-size blob
+ * whose lookup can never match it -- so an operator would otherwise have
+ * a user in their database that they can neither see nor remove.
+ *
+ * THIS IS NOT THE SAME GUARD AS THE SCHEMA'S CHECK CONSTRAINT, and the
+ * division of labour is why both exist. The schema is applied with CREATE
+ * TABLE IF NOT EXISTS, which does not alter a table that is already
+ * there: a database created by an earlier build keeps the constraint it
+ * was created with, however weak. The CHECK protects every database
+ * created from now on; this validation is what catches what an older one
+ * already admitted. Neither covers the other's case.
+ *
+ * Both predicates pin the storage class as well as the length, and that
+ * is load-bearing rather than belt-and-braces: SQL length() counts
+ * CHARACTERS for a TEXT value and BYTES for a BLOB, and a BLOB-declared
+ * column does not convert what is bound to it, so a 16-character
+ * multi-byte TEXT uid satisfies a length-only test while being 30-odd
+ * bytes -- invisible to list and unmatchable by get and delete. That is
+ * exactly the failure this validation exists to make loud, so a
+ * length-only predicate here would have been a guard that could not see
+ * the thing it was guarding against.
  *
  * Returns 0 and writes *out on success. On failure returns a negative
  * CLOAK_USER_ERR_*, sets *out to NULL (whatever it held before), and, if
@@ -412,11 +443,14 @@ int cloak_usermanager_get(cloak_usermanager_t *m, const uint8_t uid[CLOAK_UID_LE
  * about what the request says. Applying the rest anyway would perform a
  * different update than the one that was asked for.
  *
- * The 16-byte UID length is enforced by a CHECK constraint in the schema
- * rather than by an argument test here, because the C signature already
- * makes a wrong-length UID unrepresentable in-process -- the guard has to
- * live where a FUTURE caller (the admin API, decoding UIDs off the wire,
- * or any tool writing this file directly) cannot route around it. */
+ * That a uid is a CLOAK_UID_LEN-byte BLOB is enforced by a CHECK
+ * constraint in the schema rather than by an argument test here, because
+ * the C signature already makes a malformed UID unrepresentable
+ * in-process -- the guard has to live where a FUTURE caller (the admin
+ * API, decoding UIDs off the wire, or any tool writing this file
+ * directly) cannot route around it. See cloak_usermanager_open for why
+ * the constraint pins the storage class and not just the length, and for
+ * the separate validation that covers databases predating it. */
 int cloak_usermanager_write(cloak_usermanager_t *m, const cloak_user_info_t *info,
                             uint32_t fields);
 
