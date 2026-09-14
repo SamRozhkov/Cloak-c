@@ -386,9 +386,13 @@ static int line_byte(cloak_http_parser_t *p, uint8_t b, cloak_http_state_t *out)
             return -1;
         }
     }
-    /* Bounds before the store, always. line[] is sized to the larger cap,
-     * so this check -- not the array -- is what bounds the write. */
-    if (p->line_len >= cap || p->line_len >= sizeof(p->line)) {
+    /* Bounds before the store, always. This check is the ONLY thing that
+     * bounds the write, and it is sufficient only because the
+     * _Static_assert in cloak/http.h guarantees line[] is at least as
+     * large as the largest cap that governs it -- see the comment there
+     * for why that invariant lives at compile time rather than as a
+     * second runtime clause here. */
+    if (p->line_len >= cap) {
         *out = fail(p, over_status);
         return -1;
     }

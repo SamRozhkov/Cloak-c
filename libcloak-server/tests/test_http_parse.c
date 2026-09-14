@@ -34,7 +34,7 @@ typedef struct {
     size_t content_length;
 } http_case_t;
 
-#define MAX_CASES 64
+#define MAX_CASES 128
 static http_case_t g_cases[MAX_CASES];
 static size_t g_case_count;
 
@@ -198,6 +198,12 @@ static void build_cases(void) {
     err_case("HTTP/2.0 is refused", "GET / HTTP/2.0\r\n\r\n", 400);
     err_case("HTTP/1.2 is refused", "GET / HTTP/1.2\r\n\r\n", 400);
     err_case("lowercase http/1.1 is refused", "GET / http/1.1\r\n\r\n", 400);
+    /* Pins the UPPER bound of the version token: a comparison that only
+     * checks the first eight bytes accepts this, and then two parsers
+     * disagree about what protocol was spoken. */
+    err_case("trailing junk after the version", "GET / HTTP/1.1junk\r\n\r\n", 400);
+    err_case("trailing NUL-free junk one byte long", "GET / HTTP/1.1x\r\n\r\n", 400);
+    err_case("version token too short", "GET / HTTP/1.\r\n\r\n", 400);
     err_case("missing version", "GET /\r\n\r\n", 400);
     err_case("three fields plus one", "GET / x HTTP/1.1\r\n\r\n", 400);
     err_case("empty method", " / HTTP/1.1\r\n\r\n", 400);
@@ -227,8 +233,38 @@ static void build_cases(void) {
              "GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n12345", 400);
     err_case("obs-fold continuation line",
              "GET / HTTP/1.1\r\nHost: a\r\n  b\r\n\r\n", 400);
-    ok_case("HT is legal OWS in a header value",
-            "GET / HTTP/1.1\r\nHost:\tx\t\r\n\r\n", CLOAK_HTTP_METHOD_GET, "/");
+    /* OWS trimming is pinned on a header whose value CHANGES BEHAVIOUR:
+     * on Host: the value is discarded, so the case would pass whether or
+     * not the tab were trimmed. Here an untrimmed "\t4\t" fails the
+     * all-digits check and the request becomes a 400, so the assertion
+     * has something to catch. */
+    c = ok_case("HT is legal OWS around a Content-Length value",
+                "POST /x HTTP/1.1\r\nContent-Length:\t4\t\r\n\r\nbody",
+                CLOAK_HTTP_METHOD_POST, "/x");
+    c->body = "body";
+    c->body_len = 4;
+    c->have_cl = 1;
+    c->content_length = 4;
+    c->consumed = c->len;
+    /* Mixed SP and HT, both ends, same reasoning. */
+    c = ok_case("mixed SP and HT OWS around a Content-Length value",
+                "POST /x HTTP/1.1\r\nContent-Length: \t 4 \t \r\n\r\nbody",
+                CLOAK_HTTP_METHOD_POST, "/x");
+    c->body = "body";
+    c->body_len = 4;
+    c->have_cl = 1;
+    c->content_length = 4;
+    c->consumed = c->len;
+
+    /* HT is legal OWS in a header value ONLY. The header says so; these
+     * pin the "only" half. A tab in the request target is a request-line
+     * splitting vector -- a peer that treats HT as a field separator
+     * reads a different target than one that does not. */
+    err_case("HT inside the request target", "GET /a\tb HTTP/1.1\r\n\r\n", 400);
+    err_case("HT separating request-line fields", "GET\t/ HTTP/1.1\r\n\r\n", 400);
+    err_case("DEL inside the request target", "GET /a\x7f" "b HTTP/1.1\r\n\r\n", 400);
+    err_case("DEL inside a header value", "GET / HTTP/1.1\r\nHost: a\x7f" "b\r\n\r\n", 400);
+    err_case("DEL inside a header name", "GET / HTTP/1.1\r\nHo\x7f" "st: a\r\n\r\n", 400);
 
     /* --- Content-Length (brief case 6) -------------------------------- */
     ok_case("no Content-Length on GET means no body",
@@ -244,6 +280,29 @@ static void build_cases(void) {
              "POST /x HTTP/1.1\r\nContent-Length: 5 5\r\n\r\n12345", 400);
     err_case("two conflicting Content-Length headers",
              "POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n123456", 400);
+    /* Zero is THE canonical second value in a CL.CL smuggle: the peer
+     * that believes the 5 forwards a body the peer that believes the 0
+     * reads as the start of the next request. A guard that only rejects
+     * 5-vs-6 would let this through. */
+    err_case("two Content-Length headers where the second is zero",
+             "POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\n12345", 400);
+    err_case("two Content-Length headers where the first is zero",
+             "POST /x HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\n12345", 400);
+
+    /* Lengths chosen to WRAP a 64-bit size_t to a plausible value, which
+     * is the only shape that tells an in-loop cap check apart from a
+     * post-loop one. 2^64+1 wraps to 1: a parser that multiplies first
+     * and checks afterwards accepts this as a one-byte body and hands
+     * the router a request the sender never sent -- a framing
+     * differential of exactly the class Transfer-Encoding is refused to
+     * prevent. 2^64+65536 wraps to the body cap itself, which such a
+     * parser would accept as an in-bounds length. */
+    err_case("Content-Length 2^64+1 (wraps to 1)",
+             "POST /x HTTP/1.1\r\nContent-Length: 18446744073709551617\r\n\r\nA", 413);
+    err_case("Content-Length 2^64+65536 (wraps to the body cap)",
+             "POST /x HTTP/1.1\r\nContent-Length: 18446744073709617152\r\n\r\n", 413);
+    err_case("Content-Length 2^64 exactly (wraps to 0)",
+             "POST /x HTTP/1.1\r\nContent-Length: 18446744073709551616\r\n\r\n", 413);
 
     /* Leading zeros are 1*DIGIT and therefore valid; the numeric value is
      * what we act on, so no differential follows from accepting them. */
@@ -715,6 +774,20 @@ static void test_refusal_precedes_allocation(void) {
     cloak_http_parser_destroy(&p);
 }
 
+/* The caps are macros and every case above is BUILT from those macros,
+ * so the cases move with the macro and cannot detect a changed value.
+ * These six lines are what make a changed cap detectable: they pin the
+ * numbers the header justifies, so raising one is a deliberate act that
+ * updates a test rather than a silent widening of the attack surface. */
+static void test_cap_values_are_what_the_header_claims(void) {
+    ASSERT_EQ_INT(256, CLOAK_HTTP_MAX_PATH);
+    ASSERT_EQ_INT(1024, CLOAK_HTTP_MAX_REQUEST_LINE);
+    ASSERT_EQ_INT(512, CLOAK_HTTP_MAX_HEADER_LINE);
+    ASSERT_EQ_INT(4096, CLOAK_HTTP_MAX_HEADER_BLOCK);
+    ASSERT_EQ_INT(32, CLOAK_HTTP_MAX_HEADERS);
+    ASSERT_EQ_INT(65536, CLOAK_HTTP_MAX_BODY);
+}
+
 /* Sticky terminal states, and destroy()'s contract. */
 static void test_terminal_states_and_lifecycle(void) {
     const char *req = "GET / HTTP/1.1\r\n\r\n";
@@ -783,8 +856,12 @@ static void fuzz_check(cloak_http_parser_t *p, cloak_http_state_t st) {
         ASSERT_TRUE(r->body_len <= CLOAK_HTTP_MAX_BODY);
         ASSERT_TRUE(r->body_len == (r->have_content_length ? r->content_length : 0));
     } else if (st == CLOAK_HTTP_ERROR) {
+        /* 500 is deliberately NOT in this set. It has exactly one
+         * producer -- a failed malloc of at most CLOAK_HTTP_MAX_BODY
+         * bytes -- so no input can produce it, and admitting it here
+         * would weaken the assertion for nothing. */
         ASSERT_TRUE(r->status == 400 || r->status == 413 || r->status == 414 ||
-                    r->status == 431 || r->status == 500 || r->status == 501);
+                    r->status == 431 || r->status == 501);
     }
 }
 
@@ -866,6 +943,7 @@ TEST_MAIN_BEGIN()
     test_cases_whole();
     test_cases_byte_at_a_time();
     test_every_two_way_split();
+    test_cap_values_are_what_the_header_claims();
     test_short_body_never_completes();
     test_refusal_precedes_allocation();
     test_terminal_states_and_lifecycle();

@@ -229,6 +229,25 @@ typedef struct {
     cloak_http_request_t req;
 } cloak_http_parser_t;
 
+/* The invariant that makes the line-length checks in http.c sufficient:
+ * line[] must be at least as large as the largest cap that governs it,
+ * or a cap check would pass for a byte the array cannot hold.
+ *
+ * This is a COMPILE-TIME assertion on purpose. The runtime belt-and-
+ * braces version of it -- a second "or the buffer is full" clause in the
+ * store path -- is unreachable while this holds, which means no test can
+ * ever exercise it and it would sit there forever as dead code that
+ * merely looks like safety. Here it fails the build of whoever raises a
+ * cap, which is the moment and the person that need to know, rather than
+ * at runtime for a user. Raise CLOAK_HTTP_MAX_HEADER_LINE above
+ * CLOAK_HTTP_MAX_REQUEST_LINE and this line stops the build. */
+_Static_assert(CLOAK_HTTP_MAX_REQUEST_LINE <=
+                   sizeof(((cloak_http_parser_t *)0)->line),
+               "CLOAK_HTTP_MAX_REQUEST_LINE exceeds the line buffer");
+_Static_assert(CLOAK_HTTP_MAX_HEADER_LINE <=
+                   sizeof(((cloak_http_parser_t *)0)->line),
+               "CLOAK_HTTP_MAX_HEADER_LINE exceeds the line buffer");
+
 /* Resets p to its starting state. Must be called before any other
  * function; a cloak_http_parser_t is not usable zero-initialized (the
  * zero value is indistinguishable from a parser mid-request, which is
