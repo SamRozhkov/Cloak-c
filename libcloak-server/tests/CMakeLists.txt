@@ -193,3 +193,15 @@ target_include_directories(test_userpanel PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-c
 target_link_libraries(test_userpanel PRIVATE cloak-server sqlite3)
 add_test(NAME test_userpanel COMMAND test_userpanel)
 set_tests_properties(test_userpanel PROPERTIES TIMEOUT 60)
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_usermanager.c and
+# test_userpanel.c do: this file writes user rows and reads credits back
+# through cloak_usermanager_write/get, which needs cloak/usermanager.h's
+# own types -- and cloak-server's PRIVATE sqlite3 link deliberately does
+# not propagate the include path its implementation uses.
+add_executable(test_dispatcher_users test_dispatcher_users.c)
+target_include_directories(test_dispatcher_users PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_users PRIVATE cloak-server sqlite3)
+add_test(NAME test_dispatcher_users COMMAND test_dispatcher_users)
+set_tests_properties(test_dispatcher_users PROPERTIES TIMEOUT 60)

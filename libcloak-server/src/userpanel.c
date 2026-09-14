@@ -425,6 +425,10 @@ cloak_userpanel_user_t *cloak_userpanel_find(cloak_userpanel_t *p,
     return panel_find(p, uid);
 }
 
+cloak_usermanager_t *cloak_userpanel_manager(cloak_userpanel_t *p) {
+    return p == NULL ? NULL : p->cfg.manager;
+}
+
 size_t cloak_userpanel_active_count(const cloak_userpanel_t *p) {
     if (p == NULL) {
         return 0;

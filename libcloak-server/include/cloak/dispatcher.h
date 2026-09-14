@@ -11,6 +11,7 @@
 #include "cloak/server.h"
 #include "cloak/server_auth.h"
 #include "cloak/session.h"
+#include "cloak/userpanel.h"
 
 /* The server's front door: turns an accepted connection into either a
  * redirect to the cover site or an authenticated session. This is the C
@@ -111,7 +112,9 @@
  *
  * AUTHENTICATION: a connection whose first packet is a TLS record parses
  * as a real Cloak ClientHello, passes the replay check, decrypts, carries
- * a valid encryption method, an authorised UID, and a known proxy method
+ * a valid encryption method, an authorised UID (see
+ * cloak_dispatcher_config_t::panel for what "authorised" means with and
+ * without a user database behind it), and a known proxy method
  * attaches to a cloak_session_t (new or existing) instead of falling
  * through to redirect -- see dispatcher.c's dispatcher_authenticate for
  * the ordered list of checks and docs/superpowers/plans/
@@ -235,9 +238,16 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * chance to install its own on_new_stream/on_stream_data/on_writable
  * (plus their userdata) into *config before cloak_server_registry_get_or_
  * create runs; info is the fully authorised cloak_server_clientinfo_t
- * (uid already checked against cloak_server_is_bypass, proxy_method
- * already checked against cloak_server_lookup_proxy) this session is
- * being created for.
+ * (uid already accepted by the authorisation policy -- cloak_server_
+ * is_bypass, plus the panel and the per-user sessions cap when a panel
+ * is configured; proxy_method already checked against
+ * cloak_server_lookup_proxy) this session is being created for.
+ *
+ * config->valve is ALREADY SET to the authorised user's own meter when
+ * this runs, and must not be overwritten: it is what bills this session's
+ * wire bytes to that user, and a callback that replaces it hands the user
+ * free traffic silently. See cloak_dispatcher_config_t::session_config_
+ * template.
  *
  * The owner MUST NOT set config->on_broken or config->on_broken_userdata
  * -- cloak_server_registry_get_or_create overwrites both unconditionally
@@ -401,12 +411,18 @@ typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_
  *
  * session_config_template is copied by value into every NEWLY created
  * session's config (cloak_server_registry_find found nothing): the
- * dispatcher overwrites exactly two fields of the copy before passing it
- * to cloak_server_registry_get_or_create --
+ * dispatcher overwrites exactly three fields of the copy before passing
+ * it to cloak_server_registry_get_or_create --
  * obfuscator.method (the client's authenticated, wire-validated
- * encryption method) and obfuscator.session_key (a fresh
- * cloak_random_bytes key) -- so whatever this template's own obfuscator
- * field holds is irrelevant and always replaced. on_broken/
+ * encryption method), obfuscator.session_key (a fresh
+ * cloak_random_bytes key), and valve (the authorised user's own meter,
+ * cloak_userpanel_user_valve, which is NULL both for a bypass user and
+ * for a dispatcher with no panel at all) -- so whatever this template's
+ * own obfuscator and valve fields hold is irrelevant and always
+ * replaced. THE VALVE IS OVERWRITTEN RATHER THAN DEFAULTED-TO because a
+ * valve is per-USER and this template is per-DISPATCHER: a template
+ * valve would meter every user on the server into one counter, which is
+ * not a weaker version of the right answer but a wrong one. on_broken/
  * on_broken_userdata are similarly irrelevant here for the same reason
  * cloak_dispatch_prepare_session_cb's own doc comment gives: get_or_create
  * overwrites both unconditionally. This template is NEVER consulted on
@@ -437,6 +453,31 @@ typedef struct {
     cloak_reactor_t *reactor;
     cloak_server_t *srv;
     cloak_server_registry_t *registry;
+
+    /* MAY BE NULL, and what that means is a POLICY, not a degraded mode:
+     * with no panel the dispatcher's whole authorisation policy is
+     * cloak_server_is_bypass, exactly as it was before a user manager
+     * existed -- the config file's BypassUID list is served and nobody
+     * else is. That is a legitimate deployment (a server with no user
+     * database at all) and it is also what keeps every dispatcher test
+     * written before this field existed valid unchanged.
+     *
+     * With a panel, step 6 of dispatcher_authenticate (dispatcher.c)
+     * routes a bypass UID to cloak_userpanel_get_bypass_user and every
+     * other UID to cloak_userpanel_get_user, and step 8's CREATE path
+     * additionally asks cloak_usermanager_authorise_new_session whether
+     * this user may hold one more session. Every refusal from any of
+     * those redirects, byte for byte identically to an unauthenticated
+     * connection -- see dispatcher.c's step 6.
+     *
+     * BORROWED, like reactor/srv/registry, and with one ordering rule of
+     * its own that cloak/userpanel.h states and this header repeats
+     * because getting it wrong is a use-after-free rather than a bug:
+     * the panel owns the cloak_valve_t every session it authorised is
+     * metering into, so it must be closed AFTER the registry that owns
+     * those sessions -- i.e. listeners, dispatcher, proxy, registry,
+     * panel, manager, in that order. */
+    cloak_userpanel_t *panel;
 
     cloak_session_config_t session_config_template;
     cloak_dispatch_prepare_session_cb prepare_session;

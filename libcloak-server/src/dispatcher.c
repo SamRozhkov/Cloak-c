@@ -39,6 +39,39 @@ static void conn_fire_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[C
     d->cfg.session_aborted(d, uid, session_id, d->cfg.session_aborted_userdata);
 }
 
+/* Tells the panel that a user this connection made active (step 6's
+ * cloak_userpanel_get_user / _get_bypass_user) did not, after all, end up
+ * holding the session it was made active for.
+ *
+ * WHY THIS IS NOT cloak_dispatch_session_aborted_cb. That callback is the
+ * OWNER's, the dispatcher has exactly one of it, and cloak_proxy_t already
+ * holds it -- so it cannot also carry the panel's bookkeeping, and the
+ * panel does not expose a function of that shape anyway. The dispatcher
+ * holds the panel directly, so it tells it directly. The two notifications
+ * are complementary, not alternatives: session_aborted reclaims the
+ * owner's per-SESSION context, this reclaims the panel's per-USER entry,
+ * and the sites that need both fire both.
+ *
+ * WHY IT IS A NO-OP MOST OF THE TIME, and why that is the point rather
+ * than a weakness: cloak_userpanel_notify_session_closed deactivates a
+ * user only when the registry says it now holds ZERO sessions. So a
+ * connection that failed while its user still has other live sessions
+ * (including the common "an additional connection to an existing session
+ * failed") changes nothing, and only the case this function exists for --
+ * a user made active moments ago whose one and only session never came to
+ * be -- actually deactivates.
+ *
+ * WITHOUT IT the panel's own upload-cycle reaper (cloak/userpanel.h step
+ * 4) still collects such an entry, so this is promptness, not
+ * correctness: it closes the window from "up to one upload interval" (one
+ * minute by default, during which a remote attacker can hold one active
+ * table slot per distinct UID it can authenticate as) to "immediately".
+ * Safe on a NULL panel, which is what every dispatcher configured without
+ * one has. */
+static void dispatcher_release_user(cloak_dispatcher_t *d, const uint8_t uid[CLOAK_UID_LEN]) {
+    cloak_userpanel_notify_session_closed(d->cfg.panel, uid);
+}
+
 static void conn_unlink(cloak_dispatch_conn_t *c) {
     cloak_dispatcher_t *d = c->d;
     if (c->prev != NULL) {
@@ -135,6 +168,14 @@ static void conn_teardown(cloak_dispatch_conn_t *c) {
              * gone by another path has already had its on_broken. */
             conn_fire_session_aborted(c->d, c->auth_uid, c->auth_session_id);
             cloak_server_registry_close(c->d->cfg.registry, c->auth_uid, c->auth_session_id);
+            /* The panel's half of the same unwind, and AFTER the close
+             * for the reason dispatcher_authenticate's step-9 site gives:
+             * the panel deactivates only when the registry reports zero
+             * sessions. Inside this branch rather than under
+             * auth_created alone, so that a session another connection
+             * has since joined (the branch just above) does not
+             * deactivate its own user out from under it. */
+            dispatcher_release_user(c->d, c->auth_uid);
         }
         c->auth_created = 0;
     }
@@ -217,9 +258,40 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     for a session whose obfuscator.method field itself stores the
  *     invalid value, later reaching cloak_frame_obfuscate/deobfuscate
  *     with a method cloak_aead_seal/open were never validated against.
- *  6. cloak_server_is_bypass is the whole authorisation policy until a
- *     user manager exists. No logging on failure -- a prober learns
- *     nothing from a silent redirect.
+ *  6. AUTHORISE THE UID. With no panel (cfg.panel == NULL) this is
+ *     cloak_server_is_bypass and nothing else -- the policy this module
+ *     had before a user manager existed, and a legitimate deployment
+ *     rather than a degraded one (see cloak_dispatcher_config_t::panel).
+ *     With a panel it is Go's dispatchConnection, ported: a bypass UID
+ *     takes cloak_userpanel_get_bypass_user (which never consults the
+ *     database -- a bypass UID comes from the config file and may have no
+ *     row at all), every other UID takes cloak_userpanel_get_user (which
+ *     does: existence, up credit, down credit, expiry, in that order).
+ *
+ *     EVERY REFUSAL HERE IS THE SAME REFUSAL, and that is a security
+ *     property, not tidiness. Unknown UID, expired, out of credit, and
+ *     the active-user table being full all return -1 from exactly this
+ *     one place, which sends the connection to conn_start_redirect on
+ *     exactly the path an unrecognised protocol takes. No logging, no
+ *     early close, no distinct branch: a prober holding no valid
+ *     credentials must not be able to tell "no such user" from "not a
+ *     Cloak server". The one difference an attacker could in principle
+ *     measure is that the get_user path runs a SQLite lookup an
+ *     unparseable first packet never reaches -- inherent to having a
+ *     user database at all (Go pays the same cost on the same path), and
+ *     not something a branch here creates.
+ *
+ *     WHAT STEP 6 OWES THE PANEL: cloak_userpanel_get_user makes the
+ *     user ACTIVE, and cloak/userpanel.h requires that user to acquire
+ *     its first session in the SAME reactor turn -- the upload cycle's
+ *     reaper cannot distinguish an entry that has not got its session
+ *     yet from one whose session went away silently. Steps 6 through 8
+ *     are straight-line synchronous with no return to the reactor
+ *     between them, which is what satisfies that; nothing may be
+ *     inserted here that yields. The failures that CAN still happen in
+ *     between (steps 7, 8 and 9) each call dispatcher_release_user,
+ *     which tells the panel immediately rather than waiting for the
+ *     reaper -- see that function's own comment.
  *  7. cloak_server_lookup_proxy(info.proxy_method) must resolve; this
  *     task only checks existence; the address itself is a later task's
  *     concern.
@@ -228,11 +300,32 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     compose the reply with sesh->obfuscator.session_key, never a fresh
  *     one (cloak/registry.h's own get_or_create doc comment explains why
  *     composing with fresh material here silently breaks every frame on
- *     this connection with no error at the handshake). If not found,
- *     generate a fresh key, build the session config from
- *     cfg.session_config_template plus the decrypted encryption method,
- *     run the owner's prepare_session callback (if any), and
- *     cloak_server_registry_get_or_create.
+ *     this connection with no error at the handshake). If not found:
+ *
+ *     8a. THE PER-USER SESSIONS CAP, asked only on this path and only of
+ *         a metered user. Go asks it in exactly the same place
+ *         (ActiveUser.GetSession calls AuthoriseNewSession only when it
+ *         is about to make a session, and skips it entirely for a bypass
+ *         user), and the position is load-bearing in both: an ADDITIONAL
+ *         connection to an existing session is not a new session, so a
+ *         user at its cap must still be able to open a second connection
+ *         to a session it already holds -- checking the cap before the
+ *         find would refuse that. The count comes from
+ *         cloak_server_registry_count_for_uid, i.e. from the registry,
+ *         which is the only record of what is actually alive (D6 in
+ *         cloak/userpanel.h): a count kept anywhere else would disagree
+ *         with it exactly during a teardown, which is when it matters.
+ *         A refusal redirects like every other, via step 6's rule.
+ *     8b. Generate a fresh key, build the session config from
+ *         cfg.session_config_template plus the decrypted encryption
+ *         method AND the authorised user's own valve (NULL for a bypass
+ *         user and for a dispatcher with no panel, which cloak/valve.h
+ *         defines as "not metered"). THE VALVE IS WHAT MAKES METERING
+ *         EXIST AT ALL: without this line every session on the server is
+ *         unmetered, every user's credit stays where it was, and nothing
+ *         anywhere reports it.
+ *     8c. Run the owner's prepare_session callback (if any), then
+ *         cloak_server_registry_get_or_create.
  *  9. cloak_server_auth_compose_reply with a fresh nonce, a fresh pad4,
  *     and a cert length chosen uniformly from cloak_server_auth_cert_lens
  *     (a DPI-plausibility measure -- a fixed length would itself be a
@@ -241,13 +334,18 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  * On success, fills c->reply/reply_len and c->auth_* (consumed by
  * conn_continue_reply_write and conn_handoff, steps 10-11) and returns 0.
  * On any failure this function returns -1 having left the connection
- * exactly as it found it (redirectable) EXCEPT for one thing: if step 8
- * created a brand-new session and a LATER step in this same function
- * (only step 9 can fail after that point) then fails, that session is
- * torn down here, via cloak_server_registry_close, before returning --
- * matching cloak/registry.h's "created == 1 is the only correct
- * discriminator" guidance. A failure at or before step 8's create never
- * has a session to unwind. */
+ * exactly as it found it (redirectable) EXCEPT for two things. First, if
+ * step 8 created a brand-new session and a LATER step in this same
+ * function (only step 9 can fail after that point) then fails, that
+ * session is torn down here, via cloak_server_registry_close, before
+ * returning -- matching cloak/registry.h's "created == 1 is the only
+ * correct discriminator" guidance. A failure at or before step 8's create
+ * never has a session to unwind. Second, every failure AFTER step 6 has
+ * made a user active calls dispatcher_release_user, so the panel does not
+ * carry an active user that never got a session until its reaper notices;
+ * that call is a no-op whenever the user still holds sessions, so it is
+ * unconditional at each site rather than guarded by a flag that would
+ * have to be kept in step with five returns. */
 static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
     cloak_dispatcher_t *d = c->d;
     cloak_server_t *srv = d->cfg.srv;
@@ -286,14 +384,30 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
         return -1;
     }
 
-    /* 6. Authorise the UID. */
-    if (!cloak_server_is_bypass(srv, info.uid)) {
-        return -1;
+    /* 6. Authorise the UID. Every arm that refuses returns -1 from here
+     * and does nothing else -- see this function's own step-6 comment
+     * for why all four refusal reasons must be one indistinguishable
+     * outcome. */
+    cloak_userpanel_user_t *user = NULL;
+    int is_bypass = cloak_server_is_bypass(srv, info.uid);
+    if (d->cfg.panel == NULL) {
+        if (!is_bypass) {
+            return -1;
+        }
+    } else if (is_bypass) {
+        if (cloak_userpanel_get_bypass_user(d->cfg.panel, info.uid, &user) != 0) {
+            return -1;
+        }
+    } else {
+        if (cloak_userpanel_get_user(d->cfg.panel, info.uid, &user) != 0) {
+            return -1;
+        }
     }
 
     /* 7. Proxy method must be known; the resolved address itself is a
      * later task's concern. */
     if (cloak_server_lookup_proxy(srv, info.proxy_method) == NULL) {
+        dispatcher_release_user(d, info.uid);
         return -1;
     }
 
@@ -308,15 +422,43 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
          * cloak/registry.h's own get_or_create doc comment. */
         memcpy(session_key, sesh->obfuscator.session_key, CLOAK_AEAD_KEY_LEN);
     } else {
+        /* 8a. The per-user sessions cap. `user` is NULL for a dispatcher
+         * with no panel (no policy to ask) and user->bypass is set for a
+         * bypass UID (no row to ask about, and Go skips the question for
+         * the same reason) -- in both cases there is nothing to check and
+         * the manager is never touched. Note that user->bypass, not
+         * is_bypass, is what governs: cloak_userpanel_get_bypass_user
+         * returns an ALREADY-ACTIVE non-bypass user unchanged rather than
+         * silently un-metering it mid-flight, and such a user is still
+         * subject to its own cap. */
+        if (user != NULL && !user->bypass) {
+            size_t existing = cloak_server_registry_count_for_uid(d->cfg.registry, info.uid);
+            if (cloak_usermanager_authorise_new_session(cloak_userpanel_manager(d->cfg.panel),
+                                                        info.uid, (int)existing) != 0) {
+                dispatcher_release_user(d, info.uid);
+                return -1;
+            }
+        }
+
+        /* 8b. */
         cloak_random_bytes(session_key, sizeof(session_key));
 
         cloak_session_config_t session_cfg = d->cfg.session_config_template;
         session_cfg.obfuscator.method = (cloak_aead_method_t)info.encryption_method;
         memcpy(session_cfg.obfuscator.session_key, session_key, CLOAK_AEAD_KEY_LEN);
+        /* THE METER. Per-USER (it is the panel's, shared by every session
+         * that user holds) installed into a per-SESSION config, which is
+         * why it is set here and can never come from the template. NULL
+         * -- a bypass user, or no panel at all -- is cloak/valve.h's
+         * "not metered" and costs one predicted branch per transfer. */
+        session_cfg.valve = cloak_userpanel_user_valve(user);
 
+        /* 8c. */
         if (d->cfg.prepare_session != NULL &&
             d->cfg.prepare_session(d, &info, &session_cfg, d->cfg.prepare_session_userdata) != 0) {
-            /* Nothing was created yet -- nothing to unwind. */
+            /* No session was created -- but step 6 may have made a user
+             * active for one, so the panel is still owed the news. */
+            dispatcher_release_user(d, info.uid);
             return -1;
         }
 
@@ -335,6 +477,7 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
              * this, whatever prepare_session allocated is orphaned, once
              * per handshake, for as long as the registry stays full. */
             conn_fire_session_aborted(d, info.uid, info.session_id);
+            dispatcher_release_user(d, info.uid);
             return -1;
         }
     }
@@ -369,6 +512,14 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
             conn_fire_session_aborted(d, info.uid, info.session_id);
             cloak_server_registry_close(d->cfg.registry, info.uid, info.session_id);
         }
+        /* AFTER the close above, never before: the panel deactivates a
+         * user only once the registry reports zero sessions for it, so a
+         * notification sent while the session this function just closed
+         * was still in the table would be a silent no-op. Outside the
+         * `created` guard, because the existing-session path can also
+         * reach here and a release there is correctly a no-op (that
+         * session is still live). */
+        dispatcher_release_user(d, info.uid);
         return -1;
     }
 

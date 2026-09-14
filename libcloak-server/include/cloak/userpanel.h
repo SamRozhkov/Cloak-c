@@ -360,6 +360,30 @@ cloak_userpanel_user_t *cloak_userpanel_find(cloak_userpanel_t *p,
  * there is then exactly one thing that can disagree with reality. */
 size_t cloak_userpanel_active_count(const cloak_userpanel_t *p);
 
+/* The cloak_usermanager_t this panel was opened against (borrowed; the
+ * panel does not own it), or NULL if p is NULL.
+ *
+ * IT EXISTS FOR EXACTLY ONE CALLER: the dispatcher's step 8, which asks
+ * cloak_usermanager_authorise_new_session whether an already-authorised
+ * user may hold ONE MORE session. That question is not
+ * cloak_userpanel_get_user's -- Go asks it in ActiveUser.GetSession,
+ * separately and only on the create path -- and it needs the count of
+ * sessions the user already holds, which lives in the registry (D6 at the
+ * top of this file), not here.
+ *
+ * Handing the manager out rather than wrapping the question in a panel
+ * function keeps the dispatcher's authorisation sequence readable AS a
+ * sequence, in one function, in Go's own order -- and keeps this module
+ * free of a second entry point whose failure modes would have to be
+ * re-documented here. The cost is that a caller COULD reach past the
+ * panel and write to the database behind its back; do not. Read-only use
+ * (authenticate, authorise_new_session, get, list) is what this is for.
+ * Everything that MUTATES a user's credit belongs to
+ * cloak_userpanel_upload_now, which is the only writer that also settles
+ * the queue, and a second writer would double-bill or lose usage
+ * depending on which side raced. */
+cloak_usermanager_t *cloak_userpanel_manager(cloak_userpanel_t *p);
+
 /* Go's TerminateActiveUser. In order: drains this user's valve onto the
  * usage queue (so the bytes it moved are still billed), closes EVERY
  * session it holds through cloak_server_registry_close_all_for_uid, then
