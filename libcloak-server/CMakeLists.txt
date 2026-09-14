@@ -8,6 +8,7 @@ add_library(cloak-server STATIC
     src/dispatcher.c
     src/proxy.c
     src/usermanager.c
+    src/userpanel.c
 )
 
 target_include_directories(cloak-server PUBLIC include)

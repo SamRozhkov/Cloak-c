@@ -295,6 +295,69 @@ void cloak_server_registry_close(cloak_server_registry_t *reg, const uint8_t uid
     }
 }
 
+size_t cloak_server_registry_count_for_uid(const cloak_server_registry_t *reg,
+                                           const uint8_t uid[CLOAK_UID_LEN]) {
+    if (reg == NULL || uid == NULL) {
+        return 0;
+    }
+    /* Linear over the whole table -- see this function's doc comment for
+     * why there is no per-UID index. Dead entries are excluded for the
+     * same reason cloak_server_registry_count excludes them: they are no
+     * longer sessions anyone can use. */
+    size_t n = 0;
+    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
+        const struct cloak_registry_entry *entry = reg->entries[i];
+        if (entry != NULL && !entry->dead && memcmp(entry->uid, uid, CLOAK_UID_LEN) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+size_t cloak_server_registry_close_all_for_uid(cloak_server_registry_t *reg,
+                                               const uint8_t uid[CLOAK_UID_LEN],
+                                               cloak_registry_closing_cb on_closing,
+                                               void *userdata) {
+    if (reg == NULL || uid == NULL) {
+        return 0;
+    }
+
+    size_t closed = 0;
+    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
+        struct cloak_registry_entry *entry = reg->entries[i];
+        /* Dead entries are NOT skipped here, unlike in every other lookup
+         * in this file -- see this function's doc comment: a dead entry's
+         * connections are still registered with the reactor until its
+         * sweep runs, and the caller is about to free something they
+         * still point at. */
+        if (entry == NULL || memcmp(entry->uid, uid, CLOAK_UID_LEN) != 0) {
+            continue;
+        }
+
+        /* Unlink BEFORE anything else, so that an on_closing which
+         * reenters this module (the realistic one -- a proxy tearing its
+         * own bookkeeping down -- can end up calling
+         * cloak_server_registry_close or this very function again) finds
+         * nothing here to close or free a second time. The entry is a
+         * never-moved heap allocation whose address we still hold, so
+         * unlinking it does not lose it; this is the same ordering
+         * registry_on_session_broken uses when it marks an entry dead
+         * before invoking the owner's callback. */
+        reg->entries[i] = NULL;
+
+        if (on_closing != NULL) {
+            /* Still fully alive here -- this is the caller's only window
+             * to stop relays bound to it, since no on_broken will fire.
+             * See the doc comment. */
+            on_closing(reg, &entry->sesh, entry->uid, entry->session_id, userdata);
+        }
+
+        registry_free_entry(entry);
+        closed++;
+    }
+    return closed;
+}
+
 size_t cloak_server_registry_count(const cloak_server_registry_t *reg) {
     if (reg == NULL) {
         return 0;

@@ -181,3 +181,15 @@ set_tests_properties(test_usermanager PROPERTIES TIMEOUT 60)
 # requirement the block above handles.
 set_tests_properties(test_usermanager PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_usermanager does: the
+# retry-on-failed-upload case opens a second sqlite3 connection of its own
+# and holds a BEGIN IMMEDIATE write lock, which is the only way to make
+# cloak_usermanager_upload_status fail the way a real second writer makes
+# it fail (busy_timeout is 0 by design).
+add_executable(test_userpanel test_userpanel.c)
+target_include_directories(test_userpanel PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_userpanel PRIVATE cloak-server sqlite3)
+add_test(NAME test_userpanel COMMAND test_userpanel)
+set_tests_properties(test_userpanel PROPERTIES TIMEOUT 60)
