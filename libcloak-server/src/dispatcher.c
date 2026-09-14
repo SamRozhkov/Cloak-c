@@ -292,9 +292,53 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     between (steps 7, 8 and 9) each call dispatcher_release_user,
  *     which tells the panel immediately rather than waiting for the
  *     reaper -- see that function's own comment.
- *  7. cloak_server_lookup_proxy(info.proxy_method) must resolve; this
- *     task only checks existence; the address itself is a later task's
- *     concern.
+ *
+ *     6a. IS THIS AN ADMIN SESSION? A sub-step of 6 rather than a number
+ *         of its own because it is the second half of the same question
+ *         ("what is this UID getting?") and because renumbering 7-9 would
+ *         make every cross-reference in this file and in cloak/
+ *         dispatcher.h wrong. It is cloak_server_is_admin(srv, info.uid)
+ *         AND info.session_id == 0 -- BOTH halves, because the admin UID
+ *         with a non-zero session id is an ordinary session and Go says
+ *         so in as many words (internal/server/dispatcher.go:200-202:
+ *         "the distinction between going into the admin mode and normal
+ *         proxy mode is that sessionID needs == 0 for admin mode").
+ *
+ *         ITS POSITION IS THE WHOLE POINT, and it is Go's: Go takes the
+ *         admin branch at dispatcher.go:202, BEFORE consulting
+ *         sta.ProxyBook[ci.ProxyMethod] at :217, and an admin session
+ *         therefore never faces that lookup. That is not incidental.
+ *         ck-client in admin mode (cmd/ck-client/ck-client.go:159-167)
+ *         leaves ProxyMethod at whatever its config file says --
+ *         "shadowsocks" by default -- so an operator whose client config
+ *         names a method THIS server does not offer would otherwise be
+ *         locked out of administering it, with a redirect to the cover
+ *         site as the only diagnostic. Hence: decided here, before step
+ *         7, and step 7 skipped for it.
+ *
+ *         It does NOT change authorisation. The admin UID is already in
+ *         the bypass set (cloak_server_init folds it in), so step 6 has
+ *         just routed it through cloak_userpanel_get_bypass_user and it
+ *         carries a NULL valve -- Go's "unlimited QoS credits", and this
+ *         port's D6: an admin session is not metered, not rate-limited,
+ *         and has no row in the user database.
+ *
+ *         The verdict is published in info.is_admin (cloak/server_auth.h)
+ *         and is the ONLY definition of "admin session" in this project:
+ *         the owner's cloak_dispatch_prepare_session_cb reads it to
+ *         choose between cloak_adminapi_t and cloak_proxy_t rather than
+ *         re-deriving it, so the two cannot drift apart.
+ *  7. cloak_server_lookup_proxy(info.proxy_method) must resolve -- FOR
+ *     EVERY SESSION BUT AN ADMIN ONE, which skips this check entirely for
+ *     the reason 6a gives. This task only checks existence; the address
+ *     itself is a later task's concern.
+ *
+ *     WHAT THAT MEANS FOR AN OWNER WITH NO ADMIN API: a connection that
+ *     skipped this check reaches prepare_session with a proxy method this
+ *     server does not offer, and an owner that hands every session to
+ *     cloak_proxy_prepare_session gets a -1 from it (proxy.c refuses an
+ *     upstream it cannot resolve) and the same redirect this step would
+ *     have produced. The refusal moves; it does not disappear.
  *  8. cloak_server_registry_find FIRST. If found, this is an additional
  *     connection to a session that already exists: THE LIVE-KEY RULE --
  *     compose the reply with sesh->obfuscator.session_key, never a fresh
@@ -404,9 +448,16 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
         }
     }
 
-    /* 7. Proxy method must be known; the resolved address itself is a
+    /* 6a. THE ADMIN DECISION, made here and nowhere else -- see this
+     * function's own step-6a comment for why it sits BEFORE step 7 and
+     * why both halves of the test are required. */
+    info.is_admin = cloak_server_is_admin(srv, info.uid) && info.session_id == 0;
+
+    /* 7. Proxy method must be known -- except for an admin session, which
+     * never had one to offer: it skips this check exactly as Go's admin
+     * branch skips its ProxyBook lookup. The resolved address itself is a
      * later task's concern. */
-    if (cloak_server_lookup_proxy(srv, info.proxy_method) == NULL) {
+    if (!info.is_admin && cloak_server_lookup_proxy(srv, info.proxy_method) == NULL) {
         dispatcher_release_user(d, info.uid);
         return -1;
     }

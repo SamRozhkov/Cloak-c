@@ -48,6 +48,32 @@ struct cloak_userpanel {
      * would rewrite underneath the first. See cloak_userpanel_upload_now's
      * doc comment. */
     int in_cycle;
+
+    /* THE SESSION cloak_userpanel_registry_broken IS CURRENTLY FORWARDING
+     * A NOTIFICATION ABOUT, and whether this module's own bookkeeping has
+     * been seen destroying it. Both are meaningless outside that
+     * function's call, which saves and restores them around its one
+     * bookkeeping call so a nested broken notification cannot corrupt an
+     * outer one's answer.
+     *
+     * IT IS AN OBSERVATION, NOT AN INFERENCE, and that distinction is the
+     * whole reason these two fields exist rather than a test of the
+     * active table before and after. panel_on_session_closing is invoked
+     * by cloak_server_registry_close_all_for_uid with the exact
+     * cloak_session_t * it is about to free, so pointer identity against
+     * breaking_sesh answers "was THIS session destroyed?" directly.
+     * Deducing it from "the user left the active table" is wrong in at
+     * least two reachable ways, both of which cloak_userpanel_terminate's
+     * own comments name: a re-entrant get_user during the close can
+     * legitimately install a SECOND active entry for the same UID (the
+     * lookup afterwards then finds one and the deduction says "not
+     * destroyed" about a session that was), and panel_find skips a
+     * terminating entry (so a notification arriving mid-termination reads
+     * as "was not active" and again deduces the opposite of the truth).
+     * A lifetime fact that is deduced is how the use-after-free this pair
+     * closes got in; deducing it a second way would leave the same hole. */
+    const cloak_session_t *breaking_sesh;
+    int breaking_sesh_destroyed;
 };
 
 static int panel_run_cycle(cloak_userpanel_t *p);
@@ -472,8 +498,16 @@ static void panel_on_session_closing(cloak_server_registry_t *reg, cloak_session
                                      const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
                                      void *userdata) {
     (void)reg;
-    (void)sesh;
     cloak_userpanel_t *p = userdata;
+    /* THE DIRECT SIGNAL cloak_userpanel_registry_broken needs: this is the
+     * one place in this module that sees a specific cloak_session_t going
+     * away, and the registry is about to free it the moment this returns.
+     * Pointer identity, not (uid, session_id): the pair could in principle
+     * name a session that came and went, while the pointer is what the
+     * chain is about to be handed. See cloak_userpanel_t::breaking_sesh. */
+    if (p->breaking_sesh != NULL && sesh == p->breaking_sesh) {
+        p->breaking_sesh_destroyed = 1;
+    }
     if (p->cfg.on_session_closing != NULL) {
         p->cfg.on_session_closing(uid, session_id, p->cfg.on_session_closing_userdata);
     }
@@ -561,13 +595,88 @@ void cloak_userpanel_notify_session_closed(cloak_userpanel_t *p,
 void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session_t *sesh,
                                      const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
                                      void *userdata) {
-    (void)reg;
-    (void)sesh;
-    (void)session_id;
-    if (userdata == NULL || uid == NULL) {
+    cloak_userpanel_t *p = userdata;
+    if (p == NULL) {
+        /* Not this module's callback at all; there is not even a chain to
+         * reach from here. */
         return;
     }
-    cloak_userpanel_notify_session_closed(userdata, uid);
+    /* THE UID IS COPIED BEFORE ANY BOOKKEEPING RUNS, and this is a
+     * use-after-free fix, not tidiness. `uid` points INTO the registry
+     * entry that is breaking (registry.c passes entry->uid), and the
+     * bookkeeping below can reach cloak_userpanel_terminate, which calls
+     * cloak_server_registry_close_all_for_uid -- a function that
+     * deliberately does not skip dead entries and therefore frees THIS
+     * one, uid storage and session both, synchronously. Forwarding the
+     * caller's pointer to the chain after that hands the owner's link a
+     * dangling 16 bytes; the obvious thing an owner does with it (log it,
+     * key its own bookkeeping by it) then reads freed memory. Found by
+     * test_dispatcher_admin.c's chain case under ASan -- the first test
+     * to assemble all four links and actually READ what the last one is
+     * handed. */
+    uint8_t uid_copy[CLOAK_UID_LEN];
+    const uint8_t *chain_uid = NULL;
+    int destroyed_the_session = 0;
+    if (uid != NULL) {
+        memcpy(uid_copy, uid, CLOAK_UID_LEN);
+        chain_uid = uid_copy;
+
+        /* Ask to be TOLD whether this session gets destroyed, rather than
+         * deducing it afterwards from the active table -- see
+         * cloak_userpanel_t::breaking_sesh for the two reachable cases a
+         * deduction gets backwards. Saved and restored around the call
+         * because a broken notification can nest (an owner's
+         * on_session_closing may close further sessions), and an inner
+         * one must not answer the outer one's question.
+         *
+         * THE PAIR IS RESTORED AS A PAIR, AND THAT IS ONLY SAFE WHILE THE
+         * NESTING STAYS SHALLOW IN ONE PARTICULAR WAY. If an INNER
+         * notification's bookkeeping destroyed the OUTER session, the
+         * outer frame would restore prev_destroyed -- a 0 recorded before
+         * the inner call -- and go on to forward a freed sesh to its own
+         * chain. That is unreachable today and by construction, not by
+         * luck: the only route from here into another session's teardown
+         * is cloak_userpanel_terminate, which closes sessions through
+         * cloak_server_registry_close_all_for_uid, and that function
+         * fires no on_broken at all -- so no second cloak_userpanel_
+         * registry_broken frame can exist above this one, and the restore
+         * can only ever put back the NULL/0 of a non-nested call. Stated
+         * here rather than defended in code because a defence would be
+         * dead: the thing it guards against has no path. A future change
+         * that makes any session-closing route fire on_broken re-enables
+         * this, and the fix is then to propagate an inner destruction of
+         * the outer sesh rather than to restore over it. */
+        const cloak_session_t *prev_sesh = p->breaking_sesh;
+        int prev_destroyed = p->breaking_sesh_destroyed;
+        p->breaking_sesh = sesh;
+        p->breaking_sesh_destroyed = 0;
+
+        cloak_userpanel_notify_session_closed(p, uid);
+
+        destroyed_the_session = p->breaking_sesh_destroyed;
+        p->breaking_sesh = prev_sesh;
+        p->breaking_sesh_destroyed = prev_destroyed;
+    }
+
+    /* AFTER this module's own bookkeeping, and unconditionally -- a NULL
+     * uid included. This is the last module-level link of the chain
+     * described at the top of cloak/userpanel.h, and an owner's own
+     * notification must not be swallowed just because THIS module had
+     * nothing to do for that session.
+     *
+     * sesh is NULL when the bookkeeping above destroyed it. The registry
+     * promises a cloak_registry_broken_cb that sesh stays usable for the
+     * whole of the callback and is freed only on a later turn (cloak/
+     * registry.h) -- a promise THIS module is the one thing in the chain
+     * that can break, and it cannot keep it for a user it just
+     * terminated. Handing the owner NULL says so in the type instead of
+     * leaving a live-looking pointer to a destroyed session, which is
+     * this project's usual preference where an obligation can be made
+     * structural. */
+    if (p->cfg.chain != NULL) {
+        p->cfg.chain(reg, destroyed_the_session ? NULL : sesh, chain_uid, session_id,
+                     p->cfg.chain_userdata);
+    }
 }
 
 /* ------------------------------------------------------------------ */

@@ -240,8 +240,32 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
  * create runs; info is the fully authorised cloak_server_clientinfo_t
  * (uid already accepted by the authorisation policy -- cloak_server_
  * is_bypass, plus the panel and the per-user sessions cap when a panel
- * is configured; proxy_method already checked against
- * cloak_server_lookup_proxy) this session is being created for.
+ * is configured) this session is being created for.
+ *
+ * WHICH KIND OF SESSION IS THIS? info->is_admin is the dispatcher's own
+ * answer, and reading it is how an owner that runs both a cloak_proxy_t
+ * and a cloak_adminapi_t routes between them:
+ *
+ *     if (info->is_admin)
+ *         return cloak_adminapi_prepare_session(&api, info->uid,
+ *                                               info->session_id, config);
+ *     return cloak_proxy_prepare_session(d, info, config, &proxy);
+ *
+ * It is 1 exactly when this server's AdminUID opened session id 0 (see
+ * cloak/server_auth.h's own comment on the field, and dispatcher.c's step
+ * 6a). THE DISPATCHER TELLS THE OWNER RATHER THAN THE OWNER ASKING: the
+ * dispatcher must take the same decision itself anyway -- an admin
+ * session skips the proxy-method check -- and a second derivation in the
+ * owner would be a second definition of "admin session" in the same
+ * binary, free to drift from this one with nothing to detect it.
+ *
+ * ONE CONSEQUENCE AN OWNER MUST KNOW: because an admin session skips it,
+ * info->proxy_method has been checked against cloak_server_lookup_proxy
+ * for every OTHER session but not for that one. An owner with no admin
+ * API (which hands every session to cloak_proxy_prepare_session) is
+ * unaffected in observable behaviour -- that function refuses an upstream
+ * it cannot resolve and the connection is redirected, exactly as the
+ * dispatcher's own check would have redirected it.
  *
  * config->valve is ALREADY SET to the authorised user's own meter when
  * this runs, and must not be overwritten: it is what bills this session's

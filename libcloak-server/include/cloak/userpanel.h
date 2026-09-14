@@ -32,9 +32,14 @@
  *   // 1. the dispatcher authorises through the panel, and installs the
  *   //    user's valve into the session config it hands the registry:
  *   //        scfg.valve = cloak_userpanel_user_valve(user);
- *   // 2. the panel learns a session died through the PROXY'S CHAIN:
- *   proxy_cfg.chain          = cloak_userpanel_registry_broken;
- *   proxy_cfg.chain_userdata = panel;
+ *   // 2. the panel learns a session died through the BROKEN-SESSION
+ *   //    CHAIN, of which it is the last module-level link:
+ *   //        registry -> proxy -> adminapi -> panel -> (owner)
+ *   proxy_cfg.chain          = cloak_adminapi_registry_broken;
+ *   proxy_cfg.chain_userdata = &api;
+ *   api_cfg.chain            = cloak_userpanel_registry_broken;
+ *   api_cfg.chain_userdata   = panel;
+ *   // (a server with no admin API wires proxy_cfg.chain straight here)
  *   // 3. an owner that also runs a cloak_proxy_t must stop that proxy's
  *   //    relays before the panel closes a session out from under them:
  *   pcfg.on_session_closing         = <trampoline to cloak_proxy_session_aborted>;
@@ -44,11 +49,16 @@
  * registry_init takes exactly ONE cloak_registry_broken_cb for the whole
  * registry, and cloak_proxy_registry_broken already owns it -- it has to,
  * because a relay left running past its session's on_broken is a
- * use-after-free (cloak/stream_relay.h). cloak_proxy_config_t::chain
- * exists for exactly this second consumer, and the ordering is not a free
- * choice: THE PROXY RUNS FIRST, because its relays must be stopped while
- * the session is still alive, and this module's bookkeeping has no such
- * constraint.
+ * use-after-free (cloak/stream_relay.h). Each link therefore names the
+ * next, and the ordering is not a free choice: THE PROXY RUNS FIRST,
+ * because its relays must be stopped while the session is still alive;
+ * THE ADMIN API RUNS NEXT, because its per-stream contexts also hold a
+ * cloak_stream_t * and an armed deadline timer; and THIS MODULE RUNS
+ * LAST of the three, because its work is bookkeeping and because
+ * cloak_userpanel_terminate can itself close sessions, which nothing
+ * earlier in the chain may still be holding pointers into. See
+ * cloak_userpanel_config_t::chain for where an OWNER's own bookkeeping
+ * goes now that the proxy's chain slot is the admin API's.
  *
  * D6 -- THE REGISTRY IS THE ONLY SESSION STORE. Go's ActiveUser.sessions
  * map is deliberately NOT ported. A cloak_userpanel_user_t owns a valve, a
@@ -244,6 +254,56 @@ typedef struct {
      * prefers to a documented obligation wherever the obligation can be
      * expressed in the type. */
     int no_relays;
+
+    /* THE LAST LINK OF THE BROKEN-SESSION CHAIN, invoked with
+     * chain_userdata AFTER cloak_userpanel_registry_broken has done its
+     * own bookkeeping for that session. NULL (the default) simply means
+     * there is nothing further to notify.
+     *
+     * WHY THE PANEL NEEDS ONE AT ALL, given that it runs last: the
+     * registry takes exactly ONE cloak_registry_broken_cb and three
+     * modules need it, so each link names the next --
+     *
+     *     registry -> proxy -> adminapi -> panel -> (owner)
+     *
+     * -- which means cloak_proxy_config_t::chain, the slot an owner's own
+     * bookkeeping used to occupy, now belongs to the admin API. This
+     * field is where that bookkeeping moved to. Without it the chain
+     * would end here and an owner wanting its own notification would have
+     * to wrap one of the earlier links in a trampoline, which is exactly
+     * the silently-omittable shape this chain exists to avoid.
+     *
+     * It is forwarded UNCONDITIONALLY, including for a NULL uid (which an
+     * earlier link passes on when it has no key of its own) and for a uid
+     * this panel has no active user for: this function never swallows a
+     * broken notification. The one case where nothing happens at all is a
+     * NULL panel, since the chain itself lives on the panel.
+     *
+     * TWO ARGUMENTS ARE NOT WHAT THE EARLIER LINKS SAW, because this
+     * module's own bookkeeping can invalidate them both before this link
+     * runs -- a broken session that was its user's LAST one terminates
+     * that user, and cloak_userpanel_terminate closes its sessions
+     * through cloak_server_registry_close_all_for_uid, which frees the
+     * breaking registry entry outright:
+     *
+     *   - uid points at a COPY this module took before that could happen,
+     *     not at the registry entry the earlier links were handed. It is
+     *     valid for the duration of this call and no longer.
+     *   - sesh is NULL whenever that termination destroyed the session
+     *     (and unchanged otherwise). cloak/registry.h promises a broken
+     *     callback that sesh survives the whole callback; this module is
+     *     the only link that can break that promise, and it says so with
+     *     a NULL rather than with a pointer to freed memory. The
+     *     destruction is OBSERVED -- the registry names each session it is
+     *     about to free as it frees it -- not deduced from this panel's
+     *     own table afterwards, which is wrong in both directions when a
+     *     termination is re-entered.
+     *
+     * An owner's link must therefore key its bookkeeping off uid and
+     * session_id, and must treat a non-NULL sesh as usable only for the
+     * duration of the call. */
+    cloak_registry_broken_cb chain;
+    void *chain_userdata;
 } cloak_userpanel_config_t;
 
 /* Allocates the panel, copies *cfg by value (substituting the default
@@ -468,14 +528,20 @@ void cloak_userpanel_notify_session_closed(cloak_userpanel_t *p,
                                            const uint8_t uid[CLOAK_UID_LEN]);
 
 /* A cloak_registry_broken_cb (userdata: the cloak_userpanel_t). Install
- * it as cloak_proxy_config_t::chain, NOT as the registry's own on_broken
- * -- that one belongs to the proxy and must run first; see the WIRING
- * block at the top of this file.
+ * it as the chain slot of whichever module precedes this one -- the admin
+ * API's on a server that has one, the proxy's otherwise -- and NOT as the
+ * registry's own on_broken, which belongs to the proxy and must run
+ * first; see the WIRING block at the top of this file.
  *
- * It is exactly cloak_userpanel_notify_session_closed for the uid, and
+ * For the uid it is exactly cloak_userpanel_notify_session_closed, and it
  * ignores reg, sesh and session_id: which session broke does not matter,
- * only whether any are left. A NULL uid (which the proxy forwards to its
- * chain when it has no key) is a no-op. */
+ * only whether any are left. A NULL uid (which an earlier link forwards
+ * when it has no key) skips that step.
+ *
+ * It then forwards to cloak_userpanel_config_t::chain, if any, in EVERY
+ * case an earlier link would have -- a NULL uid included. A NULL panel is
+ * the one case where nothing happens at all, since the chain lives on the
+ * panel. */
 void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session_t *sesh,
                                      const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
                                      void *userdata);

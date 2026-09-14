@@ -216,3 +216,52 @@ set_tests_properties(test_dispatcher_users PROPERTIES TIMEOUT 60)
 # produce that failure. See test_write_shim.c's own top-of-file comment.
 set_tests_properties(test_dispatcher_users PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+add_executable(test_http_parse test_http_parse.c)
+target_include_directories(test_http_parse PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_http_parse PRIVATE cloak-server)
+add_test(NAME test_http_parse COMMAND test_http_parse)
+set_tests_properties(test_http_parse PROPERTIES TIMEOUT 60)
+
+add_executable(test_user_json test_user_json.c)
+target_include_directories(test_user_json PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_user_json PRIVATE cloak-server)
+add_test(NAME test_user_json COMMAND test_user_json)
+set_tests_properties(test_user_json PROPERTIES TIMEOUT 60)
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_usermanager.c and
+# test_userpanel.c do: every case here asserts the DATABASE and not just
+# the status code, through cloak_usermanager_write/get/list, and
+# cloak-server's PRIVATE sqlite3 link deliberately does not propagate the
+# include path its implementation uses.
+add_executable(test_adminapi test_adminapi.c)
+target_include_directories(test_adminapi PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_adminapi PRIVATE cloak-server sqlite3)
+add_test(NAME test_adminapi COMMAND test_adminapi)
+set_tests_properties(test_adminapi PROPERTIES TIMEOUT 60)
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_dispatcher_users.c and
+# test_adminapi.c do: this file seeds and reads user rows through
+# cloak_usermanager_write/get to assert that an admin session leaves the
+# database untouched, and cloak-server's PRIVATE sqlite3 link deliberately
+# does not propagate the include path its implementation uses.
+add_executable(test_dispatcher_admin test_dispatcher_admin.c)
+target_include_directories(test_dispatcher_admin PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_admin PRIVATE cloak-server sqlite3)
+add_test(NAME test_dispatcher_admin COMMAND test_dispatcher_admin)
+set_tests_properties(test_dispatcher_admin PROPERTIES TIMEOUT 60)
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_adminapi.c and
+# test_dispatcher_admin.c do -- and for one more: this file's
+# second-writer case opens a second sqlite3 connection of its own and
+# holds a BEGIN IMMEDIATE write lock, which is the only way to make the
+# admin API's write fail the way a real second writer makes it fail
+# (busy_timeout is 0 by design).
+add_executable(test_admin_e2e test_admin_e2e.c)
+target_include_directories(test_admin_e2e PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_admin_e2e PRIVATE cloak-server sqlite3)
+add_test(NAME test_admin_e2e COMMAND test_admin_e2e)
+set_tests_properties(test_admin_e2e PROPERTIES TIMEOUT 60)

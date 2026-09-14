@@ -37,6 +37,31 @@ typedef struct {
     uint8_t encryption_method;
     uint32_t session_id;
     int unordered; /* 0 or 1 */
+
+    /* THE ONE FIELD HERE THAT IS NOT FROM THE WIRE, and the distinction
+     * matters enough to be the first thing this comment says: every other
+     * field above is attacker-chosen plaintext, while this one is a
+     * DERIVED verdict that only the dispatcher can compute -- it needs the
+     * cloak_server_t this connection arrived at, which this module knows
+     * nothing about.
+     *
+     * cloak_server_auth_decrypt therefore zeroes it and never sets it.
+     * dispatcher.c's dispatcher_authenticate sets it, once, at its step
+     * 6a: 1 exactly when cloak_server_is_admin(srv, uid) AND session_id ==
+     * 0 -- the server's admin identity opening session 0, which Go calls
+     * admin mode (internal/server/dispatcher.go:200-202). Both halves are
+     * required: the admin UID with a non-zero session id is an ordinary
+     * session.
+     *
+     * WHY IT LIVES HERE, in the struct the dispatcher hands to its
+     * cloak_dispatch_prepare_session_cb rather than in a predicate the
+     * owner calls for itself: the owner has to route an admin session to
+     * cloak_adminapi_t instead of cloak_proxy_t (cloak/adminapi.h's WIRING
+     * block), and if it re-derived the test there would be two definitions
+     * of "admin session" in the same binary, free to drift apart. The
+     * dispatcher decides once and says so; see cloak/dispatcher.h's
+     * cloak_dispatch_prepare_session_cb. */
+    int is_admin;
 } cloak_server_clientinfo_t;
 
 /* Validates that data was encrypted by someone who knows the server's
@@ -45,7 +70,9 @@ typedef struct {
  * `session_id`, and `unordered` in `*out` are all attacker-chosen values on
  * success; the caller (a future dispatcher/user-management module) is
  * responsible for validating and authorizing `uid` before trusting anything
- * else in `*out`.
+ * else in `*out`. `is_admin` is the exception and is not read off the wire
+ * at all: this function sets it to 0 and the dispatcher decides it -- see
+ * the field's own comment above.
  *
  * Derives the ECDH shared secret (server_priv x the client's ephemeral
  * public key, carried in the ClientHello's `random` field), uses it to
