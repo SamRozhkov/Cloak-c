@@ -41,7 +41,17 @@ struct cloak_userpanel {
     cloak_user_terminate_t terminates[CLOAK_USERPANEL_MAX_QUEUED_USERS];
 
     cloak_timer_id_t upload_timer;
+
+    /* Set for the whole of one upload cycle -- the drain, the commit and
+     * the terminations it orders. It is what refuses a nested cycle: both
+     * `queue` and `terminates` are panel-wide scratch that a second cycle
+     * would rewrite underneath the first. See cloak_userpanel_upload_now's
+     * doc comment. */
+    int in_cycle;
 };
+
+static int panel_run_cycle(cloak_userpanel_t *p);
+static int panel_cycle_body(cloak_userpanel_t *p);
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -180,12 +190,29 @@ static void panel_drain_user(cloak_userpanel_t *p, cloak_userpanel_user_t *u, in
         return;
     }
     struct panel_queue_entry *e = panel_queue_slot(p, u->uid);
+    if (e == NULL && from_terminate && !p->in_cycle) {
+        /* The periodic path can afford to leave the bytes in the valve
+         * and try again next tick; a terminate cannot, because the valve
+         * is about to be freed. Force the upload now instead of dropping
+         * the usage: a successful commit empties the queue, and the retry
+         * below then always finds room.
+         *
+         * u CANNOT BE FREED BY THIS CALL even though it runs the
+         * terminations the manager orders: u->terminating was set by
+         * cloak_userpanel_terminate before it called us, so panel_find
+         * cannot return it and the terminate loop cannot reach it. The
+         * !p->in_cycle guard is what stops this recursing -- a terminate
+         * reached FROM a cycle finds the flag set, skips the flush, and
+         * takes the warn-and-drop path below. */
+        (void)panel_run_cycle(p);
+        e = panel_queue_slot(p, u->uid);
+    }
     if (e == NULL) {
         char b64[33];
         panel_uid_str(u->uid, b64);
         if (from_terminate) {
-            CLOAK_LOGW("userpanel: usage queue full (%d entries) -- usage for terminating user "
-                       "%s is lost",
+            CLOAK_LOGW("userpanel: usage queue full (%d entries) and the forced upload did not "
+                       "free it -- usage for terminating user %s is lost",
                        (int)CLOAK_USERPANEL_MAX_QUEUED_USERS, b64);
         } else {
             CLOAK_LOGW("userpanel: usage queue full (%d entries) -- user %s not drained this "
@@ -240,6 +267,22 @@ int cloak_userpanel_open(cloak_userpanel_t **out, const cloak_userpanel_config_t
     }
     if (out == NULL || cfg == NULL || cfg->manager == NULL || cfg->registry == NULL ||
         cfg->reactor == NULL) {
+        return CLOAK_USER_ERR_ARG;
+    }
+    if (cfg->on_session_closing == NULL && !cfg->no_relays) {
+        /* CONTAINMENT BY CONSTRUCTION, not a style check. Closing a
+         * user's sessions by UID fires no on_broken, which is the only
+         * window in which a cloak_stream_relay_t bound to them can still
+         * be stopped -- so a caller that runs a cloak_proxy_t and forgot
+         * this hook gets a use-after-free on the next upstream byte after
+         * the first out-of-credit user is terminated. A NULL field in a
+         * memset(0) config is invisible at every other moment; refusing
+         * the open is the only point at which it can still be cheap.
+         * See cloak_userpanel_session_closing_cb and no_relays. */
+        CLOAK_LOGE("userpanel: config has no on_session_closing and does not set no_relays -- "
+                   "refusing to open. Every session this panel closes would go down without "
+                   "the owner being given the one window in which relays bound to it can be "
+                   "stopped.");
         return CLOAK_USER_ERR_ARG;
     }
 
@@ -493,11 +536,81 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
 /* The periodic upload                                                 */
 /* ------------------------------------------------------------------ */
 
+/* Does this UID have usage sitting in the queue that has not been
+ * settled? A zeroed entry (one the drain created for an idle user) does
+ * not count: it carries nothing anyone could lose. */
+static int panel_has_queued_usage(const cloak_userpanel_t *p, const uint8_t uid[CLOAK_UID_LEN]) {
+    for (size_t i = 0; i < p->queue_n; i++) {
+        if (memcmp(p->queue[i].uid, uid, CLOAK_UID_LEN) == 0) {
+            return p->queue[i].up_usage != 0 || p->queue[i].down_usage != 0;
+        }
+    }
+    return 0;
+}
+
+/* Step 4 of the cycle: terminate every active, non-bypass user that holds
+ * no sessions and has nothing outstanding in the queue.
+ *
+ * This is a PROPERTY, not a path. cloak_server_registry_close fires no
+ * on_broken and no other notification, and it is the function the
+ * dispatcher calls most often on its unwind routes -- so an entry created
+ * by cloak_userpanel_get_user can lose its session without the panel ever
+ * being told, and would otherwise occupy a table slot for the rest of the
+ * process. Enumerating those routes is what the previous branch tried;
+ * the same leak was found three times, once per route. See
+ * cloak_userpanel_upload_now's doc comment, including the one obligation
+ * this places on callers (a user acquires its first session in the same
+ * reactor turn it is created in).
+ *
+ * The "nothing outstanding" half is what keeps this from interacting with
+ * a failed upload: a user whose bytes are still queued stays active for
+ * one more cycle, so its status line still reports active = 1 for the
+ * interval in which it actually moved them. */
+static void panel_reap_sessionless(cloak_userpanel_t *p) {
+    for (size_t i = 0; i < CLOAK_USERPANEL_MAX_ACTIVE_USERS; i++) {
+        cloak_userpanel_user_t *u = p->active[i];
+        if (u == NULL || u->bypass || u->terminating) {
+            continue;
+        }
+        if (cloak_server_registry_count_for_uid(p->cfg.registry, u->uid) != 0) {
+            continue;
+        }
+        if (panel_has_queued_usage(p, u->uid)) {
+            continue;
+        }
+        /* Frees p->active[i] and clears that slot; no other slot moves,
+         * so continuing the scan from here is safe. */
+        cloak_userpanel_terminate(p, u, "no sessions left (reaped)");
+    }
+}
+
+/* One whole cycle. The caller must have established that no cycle is
+ * already running -- panel_run_cycle sets and clears in_cycle itself. */
+static int panel_run_cycle(cloak_userpanel_t *p) {
+    p->in_cycle = 1;
+    int rc = panel_cycle_body(p);
+    p->in_cycle = 0;
+    return rc;
+}
+
 int cloak_userpanel_upload_now(cloak_userpanel_t *p) {
     if (p == NULL) {
         return CLOAK_USER_ERR_ARG;
     }
+    if (p->in_cycle) {
+        /* Refused rather than allowed to rewrite the queue and terminate
+         * list the outer cycle is still using -- see this function's doc
+         * comment. Reached from an owner's on_session_closing, which is
+         * documented as forbidden; this is the containment, not the
+         * permission. */
+        CLOAK_LOGW("userpanel: upload requested from inside an upload cycle -- refused (it "
+                   "would rewrite the batch the outer cycle is committing)");
+        return 0;
+    }
+    return panel_run_cycle(p);
+}
 
+static int panel_cycle_body(cloak_userpanel_t *p) {
     /* 1. DRAIN every active, non-bypass user. Go's updateUsageQueue. */
     for (size_t i = 0; i < CLOAK_USERPANEL_MAX_ACTIVE_USERS; i++) {
         cloak_userpanel_user_t *u = p->active[i];
@@ -506,8 +619,12 @@ int cloak_userpanel_upload_now(cloak_userpanel_t *p) {
         }
     }
 
-    /* Matches Go's early return: no transaction at all. */
+    /* Matches Go's early return: no transaction at all. Step 4 still
+     * runs -- a leaked entry has no usage to send, so an early return
+     * that skipped the reap would skip exactly the case the reap exists
+     * for. */
     if (p->queue_n == 0) {
+        panel_reap_sessionless(p);
         return 0;
     }
 
@@ -542,6 +659,11 @@ int cloak_userpanel_upload_now(cloak_userpanel_t *p) {
         CLOAK_LOGW("userpanel: upload of %d usage record(s) failed (%d) -- kept queued for the "
                    "next interval",
                    (int)p->queue_n, rc);
+        /* The reap does not depend on the upload having succeeded: a
+         * sessionless user with nothing outstanding is leaked whether or
+         * not the database is reachable, and a sustained failure is
+         * precisely when the table must not also fill up. */
+        panel_reap_sessionless(p);
         return rc;
     }
 
@@ -563,5 +685,8 @@ int cloak_userpanel_upload_now(cloak_userpanel_t *p) {
             cloak_userpanel_terminate(p, u, p->terminates[i].reason);
         }
     }
+
+    /* 4. REAP whoever nothing ever told us about. */
+    panel_reap_sessionless(p);
     return 0;
 }

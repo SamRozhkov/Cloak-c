@@ -175,13 +175,30 @@ cloak_valve_t *cloak_userpanel_user_valve(cloak_userpanel_user_t *u);
  * leaves relays running against a destroyed session, which is a
  * use-after-free the next byte the upstream sends.
  *
- * An owner with no relays (the panel's own tests, a server whose data
- * path is something else) may leave it NULL.
+ * AN OWNER WITH NO RELAYS MUST SAY SO, by setting
+ * cloak_userpanel_config_t::no_relays. Leaving this NULL without that
+ * flag is REJECTED by cloak_userpanel_open. That is deliberate and it is
+ * the whole point: a NULL here in a memset(0) config compiles clean,
+ * opens clean, and produces a use-after-free on the first upstream byte
+ * after the first out-of-credit user is terminated -- i.e. under load, in
+ * production, long after the mistake. An error at startup is the only
+ * version of that feedback anyone can act on.
  *
  * WHAT IS SAFE FROM HERE: cloak_userpanel_notify_session_closed and
  * cloak_userpanel_find are safe and are no-ops for the user being
  * terminated (it is already marked terminating and therefore invisible).
  * cloak_userpanel_terminate on that same user is safe and is a no-op.
+ *
+ * Do NOT call cloak_userpanel_upload_now from here. An upload cycle owns
+ * two pieces of panel-wide state for its duration -- the usage queue it
+ * is committing and the terminate list it is walking -- and a nested
+ * cycle would rewrite both underneath the outer one, which then
+ * terminates UIDs belonging to the nested batch and silently skips the
+ * out-of-credit users of its own. That is free service, not a crash, so
+ * nothing would ever report it. A nested call is therefore REFUSED as a
+ * no-op (returning 0, logging at WARN) rather than allowed to corrupt the
+ * batch; the refusal is containment, not permission.
+ *
  * Do NOT call cloak_userpanel_close from here -- it would free the panel
  * whose terminate is still on the stack above you. */
 typedef void (*cloak_userpanel_session_closing_cb)(const uint8_t uid[CLOAK_UID_LEN],
@@ -210,10 +227,23 @@ typedef struct {
     cloak_now_fn now_fn;
     void *now_userdata;
 
-    /* Optional, but see cloak_userpanel_session_closing_cb -- "optional"
-     * there means "only if you have no relays". */
+    /* Required unless no_relays is set; see
+     * cloak_userpanel_session_closing_cb. */
     cloak_userpanel_session_closing_cb on_session_closing;
     void *on_session_closing_userdata;
+
+    /* THE EXPLICIT OPT-OUT for on_session_closing, and the only way to
+     * open a panel without one. Set it when nothing is bound to the
+     * sessions this panel will close -- no cloak_proxy_t, no
+     * cloak_stream_relay_t, no per-session context that needs unwinding.
+     * A caller that genuinely has nothing bound says so once,
+     * deliberately, and that statement is reviewable; a caller that
+     * simply forgot the hook gets an error out of cloak_userpanel_open
+     * instead of a use-after-free the first time a user runs out of
+     * credit. This is containment by construction, which this project
+     * prefers to a documented obligation wherever the obligation can be
+     * expressed in the type. */
+    int no_relays;
 } cloak_userpanel_config_t;
 
 /* Allocates the panel, copies *cfg by value (substituting the default
@@ -226,8 +256,9 @@ typedef struct {
  * project now uses, for the same reason.
  *
  * Returns 0, CLOAK_USER_ERR_ARG (out, cfg, or any of the three required
- * pointers NULL), or CLOAK_USERPANEL_ERR_ALLOC (allocation, or the
- * reactor refused the timer). */
+ * pointers NULL, OR on_session_closing NULL without cfg->no_relays), or
+ * CLOAK_USERPANEL_ERR_ALLOC (allocation, or the reactor refused the
+ * timer). */
 int cloak_userpanel_open(cloak_userpanel_t **out, const cloak_userpanel_config_t *cfg);
 
 /* Cancels the upload timer and frees every active user and the queue.
@@ -428,6 +459,49 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
  *  3. TERMINATE. Every user the manager named is terminated, with the
  *     manager's own reason string.
  *
+ *  4. REAP. Every active, non-bypass user that currently holds ZERO
+ *     sessions in the registry and has no outstanding queued usage is
+ *     terminated too.
+ *
+ * WHY STEP 4 EXISTS, since it looks redundant next to
+ * cloak_userpanel_notify_session_closed. It is not redundant, it is the
+ * backstop that makes this module's bookkeeping a PROPERTY rather than a
+ * list of paths. cloak_server_registry_close fires no on_broken and is
+ * (per cloak/registry.h) the function the dispatcher calls most often:
+ * a proxy-dial failure, a reply-write failure after get_or_create, its
+ * own handshake unwind. Every one of those routes destroys a session
+ * WITHOUT the panel ever being told, and a user created by
+ * cloak_userpanel_get_user moments earlier is then active forever --
+ * one permanently leaked slot per distinct UID, until the table is full
+ * and every later user is refused with CLOAK_USERPANEL_ERR_FULL long
+ * after the connections responsible are gone, with nothing in the log
+ * connecting the two. The previous branch of this project spent three
+ * separate bug reports discovering that this class of leak had three
+ * paths and not one, which is exactly why this is not fixed by
+ * enumerating the dispatcher's unwinds: a reaper covers the paths nobody
+ * has found yet, and covers new ones for free.
+ *
+ * Task 5 should ALSO wire cloak_dispatch_session_aborted_cb (the
+ * previous branch added it for precisely this prepare-then-abort shape)
+ * so that the common case is reported promptly instead of waiting up to
+ * one upload interval. The reaper is what makes correctness not depend
+ * on that being remembered.
+ *
+ * THE ONE OBLIGATION THE REAPER IMPOSES ON ITS CALLER: a user must
+ * acquire its first session in the same reactor turn as the
+ * cloak_userpanel_get_user that created it. An entry that exists with
+ * zero sessions when a tick lands is, by this rule, indistinguishable
+ * from a leaked one and is reaped. The dispatcher satisfies this by
+ * construction (authorisation and cloak_server_registry_get_or_create
+ * happen in one dispatch call chain, with no reactor turn between), and
+ * a future caller that wants to pre-authorise a user and attach sessions
+ * later must hold something else to keep it alive.
+ *
+ * Bypass users are exempt: they are never metered, so a leaked bypass
+ * entry costs a table slot and nothing else, and their UIDs come from a
+ * bounded config-file list that reuses the same entries rather than
+ * growing without limit.
+ *
  * THE QUEUE OUTLIVES THE ACTIVE USER, and that is why it is a separate
  * structure rather than a field on cloak_userpanel_user_t. A user who
  * disconnects between two uploads has its usage drained onto the queue by
@@ -452,17 +526,30 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
  * charge. CLOAK_USER_ERR_WEDGED is retried too -- it is documented as
  * self-healing on the next drain.
  *
- * AT THE QUEUE CAP, a user with no entry yet is NOT drained at all: the
- * bytes stay in its valve and are drained at a later tick when there is
- * room. Nothing is lost on this path. The one path where usage can be
- * lost is cloak_userpanel_terminate finding the queue full -- the valve
- * is about to be freed, so there is nowhere to leave the bytes; it is
- * logged at WARN. That needs more than CLOAK_USERPANEL_MAX_QUEUED_USERS
- * distinct users to have moved bytes within one interval.
+ * AT THE QUEUE CAP, a user with no entry yet is NOT drained at all on the
+ * periodic path: the bytes stay in its valve and are drained at a later
+ * tick when there is room. Nothing is lost there.
  *
- * Returns 0 when there was nothing to send or the batch was accepted, and
- * the manager's negative code when it was not. p == NULL returns
- * CLOAK_USER_ERR_ARG. */
+ * cloak_userpanel_terminate has no such option -- the valve is about to
+ * be freed and there is nowhere to leave the bytes -- so when IT finds
+ * the queue full it forces an upload immediately, and records the usage
+ * in the room that frees. Only if that upload ALSO fails is the usage
+ * lost, and only then is a WARN emitted. This path is reachable, not
+ * theoretical: the queue empties only on a SUCCESSFUL upload, so a
+ * sustained failure (the very thing the retry exists for) plus ordinary
+ * user churn reaches CLOAK_USERPANEL_MAX_QUEUED_USERS in two intervals.
+ *
+ * A NESTED CYCLE IS REFUSED. An upload cycle owns the queue it is
+ * committing and the terminate list it is walking; a second cycle
+ * entered from inside the first (an owner calling this from
+ * on_session_closing, or a forced flush reached from a termination this
+ * cycle ordered) would rewrite both and make the outer one terminate the
+ * wrong users and skip its own. Re-entry therefore returns 0 without
+ * doing anything and logs at WARN.
+ *
+ * Returns 0 when there was nothing to send, the batch was accepted, or
+ * the call was refused as re-entrant; and the manager's negative code
+ * when the batch was rejected. p == NULL returns CLOAK_USER_ERR_ARG. */
 int cloak_userpanel_upload_now(cloak_userpanel_t *p);
 
 #endif

@@ -343,6 +343,7 @@ static void test_get_user_activates_and_returns_rates(void) {
     pcfg.upload_interval_ms = 60000; /* long: nothing here wants a tick */
     pcfg.now_fn = fake_now;
     pcfg.now_userdata = &now;
+    pcfg.no_relays = 1; /* nothing is bound to these sessions in this case */
 
     cloak_userpanel_t *panel = NULL;
     ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
@@ -418,6 +419,7 @@ static void test_bypass_user_never_touches_the_manager(void) {
     pcfg.upload_interval_ms = 60000;
     pcfg.now_fn = fake_now;
     pcfg.now_userdata = &now;
+    pcfg.no_relays = 1; /* nothing is bound to these sessions in this case */
 
     cloak_userpanel_t *panel = NULL;
     ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
@@ -499,6 +501,7 @@ static void test_usage_reaches_the_database_on_the_timer(void) {
     pcfg.upload_interval_ms = CASE3_INTERVAL_MS;
     pcfg.now_fn = fake_now;
     pcfg.now_userdata = &now;
+    pcfg.no_relays = 1; /* nothing is bound to these sessions in this case */
 
     cloak_userpanel_t *panel = NULL;
     uint64_t opened_at = mono_ms();
@@ -569,6 +572,18 @@ static void test_usage_reaches_the_database_on_the_timer(void) {
 typedef struct {
     int calls;
     uint32_t session_ids[8];
+    /* When set, the hook attempts an upload from inside the cycle that is
+     * terminating this user -- the thing the header forbids. The panel
+     * refuses it rather than letting it rewrite the batch the outer cycle
+     * is still walking. NOTE, so nobody reads more into this than it
+     * pins: the refusal returns 0 exactly as a successful no-op cycle
+     * would, so the return value alone does NOT distinguish the guard
+     * from its absence. What this exercises is that the whole sequence
+     * survives (under ASan) and that the outer cycle still terminates and
+     * bills everyone it was going to. */
+    cloak_userpanel_t *reentrant_upload_panel;
+    int reentrant_upload_rc;
+    int reentrant_upload_calls;
 } closing_ctx_t;
 
 static void on_session_closing(const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id,
@@ -579,6 +594,10 @@ static void on_session_closing(const uint8_t uid[CLOAK_UID_LEN], uint32_t sessio
         c->session_ids[c->calls] = session_id;
     }
     c->calls++;
+    if (c->reentrant_upload_panel != NULL) {
+        c->reentrant_upload_rc = cloak_userpanel_upload_now(c->reentrant_upload_panel);
+        c->reentrant_upload_calls++;
+    }
 }
 
 static void test_user_out_of_credit_is_terminated(void) {
@@ -590,8 +609,12 @@ static void test_user_out_of_credit_is_terminated(void) {
 
     cloak_usermanager_t *m = NULL;
     ASSERT_EQ_INT(0, cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)));
-    /* 40 bytes of upload credit: a single small frame overruns it. */
+    /* 40 bytes of upload credit: a single small frame overruns it. TWO
+     * such users, so the manager's terminate list has more than one entry
+     * and the cycle is still walking that list while the first user's
+     * sessions are being closed. */
     put_user(m, 0x21, 4, 0, 0, 40, 10000000);
+    put_user(m, 0x22, 4, 0, 0, 40, 10000000);
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -629,10 +652,29 @@ static void test_user_out_of_credit_is_terminated(void) {
     link_open(&l2, r, &reg, &obfs, uid, 12, cloak_userpanel_user_valve(u));
     ASSERT_EQ_INT(2, (int)cloak_server_registry_count_for_uid(&reg, uid));
 
-    drive_client_to_server(&l1, r, 200); /* > 40 bytes of upload credit */
-    ASSERT_TRUE(cloak_valve_rx(&u->valve) > 40);
+    uint8_t uid2[CLOAK_UID_LEN];
+    mk_uid(uid2, 0x22);
+    cloak_userpanel_user_t *u2 = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, uid2, &u2));
+    link_t l3;
+    link_open(&l3, r, &reg, &obfs, uid2, 13, cloak_userpanel_user_valve(u2));
 
+    drive_client_to_server(&l1, r, 200); /* > 40 bytes of upload credit */
+    drive_client_to_server(&l3, r, 200);
+    ASSERT_TRUE(cloak_valve_rx(&u->valve) > 40);
+    ASSERT_TRUE(cloak_valve_rx(&u2->valve) > 40);
+
+    closing.reentrant_upload_panel = panel;
     ASSERT_EQ_INT(0, cloak_userpanel_upload_now(panel));
+    ASSERT_TRUE(closing.reentrant_upload_calls > 0); /* the nested attempt really happened */
+    ASSERT_EQ_INT(0, closing.reentrant_upload_rc);
+
+    /* BOTH out-of-credit users went, not just the one whose sessions were
+     * being closed when the nested upload was attempted. */
+    ASSERT_TRUE(cloak_userpanel_find(panel, uid2) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count_for_uid(&reg, uid2));
+    cloak_user_info_t row2 = get_user_row(m, 0x22);
+    ASSERT_TRUE(row2.up_credit <= 0);
 
     /* The user is gone from the table and BOTH of its sessions are gone
      * from the registry -- including the one that carried no traffic. */
@@ -642,10 +684,12 @@ static void test_user_out_of_credit_is_terminated(void) {
     ASSERT_EQ_INT(0, (int)cloak_server_registry_count(&reg));
 
     /* Every closed session was offered to the owner first, which is the
-     * only window in which a relay bound to it could still be stopped. */
-    ASSERT_EQ_INT(2, closing.calls);
+     * only window in which a relay bound to it could still be stopped:
+     * two for the first user, one for the second. */
+    ASSERT_EQ_INT(3, closing.calls);
     ASSERT_TRUE((closing.session_ids[0] == 11 && closing.session_ids[1] == 12) ||
                 (closing.session_ids[0] == 12 && closing.session_ids[1] == 11));
+    ASSERT_EQ_INT(13, (int)closing.session_ids[2]);
 
     /* The debt is written back, which is what keeps authenticate refusing
      * this user on the next connection attempt. */
@@ -659,6 +703,7 @@ static void test_user_out_of_credit_is_terminated(void) {
 
     link_destroy_peer(&l1);
     link_destroy_peer(&l2);
+    link_destroy_peer(&l3);
     cloak_server_registry_destroy(&reg);
     cloak_userpanel_close(panel);
     cloak_usermanager_close(m);
@@ -706,6 +751,7 @@ static void test_usage_of_a_disconnected_user_is_still_billed(void) {
     pcfg.upload_interval_ms = 60000; /* the upload happens by hand, AFTER the disconnect */
     pcfg.now_fn = fake_now;
     pcfg.now_userdata = &now;
+    pcfg.no_relays = 1; /* nothing is bound to these sessions in this case */
 
     cloak_userpanel_t *panel = NULL;
     ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
@@ -1113,6 +1159,7 @@ static void test_bypass_user_is_never_metered_or_uploaded(void) {
     pcfg.upload_interval_ms = 60000;
     pcfg.now_fn = fake_now;
     pcfg.now_userdata = &now;
+    pcfg.no_relays = 1; /* nothing is bound to these sessions in this case */
 
     cloak_userpanel_t *panel = NULL;
     ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
@@ -1188,6 +1235,7 @@ static void test_failed_upload_is_retried_not_discarded(void) {
     pcfg.upload_interval_ms = 60000;
     pcfg.now_fn = fake_now;
     pcfg.now_userdata = &now;
+    pcfg.no_relays = 1; /* nothing is bound to these sessions in this case */
 
     cloak_userpanel_t *panel = NULL;
     ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
@@ -1278,6 +1326,7 @@ static void test_active_table_refuses_the_newest_at_the_cap(void) {
     pcfg.upload_interval_ms = 60000;
     pcfg.now_fn = fake_now;
     pcfg.now_userdata = &now;
+    pcfg.no_relays = 1; /* nothing is bound to these sessions in this case */
 
     cloak_userpanel_t *panel = NULL;
     ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
@@ -1354,6 +1403,285 @@ static void test_null_arguments(void) {
     cloak_userpanel_close(NULL);
 }
 
+
+/* ------------------------------------------------------------------ */
+/* 12. open REFUSES a config with no on_session_closing unless the      */
+/*     caller opts out explicitly.                                      */
+/* ------------------------------------------------------------------ */
+static void test_open_refuses_a_missing_closing_hook(void) {
+    char err[256];
+    int64_t now = T_NOW;
+
+    cloak_usermanager_t *m = NULL;
+    ASSERT_EQ_INT(0, cloak_usermanager_open(&m, NULL, fake_now, &now, err, sizeof(err)));
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    chain_ctx_t chain = {NULL, 0};
+    cloak_server_registry_t reg;
+    ASSERT_EQ_INT(0, cloak_server_registry_init(&reg, r, on_registry_broken, &chain));
+
+    cloak_userpanel_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.manager = m;
+    pcfg.registry = &reg;
+    pcfg.reactor = r;
+
+    /* Exactly what a caller who forgot the hook writes: a memset(0)
+     * config with the three obvious pointers filled in. It must not open
+     * -- the relay obligation is otherwise invisible until a user runs
+     * out of credit under load. */
+    cloak_userpanel_t *panel = (cloak_userpanel_t *)0x1;
+    ASSERT_EQ_INT(CLOAK_USER_ERR_ARG, cloak_userpanel_open(&panel, &pcfg));
+    ASSERT_TRUE(panel == NULL);
+
+    /* The deliberate opt-out opens. */
+    pcfg.no_relays = 1;
+    ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
+    ASSERT_TRUE(panel != NULL);
+    cloak_userpanel_close(panel);
+
+    /* So does supplying the hook, without the opt-out. */
+    closing_ctx_t closing;
+    memset(&closing, 0, sizeof(closing));
+    pcfg.no_relays = 0;
+    pcfg.on_session_closing = on_session_closing;
+    pcfg.on_session_closing_userdata = &closing;
+    panel = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
+    ASSERT_TRUE(panel != NULL);
+    cloak_userpanel_close(panel);
+
+    cloak_server_registry_destroy(&reg);
+    cloak_usermanager_close(m);
+    cloak_reactor_destroy(r);
+}
+
+/* ------------------------------------------------------------------ */
+/* 13. A user whose session went away by a route that notifies NOBODY   */
+/*     is reaped on the next tick -- and is billed on the way out.      */
+/* ------------------------------------------------------------------ */
+static void test_sessionless_user_is_reaped(void) {
+    char path[512];
+    char err[256];
+    int64_t now = T_NOW;
+    up_tmp_path(path, sizeof(path), "reap");
+    up_unlink(path);
+
+    cloak_usermanager_t *m = NULL;
+    ASSERT_EQ_INT(0, cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)));
+    put_user(m, 0x81, 4, 0, 0, 10000000, 10000000);
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    chain_ctx_t chain = {NULL, 0};
+    cloak_server_registry_t reg;
+    ASSERT_EQ_INT(0, cloak_server_registry_init(&reg, r, on_registry_broken, &chain));
+
+    cloak_userpanel_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.manager = m;
+    pcfg.registry = &reg;
+    pcfg.reactor = r;
+    pcfg.upload_interval_ms = 60000;
+    pcfg.now_fn = fake_now;
+    pcfg.now_userdata = &now;
+    pcfg.no_relays = 1;
+
+    cloak_userpanel_t *panel = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
+    chain.panel = panel;
+
+    uint8_t uid[CLOAK_UID_LEN];
+    mk_uid(uid, 0x81);
+    cloak_userpanel_user_t *u = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, uid, &u));
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+    link_t L;
+    link_open(&L, r, &reg, &obfs, uid, 71, cloak_userpanel_user_valve(u));
+    drive_client_to_server(&L, r, 128);
+    int64_t rx = cloak_valve_rx(&u->valve);
+    ASSERT_TRUE(rx > 0);
+
+    /* THE ROUTE THAT TELLS NOBODY. cloak_server_registry_close fires no
+     * on_broken, so the chain never runs and
+     * cloak_userpanel_notify_session_closed is never called -- this is
+     * the dispatcher's own unwind (proxy-dial failure, reply-write
+     * failure), which cloak/registry.h calls the most common caller of
+     * that function. */
+    cloak_server_registry_close(&reg, uid, 71);
+    ASSERT_EQ_INT(0, (int)cloak_server_registry_count_for_uid(&reg, uid));
+    ASSERT_EQ_INT(0, chain.broken_calls); /* nothing was notified, by construction */
+    ASSERT_TRUE(cloak_userpanel_find(panel, uid) != NULL); /* ... so the entry is still there */
+    ASSERT_EQ_INT(1, (int)cloak_userpanel_active_count(panel));
+
+    /* One cycle reaps it -- and settles its usage first, so the reaper is
+     * not a way to escape a bill. */
+    ASSERT_EQ_INT(0, cloak_userpanel_upload_now(panel));
+    ASSERT_TRUE(cloak_userpanel_find(panel, uid) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(panel));
+    cloak_user_info_t row = get_user_row(m, 0x81);
+    ASSERT_EQ_INT(10000000 - rx, row.up_credit);
+
+    link_destroy_peer(&L);
+    cloak_server_registry_destroy(&reg);
+    cloak_userpanel_close(panel);
+    cloak_usermanager_close(m);
+    cloak_reactor_destroy(r);
+    up_unlink(path);
+}
+
+/* ------------------------------------------------------------------ */
+/* 14. The queue-full path is reachable, and terminate forces an upload  */
+/*     rather than dropping the usage.                                   */
+/* ------------------------------------------------------------------ */
+
+/* Fills the queue to its cap the way a real server does: two intervals of
+ * failed uploads (the queue empties only on success) with a fresh set of
+ * UIDs each time. The first UID is given REAL usage and the rest none, so
+ * that the forced upload later has something observable to settle. */
+#define Q_ROUND (CLOAK_USERPANEL_MAX_QUEUED_USERS / 2) /* == the active cap */
+
+static void test_queue_full_forces_an_upload(void) {
+    char path[512];
+    char err[256];
+    int64_t now = T_NOW;
+    up_tmp_path(path, sizeof(path), "qfull");
+    up_unlink(path);
+
+    cloak_usermanager_t *m = NULL;
+    ASSERT_EQ_INT(0, cloak_usermanager_open(&m, path, fake_now, &now, err, sizeof(err)));
+
+    /* 2*Q_ROUND filler UIDs plus one for the terminating user. */
+    for (unsigned i = 0; i < 2 * Q_ROUND + 1; i++) {
+        cloak_user_info_t info;
+        memset(&info, 0, sizeof(info));
+        mk_uid_n(info.uid, i);
+        info.sessions_cap = 4;
+        info.up_credit = 10000000;
+        info.down_credit = 10000000;
+        info.expiry_time = T_EXPIRY;
+        ASSERT_EQ_INT(0, cloak_usermanager_write(m, &info, CLOAK_USER_FIELD_ALL));
+    }
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    chain_ctx_t chain = {NULL, 0};
+    cloak_server_registry_t reg;
+    ASSERT_EQ_INT(0, cloak_server_registry_init(&reg, r, on_registry_broken, &chain));
+
+    cloak_userpanel_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.manager = m;
+    pcfg.registry = &reg;
+    pcfg.reactor = r;
+    pcfg.upload_interval_ms = 60000;
+    pcfg.now_fn = fake_now;
+    pcfg.now_userdata = &now;
+    pcfg.no_relays = 1;
+
+    cloak_userpanel_t *panel = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_open(&panel, &pcfg));
+    chain.panel = panel;
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    /* --- interval 1: Q_ROUND UIDs, the first with real traffic ------- */
+    uint8_t marker[CLOAK_UID_LEN];
+    mk_uid_n(marker, 0);
+    cloak_userpanel_user_t *mu = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, marker, &mu));
+    link_t L;
+    link_open(&L, r, &reg, &obfs, marker, 81, cloak_userpanel_user_valve(mu));
+    drive_client_to_server(&L, r, 256);
+    int64_t marker_rx = cloak_valve_rx(&mu->valve);
+    ASSERT_TRUE(marker_rx > 0);
+    cloak_server_registry_close(&reg, marker, 81);
+    link_destroy_peer(&L);
+
+    for (unsigned i = 1; i < Q_ROUND; i++) {
+        uint8_t uid[CLOAK_UID_LEN];
+        mk_uid_n(uid, i);
+        cloak_userpanel_user_t *u = NULL;
+        ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, uid, &u));
+    }
+    ASSERT_EQ_INT((int)Q_ROUND, (int)cloak_userpanel_active_count(panel));
+
+    /* A second writer holds the lock, so every upload below fails and the
+     * queue keeps growing -- which is exactly the situation the retry
+     * design creates and the reason the cap is reachable at all. */
+    sqlite3 *other = NULL;
+    ASSERT_EQ_INT(SQLITE_OK, sqlite3_open(path, &other));
+    ASSERT_EQ_INT(SQLITE_OK, sqlite3_exec(other, "BEGIN IMMEDIATE", NULL, NULL, NULL));
+
+    ASSERT_TRUE(cloak_userpanel_upload_now(panel) != 0);
+    /* The idle ones were reaped (no sessions, nothing queued); the marker
+     * has queued usage, so it was deliberately kept for another cycle. */
+    ASSERT_EQ_INT(1, (int)cloak_userpanel_active_count(panel));
+    ASSERT_TRUE(cloak_userpanel_find(panel, marker) != NULL);
+
+    /* Its slot is freed by hand; its QUEUE entry survives it, which is
+     * the whole point of the queue being separate. */
+    cloak_userpanel_terminate(panel, mu, "make room");
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(panel));
+
+    /* --- interval 2: Q_ROUND more UIDs -> the queue reaches its cap --- */
+    for (unsigned i = Q_ROUND; i < 2 * Q_ROUND; i++) {
+        uint8_t uid[CLOAK_UID_LEN];
+        mk_uid_n(uid, i);
+        cloak_userpanel_user_t *u = NULL;
+        ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, uid, &u));
+    }
+    ASSERT_TRUE(cloak_userpanel_upload_now(panel) != 0);
+    ASSERT_EQ_INT(0, (int)cloak_userpanel_active_count(panel));
+
+    /* Nothing has reached the database yet: two failed uploads. */
+    cloak_user_info_t marker_row;
+    ASSERT_EQ_INT(0, cloak_usermanager_get(m, marker, &marker_row));
+    ASSERT_EQ_INT(10000000, marker_row.up_credit);
+
+    /* --- the terminating user, with the queue at its cap ------------- */
+    ASSERT_EQ_INT(SQLITE_OK, sqlite3_exec(other, "ROLLBACK", NULL, NULL, NULL));
+    ASSERT_EQ_INT(SQLITE_OK, sqlite3_close(other));
+
+    uint8_t last[CLOAK_UID_LEN];
+    mk_uid_n(last, 2 * Q_ROUND);
+    cloak_userpanel_user_t *lu = NULL;
+    ASSERT_EQ_INT(0, cloak_userpanel_get_user(panel, last, &lu));
+    link_t L2;
+    link_open(&L2, r, &reg, &obfs, last, 82, cloak_userpanel_user_valve(lu));
+    drive_client_to_server(&L2, r, 256);
+    int64_t last_rx = cloak_valve_rx(&lu->valve);
+    ASSERT_TRUE(last_rx > 0);
+
+    cloak_userpanel_terminate(panel, lu, "test");
+
+    /* THE DISCRIMINATING OBSERVATION, and it is made BEFORE any further
+     * upload_now: the marker's usage -- queued two intervals ago and
+     * never settled -- is now in the database. Only the forced upload
+     * inside terminate can have put it there. If the queue had not
+     * actually been full, no flush would have happened and this would
+     * still read the initial credit. */
+    ASSERT_EQ_INT(0, cloak_usermanager_get(m, marker, &marker_row));
+    ASSERT_EQ_INT(10000000 - marker_rx, marker_row.up_credit);
+
+    /* And the terminating user's own usage went into the room that
+     * freed, rather than being dropped with a warning. */
+    ASSERT_EQ_INT(0, cloak_userpanel_upload_now(panel));
+    cloak_user_info_t last_row;
+    ASSERT_EQ_INT(0, cloak_usermanager_get(m, last, &last_row));
+    ASSERT_EQ_INT(10000000 - last_rx, last_row.up_credit);
+
+    link_destroy_peer(&L2);
+    cloak_server_registry_destroy(&reg);
+    cloak_userpanel_close(panel);
+    cloak_usermanager_close(m);
+    cloak_reactor_destroy(r);
+    up_unlink(path);
+}
+
 TEST_MAIN_BEGIN()
 test_get_user_activates_and_returns_rates();
 test_bypass_user_never_touches_the_manager();
@@ -1366,5 +1694,8 @@ test_terminate_from_inside_the_broken_path();
 test_bypass_user_is_never_metered_or_uploaded();
 test_failed_upload_is_retried_not_discarded();
 test_active_table_refuses_the_newest_at_the_cap();
+test_open_refuses_a_missing_closing_hook();
+test_sessionless_user_is_reaped();
+test_queue_full_forces_an_upload();
 test_null_arguments();
 TEST_MAIN_END()
