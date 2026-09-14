@@ -483,6 +483,33 @@ static int api_streams_ge(void *ctx) {
     return cloak_adminapi_stream_count(w->api) >= w->want;
 }
 
+/* THE SERVER'S OWN WRITE PROGRESS, read straight off the public structs.
+ * cloak/adminapi.h defines cloak_adminapi_t, its session context and its
+ * stream context in full, so a test does not have to infer "the response
+ * has not finished going out" from buffer sizes -- it can look.
+ *
+ * THAT MATTERS MORE THAN IT LOOKS. The two cases below are about a
+ * response that is too big to be written in one go; sized by margin
+ * alone, either of them silently stops testing that the day a socket
+ * buffer default changes, which is exactly the shape of coverage defect
+ * this project keeps finding. Asserting resp_sent directly cannot
+ * degrade that way: if the write completes in one pass, the assertion
+ * fails instead of the case quietly passing for another reason.
+ *
+ * Returns 1 when exactly one stream context exists and it has written
+ * SOME but not ALL of its response. */
+static int server_mid_response(void *ctx) {
+    struct fixture *fx = ctx;
+    if (fx->api.sessions == NULL || fx->api.sessions->streams == NULL) {
+        return 0;
+    }
+    const cloak_adminapi_stream_t *ast = fx->api.sessions->streams;
+    if (ast->resp == NULL) {
+        return 0;
+    }
+    return ast->resp_sent > 0 && ast->resp_sent < ast->resp_len;
+}
+
 /* ---- request builders ---------------------------------------------------- */
 
 static void uid_url(const uint8_t uid[CLOAK_UID_LEN], char *out, size_t cap) {
@@ -845,6 +872,24 @@ static void test_unknown_and_malformed_uid(void) {
     ASSERT_EQ_INT(404, resp_status(&r5));
     finish(&fx, &cs, st5, &r5);
 
+    /* A path that SHARES the collection's prefix but does not end there
+     * and is not followed by a separator is a different resource
+     * entirely: 404, never a malformed-UID 400. Without this the
+     * separator test in the router is dead -- neutering it leaves
+     * "/nope" and "/admin/users/" (the two cases above) both still
+     * correct, and only this one changes. */
+    resp_t r6;
+    cloak_stream_t *st6 =
+        request(&fx, &cs, "GET /admin/usersX HTTP/1.1\r\nHost: admin\r\n\r\n", &r6);
+    ASSERT_EQ_INT(404, resp_status(&r6));
+    finish(&fx, &cs, st6, &r6);
+
+    resp_t r7;
+    cloak_stream_t *st7 = request(
+        &fx, &cs, "GET /admin/userspace/x HTTP/1.1\r\nHost: admin\r\n\r\n", &r7);
+    ASSERT_EQ_INT(404, resp_status(&r7));
+    finish(&fx, &cs, st7, &r7);
+
     client_session_close(&cs);
     fixture_destroy(&fx);
 }
@@ -1024,13 +1069,12 @@ static void test_large_response_is_delivered_completely(void) {
     client_session_t cs;
     ASSERT_EQ_INT(0, open_client(&fx, &cs, 10));
 
-    /* SHRINKING THE CLIENT'S RECEIVE BUFFER IS WHAT MAKES THIS CASE REAL,
-     * and it was added because the first version of it did not: with
-     * loopback's default buffers the whole listing fits between the two
-     * kernels, so cloak_stream_write never backs the pool up, the write
-     * pump never pauses, and on_writable is never called at all.
-     * Verified by mutation -- making adminapi_on_writable a no-op passed
-     * that version of this case and fails this one. */
+    /* Shrinking the client's receive buffer is what makes the pool
+     * genuinely back up: with loopback's defaults the whole listing fits
+     * between the two kernels and the pump never pauses at all. It is
+     * how the state is PRODUCED; server_mid_response below is what
+     * asserts the state was actually reached, so this sizing is not what
+     * the case rests on. */
     int rcvbuf = 8192;
     (void)setsockopt(cs.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
@@ -1039,18 +1083,34 @@ static void test_large_response_is_delivered_completely(void) {
     ASSERT_EQ_INT(0, cloak_usermanager_list(fx.manager, NULL, 0, &n_rows));
     ASSERT_EQ_INT(BIG_USERS, (int)n_rows);
 
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
     resp_t r;
-    cloak_stream_t *st = request(&fx, &cs, "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n", &r);
+    resp_init(&r, st);
+    ASSERT_TRUE(r.buf != NULL);
+    const char *getreq = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n";
+    ASSERT_EQ_INT((int)strlen(getreq),
+                  (int)cloak_stream_write(st, (const uint8_t *)getreq, strlen(getreq)));
+
+    /* THE PAUSE IS ASSERTED, NOT ARGUED: at some point between two
+     * reactor turns the server has written part of this response and not
+     * the rest, which is only possible if the write pump stopped on a
+     * zero budget and is waiting for on_writable. A response delivered in
+     * one pass never shows this state and fails right here. */
+    ASSERT_TRUE(pump_until(fx.reactor, server_mid_response, &fx, 600, 5));
+
+    ASSERT_TRUE(pump_until(fx.reactor, resp_complete, &r, 600, 5));
     ASSERT_EQ_INT(200, resp_status(&r));
 
     long he = resp_header_end(&r);
     ASSERT_TRUE(he > 0);
     long cl = resp_content_length(&r, he);
-    /* The response really is several times everything between the two
-     * ends -- the 20 KiB pool, the server's 8 KiB send buffer and the
-     * client's 8 KiB receive buffer -- so this case cannot silently
-     * degrade into "one write was enough". */
-    ASSERT_TRUE(cl > 4 * 20000);
+    ASSERT_TRUE(cl > 0);
     size_t blen = 0;
     const char *body = resp_body(&r, &blen);
     ASSERT_EQ_INT((int)cl, (int)blen);
@@ -1154,10 +1214,9 @@ static void test_session_broken_mid_response(void) {
      *
      * Unregistering the client's socket stops its reads; shrinking its
      * receive buffer bounds what the kernel will absorb without them. The
-     * response below (roughly 150 KiB) is then several times everything
-     * between the two ends -- the server's 20 KiB pool, its send buffer
-     * and the client's receive buffer, both shrunk -- so the server is
-     * certain to still be holding an undelivered remainder. */
+     * response below is then far more than everything between the two
+     * ends will hold. That sizing is how the state is produced;
+     * server_mid_response is what asserts it was reached. */
     int rcvbuf = 8192;
     (void)setsockopt(cs.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     ASSERT_EQ_INT(0, cloak_reactor_remove_fd(fx.reactor, cs.fd));
@@ -1183,18 +1242,14 @@ static void test_session_broken_mid_response(void) {
         cloak_reactor_run_once(fx.reactor, 2);
     }
 
-    /* MID-RESPONSE IS ASSERTED, NOT ASSUMED, from BOTH sides: the server
-     * still holds the stream context (so it still holds an undelivered
-     * response buffer and an armed deadline), and bytes of that response
-     * really did leave the server -- so this is a half-written response
-     * and not a request the parser never finished. MSG_PEEK looks at the
-     * client's own socket without consuming anything, which is the only
-     * way to observe delivery on a connection this case has deliberately
-     * stopped reading. */
+    /* MID-RESPONSE IS ASSERTED, NOT ASSUMED, and it is asserted off the
+     * server's own state rather than inferred from what the client
+     * received: this stream has written part of its response and not the
+     * rest, so the session is about to break while a half-drained
+     * response buffer and an armed deadline are still held. */
     ASSERT_EQ_INT(1, (int)cloak_adminapi_stream_count(&fx.api));
     ASSERT_EQ_INT(1, (int)cloak_adminapi_session_count(&fx.api));
-    uint8_t peek[1];
-    ASSERT_TRUE(recv(cs.fd, peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT) == 1);
+    ASSERT_EQ_INT(1, server_mid_response(&fx));
 
     /* Kill the client side outright. The server's connection sees EOF,
      * the session breaks, and the registry's broken callback -- this
@@ -1220,6 +1275,79 @@ static void test_session_broken_mid_response(void) {
         cloak_reactor_run_once(fx.reactor, 5);
     }
 
+    fixture_destroy(&fx);
+}
+
+/* ---- 12b. The deadline bounds the WRITE half too -------------------------
+ *
+ * THE MODULE'S MOST-ARGUED SAFETY PROPERTY, AND THE ONE A READER IS MOST
+ * LIKELY TO ASSUME IS COVERED BY CASE 11. It is not: case 11 abandons a
+ * request mid-HEADER, so it only ever exercises the deadline over the
+ * read half. Cancelling the timer the instant a response is composed
+ * leaves every other case in this file green, and leaves a client that
+ * issues a large GET and then simply stops reading holding a response
+ * buffer of up to the listing cap for as long as the session lives --
+ * which is precisely what the deadline exists to prevent and precisely
+ * what nothing else here would notice.
+ *
+ * Same stalled-server construction as case 12, with a short deadline: the
+ * client is unregistered from the reactor so it never reads, the server
+ * writes until its pool is full and pauses, and then NOTHING will ever
+ * resume it. Only the timer can end that. */
+
+#define WRITE_DEADLINE_MS 300
+
+static void test_deadline_bounds_the_write_half(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init_opts(&fx, "writedeadline", 20000, WRITE_DEADLINE_MS, 0, 0));
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, 18));
+
+    int rcvbuf = 8192;
+    (void)setsockopt(cs.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    ASSERT_EQ_INT(0, cloak_reactor_remove_fd(fx.reactor, cs.fd));
+
+    seed_many_users(&fx);
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    const char *req = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n";
+    ASSERT_EQ_INT((int)strlen(req),
+                  (int)cloak_stream_write(st, (const uint8_t *)req, strlen(req)));
+
+    /* Reach the stalled state, and prove it is stalled MID-RESPONSE
+     * rather than mid-request -- a deadline that only covered the read
+     * half would also reclaim a stream stuck before its headers ended,
+     * and this case must not be able to pass for that reason. */
+    struct api_count_wait w = {&fx.api, 1};
+    ASSERT_TRUE(pump_until(fx.reactor, api_streams_ge, &w, 200, 2));
+    ASSERT_TRUE(pump_until(fx.reactor, server_mid_response, &fx, 300, 2));
+    ASSERT_EQ_INT(1, server_mid_response(&fx));
+
+    uint64_t t0 = now_ms();
+    w.want = 0;
+    /* 400 turns of up to 5 ms is at least 2000 ms of budget, comfortably
+     * more than WRITE_DEADLINE_MS. */
+    ASSERT_TRUE(pump_until(fx.reactor, api_streams_eq, &w, 400, 5));
+    uint64_t elapsed = now_ms() - t0;
+
+    /* THE DURATION IS THE ASSERTION, for the same reason it is in case
+     * 11: without it this would pass identically if the context were
+     * reclaimed immediately by some other path, and would then be a test
+     * of nothing, named after a deadline it never waited for. */
+    ASSERT_TRUE(elapsed + 20 >= (uint64_t)WRITE_DEADLINE_MS);
+    ASSERT_EQ_INT(0, (int)cloak_adminapi_stream_count(&fx.api));
+    /* The session survives: one stream timing out is not the session
+     * ending. */
+    ASSERT_EQ_INT(1, (int)cloak_adminapi_session_count(&fx.api));
+
+    cloak_session_release_stream(&cs.sesh, st);
+    client_session_close(&cs);
     fixture_destroy(&fx);
 }
 
@@ -1506,6 +1634,7 @@ TEST_MAIN_BEGIN()
     test_large_response_is_delivered_completely();
     test_abandoned_stream_hits_its_deadline();
     test_session_broken_mid_response();
+    test_deadline_bounds_the_write_half();
     test_parser_errors_are_forwarded();
     test_stream_cap();
     test_listing_cap_refuses();

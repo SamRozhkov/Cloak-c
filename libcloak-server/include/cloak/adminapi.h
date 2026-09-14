@@ -88,6 +88,22 @@
  * enforced before the allocation it bounds, and every refusal returns
  * without performing the operation it refused.
  *
+ * WHAT THIS MODULE DOES NOT BOUND, stated because the memory arithmetic
+ * above invites the opposite reading. SESSION contexts are uncapped here:
+ * one is created per cloak_adminapi_prepare_session and the only limits
+ * on how many can exist are the registry's own session cap and the admin
+ * user's sessions_cap, neither of which belongs to this file. There is
+ * also NO REQUEST RATE LIMIT of any kind -- nothing stops a client from
+ * issuing back-to-back GET /admin/users and driving continuous full-table
+ * scans through a synchronous SQLite connection on the reactor thread,
+ * which stalls every other session on the server for the duration of each
+ * scan (cloak/usermanager.h's own opening section explains why that stall
+ * is real). Both are judged acceptable BECAUSE the only party who can do
+ * either already holds the admin UID and can simply delete every user
+ * instead; they are not judged impossible. An operator who shares that
+ * UID more widely than one administrator should read this paragraph as
+ * the reason not to.
+ *
  * THREADING: none, like everything else in this project. */
 
 typedef struct cloak_adminapi cloak_adminapi_t;
@@ -220,7 +236,27 @@ typedef struct cloak_adminapi_stream {
      * cloak_stream_write this module itself just made, so the pump can be
      * re-entered from within itself; the flag makes the nested call a
      * no-op and lets the outer loop, which re-reads resp_sent and the
-     * budget on every turn, finish the work. */
+     * budget on every turn, finish the work.
+     *
+     * NOT REACHED BY ANY TEST IN THIS PROJECT, and that is stated here
+     * rather than left to be assumed from the fact that this file argues
+     * for it. Both this flag and cloak_adminapi_session_t::in_writable
+     * were instrumented across the whole suite and neither branch was
+     * taken once. The window is genuinely narrow: cloak_conn_t fires
+     * on_drained inline only when a PREVIOUS write had already hit EAGAIN
+     * and the very send this pump just made is what clears the remainder
+     * (libcloak-mux/src/conn.c, conn_try_drain_send -- it deliberately
+     * does not fire for a send the kernel swallows whole), and this pump
+     * only writes when the queue is already nearly empty. Forcing that
+     * pairing would need control over which send(2) returns EAGAIN, and
+     * this project's LD_PRELOAD test shim interposes write(2), which
+     * conn.c does not use for draining.
+     *
+     * The guards stay because they are correct and cost one branch, and
+     * because the contract that makes them necessary is cloak/session.h's
+     * and can change without this file. Removing them leaves all tests
+     * passing -- which is exactly why this paragraph exists instead of a
+     * claim of coverage. */
     int pumping;
 
     cloak_timer_id_t deadline;
@@ -253,7 +289,11 @@ struct cloak_adminapi_session {
      * on_writable (which cloak_stream_write is permitted to raise from
      * inside the walk) would walk the same list underneath the outer one.
      * Refusing the nested walk loses nothing: the outer loop re-reads the
-     * budget for every stream it has not yet reached. */
+     * budget for every stream it has not yet reached.
+     *
+     * LIKE cloak_adminapi_stream_t::pumping, THIS BRANCH IS NOT REACHED
+     * BY ANY TEST IN THIS PROJECT -- see that field's own note for the
+     * measurement and for why the nesting cannot currently be forced. */
     int in_writable;
 
     struct cloak_adminapi_session *prev, *next;

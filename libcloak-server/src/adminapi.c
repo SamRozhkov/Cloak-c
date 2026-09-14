@@ -110,6 +110,21 @@ static void adminapi_stream_teardown(cloak_adminapi_stream_t *ast) {
      * stickiness exists to prevent. Tying the destroy to the free of the
      * context makes "one stream, one request" true by construction. */
     cloak_http_parser_destroy(&ast->parser);
+
+    /* THE RESPONSE IS FREED AND ITS POINTER CLEARED BEFORE THE RELEASE
+     * BELOW, AND THAT ORDER IS LOAD-BEARING. cloak_session_release_stream
+     * performs an active close, which sends a closing frame; that send
+     * can complete a connection's drain inline and so raise this
+     * session's on_writable synchronously (cloak/session.h says this
+     * callback is NOT guaranteed to run at a reactor turn boundary). This
+     * context is STILL LINKED into as->streams at that instant, so the
+     * walk in adminapi_on_writable would reach it -- and it skips a
+     * context whose resp is NULL. Clearing resp first is therefore what
+     * makes that re-entry a no-op instead of a pump against a context
+     * that is one statement away from being freed. (as->in_writable
+     * covers the same re-entry when the release happens from inside that
+     * walk; this ordering covers it when the release happens from
+     * anywhere else, which is every other teardown path.) */
     free(ast->resp);
     ast->resp = NULL;
 
