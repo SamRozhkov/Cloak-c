@@ -14,6 +14,7 @@
 #include "cloak/conn.h"
 #include "cloak/session.h"
 #include "cloak/stream_relay.h"
+#include "cloak/switchboard.h"
 #include "test_framework.h"
 
 /* ------------------------------------------------------------------ */
@@ -901,14 +902,20 @@ static void test_relay_tx_is_paced_and_resumes(void) {
  * not about what it produces. */
 struct tx_probe {
     cloak_session_t sesh;
-    cloak_stream_relay_t sr;
+    /* HEAP-ALLOCATED AND FREED BY tx_probe_stop, on purpose. The real
+     * owner, cloak_proxy_stream_t, embeds the relay BY VALUE and frees
+     * the whole struct immediately after cloak_stream_relay_stop
+     * (proxy_stream_teardown). A relay living in a test's stack frame
+     * until the reactor is destroyed can never show that a timer
+     * outliving its relay is a use-after-free; one that is freed while
+     * the reactor keeps running can. */
+    cloak_stream_relay_t *sr;
     /* Held so tx_probe_stop can RELEASE it. The relay closes the stream
      * when it stops but never releases it -- cloak/stream_relay.h is
      * explicit that freeing the stream stays the caller's job -- and a
      * closed stream is no longer active, so cloak_session_destroy's own
      * sweep will not collect it either. */
     cloak_stream_t *stream;
-    int sr_live;
     int peer;     /* the test's end of the session's connection */
     int up_outer; /* the test's end of the relay's upstream socket */
     int64_t drained;
@@ -920,16 +927,16 @@ static void tx_probe_on_stream_data(cloak_session_t *sesh, cloak_stream_t *strea
     (void)sesh;
     (void)stream;
     struct tx_probe *p = userdata;
-    if (p->sr_live) {
-        cloak_stream_relay_notify_stream_data(&p->sr);
+    if (p->sr != NULL) {
+        cloak_stream_relay_notify_stream_data(p->sr);
     }
 }
 
 static void tx_probe_on_writable(cloak_session_t *sesh, void *userdata) {
     (void)sesh;
     struct tx_probe *p = userdata;
-    if (p->sr_live) {
-        cloak_stream_relay_notify_writable(&p->sr);
+    if (p->sr != NULL) {
+        cloak_stream_relay_notify_writable(p->sr);
     }
 }
 
@@ -964,15 +971,29 @@ static int64_t drain_peer(struct tx_probe *p) {
     return total;
 }
 
-/* Takes every token the tx bucket currently has, plus one millisecond of
- * debt on top, and bills them -- exactly what ANOTHER session belonging
- * to the same user does when it moves bytes, since a valve meters and
- * paces one USER across every session they hold. The extra millisecond
- * is what makes it deterministic: the relay is then certain to find
- * nothing, rather than racing the microseconds since this call. */
-static void starve_tx_bucket(cloak_valve_t *v, int64_t rate) {
+/* Takes every token the tx bucket currently has and bills `extra_debt`
+ * bytes on top -- exactly what ANOTHER consumer on the same valve does
+ * when it moves bytes, since a valve meters and paces one USER across
+ * every stream and every session they hold.
+ *
+ * THE DEBT DEPTH IS LOAD-BEARING, and getting it wrong is why an earlier
+ * version of the re-arm test pinned nothing. A relay pausing on an empty
+ * bucket arms its timer for the time to ONE byte -- a millisecond or
+ * two. If the debt is only a millisecond deep, the bucket has refilled
+ * by the time that timer runs and the fire finds tokens, so the re-arm
+ * branch is never entered at all and deleting it changes nothing. The
+ * debt has to outlast the delay the relay computed BEFORE it was
+ * applied; tens of milliseconds does that with room to spare.
+ *
+ * Skipped entirely when the bucket is already in debt, so repeated calls
+ * hold it at roughly -extra_debt instead of driving it to the floor --
+ * where climbing back out would take a full second and outlast any
+ * sensible measurement window. */
+static void starve_tx_bucket(cloak_valve_t *v, int64_t extra_debt) {
     int64_t avail = cloak_valve_take_tx(v, (int64_t)1 << 30);
-    cloak_valve_add_tx(v, avail + rate / 1000 + 1);
+    if (avail > 0) {
+        cloak_valve_add_tx(v, avail + extra_debt);
+    }
 }
 
 static int tx_probe_start(struct tx_probe *p, cloak_reactor_t *r, cloak_valve_t *v,
@@ -1028,18 +1049,24 @@ static int tx_probe_start(struct tx_probe *p, cloak_reactor_t *r, cloak_valve_t 
     if (fcntl(up[1], F_SETFL, O_NONBLOCK) != 0) {
         return -1;
     }
-    if (cloak_stream_relay_start(&p->sr, r, &p->sesh, s, up[0], 65536, tx_probe_on_done, p) != 0) {
+    cloak_stream_relay_t *sr = malloc(sizeof(*sr));
+    if (sr == NULL) {
         return -1;
     }
-    p->sr_live = 1;
+    if (cloak_stream_relay_start(sr, r, &p->sesh, s, up[0], 65536, tx_probe_on_done, p) != 0) {
+        free(sr);
+        return -1;
+    }
+    p->sr = sr;
     p->up_outer = up[1];
     return 0;
 }
 
 static void tx_probe_stop(struct tx_probe *p) {
-    if (p->sr_live) {
-        cloak_stream_relay_stop(&p->sr);
-        p->sr_live = 0;
+    if (p->sr != NULL) {
+        cloak_stream_relay_stop(p->sr);
+        free(p->sr);
+        p->sr = NULL;
     }
     if (p->stream != NULL) {
         cloak_session_release_stream(&p->sesh, p->stream);
@@ -1054,22 +1081,50 @@ static void tx_probe_stop(struct tx_probe *p) {
     }
 }
 
-/* A relay whose own resume timer fires into an EMPTY bucket -- because
- * another session of the same user emptied it in the meantime -- must
- * RE-ARM. It is the second-most likely stall in this file and the one a
- * single busy stream can never produce: with only one relay on a valve,
- * a timer computed from that bucket always fires into a bucket that has
- * something, so the re-arm branch is dead code in every other test here.
+/* A relay whose own resume timer fires into a STILL-EMPTY bucket must
+ * arm a successor. Without that, the fire that finds nothing is the last
+ * event the relay will ever see.
  *
- * Two relays racing for one bucket would also reach it, but not
- * reliably: timers fire in deadline order, so the relay that armed first
- * keeps winning and the other can legitimately starve for the whole
- * measurement. Spending the tokens from the test instead is the same
- * situation, made deterministic. */
+ * REACHABLE, and not rarely. cloak_valve_bucket_t's delay is the time to
+ * ONE byte, and any other consumer on the same valve can take it first:
+ * a second stream's relay, a second session of the same user, or
+ * cloak_switchboard_send billing a control frame's framing overhead. Two
+ * concurrent downloads, one finishes, the pool goes quiet, and the
+ * survivor sits paused with no timer, holding a live stream and an open
+ * fd, forever.
+ *
+ * WHY THE TEST IS SHAPED LIKE THIS, because an earlier version of it was
+ * green for the wrong reason and pinned nothing:
+ *
+ *  - The competing consumer is the TEST ITSELF (starve_tx_bucket), not a
+ *    second relay. Two relays racing for one bucket reach the same state
+ *    but not reliably: timers fire in deadline order, so the relay that
+ *    armed first keeps winning and the other can legitimately starve for
+ *    a whole measurement window. Spending the tokens by hand is the same
+ *    situation made deterministic.
+ *
+ *  - NOTHING READS THE SESSION'S SOCKET inside either loop below, and
+ *    that omission is the entire point. Draining it frees kernel buffer
+ *    space, which drains the connection's send queue, which fires
+ *    on_drained -> on_writable -> cloak_stream_relay_notify_writable --
+ *    whose success path un-pauses the relay all by itself. An earlier
+ *    version of this test drained every turn and therefore measured the
+ *    PRIMARY arming site, not the re-arm: deleting the re-arm left it
+ *    green. The single read at the end is after all the measuring is
+ *    done and cannot rescue anything retroactively.
+ *
+ * With nothing written to the upstream, nothing read from the socket and
+ * nothing queued to drain, the only event left in the entire system is a
+ * timer the relay armed for itself. */
 static void test_relay_rearms_when_the_bucket_is_emptied_under_it(void) {
     static const int64_t RATE = 200000;
     static const uint64_t STARVE_MS = 80;
     static const uint64_t QUIET_MS = 300;
+    /* 4000 bytes is 20 ms at this rate: an order of magnitude longer
+     * than the 1-2 ms delay a relay pausing on an empty bucket arms, so
+     * a timer armed at any moment during the loop below fires while the
+     * bucket is still in debt. See starve_tx_bucket. */
+    static const int64_t DEBT_BYTES = 4000;
 
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -1083,47 +1138,314 @@ static void test_relay_rearms_when_the_bucket_is_emptied_under_it(void) {
     struct tx_probe p;
     ASSERT_EQ_INT(tx_probe_start(&p, r, &v, 262144), 0);
 
-    /* Get it running and paced: upstream full, downstream read, burst
-     * spent. */
+    /* Get it running and paced, and leave the connection's send queue
+     * empty so that no drain notification is owed to anyone once the
+     * measurement starts. */
     for (int i = 0; i < 40; i++) {
         stuff_peer(p.up_outer);
         cloak_reactor_run_once(r, 0);
         drain_peer(&p);
     }
     ASSERT_TRUE(p.drained > 0); /* it really was relaying */
+    int64_t before = p.drained;
 
-    /* STARVE. Every turn, take the whole bucket before the reactor runs,
-     * so the relay's resume timer fires into nothing each time. With the
-     * re-arm removed, the first such fire is the last: the relay is
-     * paused with no timer and nothing queued, so no drain notification
-     * can rescue it either. */
+    /* STARVE. Non-blocking turns, so the bucket is re-emptied thousands
+     * of times per millisecond and is held at roughly -DEBT_BYTES
+     * continuously: a resume timer firing at any point in here finds
+     * nothing and must arm a successor. With the re-arm deleted, the
+     * first such fire is the last. */
     uint64_t t0 = real_mono_ms();
     int turns = 0;
-    while (real_mono_ms() - t0 < STARVE_MS && turns < 1000000) {
-        starve_tx_bucket(&v, RATE);
-        cloak_reactor_run_once(r, 1);
-        drain_peer(&p);
+    while (real_mono_ms() - t0 < STARVE_MS && turns < 100000000) {
+        starve_tx_bucket(&v, DEBT_BYTES);
+        cloak_reactor_run_once(r, 0);
         turns++;
     }
-    int64_t at_starve = p.drained;
 
-    /* RELEASE. Nothing is taken from the bucket any more and nothing is
-     * written to the upstream (it still holds well over a hundred
-     * kilobytes). Only a timer the relay armed for itself can move
-     * another byte. */
+    /* RELEASE. The bucket is left alone from here. It climbs out of
+     * DEBT_BYTES in 20 ms and then refills at the configured rate.
+     * Nothing else changes: no upstream write, no socket read, no queued
+     * bytes to drain, so a relay that lost its timer during the loop
+     * above has nothing left that could ever wake it. */
     t0 = real_mono_ms();
     turns = 0;
     while (real_mono_ms() - t0 < QUIET_MS && turns < 1000000) {
         cloak_reactor_run_once(r, 5);
-        drain_peer(&p);
         turns++;
     }
-    int64_t resumed = p.drained - at_starve;
+
+    /* Only now is the socket read, and what comes out is everything the
+     * relay managed to forward across both loops. */
+    drain_peer(&p);
+    int64_t resumed = p.drained - before;
     if (resumed < RATE / 10) {
-        fprintf(stderr, "RE-ARM STALL: %lld relayed in %llu ms after the starvation ended\n",
-                (long long)resumed, (unsigned long long)QUIET_MS);
+        fprintf(stderr, "RE-ARM STALL: %lld relayed across %llu ms of starvation and %llu ms free\n",
+                (long long)resumed, (unsigned long long)STARVE_MS, (unsigned long long)QUIET_MS);
     }
+    /* The starvation window relays essentially nothing; the release
+     * window spends 20 ms climbing out of debt and then relays at the
+     * configured rate for the remaining ~280 ms, which is ~56000 bytes,
+     * and the socket buffer holds well over that. A tenth of the rate is
+     * a floor no scheduling noise can miss and no single stray byte can
+     * satisfy. */
     ASSERT_TRUE(resumed >= RATE / 10);
+    ASSERT_EQ_INT(p.broken, 0);
+    ASSERT_EQ_INT(p.done_calls, 0);
+
+    tx_probe_stop(&p);
+    cloak_reactor_destroy(r);
+}
+
+/* THE TIMER MUST NOT OUTLIVE THE RELAY. cloak_stream_relay_stop can be
+ * called on a relay that is rate-paused with a resume timer pending --
+ * the panel terminating a user out of credit does exactly that, via
+ * close_all_for_uid -> on_session_closing -> cloak_proxy_session_aborted
+ * -> proxy_stream_teardown -- and that owner frees the relay's storage
+ * the instant stop returns, because cloak_proxy_stream_t embeds the
+ * relay by value. A surviving timer then fires stream_relay_on_rate_timer
+ * on freed memory.
+ *
+ * The relay here is heap-allocated and freed at the same moment its real
+ * owner would free it, and the reactor is then run PAST the pending
+ * deadline before anything is destroyed. Both halves are required: a
+ * relay left on the stack has nothing to corrupt, and destroying the
+ * reactor first discards pending timers unfired -- which is exactly why
+ * every other test in this file missed this. Under ASan this fails
+ * loudly if the cancel in stream_relay_teardown is removed. */
+static void test_stopping_a_rate_paused_relay_cancels_its_timer(void) {
+    static const int64_t RATE = 200000;
+    static const uint64_t AFTER_FREE_MS = 150;
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+    cloak_valve_t v;
+    memset(&v, 0, sizeof(v));
+    cloak_valve_set_rates(&v, 0, RATE);
+
+    struct tx_probe p;
+    ASSERT_EQ_INT(tx_probe_start(&p, r, &v, 262144), 0);
+
+    for (int i = 0; i < 40; i++) {
+        stuff_peer(p.up_outer);
+        cloak_reactor_run_once(r, 0);
+        drain_peer(&p);
+    }
+    ASSERT_TRUE(p.drained > 0);
+
+    /* Drive it into a pause whose resume is tens of milliseconds away.
+     *
+     * The debt is added in small steps and the loop stops when the VALVE
+     * SAYS the delay is where it wants it, rather than by adding a fixed
+     * amount a fixed number of times. Both fixed-count versions of this
+     * were wrong: adding unconditionally five times accumulated ~100 ms
+     * of debt against a 150 ms window and failed about one ASan run in
+     * fifty, and routing it through starve_tx_bucket's "skip when
+     * already in debt" guard added no debt at all, because the relay has
+     * already paced the bucket to zero by the end of the warm-up. A loop
+     * that measures what it produced cannot be wrong in either
+     * direction.
+     *
+     * The reactor is turned each step so the relay's own timer fires,
+     * finds the growing debt and re-arms at the larger delay -- which is
+     * what leaves a pending timer whose deadline is the value asserted
+     * below. */
+    int steps = 0;
+    while (cloak_valve_tx_resume_delay_ms(&v) < 20 && steps < 1000) {
+        cloak_valve_add_tx(&v, RATE / 200); /* 5 ms of debt per step */
+        cloak_reactor_run_once(r, 0);
+        steps++;
+    }
+    ASSERT_TRUE(steps < 1000);
+    uint64_t pending_delay = cloak_valve_tx_resume_delay_ms(&v);
+    ASSERT_EQ_INT(cloak_valve_take_tx(&v, 16384), 0); /* really rate-paused */
+    /* Far enough away that the timer is certainly still pending when the
+     * relay is freed... */
+    ASSERT_TRUE(pending_delay >= 20);
+    /* ...and comfortably inside the window that runs after the free, or
+     * this test would abandon a timer and then stop watching before it
+     * could fire -- passing while exercising nothing. */
+    ASSERT_TRUE(pending_delay < AFTER_FREE_MS / 2);
+
+    /* Exactly what proxy_stream_teardown does, in exactly that order. */
+    cloak_stream_relay_stop(p.sr);
+    free(p.sr);
+    p.sr = NULL;
+
+    /* Run well past the deadline the freed relay had armed. */
+    uint64_t t0 = real_mono_ms();
+    int turns = 0;
+    while (real_mono_ms() - t0 < AFTER_FREE_MS && turns < 1000000) {
+        cloak_reactor_run_once(r, 5);
+        turns++;
+    }
+    ASSERT_EQ_INT(p.broken, 0);
+
+    tx_probe_stop(&p); /* p.sr is already NULL; this releases the rest */
+    cloak_reactor_destroy(r);
+}
+
+/* A FAILED SEND BILLS NOTHING. cloak_switchboard_send counts tx only on
+ * the success path (`rc == 0`), mirroring Go's switchboard.send, which
+ * returns from its error branches before ever reaching AddTx.
+ *
+ * Not a cosmetic accounting point now that the same counter drains the
+ * token bucket: billing a frame the kernel never took would charge the
+ * user for bytes that did not cross the socket AND push their bucket
+ * into debt, throttling them for traffic they never received. The guard
+ * was previously verified by reading; this measures it.
+ *
+ * A switchboard is driven directly here rather than through a session:
+ * the failure needed is one connection's own send-queue cap being
+ * exceeded, which is a property of cloak_conn_send and is reached by
+ * filling a socket whose peer never reads. */
+static void sbp_on_envelope(cloak_switchboard_t *sb, const uint8_t *b, size_t n, void *ud) {
+    (void)sb;
+    (void)b;
+    (void)n;
+    (void)ud;
+}
+
+static void sbp_on_broken(cloak_switchboard_t *sb, void *userdata) {
+    (void)sb;
+    int *broken = userdata;
+    (*broken)++;
+}
+
+static void test_a_failed_send_is_not_billed(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    int broken = 0;
+    cloak_switchboard_t sb;
+    ASSERT_EQ_INT(cloak_switchboard_init(&sb, r, 2048, 4096, sbp_on_envelope, NULL, sbp_on_broken,
+                                         &broken),
+                  0);
+    cloak_valve_t v;
+    memset(&v, 0, sizeof(v));
+    cloak_switchboard_set_valve(&sb, &v);
+
+    int fds[2];
+    ASSERT_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    ASSERT_EQ_INT(cloak_switchboard_add_conn(&sb, fds[0]), 0);
+    /* fds[1] is never read from: the kernel buffer fills, then the
+     * connection's own 4096-byte send queue, and the send after that
+     * fails. */
+
+    uint8_t frame[2048];
+    memset(frame, 0x5a, sizeof(frame));
+
+    int64_t billed_before_the_failure = -1;
+    int failed = 0;
+    int sends = 0;
+    for (int i = 0; i < 100000 && !failed; i++) {
+        billed_before_the_failure = cloak_valve_tx(&v);
+        if (cloak_switchboard_send(&sb, frame, sizeof(frame)) != 0) {
+            failed = 1;
+        }
+        sends++;
+    }
+    ASSERT_TRUE(failed);            /* the send really did fail */
+    ASSERT_EQ_INT(broken, 1);       /* and reported itself as a pool failure */
+    ASSERT_TRUE(sends > 1);         /* after a run of successful ones... */
+    ASSERT_TRUE(billed_before_the_failure > 0); /* ...which WERE billed */
+
+    /* The literal claim: the counter is exactly where it was before the
+     * failing call. Billing unconditionally adds 2 + 2048 here. */
+    ASSERT_EQ_INT(cloak_valve_tx(&v), billed_before_the_failure);
+
+    cloak_switchboard_destroy(&sb);
+    close(fds[1]);
+    cloak_reactor_destroy(r);
+}
+
+/* THE TWO CLOCK READS THAT DISAGREE. This is a regression test for a
+ * real stall, and it is here because the flakiness of another test in
+ * this file WAS the bug.
+ *
+ * stream_relay_fd_read_budget asks the valve two questions in a row:
+ * "may I move bytes" (cloak_valve_take_tx) and, if not, "how long until
+ * I may" (cloak_valve_tx_resume_delay_ms). Each reads the clock for
+ * itself. A bucket a fraction of a byte short at the first question can
+ * hold a whole byte at the second, and the second then answers 0 --
+ * which means "nothing to wait for", not "the valve is fine". A caller
+ * reading that 0 as "this pause is not rate-bound" arms nothing, and the
+ * relay is left paused with a full bucket, an empty pool, and no event
+ * anywhere in the system that could ever wake it.
+ *
+ * In real time that window is about five microseconds wide at 200 kB/s
+ * and it was hit roughly once in two hundred ASan runs -- found only
+ * because the relay pacing test started failing with `paused=1
+ * rate_timer=0 min_free=262144 take=16384`, which is that state exactly.
+ *
+ * A CLOCK THAT ALTERNATES A ONE-MILLISECOND SKEW makes it certain rather
+ * than rare: consecutive reads land on T and T+1, so the take refuses on
+ * a bucket the delay then finds a whole millisecond richer. Every
+ * refusal on an even-parity read reproduces it, and with the floor
+ * removed a single one is enough to wedge the relay for good.
+ *
+ * The skew rides on REAL time rather than replacing it, deliberately. A
+ * clock that simply advanced a millisecond per read also reproduces the
+ * race, but it runs the valve's time far faster than the reactor's, so
+ * the bucket starves in real terms and the relay's own computed delays
+ * grow past a second -- a correct implementation then looks stalled too,
+ * and the test asserts nothing. Skew reproduces the disagreement while
+ * leaving the pacing to within a millisecond of correct. */
+static unsigned skew_calls;
+
+static uint64_t skew_clock(void *userdata) {
+    (void)userdata;
+    return real_mono_ms() + (skew_calls++ & 1u);
+}
+
+static void test_a_refusal_that_refills_between_the_two_reads_still_arms(void) {
+    static const int64_t RATE = 200000;
+    static const uint64_t WINDOW_MS = 150;
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+    cloak_valve_t v;
+    memset(&v, 0, sizeof(v));
+    skew_calls = 0;
+    cloak_valve_set_clock(&v, skew_clock, NULL);
+    cloak_valve_set_rates(&v, 0, RATE);
+
+    struct tx_probe p;
+    ASSERT_EQ_INT(tx_probe_start(&p, r, &v, 262144), 0);
+
+    for (int i = 0; i < 40; i++) {
+        stuff_peer(p.up_outer);
+        cloak_reactor_run_once(r, 0);
+        drain_peer(&p);
+    }
+    ASSERT_TRUE(p.drained > 0); /* it relayed before any refusal */
+
+    /* Nothing is written to the upstream and nothing is read from the
+     * session's socket from here, so no readiness edge and no drain
+     * notification exists. At this rate the pool never backs up either,
+     * so there is no on_drained to fire even in principle. Every byte
+     * counted below is one a resume timer went and fetched. */
+    int64_t base = cloak_valve_tx(&v);
+    uint64_t t0 = real_mono_ms();
+    int turns = 0;
+    while (real_mono_ms() - t0 < WINDOW_MS && turns < 1000000) {
+        cloak_reactor_run_once(r, 5);
+        turns++;
+    }
+    int64_t moved = cloak_valve_tx(&v) - base;
+    if (moved <= 5000) {
+        fprintf(stderr, "ZERO-DELAY STALL: %lld bytes in %llu ms over %d turns\n", (long long)moved,
+                (unsigned long long)WINDOW_MS, turns);
+    }
+    ASSERT_TRUE(moved > 5000);
     ASSERT_EQ_INT(p.broken, 0);
     ASSERT_EQ_INT(p.done_calls, 0);
 
@@ -1177,7 +1499,7 @@ static void test_relay_pool_pause_becomes_a_rate_pause(void) {
     ASSERT_EQ_INT(p.broken, 0);
 
     /* Now empty the bucket, while the pause is still pool-bound. */
-    starve_tx_bucket(&v, RATE);
+    starve_tx_bucket(&v, 4000); /* 2 ms at this test's rate -- see starve_tx_bucket */
     ASSERT_EQ_INT(cloak_valve_take_tx(&v, 16384), 0);
 
     /* Release the pool. This delivers the one and only drain
@@ -1223,5 +1545,8 @@ TEST_MAIN_BEGIN()
     test_rx_pause_does_not_block_tx();
     test_relay_tx_is_paced_and_resumes();
     test_relay_rearms_when_the_bucket_is_emptied_under_it();
+    test_stopping_a_rate_paused_relay_cancels_its_timer();
     test_relay_pool_pause_becomes_a_rate_pause();
+    test_a_refusal_that_refills_between_the_two_reads_still_arms();
+    test_a_failed_send_is_not_billed();
 TEST_MAIN_END()

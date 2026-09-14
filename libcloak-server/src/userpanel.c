@@ -501,7 +501,18 @@ void cloak_userpanel_terminate(cloak_userpanel_t *p, cloak_userpanel_user_t *use
                reason != NULL ? reason : "no reason given");
 
     /* 1. Bill what this user moved. Must happen before the sessions go:
-     * they are what is still adding to the valve. */
+     * they are what is still adding to the valve.
+     *
+     * KNOWN AND ACCEPTED: the bytes step 2 itself causes are lost.
+     * session_close_internal's closing-session frame goes out through
+     * cloak_switchboard_send, which adds them to a valve that step 3 then
+     * frees, so they reach no queue entry and no database row. Draining
+     * again after step 2 would recover them, at the cost of a second
+     * conversion site for the same user's usage -- the exact thing
+     * cloak/valve.h forbids -- and a second queue slot that a full queue
+     * could refuse with nowhere to put the bytes. It is a few padded
+     * frames per termination, charged to nobody, and only for users who
+     * have already run out of credit. Recorded rather than fixed. */
     panel_drain_user(p, user, 1);
 
     /* 2. Close every session -- including any that is itself mid-teardown,

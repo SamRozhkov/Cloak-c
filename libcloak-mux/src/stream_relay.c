@@ -116,7 +116,31 @@ static size_t stream_relay_fd_read_budget(cloak_stream_relay_t *sr, uint64_t *ou
     cloak_valve_t *valve = cloak_session_valve(sr->sesh);
     int64_t allowed = cloak_valve_take_tx(valve, (int64_t)budget);
     if (allowed <= 0) {
-        *out_rate_delay_ms = cloak_valve_tx_resume_delay_ms(valve);
+        /* FLOORED AT 1, and this is not defensive tidiness -- a zero here
+         * is a permanent stall, and it was observed.
+         *
+         * The take above and this call read the clock independently, and
+         * a bucket that had 999 milli-bytes when the take refused can
+         * hold a whole byte a few microseconds later: at 200 kB/s that
+         * window is about five microseconds wide, and an ASan build hits
+         * it roughly once in two hundred runs. The delay then comes back
+         * 0, meaning "nothing to wait for", and every caller below reads
+         * that as "the valve is not the binding constraint" and arms
+         * nothing -- leaving the relay paused, with a full bucket, an
+         * empty pool and no event anywhere in the system that could ever
+         * wake it. Exactly the failure this module is built to be
+         * incapable of, reached through the one line that decides which
+         * of the two zeroes this is.
+         *
+         * With the floor, a non-zero *out_rate_delay_ms means precisely
+         * "the valve refused" -- which is what every caller assumes --
+         * and the worst case of the race is one wasted wake-up a
+         * millisecond later that finds the byte and resumes.
+         *
+         * conn.c's conn_pause_read_for_rate has the identical floor and
+         * is safe for the identical reason. */
+        uint64_t delay = cloak_valve_tx_resume_delay_ms(valve);
+        *out_rate_delay_ms = delay == 0 ? 1 : delay;
         return 0;
     }
     /* cloak_valve_take_tx never returns more than it was asked for, so

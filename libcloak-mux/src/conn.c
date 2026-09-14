@@ -52,12 +52,17 @@ static void conn_mark_broken(cloak_conn_t *c) {
         return; /* idempotent -- already reported */
     }
     c->broken = 1;
-    /* Cancelled here as well as in cloak_conn_destroy: the owner is free
-     * to destroy and free this connection from within on_closed, and a
-     * still-pending resume timer holding c as userdata would then fire
-     * on freed memory. */
-    cloak_reactor_cancel_timer(c->reactor, c->rx_resume_timer);
-    c->rx_resume_timer = CLOAK_TIMER_INVALID;
+    /* The rx resume timer is deliberately NOT cancelled here. Breaking a
+     * connection never frees it -- cloak_conn_destroy is the only place
+     * this connection's storage is released (cloak/conn.h makes that the
+     * owner's obligation, and cloak_switchboard_close_all is the only
+     * caller in this tree), and that function cancels before it
+     * memsets. So a cancel here could only ever be a second one, and
+     * conn_rx_resume_cb's own `if (c->broken) return` already makes a
+     * fire in the window between the two harmless. An earlier version
+     * did cancel here, with a comment asserting a use-after-free that
+     * cannot occur: dead defensive code describing an impossible bug is
+     * worse than none, because the next reader has to disprove it. */
     cloak_reactor_remove_fd(c->reactor, c->fd);
     if (c->on_closed) {
         c->on_closed(c, c->on_closed_userdata);
@@ -170,10 +175,19 @@ static void conn_pause_read_for_rate(cloak_conn_t *c) {
     if (c->rx_resume_timer == CLOAK_TIMER_INVALID) {
         uint64_t delay = cloak_valve_rx_resume_delay_ms(c->valve);
         if (delay == 0) {
-            delay = 1; /* unreachable: the take that brought us here
-                        * returned 0, so the bucket owes at least 1 ms.
-                        * A zero-delay timer would spin, so it is floored
-                        * rather than trusted. */
+            /* REACHABLE, and load-bearing -- an earlier version of this
+             * comment claimed otherwise. This call and the take that
+             * brought us here read the clock independently, so a bucket
+             * that was a fraction of a byte short at the take can hold a
+             * whole byte by the time this runs; the delay is then 0 and
+             * arming on it would be a zero-delay timer that fires
+             * immediately, finds the byte, and resumes -- harmless here
+             * only because the pause is still armed. The same race on
+             * the tx side, where a zero was read as "not rate-bound" and
+             * armed nothing at all, was a permanent stall observed about
+             * once in two hundred ASan runs (see
+             * stream_relay_fd_read_budget). */
+            delay = 1;
         }
         c->rx_resume_timer = cloak_reactor_add_timer(c->reactor, delay, conn_rx_resume_cb, c);
         if (c->rx_resume_timer == CLOAK_TIMER_INVALID) {
@@ -186,6 +200,16 @@ static void conn_pause_read_for_rate(cloak_conn_t *c) {
         }
     }
     c->read_paused = 1;
+    /* HALF OF A DELIBERATELY REDUNDANT PAIR -- see conn_rx_resume_cb for
+     * the other half and for what each one alone would still achieve.
+     * Dropping this call alone leaves every test green: the fd simply
+     * stays registered for READABLE while paused, and because the
+     * registration is edge-triggered nothing is re-delivered unless new
+     * data arrives, at which point the read loop takes 0 again and
+     * re-pauses against the timer that is already armed. It is kept
+     * because an fd registered for a readiness the owner has decided not
+     * to act on is a lie about this object's state, not because a stall
+     * depends on it. */
     conn_sync_interest(c);
 }
 
@@ -200,12 +224,21 @@ static void conn_rx_resume_cb(cloak_reactor_t *r, void *userdata) {
     }
     c->read_paused = 0;
     conn_sync_interest(c);
-    /* Pull now as well as re-arming the mask. The re-arm alone would be
-     * enough on Linux (an EPOLL_CTL_MOD re-reports an edge-triggered fd
-     * that is still ready), but this call makes the resume independent
-     * of that: if the bucket refilled, the bytes move on this turn, and
-     * the one thing this whole mechanism must never do is depend on a
-     * second event to finish what a timer started. */
+    /* THE OTHER HALF OF THE PAIR, and the redundancy is deliberate and
+     * measured: removing either of these two calls alone leaves all 45
+     * tests green, and removing both together fails the stall test. Each
+     * is independently sufficient to resume the read --
+     * conn_sync_interest's 0 -> READABLE transition re-arms an
+     * edge-triggered fd and re-reports data already in the socket, and
+     * this call pulls it directly -- so neither is individually pinned
+     * and no test can pin one without disabling the other.
+     *
+     * Kept as a pair rather than reduced to one because the two rest on
+     * different guarantees: one on an epoll_ctl(EPOLL_CTL_MOD) detail,
+     * the other on nothing but this function running. A stall is the one
+     * failure this module must not be able to produce, and this is the
+     * only place in the file where the cost of belt-and-braces is a
+     * single call on a path that runs at most once per pause. */
     conn_handle_readable(c);
 }
 
