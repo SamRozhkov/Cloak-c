@@ -40,3 +40,16 @@ target_include_directories(test_client_e2e PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-
 target_link_libraries(test_client_e2e PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_e2e COMMAND test_client_e2e)
 set_tests_properties(test_client_e2e PROPERTIES TIMEOUT 60)
+
+# cloak-server is a TEST-ONLY dependency here for the same reason every
+# other file in this directory uses it (see above): cloak_client_connector_t
+# brings up a REAL session, so the far end has to be a real dispatcher,
+# registry, panel and proxy -- a mock could not tell the difference between
+# "four connections joined one session" and "four sessions were created",
+# which is the single assertion this file most depends on. The library
+# itself still links only cloak-common and cloak-mux.
+add_executable(test_client_connector test_client_connector.c)
+target_include_directories(test_client_connector PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_client_connector PRIVATE cloak-client cloak-server)
+add_test(NAME test_client_connector COMMAND test_client_connector)
+set_tests_properties(test_client_connector PROPERTIES TIMEOUT 60)
