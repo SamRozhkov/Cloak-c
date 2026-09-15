@@ -1412,7 +1412,17 @@ static void test_two_connections_do_not_cross(void) {
  * The numbers are chosen for margin, not for tightness: alive at 88% of
  * the deadline and dead after 115% of it, so the mutation above (80%) is
  * excluded by 80 ms and the true deadline by 120 ms, both far above any
- * plausible timer jitter on a loaded machine. */
+ * plausible timer jitter on a loaded machine.
+ *
+ * THE TOLERANCE IS MEASURED, NOT ASSERTED. Scaling the armed deadline and
+ * re-running: 0.8x fails the alive side, 1.1x passes, 1.2x fails the dead
+ * side. Those are the numbers this case actually enforces -- and it did
+ * not enforce the second of them until the WAITING PUMP on the dead side
+ * was removed (see below). With that pump present, a deadline armed at
+ * THREE TIMES the configured value passed both halves, because the pump
+ * granted ~2 s of further wall clock before the assertion was ever
+ * evaluated. The one-sided-boundary defect this case was written to fix,
+ * surviving inside the fix. */
 #define SILENT_DEADLINE_MS ((uint64_t)1000)
 #define SILENT_ALIVE_AT_MS ((uint64_t)880)
 #define SILENT_DEAD_AFTER_MS ((uint64_t)270)
@@ -1457,11 +1467,20 @@ static void test_a_silent_connection_costs_no_stream(void) {
     ASSERT_EQ_INT(0, (int)cloak_client_piper_stream_count(&cl.piper));
     ASSERT_EQ_INT(0, quiet.eof);
 
-    /* SIDE TWO: past the deadline. */
+    /* SIDE TWO: past the deadline -- AND ASSERTED THE INSTANT THE CLOCK
+     * SAYS SO, with no pump_until between.
+     *
+     * THIS IS WHERE THIS CASE WAS STILL SLACK, in the very case whose
+     * comment claims to have fixed the one-sided-boundary defect. The
+     * assertion below used to be preceded by
+     * pump_until(piper_conns_are 0, PIPER_MAX_TURNS, PIPER_TURN_MS),
+     * which grants ~2 s of further wall clock before anything is
+     * evaluated -- so "dead 270 ms past a 1000 ms deadline" was really
+     * "dead by about 3.2 s", and a deadline armed at THREE TIMES the
+     * configured value passed both sides. A waiting pump on the dead side
+     * of a boundary is not a wait, it is the boundary silently moving. */
     pump_for_ms(fx.reactor, SILENT_DEAD_AFTER_MS);
 
-    pw.want = 0;
-    ASSERT_TRUE(pump_until(fx.reactor, piper_conns_are, &pw, PIPER_MAX_TURNS, PIPER_TURN_MS));
     ASSERT_EQ_INT(0, (int)cloak_client_piper_conn_count(&cl.piper));
     ASSERT_EQ_INT(0, (int)cloak_client_piper_stream_count(&cl.piper));
     /* THE ASSERTION THAT CARRIES THE D6 HALF: nothing was ever opened on

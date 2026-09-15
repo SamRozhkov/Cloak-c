@@ -115,15 +115,29 @@ static void piper_conn_teardown(cloak_client_piper_conn_t *ctx) {
              * relay's own teardown, or by the peer), so there is no
              * separate cloak_session_close_stream call to make here.
              *
-             * THE GUARD IS NOT PARANOIA. ctx->sesh is NULL once
-             * piper_on_broken has run for this context's session, and a
-             * stream cannot be released against a session that is gone --
-             * which is exactly why piper_on_broken walks every context
-             * bound to the dying session BEFORE anything forgets it, in
-             * the one window where the release is still legal. This
-             * branch is what that ordering buys, and singleplex is where
-             * it is actually exercised: there the session really does die
-             * with one context. */
+             * THE GUARD IS CURRENTLY UNREACHABLE, AND THAT IS STATED
+             * RATHER THAN DRESSED UP. An earlier version of this comment
+             * claimed ctx->sesh is NULL once piper_on_broken has run and
+             * that singleplex exercises this branch. BOTH ARE FALSE: the
+             * broken walk tears a matching context down instead of
+             * NULLing it, never touches a surviving context's session,
+             * and the only assignment of NULL is two statements below
+             * this one -- so a context that has a stream always has the
+             * session it opened it on. Replacing the condition with
+             * `if (1)` leaves both suites green, and
+             * cloak_session_release_stream does not null-check its
+             * session argument, so the branch genuinely never runs with
+             * NULL.
+             *
+             * IT IS KEPT ANYWAY, on the same ground the session guards in
+             * the two notify loops are kept: what makes it dead is an
+             * ORDERING -- "nothing forgets a live context's session" --
+             * and the plausible near-term change is a broken walk that
+             * cleared surviving contexts' sesh instead of leaving it, or
+             * a detach that did. Under either, this line is the
+             * difference between a leak and a fault in a function that
+             * cannot defend itself. It is one branch; the ordering it
+             * backstops is the module's most fragile property. */
             cloak_session_release_stream(ctx->sesh, ctx->stream);
         }
         ctx->stream = NULL;
@@ -392,7 +406,24 @@ static void piper_begin_session(cloak_client_piper_conn_t *ctx) {
     }
     ctx->awaiting_session = 1;
     pp->sessions_started++;
-    if (pp->cfg.new_session(ctx, pp->cfg.session_userdata) != 0) {
+
+    /* pp->answering is what makes the failure path below safe against an
+     * owner that answered from inside the call -- see that field's own
+     * comment. Saved and restored rather than simply cleared, so a future
+     * nested call site cannot silently lose an outer one. */
+    cloak_client_piper_conn_t *prev = pp->answering;
+    pp->answering = ctx;
+    int rc = pp->cfg.new_session(ctx, pp->cfg.session_userdata);
+    int answered = (pp->answering != ctx);
+    pp->answering = prev;
+
+    if (rc != 0) {
+        if (answered) {
+            /* The owner both answered AND reported a failed start, so ctx
+             * has already been dealt with -- and, if the answer was
+             * _failed, FREED. Nothing below may touch it. */
+            return;
+        }
         /* NOTHING WAS STARTED, so nothing may be cancelled: clearing the
          * flag before the teardown is what stops this from firing
          * cancel_session for a bring-up the owner just told us it never
@@ -895,6 +926,9 @@ void cloak_client_piper_conn_session_ready(cloak_client_piper_conn_t *ctx, cloak
     }
     cloak_client_piper_t *pp = ctx->pp;
     ctx->awaiting_session = 0;
+    if (pp->answering == ctx) {
+        pp->answering = NULL; /* answered from inside new_session */
+    }
     /* own_sesh is set BEFORE the registration can fail, deliberately: from
      * this instant the session is this context's responsibility, so even
      * the failure path below must close it rather than leak it. */
@@ -916,6 +950,14 @@ void cloak_client_piper_conn_session_failed(cloak_client_piper_conn_t *ctx) {
     }
     if (!ctx->awaiting_session) {
         return;
+    }
+    cloak_client_piper_t *pp = ctx->pp;
+    if (pp->answering == ctx) {
+        /* Answered from inside new_session. Recorded BEFORE the free, so
+         * piper_begin_session's failure path knows not to touch ctx
+         * again -- which is the whole of the defence described on
+         * cloak_client_piper_t::answering. */
+        pp->answering = NULL;
     }
     /* Cleared first so the teardown does not then fire cancel_session for
      * a bring-up the owner has just finished telling us about. */

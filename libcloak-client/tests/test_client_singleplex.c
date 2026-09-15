@@ -1501,7 +1501,14 @@ static void test_a_connection_waiting_for_its_session_pins_nothing(void) {
  * deadline and dead after a further 300 ms, both ~150 ms clear, which is
  * far above any plausible timer jitter. The clock starts slightly AFTER
  * the accept that armed the deadline, which only tightens the first
- * bound and loosens the second. */
+ * bound and loosens the second.
+ *
+ * THE TOLERANCE IS MEASURED, NOT ASSERTED. Scaling the armed deadline
+ * and re-running: 0.8x fails the alive side, 1.1x passes, 1.2x fails the
+ * dead side. So this case pins the deadline to roughly (0.8, 1.2) of its
+ * configured value in BOTH directions -- which is what the two numbers
+ * above were always supposed to mean and, before the pump_until below
+ * was removed, did not: with it, 3x passed. */
 #define WAIT_DEADLINE_MS ((uint64_t)1000)
 #define WAIT_ALIVE_AT_MS ((uint64_t)850)
 #define WAIT_DEAD_AFTER_MS ((uint64_t)300)
@@ -1537,10 +1544,20 @@ static void test_the_deadline_bounds_the_session_wait(void) {
      * learns rather than hanging. */
     pump_for_ms(fx.reactor, WAIT_DEAD_AFTER_MS);
 
-    struct piper_wait pw = {&sx.piper, 0};
-    ASSERT_TRUE(pump_until(fx.reactor, piper_conns_are, &pw, SX_MAX_TURNS, SX_TURN_MS));
+    /* ASSERTED THE INSTANT THE CLOCK SAYS SO, with no pump_until between.
+     * A waiting pump here is not a wait, it is the boundary silently
+     * moving: the 2000-turn pump_until this line replaced granted ~2 s of
+     * further wall clock before anything was evaluated, so the claimed
+     * "dead 300 ms past a 1000 ms deadline" was really "dead by about
+     * 3.2 s" and a deadline armed at THREE TIMES the configured value
+     * passed both sides. The same defect the case above it was written to
+     * fix, one level down. */
     ASSERT_EQ_INT(0, (int)cloak_client_piper_conn_count(&sx.piper));
     ASSERT_EQ_INT(1, sx.cancel_calls);
+    /* The local peer's EOF may legitimately need a turn AFTER the
+     * teardown to be read, so this one waits -- it is a statement about
+     * the peer's own socket, not about when the deadline fired, and the
+     * two assertions above have already pinned that. */
     ASSERT_TRUE(pump_until(fx.reactor, lp_at_eof, &p, SX_MAX_TURNS, SX_TURN_MS));
     ASSERT_EQ_INT(1, p.eof);
     /* Nothing was ever opened on the server, because no session was ever

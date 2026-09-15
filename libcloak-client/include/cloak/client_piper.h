@@ -454,6 +454,24 @@ struct cloak_client_piper {
     cloak_client_piper_conn_t *conns;
     size_t conn_count;
 
+    /* The context whose config::new_session call is CURRENTLY ON THE
+     * STACK, or NULL. It exists so that the two violations of that
+     * callback's contract are defended SYMMETRICALLY.
+     *
+     * cloak_client_piper_conn_session_ready already refuses to act twice,
+     * via awaiting_session. Without this field its sibling would not:
+     * an owner that called cloak_client_piper_conn_session_failed from
+     * inside new_session and then returned non-zero would have freed ctx,
+     * and new_session's own failure path would then write to it and tear
+     * it down again -- a double free reachable from an owner that merely
+     * handled its errors in the wrong order. Defending one violation and
+     * not its neighbour reads as an oversight whether or not it is one.
+     *
+     * Answering from inside new_session is still forbidden (see
+     * cloak_client_piper_new_session_fn); what this makes true is that
+     * doing it anyway is a contract error rather than memory corruption. */
+    cloak_client_piper_conn_t *answering;
+
     /* Contexts that currently hold a cloak_stream_t. Strictly less than
      * conn_count whenever any connection is still inside D6's first-byte
      * window, and THAT DIFFERENCE IS THE ONLY OBSERVABLE D6 HAS: a piper
