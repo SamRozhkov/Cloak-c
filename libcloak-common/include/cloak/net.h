@@ -111,6 +111,28 @@ typedef struct {
 int cloak_net_resolve(const char *addr, int is_udp, cloak_addr_t *out,
                       char *err, size_t err_cap);
 
+/* Disables Nagle's algorithm on fd, if and only if socktype is
+ * SOCK_STREAM. Called at the two places a socket comes into existence --
+ * cloak_dial_start and cloak_listener's accept loop -- rather than at use
+ * sites, so no module can forget it.
+ *
+ * WHY: Go's net.TCPConn sets NoDelay(true) by default, so the reference
+ * implementation has this on every socket and this port had it on none.
+ * With Nagle on, a small write that follows an un-acknowledged small
+ * segment is held by the kernel until the peer's delayed ACK -- measured
+ * at ~36-40 ms on Linux loopback -- and this project's framing layer emits
+ * exactly that shape of write (one small frame per stream event). That is
+ * a user-visible latency defect for the interactive traffic this
+ * transport carries, not a throughput trade.
+ *
+ * NOT set on SOCK_DGRAM: the proxy book's UDP entries (cloak_net_resolve's
+ * is_udp) reach the same dial path, and TCP_NODELAY is meaningless there.
+ *
+ * Advisory: the result is deliberately ignored. A kernel that refuses the
+ * option costs latency, never correctness, and failing a dial over it
+ * would be strictly worse than the delay it avoids. */
+void cloak_net_set_tcp_nodelay(int fd, int socktype);
+
 typedef struct cloak_dial cloak_dial_t;
 
 /* Fired exactly once per cloak_dial_start, with a connected, non-blocking

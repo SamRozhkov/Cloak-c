@@ -222,3 +222,49 @@ And the lesson the last branch's framing defect taught, which applies directly h
 - **Type consistency:** `cloak_client_connector_t` is produced in Task 1 and consumed in Tasks 3 and 4; `cloak_client_piper_t` in Task 2 and extended in Task 3. Test counts chain 54 → 55 → 56 → 57 → 58.
 - **The riskiest thing here** is Task 1's teardown: N connections in three different states, each owning an fd, a dial, a handshake or a timer. Every previous module in this project has found its worst bug in exactly that shape.
 - **The most consequential thing here** is D4. Go assumes all connections agreed on the session key; this port checks. A disagreement is either a bug or an attacker splitting connections across two servers, and silently taking whichever landed last is not a safe default for software whose users are targets.
+
+---
+
+## What this branch's execution left for the next ones
+
+Written at merge time from the execution ledger.
+
+### A user-facing design fact, now established rather than assumed
+
+**`NumConn > 1` buys throughput and traffic spreading, not redundancy.** Killing one underlying connection kills the whole session, even when the others are provably healthy and the server never noticed. It fails cleanly — one `on_broken`, every relay released in the legal window, both applications get EOF, no leak — but it fails. This was confirmed independently against Go's own `switchboard.go`, where `deplex` calls `passiveClose()` on *any* connection's read error, and it is stated in `switchboard.h` as intended. It is now in `client_connector.h`'s `num_conn` documentation, because an operator choosing that number deserves to know which property they are buying.
+
+### Two defects found by chasing an observation nobody could explain
+
+An engineer reported that after a burst of refused server-opened streams a healthy local connection stopped being read — deterministically, in two independent constructions. It looked like the reactor's fd-recycling path. **It was not**: a probe did exactly the feared sequence (remove an fd mid-batch, close it, receive the same number back, re-register it with data already waiting) and the readiness dispatched on the next turn. `add_fd` always allocates a fresh watcher, and `remove_fd` NULLs the table slot before the old watcher reaches the dead list.
+
+What the investigation *did* find:
+
+- **`TCP_NODELAY` was set nowhere in the project — zero occurrences in the whole tree — while Go's `net.TCPConn` sets it by default.** Every socket silently diverged from the reference: client conns, dispatcher conns, proxy relays, the admin API. Two or more small un-acknowledged segments made Nagle hold the next small frame until the peer's delayed ACK: 36-40 ms, measured, collapsing to 0 with the option set. For a transport carrying interactive traffic that is a user-visible latency defect in ordinary operation. Now set at the two socket-creation sites, and a no-op for datagram sockets, which the ProxyBook's UDP entries reach through the same dial path.
+- **`pump_until`'s iteration bound was not a time bound**, in seven byte-identical copies across the client, server and harness suites. Any EOF peer left registered re-arms every turn, so a 2000-iteration "2 second" wait completed in **4.2 ms** — a histogram over the failing window showed exactly 2000 dispatches of two EOF descriptors and nothing else. It is now bounded by `CLOCK_MONOTONIC`, with the iteration count surviving only as a backstop sized far above the spin rate. No call site needed changing, because the existing `(max_iters, per_iter_ms)` pair was reinterpreted as the millisecond budget it had always been documented as.
+
+**The lesson is the one the last branch also taught, in a different key:** the observation was reported honestly by someone who could not explain it, and was then diagnosed by measurement rather than argued away. Two real defects came out of a phantom. An unexplained observation is worth a day; the two disciplines that make that pay are refuting the hypothesis with a probe rather than by reading, and measuring the thing you believe you are bounding.
+
+### For `ck-client` (module 7)
+
+The object graph is **76 measured code lines**; a realistic `main.c` is about 325. **Nine forced-but-unenforced ordering edges — two of them not the reverse of construction, and one that fails silently** (install-after-init connects and then moves no bytes). The verdict is the same as the server modules': **build a `cloak_client_stack_t` and make it the only supported wiring.** The client graph is denser than the server's and singleplex makes it dynamic on a hot path, so the case is stronger here, not weaker.
+
+Two specific obligations:
+
+- **A retry loop above the connector must use a fresh session id and back off.** When one connection exhausts its attempts the whole session fails immediately, abandoning N−1 already-authenticated sockets — and the server has already created that session and holds it until its inactivity timeout. Reusing the id on a flaky network multiplies server-side sessions per client. Go never hits this because it never gives up; this port gives up deliberately (D2), so the caller inherits the obligation.
+- **Sockets now get `TCP_NODELAY` at creation.** Do not re-set it at use sites, and do not set it on datagram sockets.
+
+### Still owed
+
+- **Seven copies of `pump_until` remain seven copies.** `pump_for_ms` documented the exact spin hazard one function above `pump_until` in the same file, and the knowledge did not cross. A shared header for the pump helpers would have made this one fix instead of seven, and would stop the next divergence.
+- **A session dying from a real network failure** is reachable only through the splice shim this branch built for the end-to-end test; the per-object suites still cannot produce one, because their clients dial the in-process server's own listener and the accepted socket belongs to the dispatcher.
+- **Both ends are still our own code.** A self-consistent framing or handshake error remains invisible to every test in this project. The previous branch's record-layer defect is the proof that this matters, and the Go outside-oracle — copying the reference's own twenty lines into a standalone program and running it against our bytes — remains the only cure.
+
+## The test-defect tally, updated
+
+**Nine coverage defects on this branch**, on top of twenty-four from the previous five. Every one found by measuring or mutating; none by reading. Two patterns dominated:
+
+**Boundary defects, three of them, and the third was inside the fix for the second.** A deadline pinned only on the "dies eventually" side passed when armed at three times its configured value; the fix for that was itself slack by two seconds because a `pump_until` followed a `pump_for_ms` and granted extra wall clock before the assertion ran. The eventual fix does not claim a margin in prose — it records a **measured bracket** (0.8× fails one side, 1.1× passes, 1.2× fails the other) that a reader can re-derive. That is the form to copy.
+
+**Tests written against the symbol under test, twice.** A key-agreement check tested at the one array size where every wrong implementation coincides with the right one; a ceiling whose test derived both sides from the constant, so the constant could be set 256× too high unnoticed. Both fixed by asserting a literal alongside the relative boundary.
+
+And one defect worth naming on its own because it was in the security bound this branch added: **a counter scoped to the wrong object.** The refusal ceiling lived on the piper rather than the session, so it bounded the first session of a piper's life and nothing after it — a hostile server could open unlimited streams on every subsequent session. The header described the property the code did not implement, which is the tell.
