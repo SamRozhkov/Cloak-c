@@ -12,3 +12,15 @@ target_include_directories(test_client_auth PRIVATE ${CMAKE_SOURCE_DIR}/libcloak
 target_link_libraries(test_client_auth PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_auth COMMAND test_client_auth)
 set_tests_properties(test_client_auth PROPERTIES TIMEOUT 60)
+
+# cloak-server is a TEST-ONLY dependency here for the same reason
+# test_client_auth uses it (see above): the handshake's counterpart is the
+# real, merged server, so these tests drive an actual cloak_dispatcher_t
+# rather than a mock -- and the scripted server in this file composes its
+# replies with cloak_server_auth_compose_reply itself, so the bytes it
+# dribbles out one at a time cannot drift from what a real server sends.
+add_executable(test_client_transport test_client_transport.c)
+target_include_directories(test_client_transport PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_client_transport PRIVATE cloak-client cloak-server)
+add_test(NAME test_client_transport COMMAND test_client_transport)
+set_tests_properties(test_client_transport PROPERTIES TIMEOUT 60)

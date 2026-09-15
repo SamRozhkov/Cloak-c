@@ -1,5 +1,6 @@
 add_library(cloak-client STATIC
     src/client_auth.c
+    src/client_transport.c
 )
 
 target_include_directories(cloak-client PUBLIC include)
