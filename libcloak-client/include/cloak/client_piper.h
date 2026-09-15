@@ -197,6 +197,38 @@ typedef struct cloak_client_piper cloak_client_piper_t;
  * already bounded. */
 #define CLOAK_CLIENT_PIPER_DEFAULT_MAX_LOCAL_CONNS ((size_t)256)
 
+/* How many streams the SERVER may open toward this client, and have
+ * refused, before the session is closed outright. See
+ * cloak_client_piper_rejected_streams for why refusing rather than
+ * accepting, and this constant for why refusing cannot go on forever.
+ *
+ * REFUSING IS NOT FREE, and the cost is what forces a ceiling.
+ * cloak_strmtab_t remembers a closed stream id as a TOMBSTONE for the
+ * whole life of the session and never reuses another key's slot
+ * (cloak/strmtab.h says so, and gives the correctness reason), and every
+ * refusal also emits one closing-stream frame. So a server opening N
+ * distinct stream ids costs this client N permanent table entries and N
+ * outbound frames -- a one-to-one amplification that is small per event
+ * and unbounded in total.
+ *
+ * WHY CLOSING THE SESSION IS THE RIGHT CEILING, and why this does not
+ * contradict the argument against closing it on the FIRST refusal. That
+ * argument stands: one injected frame must not be able to drop every live
+ * local connection. But a server that has opened 16 streams toward a
+ * client that refused every one of them is hostile or broken, not
+ * confused -- and the decisive point is that THE SERVER CAN CLOSE THIS
+ * SESSION UNILATERALLY AT ANY TIME ANYWAY. Declining to continue
+ * therefore costs the user nothing the other end could not already take,
+ * while leaving the bounded-but-unbounded-in-total amplification above
+ * with no ceiling would.
+ *
+ * 16 rather than 1: no correct server opens even one, so any ceiling is
+ * generous, and leaving room for a handful means a server with a real bug
+ * gets a diagnosable log line and a working tunnel rather than an
+ * immediate disconnect. Much larger and the amplification it bounds stops
+ * being bounded in any useful sense. */
+#define CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS ((size_t)16)
+
 /* One accepted local connection, from the moment it is accepted until its
  * relay finishes. Heap-allocated and never moved: its address is the
  * userdata for its own reactor registration, its own timers and its own
@@ -303,6 +335,7 @@ struct cloak_client_piper {
      * ever falls. */
     size_t refused_conns;
     size_t rejected_streams;
+    size_t retried_starts;
 
     /* 1 once the corresponding line has been logged, so that neither a
      * misbehaving server nor a local process opening connections in bulk
@@ -433,9 +466,11 @@ size_t cloak_client_piper_refused_conns(const cloak_client_piper_t *pp);
  * untouched. SILENTLY ACCEPTING -- returning without doing anything --
  * is not the harmless option it looks like: cloak/session.h requires
  * exactly one release per stream this module is handed, so an ignored
- * stream leaks its memory for the life of the process AND stays counted
- * as active, which keeps the session's inactivity timeout from ever
- * retiring an otherwise idle session. A remote peer would control both.
+ * stream holds its memory FOR THE LIFE OF THE SESSION -- not of the
+ * process: it stays ACTIVE, so session_free_all_active_streams reclaims
+ * it at teardown -- and, being active, keeps the session's inactivity
+ * timeout from ever retiring an otherwise idle session. A remote peer
+ * would control both.
  * ACTUALLY ACCEPTING is worse still and there is nowhere to put it: this
  * module has no local peer to splice such a stream to, and inventing one
  * would mean the client dialling somewhere on a remote party's
@@ -447,8 +482,29 @@ size_t cloak_client_piper_refused_conns(const cloak_client_piper_t *pp);
  * every live local connection at once, which turns a violation this
  * module can absorb into a denial of service it cannot.
  *
- * One log line per piper, not per stream -- the count below stays exact
- * either way. pp == NULL returns 0. */
+ * BOUNDED: once this count reaches CLOAK_CLIENT_PIPER_MAX_REJECTED_
+ * STREAMS the session is closed (cloak_session_close), which fires
+ * on_broken and so tears every local connection down through this
+ * module's ordinary walk. See that constant for why a ceiling is
+ * necessary and why closing is the right one.
+ *
+ * One log line per piper, not per stream -- the count stays exact either
+ * way, and is what a test or an operator should read. pp == NULL returns
+ * 0. */
 size_t cloak_client_piper_rejected_streams(const cloak_client_piper_t *pp);
+
+/* Relay starts this piper has re-attempted after a transient (-2)
+ * rejection, summed over every local connection it has ever accepted.
+ * 0 on a run where no start was ever congested; strictly more when the
+ * retry ladder did any work.
+ *
+ * EXPOSED BECAUSE "THE RETRY HAPPENED" IS OTHERWISE UNOBSERVABLE: a test
+ * that only checks the local connection eventually carried its bytes
+ * would pass just as well against an implementation that treated -2 as
+ * permanent, against a server that never congested anything -- one of the
+ * coverage shapes this project has already paid for (cloak_client_
+ * connector_attempts exists for exactly the same reason). Never falls.
+ * pp == NULL returns 0. */
+size_t cloak_client_piper_retried_starts(const cloak_client_piper_t *pp);
 
 #endif

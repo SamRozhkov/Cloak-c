@@ -202,6 +202,7 @@ static void piper_try_start_relay(cloak_client_piper_conn_t *ctx) {
         return;
     }
     ctx->retries++;
+    pp->retried_starts++;
     ctx->retry_timer = cloak_reactor_add_timer(pp->cfg.reactor, pp->cfg.retry_delay_ms,
                                                piper_on_retry_timer, ctx);
     if (ctx->retry_timer == CLOAK_TIMER_INVALID) {
@@ -385,6 +386,29 @@ static void piper_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, v
      * the active close itself, so the far end learns immediately rather
      * than waiting out a timeout. */
     cloak_session_release_stream(sesh, stream);
+
+    /* THE CEILING. Refusing is cheap but not free: each refusal costs a
+     * PERMANENT cloak_strmtab_t tombstone for the life of this session
+     * (cloak/strmtab.h) and one outbound closing frame, so an unbounded
+     * refusal path is a one-to-one amplification with no end. Past the
+     * ceiling the session is closed -- see
+     * CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS for why that does not
+     * contradict refusing the FIRST one rather than tearing everything
+     * down, the short form being that the server could close this session
+     * itself at any time regardless.
+     *
+     * cloak_session_close is explicitly safe from within on_new_stream
+     * (cloak/session.h); cloak_session_destroy is not, and is not called.
+     * The close defers its teardown to the reactor, which fires on_broken,
+     * which is this module's own walk -- so every local connection is torn
+     * down through exactly one path, as always. */
+    if (pp->rejected_streams == CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS) {
+        CLOAK_LOGW("client piper: %zu streams opened toward this client and refused -- closing "
+                   "the session. A server doing this is hostile or broken, and it could close "
+                   "this session itself at any time anyway",
+                   pp->rejected_streams);
+        (void)cloak_session_close(sesh);
+    }
 }
 
 static void piper_on_stream_data(cloak_session_t *sesh, cloak_stream_t *stream, void *userdata) {
@@ -440,7 +464,17 @@ static void piper_on_writable(cloak_session_t *sesh, void *userdata) {
      * next is saved before each notify because
      * cloak_stream_relay_notify_writable CAN fire on_done: its rate-timer
      * re-arm has a failure path that tears the relay down, which frees
-     * ctx. */
+     * ctx.
+     *
+     * SAVING next IS NOT A COMPLETE DEFENCE, and the residue is stated
+     * rather than fixed. That same on_done path runs this module's
+     * teardown, which can reach cloak_stream_write and so re-enter this
+     * function; a nested pass could free the context this pass is holding
+     * in `next`. It is reachable only through an allocation failure
+     * arming the relay's rate timer, and cloak_proxy_on_writable has the
+     * identical shape -- so this is precedent-equivalent, not a
+     * regression, and a fix belongs in both at once (a generation counter
+     * on the list, or an explicit "walking" guard) rather than in one. */
     cloak_client_piper_conn_t *ctx = pp->conns;
     while (ctx != NULL) {
         cloak_client_piper_conn_t *next = ctx->next;
@@ -645,4 +679,8 @@ size_t cloak_client_piper_refused_conns(const cloak_client_piper_t *pp) {
 
 size_t cloak_client_piper_rejected_streams(const cloak_client_piper_t *pp) {
     return pp == NULL ? 0 : pp->rejected_streams;
+}
+
+size_t cloak_client_piper_retried_starts(const cloak_client_piper_t *pp) {
+    return pp == NULL ? 0 : pp->retried_starts;
 }
