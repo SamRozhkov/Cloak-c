@@ -93,3 +93,27 @@ target_include_directories(test_client_singleplex PRIVATE ${CMAKE_SOURCE_DIR}/li
 target_link_libraries(test_client_singleplex PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_singleplex COMMAND test_client_singleplex)
 set_tests_properties(test_client_singleplex PROPERTIES TIMEOUT 60)
+
+# cloak-server is a TEST-ONLY dependency here for the same reason every
+# other file in this directory uses it (see above), and this file is the
+# end of that line: it wires a real cloak_client_piper_t over a real
+# cloak_client_connector_t against the WHOLE merged server -- server
+# state, user manager, user panel, registry, proxy, dispatcher and a
+# listener -- with a fake upstream beyond it and an application socket at
+# the near end, which is exactly how ck-client and ck-server will face
+# each other. Nothing about these cases is checkable against a mock: case
+# 2 reads "four local connections produced ONE session" off
+# cloak_server_registry_count, case 3 needs a REAL user row, a real
+# credit and a real cloak_userpanel_upload_now cycle to terminate a user
+# out from under the client, and case 4 needs a real switchboard to
+# answer what happens when one of several underlying connections dies.
+# No sqlite3 link of its own is needed on top of the transitive one
+# cloak-server already provides: cloak/usermanager.h keeps
+# cloak_usermanager_t opaque and never includes sqlite3.h, and this file
+# only opens, writes one user to, and closes the manager. The library
+# itself still links only cloak-common and cloak-mux.
+add_executable(test_client_full_e2e test_client_full_e2e.c)
+target_include_directories(test_client_full_e2e PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_client_full_e2e PRIVATE cloak-client cloak-server)
+add_test(NAME test_client_full_e2e COMMAND test_client_full_e2e)
+set_tests_properties(test_client_full_e2e PROPERTIES TIMEOUT 60)
