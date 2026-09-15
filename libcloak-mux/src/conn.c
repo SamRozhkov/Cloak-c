@@ -337,7 +337,7 @@ int cloak_conn_init(cloak_conn_t *c, int fd, cloak_reactor_t *reactor,
                      cloak_conn_envelope_cb on_envelope, void *on_envelope_userdata,
                      cloak_conn_closed_cb on_closed, void *on_closed_userdata) {
     memset(c, 0, sizeof(*c));
-    if (max_frame_len == 0 || max_frame_len > 65535 || send_queue_cap == 0) {
+    if (max_frame_len == 0 || max_frame_len > CLOAK_CONN_MAX_FRAME_LEN || send_queue_cap == 0) {
         return -1;
     }
     c->fd = fd;

@@ -64,22 +64,40 @@
  * implementation's behaviour deliberately or not at all --
  * libcloak-mux/tests/test_conn_record.c pins this leniency on purpose.
  *
- * RECORD LENGTH BOUND. The length field is 16 bits, so the hard ceiling
- * this port enforces is max_frame_len <= 65535 (see cloak_conn_init),
- * which is the bound the field itself imposes and the only one that can
- * cause a wire-format error. Two softer bounds exist above it and neither
- * is enforced here: Go's common.TLSConn.Write refuses a record payload
- * over 1<<14 + 256 == 16640 (RFC 8446 s5.2's ciphertext limit), and real
- * TLS 1.3 caps record PLAINTEXT at 2^14 == 16384. Every configuration in
- * this tree sits under both (max_on_wire_size is 16401), so the stricter
- * bounds would reject nothing that is actually configured while adding a
- * second place for the limit to drift out of step with cloak_conn_init's.
- * Be aware, though, that a deployment configuring max_frame_len above
- * 16640 would emit records the reference implementation itself would
- * refuse to write and that no real TLS stack produces -- a fingerprint in
- * its own right. The u16 ceiling is a correctness bound, not a mimicry
- * one. */
+ * RECORD LENGTH BOUND: see CLOAK_CONN_MAX_FRAME_LEN below. */
 #define CLOAK_CONN_RECORD_HEADER_LEN 5
+
+/* The largest record body this connection will send or accept, ENFORCED
+ * by cloak_conn_init (and, eagerly, by cloak_session_init).
+ *
+ * 1<<14 + 256 == 16640 is the ciphertext limit RFC 8446 s5.2 puts on a
+ * TLS 1.3 record, and it is exactly the bound Go's common.TLSConn.Write
+ * refuses to exceed ("message is too long",
+ * /Users/sam/Cloak/internal/common/tls.go). Real TLS 1.3 caps record
+ * PLAINTEXT lower still, at 2^14 == 16384; the +256 is the headroom the
+ * RFC allows a record's own encryption overhead.
+ *
+ * THIS IS A MIMICRY BOUND, WHICH IS WHY IT IS ENFORCED RATHER THAN
+ * DOCUMENTED. The length field is 16 bits, so purely as a matter of
+ * wire-format correctness anything up to 65535 would encode; an earlier
+ * revision of this header enforced only that and described 16641..65535
+ * as a window to be aware of. It is not merely a window to be aware of,
+ * because it is REACHABLE: cloak_session_config_t::max_on_wire_size is
+ * operator-supplied and is handed to cloak_conn_init as max_frame_len
+ * unchanged, so nothing else in the stack stood between a configuration
+ * file and a record no TLS stack on earth emits. One oversized record is
+ * a single-probe distinguisher, in the one product whose entire purpose
+ * is not being distinguishable -- so the configuration is rejected at
+ * construction, where an operator gets an error, rather than at runtime,
+ * where a censor gets a fingerprint.
+ *
+ * It does not drift, and that is why one constant can safely serve two
+ * validators. 16640 is a wire-format constant fixed by RFC 8446 and by
+ * the reference implementation, not a local policy someone might retune;
+ * cloak_session_init checks max_on_wire_size against THIS macro rather
+ * than against a literal of its own, so the two cannot disagree. Every
+ * configuration in this tree uses 16401, comfortably inside it. */
+#define CLOAK_CONN_MAX_FRAME_LEN 16640
 
 typedef struct cloak_conn cloak_conn_t;
 
@@ -150,9 +168,11 @@ struct cloak_conn {
 };
 
 /* max_frame_len is the largest single frame's on-wire byte length this
- * connection will ever send or accept (must be 1..65535, since the
- * record's length field is a big-endian u16); a peer declaring a larger length
- * is treated as a protocol violation (connection marked broken).
+ * connection will ever send or accept (must be
+ * 1..CLOAK_CONN_MAX_FRAME_LEN -- see that macro for why the bound is the
+ * TLS record limit and not the 16-bit length field's own 65535); a peer
+ * declaring a larger length is treated as a protocol violation
+ * (connection marked broken).
  * send_queue_cap is a generous, fixed hard cap on buffered-but-not-yet-
  * written outbound bytes; exceeding it is treated exactly like a
  * connection failure (see this project's plan-level fault-model
@@ -170,8 +190,8 @@ struct cloak_conn {
  * without the caller having to.
  *
  * Returns 0 on success, -1 on invalid parameters (max_frame_len == 0,
- * max_frame_len > 65535, or send_queue_cap == 0) or allocation/reactor
- * registration failure. */
+ * max_frame_len > CLOAK_CONN_MAX_FRAME_LEN, or send_queue_cap == 0) or
+ * allocation/reactor registration failure. */
 int cloak_conn_init(cloak_conn_t *c, int fd, cloak_reactor_t *reactor,
                      size_t max_frame_len, size_t send_queue_cap,
                      cloak_conn_envelope_cb on_envelope, void *on_envelope_userdata,

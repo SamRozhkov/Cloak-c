@@ -342,13 +342,17 @@ static void test_nonconforming_type_and_version_bytes_are_still_accepted(void) {
 
 /* Unchanged behaviour, re-pinned AT THE NEW OFFSET, and the connection's
  * max_frame_len is chosen so that this case can only pass for the right
- * reason. It is 60000 here, not MAX_FRAME_LEN: bytes 0-1 of the record
- * below read as 0x1703 == 5891, which is UNDER 60000, while bytes 3-4
- * read as 0xffff == 65535, which is over it. A reader still taking the
- * length from bytes 0-1 therefore sits waiting for 5891 bytes that never
- * come and never breaks the connection, so this test fails against it --
- * which it would not have done with a 300-byte limit, where both
- * readings are over the cap and the pass says nothing. */
+ * reason. It is CLOAK_CONN_MAX_FRAME_LEN (16640) here, not MAX_FRAME_LEN:
+ * bytes 0-1 of the record below read as 0x1703 == 5891, which is UNDER
+ * 16640, while bytes 3-4 read as 0xffff == 65535, which is over it. A
+ * reader still taking the length from bytes 0-1 therefore sits waiting
+ * for 5891 bytes that never come and never breaks the connection, so this
+ * test fails against it -- which it would not have done with a 300-byte
+ * limit, where both readings are over the cap and the pass says nothing.
+ *
+ * This case only pins that the check reads the RIGHT OFFSET. It declares
+ * 0xffff against 16640 -- wildly over -- so it cannot see the check's
+ * bound loosened by a few bytes. Case 7 below is what pins that. */
 static void test_declared_length_over_max_frame_len_breaks_the_connection(void) {
     int fds[2];
     ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
@@ -361,11 +365,11 @@ static void test_declared_length_over_max_frame_len_breaks_the_connection(void) 
     record_harness_t h;
     memset(&h, 0, sizeof(h));
     cloak_conn_t c;
-    ASSERT_EQ_INT(cloak_conn_init(&c, fds[0], r, 60000u, SEND_QUEUE_CAP,
+    ASSERT_EQ_INT(cloak_conn_init(&c, fds[0], r, CLOAK_CONN_MAX_FRAME_LEN, SEND_QUEUE_CAP,
                                    on_envelope, &h, on_closed, &h), 0);
 
     /* A well-formed application-data header declaring 0xffff bytes, over
-     * this connection's 60000-byte limit. No body follows: the violation
+     * this connection's 16640-byte limit. No body follows: the violation
      * must be detected from the header alone, not by waiting for bytes
      * that were never going to arrive. */
     const uint8_t wire[] = {0x17, 0x03, 0x03, 0xff, 0xff};
@@ -383,6 +387,174 @@ static void test_declared_length_over_max_frame_len_breaks_the_connection(void) 
     close(fds[1]);
 }
 
+/* ---- 7: the length check's BOUNDARY, both sides of it ------------------ */
+
+/* WHY THIS EXISTS, AND WHY CASE 6 IS NOT ENOUGH. Case 6 declares 0xffff
+ * against a 16640-byte limit: a length three times over the cap. Every
+ * plausible wrong bound -- max_frame_len, max_envelope_len, max_frame_len
+ * plus any small constant -- rejects it, so case 6 passing says only that
+ * SOME check happens at the right offset, never that it is the right
+ * check.
+ *
+ * That gap is not hypothetical. Loosening conn.c's test from
+ * `frame_len > c->max_frame_len` to `> c->max_envelope_len` left this
+ * whole suite green while opening a remotely triggerable heap overflow:
+ * recv_scratch is malloc(max_envelope_len) == 5 + max_frame_len, but the
+ * envelope a loosened check admits is 5 + frame_len, which can reach
+ * 10 + max_frame_len -- five bytes past the end of the buffer
+ * cloak_bytequeue_read writes into. A peer chooses that length, so a
+ * censor or any on-path party could smash this process's heap with one
+ * record header.
+ *
+ * So the boundary is pinned from BOTH sides, with a body actually
+ * delivered on the accepting side -- a check that rejected max_frame_len
+ * itself would pass a one-sided "it breaks when over" test just as
+ * happily. MAX_FRAME_LEN is the connection's own configured limit, and
+ * both lengths here are written relative to it rather than as magic
+ * numbers, because it is the RELATIONSHIP (exactly at, exactly one past)
+ * that is under test, not any particular value. */
+static void test_declared_length_boundary_is_exact(void) {
+    /* 7a: exactly max_frame_len is ACCEPTED, and its whole body arrives. */
+    {
+        int fds[2];
+        ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
+        cloak_reactor_t *r = cloak_reactor_create();
+        ASSERT_TRUE(r != NULL);
+        if (r == NULL) {
+            return;
+        }
+
+        record_harness_t h;
+        memset(&h, 0, sizeof(h));
+        cloak_conn_t c;
+        ASSERT_EQ_INT(cloak_conn_init(&c, fds[0], r, MAX_FRAME_LEN, SEND_QUEUE_CAP,
+                                       on_envelope, &h, on_closed, &h), 0);
+
+        uint8_t wire[5 + MAX_FRAME_LEN];
+        wire[0] = 0x17;
+        wire[1] = 0x03;
+        wire[2] = 0x03;
+        wire[3] = (uint8_t)((MAX_FRAME_LEN >> 8) & 0xff);
+        wire[4] = (uint8_t)(MAX_FRAME_LEN & 0xff);
+        for (unsigned i = 0; i < MAX_FRAME_LEN; i++) {
+            wire[5 + i] = (uint8_t)(i * 7u + 1u);
+        }
+        ASSERT_EQ_INT(write(fds[1], wire, sizeof(wire)), (ssize_t)sizeof(wire));
+        for (int i = 0; i < 50 && h.received_count == 0; i++) {
+            pump(r);
+        }
+
+        ASSERT_EQ_INT(h.received_count, 1);
+        ASSERT_EQ_INT(h.closed_count, 0);
+        if (h.received_count == 1) {
+            /* The full body, not a truncated one: an off-by-one in the
+             * other direction would show up here and nowhere else. */
+            ASSERT_EQ_INT((long long)h.received_len[0], (long long)MAX_FRAME_LEN);
+            ASSERT_MEM_EQ(h.received[0], wire + 5, MAX_FRAME_LEN);
+        }
+
+        cloak_conn_destroy(&c);
+        cloak_reactor_destroy(r);
+        close(fds[0]);
+        close(fds[1]);
+    }
+
+    /* 7b: exactly max_frame_len + 1 BREAKS the connection -- one byte
+     * over, which is the smallest loosening any wrong bound can produce
+     * and the one case 6 cannot see. */
+    {
+        int fds[2];
+        ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
+        cloak_reactor_t *r = cloak_reactor_create();
+        ASSERT_TRUE(r != NULL);
+        if (r == NULL) {
+            return;
+        }
+
+        record_harness_t h;
+        memset(&h, 0, sizeof(h));
+        cloak_conn_t c;
+        ASSERT_EQ_INT(cloak_conn_init(&c, fds[0], r, MAX_FRAME_LEN, SEND_QUEUE_CAP,
+                                       on_envelope, &h, on_closed, &h), 0);
+
+        /* Header only. The violation must be detected from the declared
+         * length alone; a body is never sent, so an implementation that
+         * waited for one would hang here rather than fail, and the
+         * bounded pump below turns that hang into a failure too. */
+        const unsigned too_long = MAX_FRAME_LEN + 1u;
+        uint8_t wire[5];
+        wire[0] = 0x17;
+        wire[1] = 0x03;
+        wire[2] = 0x03;
+        wire[3] = (uint8_t)((too_long >> 8) & 0xff);
+        wire[4] = (uint8_t)(too_long & 0xff);
+        ASSERT_EQ_INT(write(fds[1], wire, sizeof(wire)), (ssize_t)sizeof(wire));
+        for (int i = 0; i < 50 && h.closed_count == 0; i++) {
+            pump(r);
+        }
+
+        ASSERT_EQ_INT(h.closed_count, 1);
+        ASSERT_EQ_INT(h.received_count, 0);
+
+        cloak_conn_destroy(&c);
+        cloak_reactor_destroy(r);
+        close(fds[0]);
+        close(fds[1]);
+    }
+}
+
+/* ---- 8: the configured max_frame_len bound, both sides of it ----------- */
+
+/* CLOAK_CONN_MAX_FRAME_LEN is a MIMICRY bound, not a correctness one: a
+ * bigger value would still encode in the record's 16-bit length field,
+ * and would still round-trip perfectly between two copies of this port.
+ * What it would not do is look like TLS -- 16640 is the ciphertext limit
+ * RFC 8446 s5.2 sets and the exact point Go's own common.TLSConn.Write
+ * refuses to write ("message is too long"). So no functional test can
+ * ever notice this bound going missing, and it has to be pinned directly.
+ *
+ * It is reachable from configuration -- cloak_session_config_t's
+ * operator-supplied max_on_wire_size becomes this argument unchanged --
+ * which is why it is rejected at construction rather than left to a
+ * comment. Both sides, because a bound that also rejected 16640 itself
+ * would break every legitimate maximum-sized configuration. */
+static void test_max_frame_len_is_capped_at_the_tls_record_limit(void) {
+    int fds[2];
+    ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    /* Exactly the limit is accepted. Literal 16640, not the macro: the
+     * value is fixed by RFC 8446 and by the reference implementation, so
+     * a test that read it back out of the header would agree with any
+     * future edit to the header instead of catching it. */
+    cloak_conn_t ok;
+    ASSERT_EQ_INT(cloak_conn_init(&ok, fds[0], r, 16640u, SEND_QUEUE_CAP,
+                                   on_envelope, NULL, on_closed, NULL), 0);
+    cloak_conn_destroy(&ok);
+
+    /* One over is rejected... */
+    cloak_conn_t over;
+    ASSERT_EQ_INT(cloak_conn_init(&over, fds[0], r, 16641u, SEND_QUEUE_CAP,
+                                   on_envelope, NULL, on_closed, NULL), -1);
+    cloak_conn_destroy(&over);
+
+    /* ...and so is 65535, which the 16-bit length field would happily
+     * encode. This is the value the bound used to be, so it is the one
+     * that proves the bound actually moved. */
+    cloak_conn_t way_over;
+    ASSERT_EQ_INT(cloak_conn_init(&way_over, fds[0], r, 65535u, SEND_QUEUE_CAP,
+                                   on_envelope, NULL, on_closed, NULL), -1);
+    cloak_conn_destroy(&way_over);
+
+    cloak_reactor_destroy(r);
+    close(fds[0]);
+    close(fds[1]);
+}
+
 TEST_MAIN_BEGIN()
     test_sent_frame_is_wrapped_in_an_application_data_record();
     test_received_record_is_accepted_and_payload_dispatched();
@@ -390,4 +562,6 @@ TEST_MAIN_BEGIN()
     test_two_records_in_one_read_are_both_dispatched();
     test_nonconforming_type_and_version_bytes_are_still_accepted();
     test_declared_length_over_max_frame_len_breaks_the_connection();
+    test_declared_length_boundary_is_exact();
+    test_max_frame_len_is_capped_at_the_tls_record_limit();
 TEST_MAIN_END()
