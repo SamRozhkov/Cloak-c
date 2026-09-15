@@ -253,15 +253,26 @@ static void feed(cloak_client_handshake_t *h, const uint8_t *data, size_t len) {
                     return;
                 }
             }
-            /* The total-reply ceiling this module's header promises a
-             * caller, checked rather than left as an arithmetic
-             * derivation a reader has to redo. It cannot fire while the
-             * per-record bound above holds and the reply is exactly
-             * CLOAK_CLIENT_HANDSHAKE_REPLY_RECORDS records -- 3 * (5 +
-             * 16640) is precisely the ceiling -- so it is a guard on
-             * those two constants rather than on the wire: change either
-             * of them inconsistently and this trips instead of silently
-             * making the documented bound a lie. */
+            /* A CONSISTENCY GUARD BETWEEN TWO CONSTANTS. NOT a bound on
+             * the wire -- read that first, because it looks like one.
+             *
+             * No input can reach it. CLOAK_CLIENT_HANDSHAKE_MAX_REPLY_BYTES
+             * is defined as exactly CLOAK_CLIENT_HANDSHAKE_REPLY_RECORDS *
+             * (5 + CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY), the per-record
+             * bound above already rejects any record whose body exceeds
+             * CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY, and the reply is
+             * always exactly that many records -- so the
+             * sum is arithmetically incapable of exceeding the ceiling
+             * while those two hold. This project's rule is to delete
+             * unreachable defensive code rather than annotate it, and on
+             * the wire-bound reading this would go.
+             *
+             * It is kept on the other reading: it is what makes an
+             * inconsistent edit to those two constants FAIL LOUDLY here
+             * instead of silently turning the header's documented ceiling
+             * into a lie. That is a real job, and there is nowhere
+             * cheaper to do it. If you change either constant, expect this
+             * to be the thing that tells you. */
             if (h->reply_bytes + h->body_total > CLOAK_CLIENT_HANDSHAKE_MAX_REPLY_BYTES) {
                 fail(h, CLOAK_CLIENT_HANDSHAKE_ERR_PROTOCOL);
                 return;

@@ -851,46 +851,21 @@ static void test_pipelined_frame_survives_handoff(void) {
 
 /* ---- test 3: two connections, one session ------------------------------- */
 
-/* The handshake half of client_harness.h's client_session_open, stopping
- * at the recovered session key. Needed because this test has to run TWO
- * handshakes against the same (uid, session_id) before either socket is
- * handed to a cloak_session_t -- a shape that helper's single call cannot
- * express, since it builds a session per connection. */
+/* Two handshakes must complete against the same (uid, session_id) before
+ * EITHER socket is handed to a cloak_session_t, which client_session_open
+ * cannot express because it builds a session per connection. It is not
+ * hand-rolled for that, though: client_handshake_run is exactly this
+ * shape already -- it drives the real cloak_client_handshake_t and hands
+ * back a bare connected fd and the recovered session key, building no
+ * session at all. So this is a thin adapter onto the fixture's own
+ * server_pub/uid/port, and the good-path wire format has one
+ * implementation in this tree, not two. */
 static int handshake_only(struct fixture *fx, uint32_t session_id, int *out_fd,
                           uint8_t out_key[CLOAK_AEAD_KEY_LEN]) {
-    *out_fd = -1;
-
-    int64_t now = (int64_t)time(NULL);
-    uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
-    uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
-    size_t record_len =
-        build_client_record(fx->server_pub, fx->uid_ok, "ss", (uint8_t)CLOAK_AEAD_AES_256_GCM, now,
-                            session_id, 0, record, sizeof(record), shared_secret);
-    if (record_len == 0) {
-        return -1;
-    }
-
-    int fd = client_connect(front_port(fx));
-    if (fd < 0) {
-        return -1;
-    }
-    if (write(fd, record, record_len) != (ssize_t)record_len) {
-        close(fd);
-        return -1;
-    }
-
-    uint8_t reply[512];
-    size_t reply_len = 0;
-    if (read_reply(fx->reactor, fd, reply, sizeof(reply), &reply_len) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (extract_session_key_from_reply(shared_secret, reply, reply_len, out_key) != 0) {
-        close(fd);
-        return -1;
-    }
+    int fd = client_handshake_run(fx->reactor, front_port(fx), fx->server_pub, fx->uid_ok, "ss",
+                                  session_id, 0, out_key);
     *out_fd = fd;
-    return 0;
+    return fd < 0 ? -1 : 0;
 }
 
 /* Enough frames that "the switchboard picked one connection uniformly at

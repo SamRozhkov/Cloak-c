@@ -91,12 +91,29 @@
  * construction, where an operator gets an error, rather than at runtime,
  * where a censor gets a fingerprint.
  *
- * It does not drift, and that is why one constant can safely serve two
- * validators. 16640 is a wire-format constant fixed by RFC 8446 and by
- * the reference implementation, not a local policy someone might retune;
- * cloak_session_init checks max_on_wire_size against THIS macro rather
- * than against a literal of its own, so the two cannot disagree. Every
- * configuration in this tree uses 16401, comfortably inside it. */
+ * It does not drift, and that is why one constant can safely serve all
+ * THREE of the validators that enforce it. 16640 is a wire-format
+ * constant fixed by RFC 8446 and by the reference implementation, not a
+ * local policy someone might retune; cloak_conn_init enforces it,
+ * cloak_session_init checks max_on_wire_size against THIS macro before
+ * there is a conn to construct, and cloak_switchboard_init checks the
+ * max_frame_len it forwards -- each reading the macro rather than a
+ * literal of its own, so they cannot disagree. (An earlier revision of
+ * this paragraph said "two validators" and missed the switchboard, which
+ * was at that moment still rejecting only > 65535: a header asserting
+ * that drift is impossible while drift is present makes the resulting
+ * behaviour harder to diagnose, not easier.) Every configuration in this
+ * tree uses 16401, comfortably inside it.
+ *
+ * COMPATIBILITY NOTE, for anyone upgrading rather than deploying fresh:
+ * this bound is NEW, and it is narrower than what shipped before. These
+ * three functions previously accepted max_frame_len / max_on_wire_size up
+ * to 65535, so a configuration anywhere in 16641..65535 that used to
+ * start will now fail construction -- cloak_session_init returns -1 -- 
+ * rather than quietly emitting records no TLS stack produces. The fix is
+ * to lower max_on_wire_size to 16640 or below; 16401 is this project's
+ * usual value. Deliberate, and preferred over the alternative, which was
+ * shipping a single-probe distinguisher in a circumvention tool. */
 #define CLOAK_CONN_MAX_FRAME_LEN 16640
 
 typedef struct cloak_conn cloak_conn_t;

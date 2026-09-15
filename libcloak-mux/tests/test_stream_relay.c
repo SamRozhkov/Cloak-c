@@ -1241,6 +1241,118 @@ static void test_start_rejects_when_no_connection_can_ever_fit_one_frame(void) {
     cloak_reactor_destroy(r);
 }
 
+/* THE FRAME COST'S EXACT VALUE, BOTH SIDES OF IT.
+ *
+ * test_start_rejects_when_no_connection_can_ever_fit_one_frame above uses
+ * a cap of 8192 against a cost of 16406 -- half the cost, so it passes
+ * against any frame cost within a factor of two and cannot see the cost
+ * change at all. That is not a hypothetical weakness: substituting 2 for
+ * CLOAK_CONN_RECORD_HEADER_LEN inside stream_relay_frame_cost_for left
+ * this whole suite green, and the escape window was exactly {2,3,4} --
+ * precisely the three bytes the TLS record header added. Nothing pinned
+ * them, and the comment on that test had already been edited from "one
+ * byte too small" to "four bytes too small", which is a written record of
+ * a test losing its discriminating power.
+ *
+ * UNDER-COUNTING HERE IS NOT COSMETIC. cloak_stream_relay_start would
+ * admit a stream whose worst-case frame does not fit; cloak_conn_send
+ * then trips the send queue's hard cap and calls conn_mark_broken, which
+ * is fatal to the WHOLE POOL -- the connection dies instead of the stream
+ * being rejected and retried, which is the exact outcome this guard
+ * exists to prevent.
+ *
+ * So the cap is placed at cost-1 (must reject) and cost (must accept),
+ * one byte apart, which no wrong constant can straddle. The cost is
+ * WRITTEN OUT from its parts here rather than read from
+ * stream_relay_frame_cost_for: a test that asked the function under test
+ * what it costs would agree with any future change to it instead of
+ * catching it -- which is precisely how the escape above survived. A
+ * small max_on_wire_size is used so the numbers stay legible. */
+#define COST_WIRE_SIZE 512u
+#define COST_MAX_PAYLOAD (COST_WIRE_SIZE - (unsigned)CLOAK_FRAME_HEADER_LEN - (unsigned)CLOAK_FRAME_MAX_EXTRA_LEN)
+/* 5 + 243 + 14 + 255 == 517. The 5 is spelled as a literal on purpose:
+ * it is the TLS record header the wire format requires, and reading it
+ * back out of CLOAK_CONN_RECORD_HEADER_LEN would make this test track the
+ * implementation instead of the protocol. */
+#define COST_ONE_FRAME (5u + COST_MAX_PAYLOAD + (unsigned)CLOAK_FRAME_HEADER_LEN + (unsigned)CLOAK_FRAME_MAX_EXTRA_LEN)
+
+/* Returns cloak_stream_relay_start's verdict for a one-connection pool
+ * whose send queue cap is exactly `cap`. Everything else is held fixed. */
+static int relay_start_verdict_at_cap(size_t cap) {
+    cloak_stream_relay_t relay;
+    memset(&relay, 0xAA, sizeof(relay));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return 0;
+    }
+
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    memset(&a, 0, sizeof(a));
+    cloak_session_config_t cfg;
+    fill_config(&cfg, &a, &obfs);
+    cfg.max_on_wire_size = COST_WIRE_SIZE;
+    cfg.stream_recv_capacity = 65536;
+    cfg.conn_send_queue_cap = cap;
+
+    int verdict = 0;
+    if (cloak_session_init(&a.sesh, 12, r, &cfg) != 0) {
+        ASSERT_TRUE(0);
+        goto done_reactor;
+    }
+    if (cloak_session_add_conn(&a.sesh, fds[0]) != 0) {
+        ASSERT_TRUE(0);
+        goto done_session;
+    }
+
+    /* Nothing has been written, so the pool's minimum free space is
+     * exactly cap -- which is what makes this a test of the COST and not
+     * of anything transient. */
+    ASSERT_EQ_INT((long long)cloak_session_send_min_conn_free(&a.sesh), (long long)cap);
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        goto done_session;
+    }
+
+    int sock_fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds));
+    verdict = cloak_stream_relay_start(&relay, r, &a.sesh, s, sock_fds[0], 4096, on_relay_done,
+                                       NULL);
+    if (verdict == 0) {
+        /* Accepted: the relay owns sock_fds[0] now and stop() closes it. */
+        cloak_stream_relay_stop(&relay);
+    } else {
+        close(sock_fds[0]);
+    }
+    close(sock_fds[1]);
+    cloak_session_release_stream(&a.sesh, s);
+
+done_session:
+    cloak_session_destroy(&a.sesh);
+done_reactor:
+    close(fds[1]);
+    cloak_reactor_destroy(r);
+    return verdict;
+}
+
+static void test_start_boundary_is_exactly_one_worst_case_frame(void) {
+    /* One byte short of a worst-case frame: the transient rejection. */
+    ASSERT_EQ_INT(-2, relay_start_verdict_at_cap(COST_ONE_FRAME - 1u));
+    /* Exactly a worst-case frame: accepted. A guard that rejected its own
+     * boundary would pass the line above just as happily, and would
+     * refuse every pool sized exactly right. */
+    ASSERT_EQ_INT(0, relay_start_verdict_at_cap(COST_ONE_FRAME));
+}
+
 /* Regression test for finding 3 (final whole-branch review): the
  * realistic failure cloak_switchboard_send's random-connection pick
  * creates is not an unlucky run, it is one congested connection in a
@@ -1415,5 +1527,6 @@ TEST_MAIN_BEGIN()
     test_stop_before_immediate_finish_fires_cancels_timer();
     test_stopping_relay_from_on_broken_avoids_use_after_free();
     test_start_rejects_when_no_connection_can_ever_fit_one_frame();
+    test_start_boundary_is_exactly_one_worst_case_frame();
     test_session_survives_one_congested_connection_among_many();
 TEST_MAIN_END()
