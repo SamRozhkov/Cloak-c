@@ -49,7 +49,14 @@ int cloak_switchboard_init(cloak_switchboard_t *sb, cloak_reactor_t *reactor,
                             cloak_switchboard_envelope_cb on_envelope, void *on_envelope_userdata,
                             cloak_switchboard_broken_cb on_broken, void *on_broken_userdata) {
     memset(sb, 0, sizeof(*sb));
-    if (max_frame_len == 0 || max_frame_len > 65535 || conn_send_queue_cap == 0) {
+    /* CLOAK_CONN_MAX_FRAME_LEN, not a 65535 of its own: switchboard.h
+     * promises "same validation as cloak_conn_init", and max_frame_len is
+     * forwarded to cloak_conn_init unchanged by add_conn. Restating the
+     * bound as a literal here let the two drift once already -- a caller
+     * passing 20000 got a successful init and then -1 from every single
+     * add_conn, which is a far harder failure to read than a rejection at
+     * construction. */
+    if (max_frame_len == 0 || max_frame_len > CLOAK_CONN_MAX_FRAME_LEN || conn_send_queue_cap == 0) {
         return -1;
     }
     sb->reactor = reactor;
@@ -128,16 +135,33 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
          * divergence from Go, and one that loses the bytes of a frame
          * still queued when a connection dies.
          *
-         * CLOAK_CONN_LEN_PREFIX_LEN is included because cloak_conn_send
-         * adds that prefix to every frame, so it genuinely crosses the
+         * CLOAK_CONN_RECORD_HEADER_LEN is included because cloak_conn_send
+         * adds that record header to every frame, so it genuinely crosses the
          * socket: the count is the whole on-wire envelope, which is also
-         * exactly what the peer's RX side counts for the same frame. In
-         * Go the equivalent framing lives inside the transport conn
-         * (a TLS record header), below the point either counter sees.
+         * exactly what the peer's RX side counts for the same frame.
+         *
+         * THIS DELIBERATELY DIVERGES FROM GO, AND THE DIVERGENCE WIDENED
+         * WITH THE RECORD HEADER. Go writes the same five bytes, but does
+         * not bill them: common.TLSConn.Write ends `return n -
+         * recordLayerLength`, subtracting its own framing, and
+         * TLSConn.Read likewise returns dataLength, so Go bills exactly
+         * frame_len in each direction. This port bills frame_len + 5 here
+         * and raw wire bytes on the RX side (conn.c's own counting point
+         * explains why an envelope-level RX counter would meter a peer
+         * that streams megabytes which never assemble into a valid frame
+         * as zero -- unmetered traffic is not a cosmetic difference when
+         * the counter charges a user's credit, and cloak/valve.h states
+         * the WIRE-BYTES rule as this project's ruling). The counters are
+         * NOT to be aligned with Go's; what changed with this branch is
+         * only the size of the gap, from two bytes per frame to five,
+         * which on a ~30-byte interactive frame is roughly a 17%
+         * over-count against Go rather than 7%. An operator comparing a
+         * Cloak-C bill against a Cloak-Go one should expect that, and
+         * cloak/valve.h is where it is promised.
          *
          * rx/tx here are the SERVER's directions, NOT the user manager's
          * up/down -- see cloak/valve.h before touching this line. */
-        cloak_valve_add_tx(sb->valve, (int64_t)(CLOAK_CONN_LEN_PREFIX_LEN + frame_len));
+        cloak_valve_add_tx(sb->valve, (int64_t)(CLOAK_CONN_RECORD_HEADER_LEN + frame_len));
     }
     return rc;
 }

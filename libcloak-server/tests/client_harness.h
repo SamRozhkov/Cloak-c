@@ -24,9 +24,41 @@
  * rather than plain `static`: a `static inline` function that is never
  * used does not trigger -Wunused-function, where a plain `static` one
  * would (verified against this project's actual -Wall -Wextra build, not
- * merely assumed). */
+ * merely assumed).
+ *
+ * THE GOOD-PATH HANDSHAKE IS NO LONGER HAND-ROLLED. client_session_open
+ * below -- the only helper here that completes a WELL-FORMED handshake
+ * and hands the socket to a session -- now drives the real
+ * cloak_client_handshake_t from libcloak-client (cloak/client_transport.h)
+ * instead of assembling the ClientHello and un-splicing the reply itself.
+ * That removes the second implementation of this wire format that was
+ * free to drift from the first, and it makes every test built on this
+ * helper a test of the shipped client as well as of the server.
+ *
+ * WHAT DELIBERATELY DID NOT CONVERT, and why it is not redundant:
+ * build_auth_payload, build_client_record, read_reply and
+ * extract_session_key_from_reply stay, because their callers need things
+ * a well-behaved library client structurally cannot give them --
+ * handshakes that are stale, unauthorised, replayed, unordered or carry
+ * an out-of-range encryption method; the RECORD BYTES themselves, so a
+ * redirect test can assert the cover site received them byte for byte; a
+ * socket whose exact write moment is under the test's control, so
+ * test_write_shim.c can be armed against that connection's peer port
+ * first; and a connection that never reads its reply at all, which is the
+ * only way to hold the dispatcher in writing_reply. Each of those is
+ * listed against its call sites in this module's task-4 report. A harness
+ * that can still construct a BAD handshake is worth keeping; the one that
+ * duplicated the good one is not.
+ *
+ * cloak-client is a TEST-ONLY link dependency of the binaries that
+ * include this header. It is NOT a dependency of libcloak-server, which
+ * still links only cloak-common and cloak-mux and has no reason ever to
+ * depend on the client library -- exactly as libcloak-client's own tests
+ * link cloak-server as their test-only oracle without libcloak-client
+ * depending on it. */
 
 #include "cloak/base64.h"
+#include "cloak/client_transport.h"
 #include "cloak/clienthello.h"
 #include "cloak/config.h"
 #include "cloak/crypto.h"
@@ -38,6 +70,7 @@
 #include "test_framework.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -150,6 +183,35 @@ static inline int client_connect(int port) {
     return fd;
 }
 
+/* The same connection, NON-BLOCKING, which is what
+ * cloak_client_handshake_t requires of the fd it is handed (it runs
+ * entirely from reactor callbacks and must never block the reactor it
+ * shares with the server under test). Separate from client_connect rather
+ * than replacing it: every caller that writes a hand-built record and
+ * then reads with a receive timeout wants the blocking one, and changing
+ * that under them would change what those tests do. */
+static inline int client_connect_nonblocking(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(fd);
+        return -1;
+    }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /* The client's own local (ephemeral) port -- which is exactly the PEER
  * port the dispatcher's accepted socket for this same connection will
  * report via getpeername(), and therefore what test_write_shim.c's
@@ -164,10 +226,48 @@ static inline int client_local_port(int fd) {
     return ntohs(sa.sin_port);
 }
 
-/* ---- building a real Cloak ClientHello ------------------------------------
+/* ---- building a Cloak ClientHello BY HAND ---------------------------------
  *
- * This builds a REAL Cloak handshake from primitives already merged
- * elsewhere in this project -- cloak_x25519_generate_keypair/
+ * THESE FOUR HELPERS (build_auth_payload, build_client_record, read_reply,
+ * extract_session_key_from_reply) ARE NOT REDUNDANT WITH
+ * cloak_client_handshake_t, and are deliberately kept hand-rolled. Their
+ * callers need exactly the things a well-behaved library client cannot
+ * produce:
+ *
+ *   - DELIBERATELY BAD HANDSHAKES. An unauthorised UID, an unknown proxy
+ *     method, a timestamp outside the +/-180 s window, an encryption
+ *     method byte outside cloak_aead_method_t's range, the unordered flag
+ *     on a server with no datagram path, or the exact same record bytes
+ *     replayed on a second connection. The library builds none of these:
+ *     it stamps the current time, takes its proxy method from a config a
+ *     real client validated, and has no way to emit a record twice.
+ *     (test_dispatcher_auth.c cases 4-8 and 11, test_dispatcher_users.c's
+ *     and test_dispatcher_admin.c's and test_admin_e2e.c's refusal
+ *     probes, test_proxy_stream.c's expect_redirect.)
+ *
+ *   - THE RECORD BYTES THEMSELVES. Every redirect assertion in this suite
+ *     is "the cover site received the client's own first packet byte for
+ *     byte", which needs the buffer that was written, not just a socket
+ *     that wrote one.
+ *
+ *   - CONTROL OF THE WRITE MOMENT. test_write_shim.c is armed against a
+ *     connection's peer port BEFORE its ClientHello is written, and in
+ *     several cases the reply is then never allowed to complete at all
+ *     (sticky EAGAIN), which is the only way to hold the dispatcher in
+ *     writing_reply. A library handshake driven from the reactor would
+ *     time out there instead, and would read a reply these tests need to
+ *     leave unread.
+ *
+ *   - RAW REPLY BYTES. test_dispatcher_auth.c bounds the reply's total
+ *     length (165..206, the fake Certificate's own variable size);
+ *     cloak_client_handshake_t consumes and discards that tail by design
+ *     and never reports a length.
+ *
+ * What DID convert is client_session_open, at the bottom of this file --
+ * the one helper whose whole job was a well-formed handshake.
+ *
+ * What follows builds a REAL Cloak handshake from primitives already
+ * merged elsewhere in this project -- cloak_x25519_generate_keypair/
  * cloak_x25519_shared_secret, cloak_aead_seal, and cloak_clienthello_build
  * -- rather than a mock, so a passing test using it means the dispatcher's
  * authentication path genuinely agrees with the rest of this codebase
@@ -343,14 +443,131 @@ static inline int extract_session_key_from_reply(const uint8_t shared_secret[CLO
  *
  * A fully established CLIENT side of a Cloak session, for tests that need
  * to pass real traffic rather than only complete a handshake. Wraps what
- * every such test would otherwise repeat: connect, send a ClientHello
- * built by build_client_record, read the reply, recover the session key
- * from it, build a matching obfuscator, and bring up a client-side
- * cloak_session_t over the same socket.
+ * every such test would otherwise repeat: connect, complete the
+ * handshake, build an obfuscator from the session key the server chose,
+ * and bring up a client-side cloak_session_t over the same socket.
+ *
+ * THE HANDSHAKE HERE IS THE LIBRARY'S, not this file's: a real
+ * cloak_client_handshake_t (cloak/client_transport.h), the same object a
+ * ck-client binary will use. It replaced a hand-rolled sequence of
+ * build_client_record + read_reply + extract_session_key_from_reply that
+ * had been the de facto client for four modules. The three pieces of
+ * evidence that this is the same protocol and not merely a similar one:
+ * the reimplemented key recovery was compared field by field against
+ * extract_session_key_from_reply, against
+ * cloak_server_auth_compose_reply's doc comment, and against Go's own
+ * split, and all four agree (Task 3's review); libcloak-client's
+ * test_client_e2e.c asserts the recovered key equals the server's own
+ * cloak_session_t's obfuscator key byte for byte; and every test in this
+ * suite that was built on the hand-rolled version still passes unchanged
+ * on this one, which is the assertion the conversion exists to make.
  *
  * The client session runs on the SAME reactor as the server under test --
  * one pump_until loop drives both ends, exactly as the existing tests
- * already drive their fake cover site. */
+ * already drive their fake cover site, and the handshake object is driven
+ * by that same reactor rather than by a blocking read. */
+
+/* The handshake's own deadline, and the outer bound on the pump that
+ * drives it. The deadline is the shorter of the two, deliberately: a
+ * server that stops mid-reply is ended by cloak_client_handshake_t's own
+ * timer (a reported CLOAK_CLIENT_HANDSHAKE_ERR_TIMEOUT and a -1 from this
+ * function), not by this loop silently running out of turns. The pump
+ * bound is the backstop for a deadline that failed to fire at all.
+ * Neither is ever reached on a healthy handshake, which completes in a
+ * handful of reactor turns on loopback. */
+#define CLIENT_HANDSHAKE_TIMEOUT_MS 3000u
+#define CLIENT_HANDSHAKE_MAX_TURNS 1000
+#define CLIENT_HANDSHAKE_TURN_MS 5
+
+typedef struct {
+    int calls;
+    cloak_client_handshake_status_t status;
+    uint8_t key[CLOAK_AEAD_KEY_LEN];
+    int have_key;
+} client_handshake_result_t;
+
+static inline void client_handshake_on_done(cloak_client_handshake_t *h,
+                                            cloak_client_handshake_status_t status,
+                                            void *userdata) {
+    client_handshake_result_t *res = userdata;
+    res->calls++;
+    res->status = status;
+    const uint8_t *k = cloak_client_handshake_session_key(h);
+    if (k != NULL) {
+        memcpy(res->key, k, CLOAK_AEAD_KEY_LEN);
+        res->have_key = 1;
+    }
+}
+
+static inline int client_handshake_fired(void *ctx) {
+    client_handshake_result_t *res = ctx;
+    return res->calls > 0;
+}
+
+/* Connects to port and runs one complete client handshake on r, returning
+ * the connected fd (never closed by the handshake object, on any path)
+ * with the server's chosen session key in out_key -- or -1, having closed
+ * the fd itself.
+ *
+ * No ASSERT_ here: some callers legitimately expect a handshake to fail
+ * (a refused UID), and this function's contract is a return value. */
+static inline int client_handshake_run(cloak_reactor_t *r, int port,
+                                       const uint8_t server_pub[CLOAK_X25519_KEY_LEN],
+                                       const uint8_t uid[CLOAK_UID_LEN], const char *proxy_method,
+                                       uint32_t session_id, int unordered,
+                                       uint8_t out_key[CLOAK_AEAD_KEY_LEN]) {
+    int fd = client_connect_nonblocking(port);
+    if (fd < 0) {
+        return -1;
+    }
+
+    client_handshake_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    cloak_client_handshake_config_t hcfg;
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.reactor = r;
+    hcfg.fd = fd;
+    hcfg.browser = CLOAK_CLIENT_BROWSER_CHROME;
+    /* The same SNI build_client_record used, so nothing observable about
+     * the ClientHello these tests see changes with this conversion. */
+    hcfg.server_name = "www.example.com";
+    memcpy(hcfg.server_pub, server_pub, CLOAK_X25519_KEY_LEN);
+    memcpy(hcfg.uid, uid, CLOAK_UID_LEN);
+    hcfg.proxy_method = proxy_method;
+    hcfg.encryption_method = (uint8_t)CLOAK_AEAD_AES_256_GCM;
+    hcfg.session_id = session_id;
+    hcfg.unordered = unordered;
+    hcfg.now_unix = (int64_t)time(NULL);
+    hcfg.timeout_ms = CLIENT_HANDSHAKE_TIMEOUT_MS;
+    hcfg.on_done = client_handshake_on_done;
+    hcfg.on_done_userdata = &res;
+
+    /* h lives in this frame and stays at a fixed address until on_done has
+     * fired, which cloak/client_transport.h requires; the pump below never
+     * returns before that or before the object has been destroyed. */
+    cloak_client_handshake_t h;
+    if (cloak_client_handshake_init(&h, &hcfg) != 0) {
+        cloak_client_handshake_destroy(&h);
+        close(fd);
+        return -1;
+    }
+    if (cloak_client_handshake_start(&h) != 0) {
+        cloak_client_handshake_destroy(&h);
+        close(fd);
+        return -1;
+    }
+
+    int fired = pump_until(r, client_handshake_fired, &res, CLIENT_HANDSHAKE_MAX_TURNS,
+                           CLIENT_HANDSHAKE_TURN_MS);
+    cloak_client_handshake_destroy(&h);
+    if (!fired || res.status != CLOAK_CLIENT_HANDSHAKE_DONE || !res.have_key) {
+        close(fd);
+        return -1;
+    }
+    memcpy(out_key, res.key, CLOAK_AEAD_KEY_LEN);
+    return fd;
+}
 typedef struct {
     cloak_session_t sesh;
     int sesh_ready;
@@ -381,35 +598,10 @@ static inline int client_session_open(client_session_t *cs, cloak_reactor_t *r, 
     memset(cs, 0, sizeof(*cs));
     cs->fd = -1;
 
-    int64_t now = (int64_t)time(NULL);
-    uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
-    uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
-    size_t record_len = build_client_record(server_pub, uid, proxy_method,
-                                            (uint8_t)CLOAK_AEAD_AES_256_GCM, now, session_id,
-                                            unordered, record, sizeof(record), shared_secret);
-    if (record_len == 0) {
-        return -1;
-    }
-
-    int fd = client_connect(port);
-    if (fd < 0) {
-        return -1;
-    }
-    if (write(fd, record, record_len) != (ssize_t)record_len) {
-        close(fd);
-        return -1;
-    }
-
-    uint8_t reply[512];
-    size_t reply_len = 0;
-    if (read_reply(r, fd, reply, sizeof(reply), &reply_len) != 0) {
-        close(fd);
-        return -1;
-    }
-
     uint8_t session_key[CLOAK_AEAD_KEY_LEN];
-    if (extract_session_key_from_reply(shared_secret, reply, reply_len, session_key) != 0) {
-        close(fd);
+    int fd = client_handshake_run(r, port, server_pub, uid, proxy_method, session_id, unordered,
+                                  session_key);
+    if (fd < 0) {
         return -1;
     }
     memcpy(cs->session_key, session_key, CLOAK_AEAD_KEY_LEN);

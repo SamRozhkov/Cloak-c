@@ -333,12 +333,14 @@ static void test_exact_rate_over_a_simulated_second(void) {
 /* ------------------------------------------------------------------ */
 
 /* A stream of all-zero bytes is a valid stream of zero-length frames on
- * this wire format: a big-endian u16 length prefix of 0x0000 followed by
- * nothing. So the test can shovel raw zeros at the connection and every
- * one of them is accepted, counted and dispatched -- no obfuscator, no
- * session, no framing to build. Two wire bytes per envelope, which is
- * what lets test 6 below cross-check the meter against an independently
- * counted quantity. */
+ * this wire format: the reader takes a record's length from bytes 3-4 and
+ * deliberately does not validate the type or version bytes (see
+ * cloak/conn.h), so five zero bytes are a zero-length record. The test can
+ * therefore shovel raw zeros at the connection and every one of them is
+ * accepted, counted and dispatched -- no obfuscator, no session, no
+ * framing to build. FIVE wire bytes per envelope, which is what lets test
+ * 6 below cross-check the meter against an independently counted
+ * quantity. */
 struct rx_probe {
     cloak_conn_t conn;
     int64_t envelopes;
@@ -601,13 +603,13 @@ static void test_paused_direction_resumes_on_time_alone(void) {
     /* 6. BYTES MOVED UNDER A LIMIT ARE STILL COUNTED BY THE METERING
      * HALF -- cross-checked against a quantity this file counted for
      * itself, never against the implementation's own expression. Every
-     * envelope on this wire is exactly two bytes (a 0x0000 length prefix
-     * and no payload), so the meter must equal twice the number of
-     * envelopes dispatched, give or take the single odd byte that can be
-     * sitting half-read in the accumulator. */
+     * envelope on this wire is exactly five bytes (an all-zero record
+     * header declaring a zero-length body), so the meter must equal five
+     * times the number of envelopes dispatched, give or take the up to
+     * four odd bytes that can be sitting half-read in the accumulator. */
     int64_t metered = cloak_valve_rx(&v);
-    ASSERT_TRUE(metered >= p.envelopes * 2);
-    ASSERT_TRUE(metered <= p.envelopes * 2 + 1);
+    ASSERT_TRUE(metered >= p.envelopes * 5);
+    ASSERT_TRUE(metered <= p.envelopes * 5 + 4);
 
     rx_probe_stop(&p, peer);
     cloak_reactor_destroy(r);
@@ -660,10 +662,13 @@ static void test_rx_pause_does_not_block_tx(void) {
         cloak_reactor_run_once(r, 1);
         n = read(peer, got, sizeof(got));
     }
-    ASSERT_EQ_INT((long long)n, (long long)(sizeof(payload) + CLOAK_CONN_LEN_PREFIX_LEN));
-    ASSERT_EQ_INT(got[0], 0);
-    ASSERT_EQ_INT(got[1], (int)sizeof(payload));
-    ASSERT_MEM_EQ(got + CLOAK_CONN_LEN_PREFIX_LEN, payload, sizeof(payload));
+    ASSERT_EQ_INT((long long)n, (long long)(sizeof(payload) + CLOAK_CONN_RECORD_HEADER_LEN));
+    ASSERT_EQ_INT(got[0], 0x17);
+    ASSERT_EQ_INT(got[1], 0x03);
+    ASSERT_EQ_INT(got[2], 0x03);
+    ASSERT_EQ_INT(got[3], 0);
+    ASSERT_EQ_INT(got[4], (int)sizeof(payload));
+    ASSERT_MEM_EQ(got + CLOAK_CONN_RECORD_HEADER_LEN, payload, sizeof(payload));
 
     /* rx is still throttled afterwards -- the write did not quietly
      * unpause the read half. */
@@ -1512,7 +1517,7 @@ static void test_relay_pool_pause_becomes_a_rate_pause(void) {
      * whole frame, while the bucket still has plenty. If this were the
      * other way round the test would be exercising the ordinary
      * rate-pause path and would pass with the code under test deleted. */
-    ASSERT_TRUE(cloak_session_send_min_conn_free(&p.sesh) < 16403);
+    ASSERT_TRUE(cloak_session_send_min_conn_free(&p.sesh) < 16406);
     ASSERT_TRUE(cloak_valve_take_tx(&v, 16384) == 16384);
     ASSERT_EQ_INT(p.broken, 0);
 

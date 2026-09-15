@@ -6,7 +6,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "cloak/conn.h" /* CLOAK_CONN_LEN_PREFIX_LEN: a fixed wire-format
+#include "cloak/conn.h" /* CLOAK_CONN_RECORD_HEADER_LEN: a fixed wire-format
                           * constant, needed below to compute the true
                           * worst-case on-wire cost of one frame -- not a
                           * reach into any per-instance connection state. */
@@ -18,12 +18,20 @@ static void stream_relay_teardown(cloak_stream_relay_t *sr, int fire_done);
 /* The worst-case on-wire bytes a single full frame can ever cost
  * (matching cloak_frame_obfuscate's own worst case: CLOAK_FRAME_HEADER_LEN
  * + payload + up to CLOAK_FRAME_MAX_EXTRA_LEN of padding/AEAD tag, plus
- * the connection layer's own CLOAK_CONN_LEN_PREFIX_LEN length prefix).
+ * the connection layer's own CLOAK_CONN_RECORD_HEADER_LEN TLS record header).
  * Shared by stream_relay_fd_read_budget and cloak_stream_relay_start's own
  * start-time rejection check so the two can never disagree about what
- * "one frame's worth of room" means. */
+ * "one frame's worth of room" means.
+ *
+ * OPERATIONAL NOTE: this cost grew by three bytes (16403 -> 16406 at the
+ * usual max_on_wire_size of 16401) when the connection layer's two-byte
+ * length prefix became a five-byte TLS record header, so a deployment
+ * whose conn_send_queue_cap sits between 16403 and 16405 flips from
+ * accepting streams to refusing every one of them at start -- correct
+ * behaviour, since such a pool genuinely cannot hold a worst-case frame,
+ * but silent and baffling from the outside. Raise conn_send_queue_cap. */
 static size_t stream_relay_frame_cost_for(const cloak_stream_t *stream) {
-    return (size_t)CLOAK_CONN_LEN_PREFIX_LEN + stream->max_payload_per_frame +
+    return (size_t)CLOAK_CONN_RECORD_HEADER_LEN + stream->max_payload_per_frame +
            (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
 }
 

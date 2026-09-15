@@ -661,8 +661,9 @@ static void test_stack_carries_traffic_end_to_end(void) {
 /* ---- test 2: a frame buffered across the hand-off ----------------------- */
 
 /* One complete mux envelope exactly as cloak_conn_send puts it on the
- * wire: a big-endian u16 length prefix (CLOAK_CONN_LEN_PREFIX_LEN) around
- * the frame cloak_frame_obfuscate produces. Both are public, stateless
+ * wire: a TLS application-data record header
+ * (CLOAK_CONN_RECORD_HEADER_LEN -- 0x17 0x03 0x03 then a big-endian u16
+ * length) around the frame cloak_frame_obfuscate produces. Both are public, stateless
  * APIs -- cloak_frame_obfuscate takes the whole obfuscator by value and
  * nothing else, so a frame built here is indistinguishable from one
  * session.c built (session.c's own session-closing frame is composed with
@@ -686,15 +687,18 @@ static size_t build_wire_frame(const uint8_t key[CLOAK_AEAD_KEY_LEN], uint32_t s
     f.payload = payload;
     f.payload_len = payload_len;
 
-    long n = cloak_frame_obfuscate(&o, &f, out + CLOAK_CONN_LEN_PREFIX_LEN,
-                                   out_cap - CLOAK_CONN_LEN_PREFIX_LEN, 0);
+    long n = cloak_frame_obfuscate(&o, &f, out + CLOAK_CONN_RECORD_HEADER_LEN,
+                                   out_cap - CLOAK_CONN_RECORD_HEADER_LEN, 0);
     ASSERT_TRUE(n > 0);
     if (n <= 0) {
         return 0;
     }
-    out[0] = (uint8_t)(((unsigned long)n >> 8) & 0xff);
-    out[1] = (uint8_t)((unsigned long)n & 0xff);
-    return CLOAK_CONN_LEN_PREFIX_LEN + (size_t)n;
+    out[0] = 0x17;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    out[3] = (uint8_t)(((unsigned long)n >> 8) & 0xff);
+    out[4] = (uint8_t)((unsigned long)n & 0xff);
+    return CLOAK_CONN_RECORD_HEADER_LEN + (size_t)n;
 }
 
 /* The write shim consumes CLOAK_TEST_FORCE_PEER_PORT the instant it fakes
@@ -759,7 +763,7 @@ static void test_pipelined_frame_survives_handoff(void) {
      * average case fails on roughly one run in fifteen -- which is what it
      * did, found by the 50-run repeat loop rather than by the first
      * green run. */
-    uint8_t frame[CLOAK_CONN_LEN_PREFIX_LEN + CLOAK_FRAME_HEADER_LEN + 16 +
+    uint8_t frame[CLOAK_CONN_RECORD_HEADER_LEN + CLOAK_FRAME_HEADER_LEN + 16 +
                   CLOAK_FRAME_MAX_EXTRA_LEN];
     size_t frame_len = build_wire_frame(cs.session_key, PIPELINED_STREAM_ID, 0, "PIPELINED", 9,
                                         frame, sizeof(frame));
@@ -847,46 +851,21 @@ static void test_pipelined_frame_survives_handoff(void) {
 
 /* ---- test 3: two connections, one session ------------------------------- */
 
-/* The handshake half of client_harness.h's client_session_open, stopping
- * at the recovered session key. Needed because this test has to run TWO
- * handshakes against the same (uid, session_id) before either socket is
- * handed to a cloak_session_t -- a shape that helper's single call cannot
- * express, since it builds a session per connection. */
+/* Two handshakes must complete against the same (uid, session_id) before
+ * EITHER socket is handed to a cloak_session_t, which client_session_open
+ * cannot express because it builds a session per connection. It is not
+ * hand-rolled for that, though: client_handshake_run is exactly this
+ * shape already -- it drives the real cloak_client_handshake_t and hands
+ * back a bare connected fd and the recovered session key, building no
+ * session at all. So this is a thin adapter onto the fixture's own
+ * server_pub/uid/port, and the good-path wire format has one
+ * implementation in this tree, not two. */
 static int handshake_only(struct fixture *fx, uint32_t session_id, int *out_fd,
                           uint8_t out_key[CLOAK_AEAD_KEY_LEN]) {
-    *out_fd = -1;
-
-    int64_t now = (int64_t)time(NULL);
-    uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
-    uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
-    size_t record_len =
-        build_client_record(fx->server_pub, fx->uid_ok, "ss", (uint8_t)CLOAK_AEAD_AES_256_GCM, now,
-                            session_id, 0, record, sizeof(record), shared_secret);
-    if (record_len == 0) {
-        return -1;
-    }
-
-    int fd = client_connect(front_port(fx));
-    if (fd < 0) {
-        return -1;
-    }
-    if (write(fd, record, record_len) != (ssize_t)record_len) {
-        close(fd);
-        return -1;
-    }
-
-    uint8_t reply[512];
-    size_t reply_len = 0;
-    if (read_reply(fx->reactor, fd, reply, sizeof(reply), &reply_len) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (extract_session_key_from_reply(shared_secret, reply, reply_len, out_key) != 0) {
-        close(fd);
-        return -1;
-    }
+    int fd = client_handshake_run(fx->reactor, front_port(fx), fx->server_pub, fx->uid_ok, "ss",
+                                  session_id, 0, out_key);
     *out_fd = fd;
-    return 0;
+    return fd < 0 ? -1 : 0;
 }
 
 /* Enough frames that "the switchboard picked one connection uniformly at

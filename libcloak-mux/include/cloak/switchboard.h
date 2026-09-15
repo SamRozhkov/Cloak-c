@@ -10,7 +10,7 @@
 typedef struct cloak_switchboard cloak_switchboard_t;
 typedef struct cloak_conn cloak_conn_t;
 
-/* frame_bytes/len: an already length-prefix-stripped, still-obfuscated
+/* frame_bytes/len: an already record-header-stripped, still-obfuscated
  * frame's bytes, valid only for the duration of this call (points into
  * the originating cloak_conn_t's reused scratch buffer). */
 typedef void (*cloak_switchboard_envelope_cb)(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len, void *userdata);
@@ -82,7 +82,7 @@ void cloak_switchboard_destroy(cloak_switchboard_t *sb);
 int cloak_switchboard_add_conn(cloak_switchboard_t *sb, int fd);
 
 /* Picks one connection uniformly at random from the pool and sends
- * frame_bytes/frame_len through it (length-prefixed by that connection,
+ * frame_bytes/frame_len through it (wrapped in a TLS record by that connection,
  * see cloak_conn_send). Returns 0 on success, -1 if sb is broken, the
  * pool is empty, or the picked connection's send fails (in the last
  * case, on_broken fires synchronously before this call returns -- see

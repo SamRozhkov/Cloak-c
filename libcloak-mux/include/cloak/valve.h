@@ -47,7 +47,7 @@
  * WIRE BYTES, NOT PAYLOAD BYTES. The counters accumulate the bytes that
  * actually cross the socket: a stream's payload plus the frame header,
  * the AEAD tag, the obfuscator's random padding, and the connection's
- * own length prefix. A user therefore pays for the framing overhead they
+ * own TLS record header. A user therefore pays for the framing overhead they
  * cause, and their metered usage is legitimately larger than the number
  * of bytes their application transferred -- which is the same quantity
  * Go counts (switchboard.go counts conn.Write's and conn.Read's byte

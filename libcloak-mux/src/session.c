@@ -4,6 +4,11 @@
 #include <string.h>
 
 #include "cloak/common.h"
+#include "cloak/conn.h" /* CLOAK_CONN_MAX_FRAME_LEN: max_on_wire_size is
+                         * handed to cloak_conn_init as max_frame_len
+                         * unchanged, so the eager check below must be the
+                         * SAME bound, taken from the same macro rather
+                         * than restated as a literal here. */
 
 /* Every cloak_stream_t this session creates is actually the first member
  * of this wrapper -- see session.h's "Stream memory ownership" note for
@@ -403,7 +408,7 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
         config->stream_recv_capacity == 0 ||
         config->stream_recv_capacity < config->max_on_wire_size - CLOAK_FRAME_HEADER_LEN ||
         config->conn_send_queue_cap == 0 ||
-        config->max_on_wire_size > 65535) {
+        config->max_on_wire_size > CLOAK_CONN_MAX_FRAME_LEN) {
         return -1;
     }
 

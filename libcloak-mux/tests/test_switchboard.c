@@ -79,10 +79,13 @@ static void test_send_reaches_one_of_the_pool_and_receives_back(void) {
         ssize_t n = read(peer_fds[i], wire, sizeof(wire));
         if (n > 0) {
             hits++;
-            ASSERT_EQ_INT(n, 7);
-            ASSERT_EQ_INT(wire[0], 0);
-            ASSERT_EQ_INT(wire[1], 5);
-            ASSERT_MEM_EQ(wire + 2, payload, 5);
+            ASSERT_EQ_INT(n, 10);
+            ASSERT_EQ_INT(wire[0], 0x17); /* TLS application-data record */
+            ASSERT_EQ_INT(wire[1], 0x03);
+            ASSERT_EQ_INT(wire[2], 0x03);
+            ASSERT_EQ_INT(wire[3], 0);
+            ASSERT_EQ_INT(wire[4], 5);
+            ASSERT_MEM_EQ(wire + 5, payload, 5);
         }
     }
     ASSERT_EQ_INT(hits, 1);
@@ -90,7 +93,7 @@ static void test_send_reaches_one_of_the_pool_and_receives_back(void) {
     /* Any peer can send back, and it's routed to the switchboard's
      * on_envelope callback regardless of which underlying conn it
      * arrived on. */
-    uint8_t reply_wire[2 + 3] = {0, 3, 'h', 'i', '!'};
+    uint8_t reply_wire[5 + 3] = {0x17, 0x03, 0x03, 0, 3, 'h', 'i', '!'};
     ASSERT_EQ_INT(write(fds_b[1], reply_wire, sizeof(reply_wire)), (ssize_t)sizeof(reply_wire));
     pump_reactor_once(r);
     ASSERT_EQ_INT(h.received_count, 1);

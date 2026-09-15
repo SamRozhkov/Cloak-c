@@ -71,17 +71,24 @@ static void test_single_envelope_round_trip(void) {
     ASSERT_EQ_INT(cloak_conn_send(&c, payload, sizeof(payload)), 0);
 
     /* Read what conn_send just wrote directly off the raw peer fd,
-     * confirming the on-wire envelope is exactly [00 0A][payload]. */
+     * confirming the on-wire envelope is exactly
+     * [17 03 03 00 0A][payload] -- a TLS application-data record.
+     * test_conn_record.c is where that header is pinned in detail; here
+     * it is only carried along so this file keeps testing the queueing
+     * and dispatch behaviour it is actually about. */
     uint8_t wire[64];
     ssize_t n = read(fds[1], wire, sizeof(wire));
-    ASSERT_EQ_INT(n, 12);
-    ASSERT_EQ_INT(wire[0], 0);
-    ASSERT_EQ_INT(wire[1], 10);
-    ASSERT_MEM_EQ(wire + 2, payload, 10);
+    ASSERT_EQ_INT(n, 15);
+    ASSERT_EQ_INT(wire[0], 0x17);
+    ASSERT_EQ_INT(wire[1], 0x03);
+    ASSERT_EQ_INT(wire[2], 0x03);
+    ASSERT_EQ_INT(wire[3], 0);
+    ASSERT_EQ_INT(wire[4], 10);
+    ASSERT_MEM_EQ(wire + 5, payload, 10);
 
-    /* Now the reverse direction: peer writes a raw envelope, conn must
+    /* Now the reverse direction: peer writes a raw record, conn must
      * parse and dispatch it. */
-    uint8_t reply_wire[2 + 5] = {0, 5, 'h', 'e', 'l', 'l', 'o'};
+    uint8_t reply_wire[5 + 5] = {0x17, 0x03, 0x03, 0, 5, 'h', 'e', 'l', 'l', 'o'};
     ASSERT_EQ_INT(write(fds[1], reply_wire, sizeof(reply_wire)), (ssize_t)sizeof(reply_wire));
     pump_reactor_once(r);
 
@@ -108,9 +115,9 @@ static void test_multiple_envelopes_in_one_read(void) {
                                    on_envelope, &h, on_closed, &h), 0);
 
     uint8_t wire[] = {
-        0, 3, 'f', 'o', 'o',
-        0, 3, 'b', 'a', 'r',
-        0, 4, 'q', 'u', 'u', 'x',
+        0x17, 0x03, 0x03, 0, 3, 'f', 'o', 'o',
+        0x17, 0x03, 0x03, 0, 3, 'b', 'a', 'r',
+        0x17, 0x03, 0x03, 0, 4, 'q', 'u', 'u', 'x',
     };
     ASSERT_EQ_INT(write(fds[1], wire, sizeof(wire)), (ssize_t)sizeof(wire));
     pump_reactor_once(r);
@@ -140,10 +147,13 @@ static void test_envelope_split_across_many_small_writes(void) {
 
     uint8_t payload[200];
     for (int i = 0; i < 200; i++) payload[i] = (uint8_t)(i & 0xff);
-    uint8_t wire[2 + 200];
-    wire[0] = 0;
-    wire[1] = 200;
-    memcpy(wire + 2, payload, 200);
+    uint8_t wire[5 + 200];
+    wire[0] = 0x17;
+    wire[1] = 0x03;
+    wire[2] = 0x03;
+    wire[3] = 0;
+    wire[4] = 200;
+    memcpy(wire + 5, payload, 200);
 
     size_t off = 0;
     while (off < sizeof(wire)) {
@@ -188,7 +198,7 @@ static void test_send_drains_across_epollout_when_kernel_buffer_is_small(void) {
     /* Drain the peer's read side in a loop, pumping the reactor between
      * reads so cloak_conn_t's EPOLLOUT-driven drain keeps making
      * progress as kernel buffer space frees up. */
-    uint8_t assembled[2 + 290];
+    uint8_t assembled[5 + 290];
     size_t assembled_len = 0;
     for (int iter = 0; iter < 50 && assembled_len < sizeof(assembled); iter++) {
         pump_reactor_once(r);
@@ -202,9 +212,12 @@ static void test_send_drains_across_epollout_when_kernel_buffer_is_small(void) {
     }
 
     ASSERT_EQ_INT(assembled_len, sizeof(assembled));
-    ASSERT_EQ_INT(assembled[0], 1); /* 290 >> 8 */
-    ASSERT_EQ_INT(assembled[1], (uint8_t)290);
-    ASSERT_MEM_EQ(assembled + 2, big_payload, 290);
+    ASSERT_EQ_INT(assembled[0], 0x17);
+    ASSERT_EQ_INT(assembled[1], 0x03);
+    ASSERT_EQ_INT(assembled[2], 0x03);
+    ASSERT_EQ_INT(assembled[3], 1); /* 290 >> 8 */
+    ASSERT_EQ_INT(assembled[4], (uint8_t)290);
+    ASSERT_MEM_EQ(assembled + 5, big_payload, 290);
 
     cloak_conn_destroy(&c);
     cloak_reactor_destroy(r);
@@ -251,8 +264,8 @@ static void test_oversized_frame_len_is_rejected_not_wedged(void) {
     /* Declares a frame_len far larger than MAX_FRAME_LEN -- a protocol
      * violation that must mark the connection broken (not silently wait
      * forever for bytes that were never going to arrive validly). */
-    uint8_t wire[2] = {0xff, 0xff};
-    ASSERT_EQ_INT(write(fds[1], wire, sizeof(wire)), 2);
+    uint8_t wire[5] = {0x17, 0x03, 0x03, 0xff, 0xff};
+    ASSERT_EQ_INT(write(fds[1], wire, sizeof(wire)), 5);
     pump_reactor_once(r);
 
     ASSERT_EQ_INT(h.closed_count, 1);

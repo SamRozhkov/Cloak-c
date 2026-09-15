@@ -937,11 +937,11 @@ static void test_refused_upstream_closes_only_that_stream(void) {
  *
  * The rejection is provoked by SIZING, not by racing a drain. At
  * max_on_wire_size 16401 one worst-case frame costs
- * CLOAK_CONN_LEN_PREFIX_LEN(2) + max_payload_per_frame(16401-14-255) +
- * CLOAK_FRAME_HEADER_LEN(14) + CLOAK_FRAME_MAX_EXTRA_LEN(255) = 16403
+ * CLOAK_CONN_RECORD_HEADER_LEN(5) + max_payload_per_frame(16401-14-255) +
+ * CLOAK_FRAME_HEADER_LEN(14) + CLOAK_FRAME_MAX_EXTRA_LEN(255) = 16406
  * bytes, and that is the exact quantity cloak_stream_relay_start compares
  * cloak_session_send_min_conn_free against. A pool of 16402 is therefore
- * one byte too small, permanently -- which is what makes this
+ * four bytes too small, permanently -- which is what makes this
  * deterministic where the genuinely transient version of the same
  * condition is not: the transient one clears within the same reactor
  * turn it appears in, and the dial completion that would observe it

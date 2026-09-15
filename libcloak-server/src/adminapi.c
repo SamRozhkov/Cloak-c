@@ -2,7 +2,7 @@
 #include "cloak/adminapi.h"
 
 #include "cloak/base64.h"
-#include "cloak/conn.h" /* CLOAK_CONN_LEN_PREFIX_LEN: a fixed wire-format
+#include "cloak/conn.h" /* CLOAK_CONN_RECORD_HEADER_LEN: a fixed wire-format
                          * constant needed to compute the true on-wire
                          * cost of one frame, exactly as
                          * libcloak-mux/src/stream_relay.c uses it -- not
@@ -281,7 +281,7 @@ static int adminapi_respond_text(cloak_adminapi_stream_t *ast, int status, const
  * cost of n raw bytes is not n: cloak_stream_write chunks them into
  * ceil(n / max_payload_per_frame) frames and each frame costs a header,
  * up to CLOAK_FRAME_MAX_EXTRA_LEN of padding/AEAD and the connection
- * layer's length prefix on top of its payload.
+ * layer's TLS record header on top of its payload.
  *
  * It budgets off cloak_session_send_min_conn_free -- the MINIMUM free
  * space over every connection in the pool -- and not the aggregate,
@@ -302,7 +302,7 @@ static int adminapi_respond_text(cloak_adminapi_stream_t *ast, int status, const
  * path. */
 static size_t adminapi_write_budget(const cloak_adminapi_stream_t *ast) {
     const cloak_stream_t *s = ast->stream;
-    size_t frame_cost = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + s->max_payload_per_frame +
+    size_t frame_cost = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + s->max_payload_per_frame +
                         (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
     size_t frames = cloak_session_send_min_conn_free(ast->as->sesh) / frame_cost;
     return frames * s->max_payload_per_frame;

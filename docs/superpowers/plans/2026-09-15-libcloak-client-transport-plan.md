@@ -240,3 +240,53 @@ Two standing disciplines: **mutate the call sites, not the helper** — twice a 
 - **Type consistency:** the payload builder's outputs feed `cloak_clienthello_build`'s documented inputs and `cloak_server_auth_decrypt`'s documented inputs, both merged and unchanged. Test counts chain 50 → 51 → 52 → 53 → 54.
 - **The riskiest thing here** is Task 1, because it changes the wire format of merged, well-tested code. It is also the only task whose absence would be a security defect rather than a missing feature, which is why it is first.
 - **The most consequential thing here** is that Task 1 exists at all. The disguise this program is built to maintain was being dropped one round trip in, and no test noticed, because every test spoke the same wrong dialect to itself.
+
+---
+
+## What this branch's execution left for the next ones
+
+Written at merge time from the execution ledger.
+
+### The framing correction, and what it cost
+
+The defect and its argument are recorded at the top of this plan. Three things about the correction are worth carrying:
+
+- **The interop check that would have caught it originally is now in the toolkit.** Go 1.25.6 is on the development host, and `internal/` packages are not importable from outside `cbeuw/Cloak`'s module — so the technique is to copy the twenty or so relevant lines verbatim into a standalone program and say in the report that they were copied. Both directions were run: our emitted bytes proved **byte-identical** to what Go's `AddRecordLayer` produces for the same payloads, and Go's record stream parsed correctly by our reader when fed in chunks deliberately sized to split record headers. Any future change to a wire format should get the same treatment.
+- **A compatibility break an operator must be told about.** `cloak_session_init` now rejects `max_on_wire_size > 16640`, where it previously accepted up to 65535. Nothing in this tree used the window, and a configuration inside it emitted records the reference implementation's own writer refuses to produce, but a deployment above that size will start failing at startup. The enforcement carries this note in-tree, beside the check.
+- **Per-frame on-wire cost rose three bytes**, from 16403 to 16406 for a maximum frame. A deployment with `conn_send_queue_cap` between those values silently flips from accepting streams to refusing them at start. Noted in-tree at `stream_relay_frame_cost_for`.
+
+### A deliberate divergence from Go, now documented rather than denied
+
+Go's `TLSConn.Write` returns `n - recordLayerLength` and its `Read` returns `dataLength`, so **Go bills a frame's payload only**. This port bills `frame_len + 5` on TX and raw wire bytes on RX. The RX choice is an argued ruling from the user-manager module — an envelope-level counter would meter a peer that streams megabytes never assembling into a valid frame as zero, and unmetered traffic is not cosmetic when the counter charges a user's credit.
+
+The divergence is therefore kept, but this branch **widened** it from two bytes per frame to five: on a ~30-byte interactive frame that is roughly a 17% over-count against an equivalent Go deployment, up from 7%. An intermediate version of this branch replaced the honest note with a claim that the two ports bill identically; that claim was false and has been corrected. **A false parity claim on a billing path is worse than a documented divergence** — if the counters are ever aligned, do it deliberately, not by believing a comment.
+
+### For the client connector and piper (the next module)
+
+`libcloak-client` now has the payload builder and the handshake. What it does not have is everything above a single connection: dialing `NumConn` connections, bringing up a client-side session across them, reconnection, and the local listener that accepts application connections and routes them onto streams. Go's `connector.go` and `piper.go` are the references, and `client_harness.h`'s `client_session_open` — which now drives the real library — is the working two-connection precedent.
+
+Two things that module inherits:
+
+- **The harness's malformed-handshake builders stay and are load-bearing.** About twenty call sites across four modules need stale, unauthorised, replayed, unordered or bad-encryption-method handshakes, the raw record bytes for byte-for-byte cover-site assertions, the write moment under test control so the `LD_PRELOAD` shim can be armed first, or raw reply lengths the library discards. They are not redundant with the library and should not be "cleaned up".
+- **Nine server test binaries now link `cloak-client`.** That is test-only; the `cloak-client` library itself links only `cloak-common` and `cloak-mux`, and the dependency must not be allowed to invert.
+
+### An amendment to this project's unreachable-guard rule
+
+The rule has been *delete when the unreachability is structural and permanent; annotate when a plausible near-term change makes it live*. It was applied a third time on this branch and did not fit: `client_transport.c`'s reply-ceiling comparison is structurally and permanently unreachable — the per-record bound times exactly three records **is** the ceiling — so the rule said delete, and it was kept under a different justification: it guards two constants against inconsistent change. That justification is legitimate, so the rule now reads:
+
+> Delete when the unreachability is structural and permanent **and the guard protects nothing but the wire**. Annotate when a plausible near-term change makes it live, **or when the guard's real subject is the consistency of two constants rather than the input**.
+
+## The test-defect tally, updated
+
+**Six coverage defects on this branch**, on top of eighteen from the previous three. Every one found by measuring or mutating; none by reading. This branch's instances, and three of them are the recurring shape:
+
+1. A browser-fingerprint test that exercised **one template three times** — returning the Chrome template for all three browsers passed everything.
+2. A fingerprint list **validated against itself** — both checks compared the generated value against the array the generator drew from, proving only that it used its own list.
+3. A partial-write test whose **first three versions were green while covering nothing**, because an edge-triggered write event only fires with roughly half the send buffer free, so the payload always went out in one call.
+4. A per-character variety check that passed when every letter in the label was the same, collapsing the name space from 26ⁿ to 26.
+5. A record-length boundary pinned so far outside the range that loosening the real bound by a few bytes went unnoticed — the loosened version was a **remotely triggerable heap overflow**.
+6. Two framing-cost expressions where the newly added bytes were invisible: one escaped at exactly `{2,3,4}`, bisected; the other was green even with **all 274 bytes** of overhead removed.
+
+Two of those — 5 and 6 — share a sharper variant worth naming on its own: **a boundary test must fail on both sides.** A case that only rejects something far outside the range passes with the bound set anywhere; the fix in each instance was a pair at `limit` and `limit ± 1`, and in the framing case the over-count direction had to be pinned separately from the under-count one.
+
+And the lesson the framing defect itself teaches, which no amount of mutation testing would have produced: **round-trip tests cannot see a self-consistent error.** Both ends of every test in this project are its own code, so a wrong wire format that both halves agree on is invisible from inside. The only cure is an outside oracle — the real Go implementation, run against our bytes.

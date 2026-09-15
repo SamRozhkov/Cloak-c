@@ -265,3 +265,44 @@ target_include_directories(test_admin_e2e PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-c
 target_link_libraries(test_admin_e2e PRIVATE cloak-server sqlite3)
 add_test(NAME test_admin_e2e COMMAND test_admin_e2e)
 set_tests_properties(test_admin_e2e PROPERTIES TIMEOUT 60)
+
+# ---------------------------------------------------------------------------
+# cloak-client, for the nine test binaries that include client_harness.h.
+#
+# That header's good-path handshake (client_session_open) now drives the
+# real cloak_client_handshake_t instead of assembling a ClientHello and
+# un-splicing the reply itself -- see the header's own top-of-file note for
+# what converted and what deliberately did not. The link is what that
+# needs, and the include directory cloak-client exports is what the
+# header's `#include "cloak/client_transport.h"` needs even in the two
+# includers that never call the converted helper.
+#
+# THIS IS NOT A LIBRARY DEPENDENCY AND DOES NOT MAKE ONE. cloak-server
+# still links only cloak-common and cloak-mux (plus its private sqlite3
+# and cjson); nothing in libcloak-server/src references libcloak-client,
+# and nothing will. This is the exact mirror of
+# libcloak-client/tests/CMakeLists.txt, where cloak-server is a test-only
+# oracle for the client's tests without the client library depending on
+# it.
+#
+# APPENDED rather than folded into each target's own
+# target_link_libraries line above, for the reason this project appends
+# everywhere else (libcloak-server/CMakeLists.txt does the same for
+# src/http.c, src/user_json.c and src/adminapi.c): the existing content of
+# this file stays byte-identical, including the ASan/LD_PRELOAD block that
+# several of these targets depend on. CMake applies these to the
+# already-declared targets either way, and resolves `cloak-client` at
+# generate time even though libcloak-client is add_subdirectory'd after
+# this directory.
+foreach(_cloak_harness_test
+        test_dispatcher_auth
+        test_dispatcher_limits
+        test_proxy_stream
+        test_proxy_teardown
+        test_server_e2e
+        test_dispatcher_users
+        test_adminapi
+        test_dispatcher_admin
+        test_admin_e2e)
+    target_link_libraries(${_cloak_harness_test} PRIVATE cloak-client)
+endforeach()

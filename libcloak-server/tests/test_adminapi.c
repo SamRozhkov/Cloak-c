@@ -1140,6 +1140,137 @@ static void test_large_response_is_delivered_completely(void) {
     fixture_destroy(&fx);
 }
 
+/* ---- 10b. The write budget's framing overhead, both sides of it -------- */
+
+/* WHY THIS EXISTS. adminapi_write_budget's frame-cost expression -- the
+ * record header, the frame header and the padding/AEAD allowance added on
+ * top of max_payload_per_frame -- was constrained by NOTHING. Substituting
+ * 2 for CLOAK_CONN_RECORD_HEADER_LEN left the suite green; so did deleting
+ * all 274 bytes of overhead and budgeting off the payload size alone. Case
+ * 10 above cannot see it: its 20000-byte pool is comfortably more than one
+ * worst-case frame (16406 at max_on_wire_size 16401), so it passes for any
+ * cost within a wide band.
+ *
+ * WHAT AN UNDER-COUNT DOES. The budget is what decides how big a chunk the
+ * pump may hand cloak_stream_write. Under-count it and the pump hands over
+ * more than the pool can hold; cloak_conn_send then trips the send queue's
+ * hard cap and calls conn_mark_broken, which is fatal to the whole pool --
+ * the admin session's connection dies mid-response. On the listing path,
+ * which is the one that produces multi-frame responses, that is the
+ * difference between an operator getting their user list and getting a
+ * dead tunnel.
+ *
+ * HOW IT IS PINNED. The pool is placed one byte either side of exactly one
+ * worst-case frame, which no wrong cost can straddle:
+ *
+ *   - at cost, the response must be delivered COMPLETE. A cost that is too
+ *     LARGE budgets zero frames forever and delivers nothing, so this side
+ *     catches over-counting; an over-estimate large enough to admit two
+ *     frames into a one-frame pool breaks the connection and fails here
+ *     too, which is what kills the drop-all-overhead mutation.
+ *   - at cost-1, the response must NOT be delivered, and the session must
+ *     still be ALIVE. A pool that cannot hold one worst-case frame is a
+ *     pool this module must refuse to gamble with -- the same ruling
+ *     cloak_stream_relay_start makes -- so refusing is the correct
+ *     behaviour, and any under-count at all (2, 3, 4, or dropping the
+ *     overhead entirely) makes the budget admit a frame and deliver the
+ *     response, failing this side.
+ *
+ * The cost is written out from its parts, not read back from the module
+ * under test: a test that asked the implementation what a frame costs
+ * would agree with any future change to it rather than catch it, which is
+ * exactly how the expression escaped coverage in the first place. The 5 is
+ * a literal because it is the TLS record header the wire format requires.
+ */
+#define BUDGET_WIRE_SIZE 16401u
+#define BUDGET_MAX_PAYLOAD \
+    (BUDGET_WIRE_SIZE - (unsigned)CLOAK_FRAME_HEADER_LEN - (unsigned)CLOAK_FRAME_MAX_EXTRA_LEN)
+#define BUDGET_ONE_FRAME                                                       \
+    (5u + BUDGET_MAX_PAYLOAD + (unsigned)CLOAK_FRAME_HEADER_LEN +               \
+     (unsigned)CLOAK_FRAME_MAX_EXTRA_LEN)
+
+/* Runs one listing request against a server pool of exactly `cap` bytes
+ * and reports whether the response arrived complete. out_broken receives
+ * the client session's broken flag, so a caller can tell "refused to
+ * write" apart from "killed the connection". */
+static int listing_completes_at_cap(const char *tag, size_t cap, int *out_broken) {
+    struct fixture fx;
+    *out_broken = 0;
+    if (fixture_init_opts(&fx, tag, cap, 0, 0, 0) != 0) {
+        ASSERT_TRUE(0);
+        return 0;
+    }
+    client_session_t cs;
+    if (open_client(&fx, &cs, 10) != 0) {
+        ASSERT_TRUE(0);
+        fixture_destroy(&fx);
+        return 0;
+    }
+
+    /* Same as case 10: a small client receive buffer is what makes the
+     * server's pool genuinely back up instead of the whole listing
+     * slipping between the two kernels in one pass. */
+    int rcvbuf = 8192;
+    (void)setsockopt(cs.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+    seed_many_users(&fx);
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return 0;
+    }
+    resp_t r;
+    resp_init(&r, st);
+    ASSERT_TRUE(r.buf != NULL);
+    const char *getreq = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n";
+    ASSERT_EQ_INT((int)strlen(getreq),
+                  (int)cloak_stream_write(st, (const uint8_t *)getreq, strlen(getreq)));
+
+    int complete = pump_until(fx.reactor, resp_complete, &r, 1200, 5);
+    if (complete) {
+        /* Complete means INTACT, not merely terminated: a truncated or
+         * gap-ridden body would satisfy a length check that only counted
+         * bytes already read. */
+        ASSERT_EQ_INT(200, resp_status(&r));
+        long he = resp_header_end(&r);
+        long cl = he > 0 ? resp_content_length(&r, he) : -1;
+        size_t blen = 0;
+        const char *body = resp_body(&r, &blen);
+        ASSERT_TRUE(cl > 0);
+        ASSERT_EQ_INT((int)cl, (int)blen);
+        int objects = 0;
+        for (size_t i = 0; i < blen; i++) {
+            if (body[i] == '{') {
+                objects++;
+            }
+        }
+        ASSERT_EQ_INT(BIG_USERS, objects);
+    }
+    *out_broken = cs.broken;
+
+    finish(&fx, &cs, st, &r);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+    return complete;
+}
+
+static void test_write_budget_boundary_is_exactly_one_worst_case_frame(void) {
+    /* Exactly one worst-case frame: delivered, whole. */
+    int broken_ok = 0;
+    ASSERT_EQ_INT(1, listing_completes_at_cap("budget-fits", BUDGET_ONE_FRAME, &broken_ok));
+    ASSERT_EQ_INT(0, broken_ok);
+
+    /* One byte short: refused. Not delivered, and -- the half that says
+     * this is a refusal rather than a crash -- the session survives. */
+    int broken_short = 0;
+    ASSERT_EQ_INT(0, listing_completes_at_cap("budget-short", BUDGET_ONE_FRAME - 1u,
+                                              &broken_short));
+    ASSERT_EQ_INT(0, broken_short);
+}
+
 /* ---- 11. A stream abandoned mid-request is closed by its deadline -------- */
 
 #define DEADLINE_MS 300
@@ -1896,6 +2027,7 @@ TEST_MAIN_BEGIN()
     test_options();
     test_request_split_into_single_bytes();
     test_large_response_is_delivered_completely();
+    test_write_budget_boundary_is_exactly_one_worst_case_frame();
     test_abandoned_stream_hits_its_deadline();
     test_session_broken_mid_response();
     test_deadline_bounds_the_write_half();
