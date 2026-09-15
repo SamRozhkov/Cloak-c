@@ -256,7 +256,23 @@ typedef struct cloak_client_piper cloak_client_piper_t;
  * generous, and leaving room for a handful means a server with a real bug
  * gets a diagnosable log line and a working tunnel rather than an
  * immediate disconnect. Much larger and the amplification it bounds stops
- * being bounded in any useful sense. */
+ * being bounded in any useful sense.
+ *
+ * IT IS COUNTED PER SESSION, NOT PER PIPER, and that distinction is the
+ * whole bound rather than a detail. The resource being amplified -- a
+ * cloak_strmtab_t tombstone -- lives in ONE session's table and dies with
+ * it, so a per-session count is the one that matches what it protects.
+ * The other reading is also unsafe rather than merely imprecise: a
+ * lifetime counter on the piper is spent once and never refilled, so in
+ * singleplex (a session per local connection) sessions 1..16 would each
+ * absorb one rogue stream, the sixteenth would close its own session, and
+ * every session after that would be UNBOUNDED -- the exact opposite of
+ * the guarantee. The same holds in shared mode for any owner that brings
+ * a replacement session up through cloak_client_piper_set_session. So the
+ * count lives on the singleplex context that owns its session, and on the
+ * piper (reset by cloak_client_piper_set_session) for the shared one, and
+ * the trigger is >= rather than == so that no miscount can step over
+ * it. */
 #define CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS ((size_t)16)
 
 /* One accepted local connection, from the moment it is accepted until its
@@ -320,6 +336,15 @@ typedef struct cloak_client_piper_conn {
     int awaiting_session;
 
     cloak_stream_t *stream; /* owned by the session; released by us */
+
+    /* Streams THIS CONTEXT'S OWN session (singleplex: own_sesh) has had
+     * refused, and whether that session's one log line has been written.
+     * Both are meaningless for a shared-session context, which uses the
+     * piper-wide pair instead -- see
+     * CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS for why the bound has to be
+     * per session and cannot be per piper. */
+    size_t rejected_streams;
+    int logged_rejected_stream;
 
     cloak_stream_relay_t relay; /* live only while relaying != 0 */
     int relaying;
@@ -481,9 +506,17 @@ struct cloak_client_piper {
     /* Local connections refused at max_local_conns, and streams the
      * SERVER opened toward us and had refused (see
      * cloak_client_piper_rejected_streams). Diagnostics only; neither
-     * ever falls. */
+     * ever falls -- rejected_streams is a LIFETIME total over every
+     * session this piper has served, which is what an operator wants to
+     * read and is deliberately NOT what the ceiling is checked against. */
     size_t refused_conns;
     size_t rejected_streams;
+
+    /* The SHARED session's own refusal count and log-once flag, reset by
+     * cloak_client_piper_set_session because that installs a different
+     * session. A singleplex context keeps its own pair on the context
+     * instead; this pair is untouched in that mode. */
+    size_t shared_rejected_streams;
     size_t retried_starts;
     size_t sessions_started;
 
@@ -495,7 +528,11 @@ struct cloak_client_piper {
      * exists because its caps are crossed in normal operation by an
      * honest client's own parallelism, whereas both of these conditions
      * mean something is wrong and stays wrong. The counts above stay
-     * exact either way, and are what a test or an operator should read. */
+     * exact either way, and are what a test or an operator should read.
+     *
+     * logged_rejected_stream is PER SHARED SESSION (cleared by
+     * cloak_client_piper_set_session) for the same reason its counter is:
+     * a second session's first rogue stream is news, not a repeat. */
     int logged_rejected_stream;
     int logged_refused_conn;
 };
@@ -554,7 +591,15 @@ void cloak_client_piper_install(cloak_client_piper_t *pp, cloak_session_config_t
  * teardown walk (a stream can only be released while its session lives),
  * whereas a caller swapping in a new session wants the old contexts gone
  * first too. Call cloak_client_piper_destroy for that; this function is
- * deliberately not a teardown in disguise. */
+ * deliberately not a teardown in disguise.
+ *
+ * IT DOES RESET THE SHARED SESSION'S REFUSAL BOOKKEEPING, because that is
+ * scoped to a session and this installs a different one: the new session
+ * gets the full CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS budget and its
+ * own first log line. Without the reset an owner that reconnects would
+ * find the ceiling already spent and every session after the first
+ * unbounded. The lifetime total cloak_client_piper_rejected_streams
+ * reports is NOT reset. */
 void cloak_client_piper_set_session(cloak_client_piper_t *pp, cloak_session_t *sesh);
 
 /* A cloak_listener_accept_cb (userdata: the cloak_client_piper_t). Pass
@@ -663,11 +708,14 @@ size_t cloak_client_piper_refused_conns(const cloak_client_piper_t *pp);
  * every live local connection at once, which turns a violation this
  * module can absorb into a denial of service it cannot.
  *
- * BOUNDED: once this count reaches CLOAK_CLIENT_PIPER_MAX_REJECTED_
- * STREAMS the session is closed (cloak_session_close), which fires
- * on_broken and so tears every local connection down through this
- * module's ordinary walk. See that constant for why a ceiling is
- * necessary and why closing is the right one.
+ * A LIFETIME TOTAL over every session this piper has served, which is
+ * what an operator reading it wants. THE CEILING IS NOT CHECKED AGAINST
+ * IT: once a SINGLE SESSION has had CLOAK_CLIENT_PIPER_MAX_REJECTED_
+ * STREAMS refused, that session is closed (cloak_session_close), which
+ * fires on_broken and so tears its local connections down through this
+ * module's ordinary walk. See that constant for why the bound is per
+ * session, why a piper-wide one would be unbounded from the seventeenth
+ * session onward, and why closing is the right answer.
  *
  * One log line per piper, not per stream -- the count stays exact either
  * way, and is what a test or an operator should read. pp == NULL returns

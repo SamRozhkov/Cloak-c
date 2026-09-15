@@ -136,6 +136,21 @@ static void fail(cloak_client_connector_t *c, cloak_client_connector_error_t err
 
 /* MUST be the last statement of any function the reactor can call into
  * this file: c may be destroyed or freed by on_done. */
+/* THE `|| c->notified` CONJUNCT IS DEFENSIVE AND UNPINNED, and this note
+ * exists so that is a recorded decision rather than an oversight -- the
+ * same treatment this tree gives the D3 transport conjunct and the
+ * piper's own `pp->sesh != NULL` release guard.
+ *
+ * Deleting it leaves every test green, and no live double-fire could be
+ * constructed: every path that can re-enter this function does so only
+ * after the status has already left PENDING, and each of those paths
+ * returns early on a non-pending status of its own. So the first
+ * conjunct alone is sufficient TODAY. It is kept because "on_done fires
+ * exactly once" is a contract this header states in capitals and that a
+ * caller may free its own storage on; the cost of the guard is one
+ * branch, and the cost of losing it is a use-after-free in a caller that
+ * did what the header told it to. It is NOT dead code -- it is a second
+ * lock on a door whose first lock is load-bearing. */
 static void finish(cloak_client_connector_t *c) {
     if (c->status == CLOAK_CLIENT_CONNECTOR_PENDING || c->notified) {
         return;

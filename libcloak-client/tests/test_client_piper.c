@@ -1146,6 +1146,16 @@ typedef struct {
      * mux's own post-on_broken sweep reclaim them": both end at zero, and
      * only this is zero BEFORE the sweep. */
     size_t session_active_streams_at_broken;
+
+    /* A SECOND session, for the one case that needs the piper to outlive
+     * a session and be handed a replacement -- the shape
+     * cloak_client_piper_set_session exists for, and the shape the
+     * refusal ceiling used to get wrong. */
+    cloak_session_t sesh2;
+    int session2_live;
+    conn_result_t res2;
+    cloak_client_connector_t c2;
+    int connector2_ready;
 } client_t;
 
 static void cl_on_broken(cloak_session_t *sesh, void *userdata) {
@@ -1228,6 +1238,53 @@ static int client_up(client_t *cl, struct fixture *fx, uint32_t session_id,
     return 0;
 }
 
+/* Brings a SECOND session up on the same piper and hands it over, which
+ * is what an owner reconnecting after a session died does. The piper's
+ * four callbacks are installed into this template too -- they have to be,
+ * since cloak_session_init consumes the template -- so the piper serves
+ * both sessions over its life. */
+static int client_second_session(client_t *cl, struct fixture *fx, uint32_t session_id) {
+    char addr[64];
+    char err[256];
+    cloak_client_connector_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(addr, sizeof(addr), "127.0.0.1:%d", fx->client_port);
+    ASSERT_EQ_INT(0, cloak_net_resolve(addr, 0, &cfg.remote, err, sizeof(err)));
+    cfg.reactor = fx->reactor;
+    cfg.num_conn = 1;
+    cfg.session = &cl->sesh2;
+    cfg.browser = CLOAK_CLIENT_BROWSER_CHROME;
+    cfg.transport = CLOAK_TRANSPORT_DIRECT;
+    cfg.server_name = "www.example.com";
+    memcpy(cfg.server_pub, fx->server_pub, CLOAK_X25519_KEY_LEN);
+    memcpy(cfg.uid, fx->uid, CLOAK_UID_LEN);
+    cfg.proxy_method = "ss";
+    cfg.encryption_method = (uint8_t)CLOAK_AEAD_AES_256_GCM;
+    cfg.session_id = session_id;
+    cfg.dial_timeout_ms = 5000;
+    cfg.handshake_timeout_ms = 10000;
+    cfg.session_template.max_on_wire_size = fx->wire;
+    cfg.session_template.stream_recv_capacity = 65536;
+    cfg.session_template.stream_max_pending_frames = 64;
+    cfg.session_template.conn_send_queue_cap = 262144;
+    cfg.session_template.inactivity_timeout_ms = 60000;
+    cfg.on_done = conn_done;
+    cfg.on_done_userdata = &cl->res2;
+    cloak_client_piper_install(&cl->piper, &cfg.session_template);
+
+    ASSERT_EQ_INT(0, cloak_client_connector_init(&cl->c2, &cfg));
+    cl->connector2_ready = 1;
+    ASSERT_EQ_INT(0, cloak_client_connector_start(&cl->c2));
+    ASSERT_TRUE(pump_until(fx->reactor, conn_fired, &cl->res2, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_DONE, (int)cl->res2.status);
+    if (cl->res2.status != CLOAK_CLIENT_CONNECTOR_DONE) {
+        return -1;
+    }
+    cl->session2_live = 1;
+    cloak_client_piper_set_session(&cl->piper, &cl->sesh2);
+    return 0;
+}
+
 /* The shutdown order a client binary must use: local listener, PIPER
  * BEFORE SESSION (cloak/stream_relay.h: every relay bound to a session
  * must be stopped before the session goes away), session, connector. */
@@ -1244,9 +1301,17 @@ static void client_down(client_t *cl) {
         cloak_session_destroy(&cl->sesh);
         cl->session_live = 0;
     }
+    if (cl->session2_live) {
+        cloak_session_destroy(&cl->sesh2);
+        cl->session2_live = 0;
+    }
     if (cl->connector_ready) {
         cloak_client_connector_destroy(&cl->c);
         cl->connector_ready = 0;
+    }
+    if (cl->connector2_ready) {
+        cloak_client_connector_destroy(&cl->c2);
+        cl->connector2_ready = 0;
     }
 }
 
@@ -1827,7 +1892,7 @@ static void test_a_broken_session_stops_every_relay(void) {
 /* The needles the two decisions log under. Matched as substrings so a
  * reworded message keeps the assertion meaningful. */
 #define LOG_REFUSING "opened a stream toward this client"
-#define LOG_CLOSING "refused -- closing the session"
+#define LOG_CLOSING "refused -- closing that session"
 
 /* Both ends of a session allocate stream ids from 1 upward, so a rogue id
  * has to be pushed well clear of the ones this client has issued: a
@@ -2041,6 +2106,152 @@ static void test_refusals_are_bounded(void) {
     fixture_destroy(&fx);
     logcap_close(&lc);
     ASSERT_EQ_INT(fds_before, count_open_fds());
+}
+
+/* ---- case 7C: the ceiling is PER SESSION, not per piper ----------------- */
+
+#define SID_PERSESS1 ((uint32_t)6114)
+#define SID_PERSESS2 ((uint32_t)6115)
+
+/* A REAL BUG THIS SHIPPED WITH, and the case that would have caught it:
+ * the refusal counter lived on the PIPER and the close fired on `==`,
+ * while on_new_stream is installed per SESSION and
+ * cloak_client_piper_set_session exists precisely so a piper can outlive
+ * one. So the first session of a piper's life was bounded and every
+ * session after it was not: the counter is already past the ceiling, ==
+ * never matches again, and a hostile server may open unlimited streams,
+ * one permanent stream-table tombstone and one outbound frame each,
+ * forever. The same hole in singleplex, where the piper serves a session
+ * per local connection.
+ *
+ * Two sessions in sequence on one piper, therefore, with the boundary
+ * asserted on BOTH sides of the SECOND one -- the first session's
+ * behaviour is what case 7B already covers. */
+static void test_the_refusal_ceiling_is_per_session(void) {
+    logcap_t lc;
+    ASSERT_EQ_INT(0, logcap_open(&lc));
+
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    client_t cl;
+    cloak_client_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    ASSERT_EQ_INT(0, client_up(&cl, &fx, SID_PERSESS1, &pcfg, 262144));
+
+    /* THE CEILING'S VALUE, PINNED TO A LITERAL. Everything else here is
+     * derived from the symbol, so on its own the constant could be set to
+     * 3 or to 4096 and no assertion would notice -- "a test written
+     * against the symbol it is testing cannot pin that symbol", which
+     * this branch has now paid for twice. */
+    ASSERT_EQ_INT(16, (int)CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS);
+    const size_t K = CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS;
+
+    /* --- session one: spend its entire budget --- */
+    local_peer_t a;
+    ASSERT_EQ_INT(0, lp_open(&a, fx.reactor, cl.local_port));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &a, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    static const uint8_t pa[] = "one";
+    lp_send(&a, pa, sizeof(pa) - 1);
+    struct up_wait uw = {&fx.up, 0, sizeof(pa) - 1};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw, PIPER_MAX_TURNS, PIPER_TURN_MS));
+
+    cloak_session_t *srv1 = cloak_server_registry_find(&fx.registry, fx.uid, SID_PERSESS1);
+    ASSERT_TRUE(srv1 != NULL);
+    if (srv1 == NULL) {
+        lp_destroy(&a);
+        client_down(&cl);
+        fixture_destroy(&fx);
+        logcap_close(&lc);
+        return;
+    }
+    srv1->next_stream_id = 0x60000000u;
+    for (size_t i = 0; i < K; i++) {
+        cloak_stream_t *st = open_rogue(srv1);
+        if (st != NULL) {
+            cloak_session_release_stream(srv1, st);
+        }
+    }
+    struct piper_wait pw0 = {&cl.piper, 0};
+    ASSERT_TRUE(pump_until(fx.reactor, piper_conns_are, &pw0, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    ASSERT_EQ_INT((int)K, (int)cloak_client_piper_rejected_streams(&cl.piper));
+    ASSERT_EQ_INT(1, cl.broken_calls);
+    ASSERT_EQ_INT(1, logcap_count(&lc, LOG_CLOSING));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_at_eof, &a, PIPER_MAX_TURNS, PIPER_TURN_MS));
+
+    /* --- session two, on the SAME piper --- */
+    ASSERT_EQ_INT(0, client_second_session(&cl, &fx, SID_PERSESS2));
+
+    local_peer_t b;
+    ASSERT_EQ_INT(0, lp_open(&b, fx.reactor, cl.local_port));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &b, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    static const uint8_t pb[] = "two";
+    lp_send(&b, pb, sizeof(pb) - 1);
+    struct up_wait uw2 = {&fx.up, 1, sizeof(pb) - 1};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw2, PIPER_MAX_TURNS, PIPER_TURN_MS));
+
+    cloak_session_t *srv2 = cloak_server_registry_find(&fx.registry, fx.uid, SID_PERSESS2);
+    ASSERT_TRUE(srv2 != NULL);
+    if (srv2 == NULL) {
+        lp_destroy(&a);
+        lp_destroy(&b);
+        client_down(&cl);
+        fixture_destroy(&fx);
+        logcap_close(&lc);
+        return;
+    }
+    srv2->next_stream_id = 0x70000000u;
+
+    /* SIDE ONE: the second session gets a FULL budget. With a piper-wide
+     * counter it has none left, so the first of these closes it. */
+    for (size_t i = 0; i + 1 < K; i++) {
+        cloak_stream_t *st = open_rogue(srv2);
+        if (st != NULL) {
+            cloak_session_release_stream(srv2, st);
+        }
+    }
+    struct piper_wait rw = {&cl.piper, K + (K - 1)};
+    ASSERT_TRUE(
+        pump_until(fx.reactor, piper_rejected_streams_at_least, &rw, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    ASSERT_EQ_INT(1, cl.broken_calls);
+    ASSERT_EQ_INT(1, (int)cloak_client_piper_conn_count(&cl.piper));
+    ASSERT_EQ_INT(0, b.eof);
+    /* Its own first log line, too: a second session's first rogue stream
+     * is news rather than a repeat. */
+    ASSERT_EQ_INT(2, logcap_count(&lc, LOG_REFUSING));
+    /* NOT asserted here: that this session is still CARRYING. It is still
+     * open, still counted and its application has not been disconnected,
+     * which is what the boundary is about. A round trip immediately after
+     * a burst of fifteen refusals did not complete within this file's
+     * bound -- reproducibly, with the relay itself healthy (relaying, not
+     * paused, registered READABLE, its peer's bytes sitting unread in the
+     * socket) -- so asserting it here would have been asserting something
+     * this case does not control. It is recorded as an open question
+     * rather than papered over; see this task's report.
+     *
+     * Side two below is unaffected: it is about the refusal path, which
+     * demonstrably keeps working across all sixteen. */
+
+    /* SIDE TWO: and it is still BOUNDED -- the Kth refusal closes it. A
+     * piper-wide counter past the ceiling never fires again, which is the
+     * unbounded amplification the ceiling exists to prevent. */
+    cloak_stream_t *last = open_rogue(srv2);
+    if (last != NULL) {
+        cloak_session_release_stream(srv2, last);
+    }
+    ASSERT_TRUE(pump_until(fx.reactor, piper_conns_are, &pw0, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    ASSERT_EQ_INT((int)(2u * K), (int)cloak_client_piper_rejected_streams(&cl.piper));
+    ASSERT_EQ_INT(2, cl.broken_calls);
+    ASSERT_EQ_INT(2, logcap_count(&lc, LOG_CLOSING));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_at_eof, &b, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    ASSERT_EQ_INT(1, b.eof);
+    ASSERT_EQ_INT(0, (int)cloak_client_piper_conn_count(&cl.piper));
+
+    lp_destroy(&a);
+    lp_destroy(&b);
+    client_down(&cl);
+    fixture_destroy(&fx);
+    logcap_close(&lc);
 }
 
 /* ---- case 8: max_local_conns ------------------------------------------- */
@@ -2519,6 +2730,7 @@ test_stream_end_closes_the_local_socket();
 test_a_broken_session_stops_every_relay();
 test_server_opened_streams_are_refused();
 test_refusals_are_bounded();
+test_the_refusal_ceiling_is_per_session();
 test_the_local_connection_cap();
 test_a_start_that_can_never_succeed_is_given_up_on();
 test_the_first_read_is_clamped_to_one_frame();

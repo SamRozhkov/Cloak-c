@@ -557,18 +557,48 @@ static void piper_on_local_readable(cloak_reactor_t *r, int fd, uint32_t events,
  * inactivity timeout from ever retiring it, both under a remote peer's
  * control) and why tearing the whole session down is worse than absorbing
  * it. */
+/* The singleplex context that OWNS sesh, or NULL when sesh is the shared
+ * one (or is not this piper's at all). It is what makes the refusal
+ * ceiling per SESSION: the counter lives next to the thing it bounds.
+ *
+ * A linear scan, for the same reason every other scan in this file is
+ * one: this list holds one entry per live local connection and this runs
+ * only when a server has done something no correct server does. */
+static cloak_client_piper_conn_t *piper_session_owner(cloak_client_piper_t *pp,
+                                                      const cloak_session_t *sesh) {
+    for (cloak_client_piper_conn_t *ctx = pp->conns; ctx != NULL; ctx = ctx->next) {
+        if (ctx->own_sesh && ctx->sesh == sesh) {
+            return ctx;
+        }
+    }
+    return NULL;
+}
+
 static void piper_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, void *userdata) {
     cloak_client_piper_t *pp = userdata;
     if (pp == NULL || sesh == NULL || stream == NULL) {
         return;
     }
-    pp->rejected_streams++;
-    if (!pp->logged_rejected_stream) {
-        pp->logged_rejected_stream = 1;
+
+    /* THE COUNT THE CEILING IS CHECKED AGAINST IS THIS SESSION'S, not
+     * this piper's. The tombstone each refusal costs lives in ONE
+     * session's stream table, and a piper-wide counter is spent once and
+     * never refilled -- which would leave every session after the
+     * sixteenth entirely unbounded, in exactly the mode (singleplex) that
+     * creates sessions most often. See
+     * CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS. */
+    cloak_client_piper_conn_t *owner = piper_session_owner(pp, sesh);
+    size_t *count = owner != NULL ? &owner->rejected_streams : &pp->shared_rejected_streams;
+    int *logged = owner != NULL ? &owner->logged_rejected_stream : &pp->logged_rejected_stream;
+
+    pp->rejected_streams++; /* the lifetime total, for diagnostics only */
+    (*count)++;
+    if (!*logged) {
+        *logged = 1;
         CLOAK_LOGW("client piper: the server opened a stream toward this client -- refusing. "
                    "Every stream in this protocol is client-initiated, so this is a server bug "
-                   "or a server that is not the one we think it is; further occurrences are "
-                   "counted but not logged");
+                   "or a server that is not the one we think it is; further occurrences on this "
+                   "session are counted but not logged");
     }
     /* Legal from within on_new_stream (cloak/session.h), and it performs
      * the active close itself, so the far end learns immediately rather
@@ -590,11 +620,14 @@ static void piper_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, v
      * The close defers its teardown to the reactor, which fires on_broken,
      * which is this module's own walk -- so every local connection is torn
      * down through exactly one path, as always. */
-    if (pp->rejected_streams == CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS) {
-        CLOAK_LOGW("client piper: %zu streams opened toward this client and refused -- closing "
-                   "the session. A server doing this is hostile or broken, and it could close "
-                   "this session itself at any time anyway",
-                   pp->rejected_streams);
+    /* >= rather than ==: an exact-equality trigger is one miscount away
+     * from never firing at all, and the failure mode of never firing is
+     * the unbounded amplification this whole branch exists to prevent. */
+    if (*count >= CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS) {
+        CLOAK_LOGW("client piper: %zu streams opened toward this client on one session and "
+                   "refused -- closing that session. A server doing this is hostile or broken, "
+                   "and it could close the session itself at any time anyway",
+                   *count);
         (void)cloak_session_close(sesh);
     }
 }
@@ -820,6 +853,14 @@ void cloak_client_piper_set_session(cloak_client_piper_t *pp, cloak_session_t *s
         return;
     }
     pp->sesh = sesh;
+    /* A DIFFERENT SESSION GETS A FRESH BUDGET AND A FRESH FIRST LOG LINE.
+     * Both are scoped to a session -- the tombstones the ceiling bounds
+     * live in one session's table -- so carrying them across a reconnect
+     * would leave the replacement session with the ceiling already spent
+     * and therefore unbounded. The lifetime total is deliberately not
+     * reset; it is diagnostics. */
+    pp->shared_rejected_streams = 0;
+    pp->logged_rejected_stream = 0;
 }
 
 void cloak_client_piper_on_accept(cloak_listener_t *l, int fd, void *userdata) {

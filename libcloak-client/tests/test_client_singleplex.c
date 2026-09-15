@@ -48,6 +48,7 @@
 #include "cloak/registry.h"
 #include "cloak/server.h"
 #include "cloak/session.h"
+#include "cloak/switchboard.h"
 #include "cloak/stream.h"
 #include "cloak/usermanager.h"
 #include "cloak/userpanel.h"
@@ -1706,6 +1707,97 @@ static void test_a_dying_session_leaves_the_other_alone(void) {
     fixture_destroy(&fx);
 }
 
+/* ---- case 9: a dying session leaves a HANDSHAKING connection alone ------ */
+
+#define SID_WAITSURV ((uint32_t)7901)
+
+/* THE CLAIM THE BROKEN WALK MAKES that nothing pinned: it tears down the
+ * contexts bound to the session that died and leaves every other context
+ * "entirely alone". Case 7 proves that for a neighbour whose session is
+ * LIVE. The neighbour this case uses is the one singleplex actually
+ * creates most often and the one the walk is most likely to catch by
+ * accident: a connection whose own session is still BEING BROUGHT UP, so
+ * its ctx->sesh is NULL and it matches nothing the walk should match.
+ *
+ * Mutating the walk to `ctx->sesh == sesh || ctx->awaiting_session`
+ * passed all three suites before this case existed -- and that mutation
+ * is exactly the failure singleplex exists to prevent, since it makes one
+ * session's death kill every connection that happened to be handshaking
+ * at that moment. */
+static void test_a_dying_session_leaves_a_handshaking_one_alone(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    sx_t sx;
+    cloak_client_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    ASSERT_EQ_INT(0, sx_up(&sx, &fx, 1, SID_WAITSURV, &pcfg));
+
+    /* A: a complete, live singleplex session. */
+    local_peer_t a;
+    ASSERT_EQ_INT(0, lp_open(&a, fx.reactor, sx.local_port));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &a, SX_MAX_TURNS, SX_TURN_MS));
+    static const uint8_t pa[] = {0x0a, 0x0b, 0x0c};
+    sx_round_trip(&fx, &a, pa, sizeof(pa));
+
+    /* B: held inside its own bring-up -- new_session has been called and
+     * answered neither way, so B's context is awaiting_session with a
+     * NULL sesh. */
+    sx.hold_next = 1;
+    local_peer_t b;
+    ASSERT_EQ_INT(0, lp_open(&b, fx.reactor, sx.local_port));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &b, SX_MAX_TURNS, SX_TURN_MS));
+    static const uint8_t pb[] = {0x1a, 0x1b, 0x1c, 0x1d};
+    lp_send(&b, pb, sizeof(pb));
+    struct sx_int_wait nw = {&sx.new_session_calls, 2};
+    ASSERT_TRUE(pump_until(fx.reactor, sx_int_is, &nw, SX_MAX_TURNS, SX_TURN_MS));
+
+    struct piper_wait pw = {&sx.piper, 2};
+    ASSERT_TRUE(pump_until(fx.reactor, piper_conns_are, &pw, SX_MAX_TURNS, SX_TURN_MS));
+    /* Exactly one stream: A's. B has no session, so no stream. */
+    ASSERT_EQ_INT(1, (int)cloak_client_piper_stream_count(&sx.piper));
+    ASSERT_EQ_INT(0, sx.cancel_calls);
+
+    /* Kill A's session in the one way that reaches the on_broken window
+     * with the relay still bound (see case 7's own note on why an
+     * ordinary per-stream close does not). */
+    ASSERT_EQ_INT(0, cloak_session_close(&sx.sessions[0].sesh));
+    struct sx_int_wait dw = {&sx.sessions_destroyed, 1};
+    ASSERT_TRUE(pump_until(fx.reactor, sx_int_is, &dw, SX_MAX_TURNS, SX_TURN_MS));
+
+    /* THE ASSERTIONS THAT CARRY THIS CASE. At the instant A's chain ran,
+     * B's context was still there -- and, the sharper half, the owner was
+     * never told to forget B's bring-up. cancel_session firing is what a
+     * walk that swept awaiting_session contexts would produce, and it is
+     * observable even though B's context count alone might not be. */
+    ASSERT_EQ_INT(1, (int)sx.sessions[0].conns_at_broken);
+    ASSERT_EQ_INT(0, (int)sx.sessions[0].streams_at_broken);
+    ASSERT_EQ_INT(0, sx.cancel_calls);
+    ASSERT_EQ_INT(1, (int)cloak_client_piper_conn_count(&sx.piper));
+    ASSERT_EQ_INT(0, b.eof);
+
+    ASSERT_TRUE(pump_until(fx.reactor, lp_at_eof, &a, SX_MAX_TURNS, SX_TURN_MS));
+    ASSERT_EQ_INT(1, a.eof);
+
+    /* AND B COMPLETES NORMALLY once its bring-up is released -- still
+     * counted is not the same as still working, and the bytes it sent
+     * before its session existed are the ones that arrive. */
+    sx_release_held(&sx);
+    struct lp_wait lw = {&b, sizeof(pb)};
+    ASSERT_TRUE(pump_until(fx.reactor, lp_has_len, &lw, SX_MAX_TURNS, SX_TURN_MS));
+    uint8_t want[sizeof(pb)];
+    xor_fill(want, pb, sizeof(pb));
+    ASSERT_EQ_INT((int)sizeof(pb), (int)b.in_len);
+    ASSERT_MEM_EQ(b.in, want, sizeof(pb));
+    ASSERT_EQ_INT(0, sx.cancel_calls);
+    ASSERT_EQ_INT(1, (int)cloak_client_piper_stream_count(&sx.piper));
+
+    lp_destroy(&a);
+    lp_destroy(&b);
+    sx_down(&sx);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
 test_singleplex_gives_each_connection_its_own_session();
 test_each_session_dies_with_its_own_connection();
@@ -1714,5 +1806,6 @@ test_without_singleplex_two_connections_share_one_session();
 test_a_connection_waiting_for_its_session_pins_nothing();
 test_the_deadline_bounds_the_session_wait();
 test_a_dying_session_leaves_the_other_alone();
+test_a_dying_session_leaves_a_handshaking_one_alone();
 test_singleplex_config_contracts();
 TEST_MAIN_END()

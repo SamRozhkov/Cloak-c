@@ -75,6 +75,18 @@
  * pick a different server between rounds. Not buried here, where its only
  * observable effect is that nothing ever happens.
  *
+ * AND THAT OUTER LOOP MUST USE A FRESH SESSION ID AND BACK OFF BETWEEN
+ * ROUNDS. One connection exhausting its attempts fails the whole
+ * invocation immediately, abandoning the N-1 sockets that DID
+ * authenticate -- and the server holds the session those sockets joined
+ * until its own inactivity timeout expires. Retrying under the same
+ * session id would then attach to a half-dead server-side session;
+ * retrying without a delay, on a flaky network, multiplies server-side
+ * sessions per client. Go never meets this because it never gives up:
+ * its goroutine keeps retrying that one connection forever, so the
+ * session id it was built with stays the right one. A caller that bounds
+ * the attempts inherits the obligation.
+ *
  * THE BOUND: 5 attempts per connection. The failures this retry loop
  * exists to survive are transient at the scale of seconds -- a DHCP
  * renewal or Wi-Fi roam between association and route (typically under
@@ -215,7 +227,19 @@ typedef struct {
     cloak_addr_t remote;
 
     /* How many underlying connections this session gets. 1 to
-     * CLOAK_CLIENT_CONNECTOR_MAX_CONN. Go's NumConn. */
+     * CLOAK_CLIENT_CONNECTOR_MAX_CONN. Go's NumConn.
+     *
+     * WHAT MORE THAN ONE BUYS, because the obvious reading is wrong and
+     * an operator choosing this number deserves the right one: NumConn >
+     * 1 buys THROUGHPUT and traffic spreading -- one stream's frames are
+     * distributed over the pool, so no single TCP connection's congestion
+     * window bounds the session, and an observer sees several ordinary
+     * flows instead of one long one. It does NOT buy REDUNDANCY. A single
+     * connection failing is fatal to the WHOLE session, in this port and
+     * in Go alike (internal/multiplex/switchboard.go closes the session
+     * when any connection errors), so N connections means N chances to
+     * lose the session rather than N-1 spares. This was confirmed against
+     * the reference rather than assumed. */
     int num_conn;
 
     /* Storage for the session, owned by the caller, untouched unless and

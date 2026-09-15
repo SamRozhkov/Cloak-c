@@ -1805,7 +1805,6 @@ static void test_one_underlying_connection_dying_kills_the_session(void) {
     ASSERT_EQ_INT(0, cl.broken_calls);
     ASSERT_EQ_INT(0, cl.sesh.closed);
 
-    size_t survivor_mark = sh->conns[1].c2s_bytes;
     cl.probe_shim = sh;
     cl.probe_idx = 1;
 
@@ -1829,7 +1828,12 @@ static void test_one_underlying_connection_dying_kills_the_session(void) {
     ASSERT_EQ_INT(0, cl.survivor_eof_at_broken);
     ASSERT_TRUE(cl.survivor_sfd_at_broken >= 0);
     ASSERT_EQ_INT(0, sh->conns[1].killed);
-    ASSERT_TRUE(sh->conns[1].c2s_bytes >= survivor_mark);
+    /* No "the survivor carried at least as many bytes as before" check
+     * here: c2s_bytes only ever rises and the mark was sampled moments
+     * earlier, so such a line cannot fail -- the same vacuous shape as
+     * the `accept_count >= idx` predicate this branch already recorded
+     * once. The two samples above, taken INSIDE the broken callback, are
+     * this case's real witnesses. */
     /* The pool was never drained either -- but see pool_conns_at_broken's
      * own comment: the array does not shrink, so this is the weaker
      * companion to the two samples above, not a substitute for them. */
