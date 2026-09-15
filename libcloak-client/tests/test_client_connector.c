@@ -109,11 +109,52 @@
 
 typedef int (*pump_done_fn)(void *ctx);
 
+/* Local to pump_until so that files which define their own monotonic_ms
+ * later (or not at all) both work; see pump_until's own comment. */
+static uint64_t pump_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* Pumps the reactor until done(ctx) is true, bounded by REAL TIME:
+ * max_iters * per_iter_ms milliseconds, which is what every caller's
+ * (turns, ms-per-turn) pair was always documented to mean. Returns 1 if
+ * done became true, 0 if the budget ran out.
+ *
+ * THE BOUND IS WALL-CLOCK AND NOT AN ITERATION COUNT, and that
+ * distinction is a defect these suites already paid for.
+ * cloak_reactor_run_once blocks for its full per_iter_ms only when
+ * NOTHING is ready; one permanently-ready descriptor makes every turn
+ * return immediately and a loop of max_iters turns then expires in
+ * milliseconds. The usual such descriptor is an EOF-readable peer left
+ * registered after a teardown: its handler reads 0, then re-arms
+ * edge-triggered interest, and the hangup is re-reported every single
+ * turn. Measured on this branch: a caller asking for "2000 turns of 1 ms"
+ * and believing it had asked for two seconds got 4.2 ms, with a dispatch
+ * histogram showing exactly two such fds serviced 2000 times each and
+ * nothing else in between. Every wait in these suites was one busy
+ * descriptor away from a false negative, and one of them had already
+ * become one -- see case 7D's neighbours in test_client_piper.c.
+ *
+ * THE ITERATION CEILING IS A BACKSTOP AGAINST A CLOCK THAT DOES NOT
+ * ADVANCE, sized so it cannot bind first: a busy descriptor spins at
+ * roughly 600k turns per second and this sits about forty times above
+ * that, which is how pump_for_ms sizes its own ceiling for the same
+ * reason. Do not shrink it back toward the spin rate; that turns this
+ * back into an iteration bound wearing a clock. */
 static int pump_until(cloak_reactor_t *r, pump_done_fn done, void *ctx, int max_iters,
                       int per_iter_ms) {
-    for (int i = 0; i < max_iters; i++) {
+    uint64_t budget_ms = (uint64_t)(max_iters > 0 ? max_iters : 0) *
+                         (uint64_t)(per_iter_ms > 0 ? per_iter_ms : 0);
+    uint64_t start = pump_monotonic_ms();
+    uint64_t ceiling = budget_ms * 1000u + 5000000u;
+    for (uint64_t i = 0; i < ceiling; i++) {
         if (done(ctx)) {
             return 1;
+        }
+        if (pump_monotonic_ms() - start >= budget_ms) {
+            break;
         }
         cloak_reactor_run_once(r, per_iter_ms);
     }

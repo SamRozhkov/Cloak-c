@@ -74,11 +74,52 @@
 
 typedef int (*pump_done_fn)(void *ctx);
 
+/* Local to pump_until so that files which define their own monotonic_ms
+ * later (or not at all) both work; see pump_until's own comment. */
+static uint64_t pump_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* Pumps the reactor until done(ctx) is true, bounded by REAL TIME:
+ * max_iters * per_iter_ms milliseconds, which is what every caller's
+ * (turns, ms-per-turn) pair was always documented to mean. Returns 1 if
+ * done became true, 0 if the budget ran out.
+ *
+ * THE BOUND IS WALL-CLOCK AND NOT AN ITERATION COUNT, and that
+ * distinction is a defect these suites already paid for.
+ * cloak_reactor_run_once blocks for its full per_iter_ms only when
+ * NOTHING is ready; one permanently-ready descriptor makes every turn
+ * return immediately and a loop of max_iters turns then expires in
+ * milliseconds. The usual such descriptor is an EOF-readable peer left
+ * registered after a teardown: its handler reads 0, then re-arms
+ * edge-triggered interest, and the hangup is re-reported every single
+ * turn. Measured on this branch: a caller asking for "2000 turns of 1 ms"
+ * and believing it had asked for two seconds got 4.2 ms, with a dispatch
+ * histogram showing exactly two such fds serviced 2000 times each and
+ * nothing else in between. Every wait in these suites was one busy
+ * descriptor away from a false negative, and one of them had already
+ * become one -- see case 7D's neighbours in test_client_piper.c.
+ *
+ * THE ITERATION CEILING IS A BACKSTOP AGAINST A CLOCK THAT DOES NOT
+ * ADVANCE, sized so it cannot bind first: a busy descriptor spins at
+ * roughly 600k turns per second and this sits about forty times above
+ * that, which is how pump_for_ms sizes its own ceiling for the same
+ * reason. Do not shrink it back toward the spin rate; that turns this
+ * back into an iteration bound wearing a clock. */
 static int pump_until(cloak_reactor_t *r, pump_done_fn done, void *ctx, int max_iters,
                       int per_iter_ms) {
-    for (int i = 0; i < max_iters; i++) {
+    uint64_t budget_ms = (uint64_t)(max_iters > 0 ? max_iters : 0) *
+                         (uint64_t)(per_iter_ms > 0 ? per_iter_ms : 0);
+    uint64_t start = pump_monotonic_ms();
+    uint64_t ceiling = budget_ms * 1000u + 5000000u;
+    for (uint64_t i = 0; i < ceiling; i++) {
         if (done(ctx)) {
             return 1;
+        }
+        if (pump_monotonic_ms() - start >= budget_ms) {
+            break;
         }
         cloak_reactor_run_once(r, per_iter_ms);
     }
@@ -2321,18 +2362,39 @@ static void test_the_refusal_ceiling_is_per_session(void) {
     /* Its own first log line, too: a second session's first rogue stream
      * is news rather than a repeat. */
     ASSERT_EQ_INT(2, logcap_count(&lc, LOG_REFUSING));
-    /* NOT asserted here: that this session is still CARRYING. It is still
-     * open, still counted and its application has not been disconnected,
-     * which is what the boundary is about. A round trip immediately after
-     * a burst of fifteen refusals did not complete within this file's
-     * bound -- reproducibly, with the relay itself healthy (relaying, not
-     * paused, registered READABLE, its peer's bytes sitting unread in the
-     * socket) -- so asserting it here would have been asserting something
-     * this case does not control. It is recorded as an open question
-     * rather than papered over; see this task's report.
+    /* AND IT IS STILL CARRYING -- the half of the boundary that says the
+     * survivors survived usefully, not merely that they were counted.
      *
-     * Side two below is unaffected: it is about the refusal path, which
-     * demonstrably keeps working across all sixteen. */
+     * THIS ASSERTION WAS DROPPED ONCE, on a diagnosis that turned out to
+     * be wrong in both of its halves, and the correction is worth keeping
+     * because the wrong version was persuasive. It was recorded as "a
+     * round trip after fifteen refusals never completes, with the relay
+     * healthy and its peer's bytes sitting unread" and blamed on the
+     * reactor's fd-recycling path. Neither part held. The bytes were
+     * never unread: the relay took its readable edge immediately and
+     * cloak_stream_write accepted all of them -- session_send_queued == 0
+     * means everything reached the kernel, not that nothing was written.
+     * And nothing stalled: the round trip completed every time, in 36-40
+     * ms, which is Nagle holding a small frame behind an un-acknowledged
+     * one (case 7D now pins that, and TCP_NODELAY removes it).
+     *
+     * WHAT MADE IT LOOK PERMANENT WAS THIS CASE, not the reactor: it is
+     * the only case that tears a whole session down and then keeps
+     * pumping, so it is the only one that leaves EOF-readable descriptors
+     * registered (local peer `a`, and the fake upstream's first
+     * connection). Those spin pump_until's turns at ~600k/s, which
+     * collapsed its nominal 2 s into 4.2 ms -- far under the 36 ms it was
+     * waiting for. Case 7 does the same two refusals and the same round
+     * trip and passed throughout, because it has no torn-down session
+     * spinning beside it. With pump_until bounded by the clock, the
+     * assertion holds. The threshold was also two refusals, never
+     * fifteen; fifteen is just where this case happened to look. */
+    static const uint8_t pb2[] = "still carrying";
+    const size_t pb2_len = sizeof(pb2) - 1;
+    lp_send(&b, pb2, pb2_len);
+    struct up_wait uw3 = {&fx.up, 1, (sizeof(pb) - 1) + pb2_len};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw3, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    ASSERT_MEM_EQ(fx.up.conns[1].in + sizeof(pb) - 1, pb2, pb2_len);
 
     /* SIDE TWO: and it is still BOUNDED -- the Kth refusal closes it. A
      * piper-wide counter past the ceiling never fires again, which is the
