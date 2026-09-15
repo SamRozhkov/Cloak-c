@@ -49,8 +49,11 @@ static int64_t connector_now(const cloak_client_connector_t *c) {
     return (int64_t)time(NULL);
 }
 
-/* D2's backoff: base * 2^(attempt-1), capped, then a random reduction of
- * up to half.
+/* D2's backoff: base * 2^(attempt-1), capped, then jittered by +/-25%
+ * AROUND that value -- symmetric, so the mean is the nominal interval and
+ * the schedule the header documents is the schedule that happens. See
+ * cloak/client_connector.h for why the jitter exists at all (a
+ * thundering-herd argument, and only that) and why it is not one-sided.
  *
  * The jitter draws a single byte and scales, rather than reducing a wide
  * random value modulo the interval: the quantity being randomised is a
@@ -68,8 +71,9 @@ static uint64_t backoff_ms(const cloak_client_connector_t *c, int attempt) {
     }
     uint8_t r = 0;
     cloak_random_bytes(&r, 1);
-    /* Subtract between 0 and just under half the interval. */
-    return delay - (delay / 2u) * (uint64_t)r / 256u;
+    /* [delay - delay/4, delay + delay/4), centred on delay. */
+    uint64_t span = delay / 4u;
+    return delay - span + (2u * span) * (uint64_t)r / 256u;
 }
 
 /* Releases everything one connection holds. Idempotent, and the ONLY
@@ -264,13 +268,6 @@ static void on_handshake_done(cloak_client_handshake_t *h,
             return;
         }
         memcpy(conn->key, key, CLOAK_AEAD_KEY_LEN);
-        if (c->key_hook != NULL) {
-            /* TEST SEAM ONLY -- see cloak_client_connector_key_hook_fn.
-             * Placed here, between recovering the key and comparing it,
-             * because that is the only point at which a disagreement can
-             * be injected without also breaking the handshake itself. */
-            c->key_hook(conn->index, conn->key, c->key_hook_userdata);
-        }
         conn->have_key = 1;
         conn->done = 1;
         c->completed++;
@@ -292,6 +289,16 @@ static void on_handshake_done(cloak_client_handshake_t *h,
      * cloak_client_connector_conn_t::browser, and it is load-bearing:
      * this port's Chrome ClientHello is 1720 bytes and some networks drop
      * a first packet over 1500. Do not remove this as superstition. */
+    /* The transport conjunct CANNOT currently be false: cloak_client_connector_init
+     * rejects every non-direct transport, so a CDN connector never exists
+     * to reach this line. It is kept, and annotated rather than deleted,
+     * for the same reason cloak/client_transport.h keeps its third reply
+     * bound -- it guards the CONFIGURATION SPACE, not the wire, and it is
+     * the half of Go's condition that stops being vacuous the day a
+     * WebSocket transport lands (a CDN's first packet is an HTTP upgrade,
+     * not a ClientHello, so falling back on it would be meaningless).
+     * Structurally dead today; not superstition, and not removable
+     * without also removing the note in init that pairs with it. */
     if (c->transport == CLOAK_TRANSPORT_DIRECT && conn->browser == CLOAK_CLIENT_BROWSER_CHROME) {
         conn->browser = CLOAK_CLIENT_BROWSER_FIREFOX;
     }
@@ -442,6 +449,9 @@ int cloak_client_connector_init(cloak_client_connector_t *c,
     if (cfg->transport != CLOAK_TRANSPORT_DIRECT) {
         return -1;
     }
+    /* NOTE, paired with on_handshake_done's D3 guard: this rejection is
+     * what makes that guard's transport conjunct structurally unreachable.
+     * If this ever admits another transport, that conjunct becomes live. */
     /* Checked here rather than left to cloak_client_handshake_init, which
      * would report it once per attempt as a non-retryable handshake
      * failure. An over-long SNI is a configuration error and says so. */
@@ -484,8 +494,6 @@ int cloak_client_connector_init(cloak_client_connector_t *c,
     c->now_fn = cfg->now_fn;
     c->now_userdata = cfg->now_userdata;
     c->session_template = cfg->session_template;
-    c->key_hook = cfg->key_hook;
-    c->key_hook_userdata = cfg->key_hook_userdata;
     c->on_done = cfg->on_done;
     c->on_done_userdata = cfg->on_done_userdata;
 

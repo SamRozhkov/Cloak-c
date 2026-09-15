@@ -43,8 +43,36 @@
  * EVERY WAIT IS A BOUNDED pump_until, the discipline every reactor test
  * in this tree states. */
 
+/* THE IMPLEMENTATION IS COMPILED INTO THIS TEST, not linked from
+ * libcloak-client.a.
+ *
+ * WHY. D4's key check can only be exercised by making two connections
+ * disagree, and the only honest way to do that is to reach into the
+ * connector's own per-connection state between the moment a key is
+ * recorded and the moment the keys are compared. The first version of
+ * this file bought that with a `key_hook` function pointer in the PUBLIC
+ * config struct -- i.e. it shipped a live "corrupt the session key" hook
+ * in production code, in a program whose users are targets, guarded by
+ * nothing but a NULL check and a comment. That is not a trade worth
+ * making for test access.
+ *
+ * Including the translation unit gives the same forcing power with no
+ * production surface at all: this file IS client_connector.c's
+ * translation unit, so writing to c->conns[i].key here does not violate
+ * the header's "nothing outside client_connector.c may write to any
+ * field" rule -- it is inside it.
+ *
+ * The archive still supplies client_transport.c and client_auth.c. It
+ * does NOT supply client_connector.c.o: a static archive member is only
+ * pulled in to resolve an undefined symbol, every connector symbol is
+ * already defined here, and nothing else in libcloak-client.a or
+ * libcloak-server.a references one.
+ *
+ * Mutations to libcloak-client/src/client_connector.c are therefore still
+ * what this file tests -- it is the same file, compiled once more. */
+#include "../src/client_connector.c"
+
 #include "cloak/base64.h"
-#include "cloak/client_connector.h"
 #include "cloak/conn.h"
 #include "cloak/crypto.h"
 #include "cloak/dispatcher.h"
@@ -141,7 +169,7 @@ static void pump_for_ms(cloak_reactor_t *r, uint64_t ms) {
 static int count_open_fds(void) {
     DIR *d = opendir("/proc/self/fd");
     if (d == NULL) {
-        return -1;
+        return -1; /* every caller asserts this did not happen */
     }
     int n = 0;
     while (readdir(d) != NULL) {
@@ -513,6 +541,13 @@ typedef struct gate {
      * MTU, which this port's 1720-byte Chrome ClientHello exceeds and its
      * 658-byte Firefox one does not. */
     int max_first_record;
+    /* The size check applies only to the first size_check_first accepted
+     * connections; later ones are forwarded whatever their size. That is
+     * what lets one connection of a session hit the oversized-ClientHello
+     * drop while another does not, which is the only way to observe that
+     * D3's fallback really is PER CONNECTION. 0 with max_first_record set
+     * means "check everything". */
+    int size_check_first;
 
     int accepts;
     int refused;
@@ -628,7 +663,7 @@ static void gate_on_accept(cloak_listener_t *l, int fd, void *userdata) {
         return; /* held open, never registered, never answered */
     }
 
-    if (g->max_first_record > 0) {
+    if (g->max_first_record > 0 && (g->size_check_first == 0 || idx < g->size_check_first)) {
         if (cloak_reactor_add_fd(g->reactor, fd, CLOAK_REACTOR_READABLE, gate_on_inspect, gc) !=
             0) {
             close(fd);
@@ -640,6 +675,21 @@ static void gate_on_accept(cloak_listener_t *l, int fd, void *userdata) {
     }
 
     gate_forward(gc);
+}
+
+/* Forwards every connection the gate has been holding stalled. The
+ * teardown and key-disagreement cases use this to control exactly WHEN
+ * the last connection of a session completes, which is the only way to
+ * get a foothold between "some connections have recorded their key" and
+ * "the keys are compared". */
+static void gate_release_stalled(gate_t *g) {
+    for (int i = 0; i < g->nslots; i++) {
+        gate_conn_t *gc = &g->conns[i];
+        if (gc->stalled && gc->client_fd >= 0) {
+            gc->stalled = 0;
+            gate_forward(gc);
+        }
+    }
 }
 
 static int gate_open(gate_t *g, cloak_reactor_t *r, int front_tcp_port) {
@@ -711,19 +761,6 @@ static void conn_done(cloak_client_connector_t *c, cloak_client_connector_status
 static int conn_fired(void *ctx) {
     conn_result_t *res = ctx;
     return res->calls > 0;
-}
-
-typedef struct {
-    int calls;
-    int corrupt_index; /* -1 corrupts nothing */
-} key_hook_ctx_t;
-
-static void key_hook(int conn_index, uint8_t key[CLOAK_AEAD_KEY_LEN], void *userdata) {
-    key_hook_ctx_t *k = userdata;
-    k->calls++;
-    if (conn_index == k->corrupt_index) {
-        key[0] = (uint8_t)(key[0] ^ 0x01u);
-    }
 }
 
 /* Fills cfg with everything every case here shares. The caller overrides
@@ -1037,88 +1074,204 @@ static void test_connector_gives_up_after_the_attempt_bound(void) {
 
 #define SID_KEYBAD ((uint32_t)5105)
 #define SID_KEYOK ((uint32_t)5106)
+#define SID_KEYFAR ((uint32_t)5114)
 
-/* BOTH SIDES OF THE BOUNDARY, in one case, because a test that only
- * showed the corrupt key failing would also pass if the mere PRESENCE of
- * the hook broke the session.
+struct completed_wait {
+    cloak_client_connector_t *c;
+    int want;
+};
+
+static int completed_is(void *ctx) {
+    struct completed_wait *w = ctx;
+    return w->c->completed >= w->want;
+}
+
+/* Runs one connector of num_conn connections through a gate that holds
+ * the LAST connection to arrive, waits until every other connection has
+ * recorded its key, then corrupts the key of the connection at
+ * victim_slot -- counted over the connections that have already finished,
+ * from the highest index down -- and lets the last one through.
  *
- * Part A installs the hook and corrupts connection 1's recovered key:
- * the connector must refuse the whole session with
- * CLOAK_CLIENT_CONNECTOR_ERR_KEY_MISMATCH, rather than doing what Go does
- * -- store each key into an atomic and use whichever landed last, which
- * here would produce a live session whose obfuscator is wrong for one of
- * its two connections.
+ * WHY THE FOOTHOLD IS NEEDED. The keys are compared the instant the last
+ * handshake completes, inside one reactor turn, so there is no moment
+ * between turns at which a test could reach in. Stalling one connection
+ * at the gate creates that moment: N-1 keys are recorded and nothing has
+ * been compared yet.
  *
- * Part B installs the SAME hook, corrupting nothing, and the session must
- * come up. */
+ * victim_index_out reports which connector index was actually corrupted,
+ * because the mapping from connector index to gate accept order is not
+ * guaranteed and this test does not assume one. */
+static int force_key_disagreement(struct fixture *fx, gate_t *gate, cloak_client_connector_t *c,
+                                  conn_result_t *res, int num_conn, int min_victim_index,
+                                  int *victim_index_out) {
+    struct completed_wait cw = {c, num_conn - 1};
+    if (!pump_until(fx->reactor, completed_is, &cw, CONN_MAX_TURNS, CONN_TURN_MS)) {
+        ASSERT_TRUE(0);
+        return -1;
+    }
+    ASSERT_EQ_INT(num_conn - 1, c->completed);
+    ASSERT_EQ_INT(0, res->calls); /* nothing compared, nothing reported */
+
+    /* The highest-indexed connection that has already recorded a key. */
+    int victim = -1;
+    for (int i = num_conn - 1; i >= 0; i--) {
+        if (c->conns[i].done) {
+            victim = i;
+            break;
+        }
+    }
+    ASSERT_TRUE(victim >= min_victim_index);
+    if (victim < min_victim_index) {
+        return -1;
+    }
+    c->conns[victim].key[0] = (uint8_t)(c->conns[victim].key[0] ^ 0x01u);
+    *victim_index_out = victim;
+
+    gate_release_stalled(gate);
+    ASSERT_TRUE(pump_until(fx->reactor, conn_fired, res, CONN_MAX_TURNS, CONN_TURN_MS));
+    return 0;
+}
+
+/* THREE PARTS, because two of them alone pin nothing.
+ *
+ * Part A is the basic claim: two connections, one key corrupted, and the
+ * connector refuses the whole session rather than doing what Go does --
+ * store each key into an atomic and use whichever landed last, which here
+ * would produce a live session whose obfuscator is wrong for one of its
+ * two connections.
+ *
+ * Part B is the other side of the boundary: the same machinery, the same
+ * stall-and-release, nothing corrupted, and the session must come up.
+ * Without it, an implementation that broke whenever a connection was
+ * stalled would pass part A.
+ *
+ * PART C IS THE ONE THAT ACTUALLY PINS D4. At num_conn == 2 every wrong
+ * implementation coincides with the right one: "compare all N" and
+ * "compare conns[1] against conns[0]" are the same program. Part C runs
+ * four connections and corrupts one at index >= 2, so a keys_agree
+ * narrowed to the first pair -- a weakening, not a deletion, and exactly
+ * the mutation a careless refactor produces -- lets a mismatched session
+ * through and fails here. This is the module's headline divergence from
+ * the reference; a test that could not tell those two implementations
+ * apart would not be testing it. */
 static void test_connector_rejects_a_key_disagreement(void) {
-    /* ---- A: one connection's key is corrupted ---- */
+    /* ---- A: two connections, one corrupted ---- */
     {
         struct fixture fx;
         ASSERT_EQ_INT(0, fixture_init(&fx));
 
+        gate_t gate;
+        ASSERT_EQ_INT(0, gate_open(&gate, fx.reactor, front_port(&fx)));
+        gate.stall_from = 1; /* hold the second connection to arrive */
+
         cloak_session_t sesh;
         conn_result_t res;
         memset(&res, 0, sizeof(res));
-        key_hook_ctx_t hook = {0, 1};
 
         cloak_client_connector_config_t cfg;
-        connector_config(&cfg, &fx, &sesh, SID_KEYBAD, front_port(&fx), &res);
+        connector_config(&cfg, &fx, &sesh, SID_KEYBAD, cloak_listener_port(&gate.l), &res);
         cfg.num_conn = 2;
-        cfg.key_hook = key_hook;
-        cfg.key_hook_userdata = &hook;
 
         cloak_client_connector_t c;
         ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
         ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
-        ASSERT_TRUE(pump_until(fx.reactor, conn_fired, &res, CONN_MAX_TURNS, CONN_TURN_MS));
 
-        ASSERT_EQ_INT(1, res.calls);
-        ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_FAILED, (int)res.status);
-        ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_ERR_KEY_MISMATCH, (int)res.error);
-        ASSERT_TRUE(res.session == NULL);
-        ASSERT_TRUE(cloak_client_connector_session(&c) == NULL);
-        ASSERT_TRUE(cloak_client_connector_session_key(&c) == NULL);
-        /* Both handshakes really did succeed -- the failure is the CHECK,
-         * not a connection that never got there. */
-        ASSERT_EQ_INT(2, hook.calls);
-        ASSERT_EQ_INT(2, cloak_client_connector_attempts(&c));
-        ASSERT_EQ_INT(2, fx.attached_calls);
+        int victim = -1;
+        if (force_key_disagreement(&fx, &gate, &c, &res, 2, 0, &victim) == 0) {
+            ASSERT_EQ_INT(1, res.calls);
+            ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_FAILED, (int)res.status);
+            ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_ERR_KEY_MISMATCH, (int)res.error);
+            ASSERT_TRUE(res.session == NULL);
+            ASSERT_TRUE(cloak_client_connector_session(&c) == NULL);
+            ASSERT_TRUE(cloak_client_connector_session_key(&c) == NULL);
+            /* Both handshakes really did succeed against the real server
+             * -- the failure is the CHECK, not a connection that never
+             * got there. */
+            ASSERT_EQ_INT(2, cloak_client_connector_attempts(&c));
+            ASSERT_EQ_INT(2, fx.attached_calls);
+        }
 
         cloak_client_connector_destroy(&c);
+        gate_close(&gate);
         fixture_destroy(&fx);
     }
 
-    /* ---- B: the same hook, corrupting nothing ---- */
+    /* ---- B: the same machinery, nothing corrupted ---- */
     {
         struct fixture fx;
         ASSERT_EQ_INT(0, fixture_init(&fx));
 
+        gate_t gate;
+        ASSERT_EQ_INT(0, gate_open(&gate, fx.reactor, front_port(&fx)));
+        gate.stall_from = 1;
+
         cloak_session_t sesh;
         conn_result_t res;
         memset(&res, 0, sizeof(res));
-        key_hook_ctx_t hook = {0, -1};
 
         cloak_client_connector_config_t cfg;
-        connector_config(&cfg, &fx, &sesh, SID_KEYOK, front_port(&fx), &res);
+        connector_config(&cfg, &fx, &sesh, SID_KEYOK, cloak_listener_port(&gate.l), &res);
         cfg.num_conn = 2;
-        cfg.key_hook = key_hook;
-        cfg.key_hook_userdata = &hook;
 
         cloak_client_connector_t c;
         ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
         ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+
+        struct completed_wait cw = {&c, 1};
+        ASSERT_TRUE(pump_until(fx.reactor, completed_is, &cw, CONN_MAX_TURNS, CONN_TURN_MS));
+        ASSERT_EQ_INT(0, res.calls);
+        gate_release_stalled(&gate);
         ASSERT_TRUE(pump_until(fx.reactor, conn_fired, &res, CONN_MAX_TURNS, CONN_TURN_MS));
 
         ASSERT_EQ_INT(1, res.calls);
         ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_DONE, (int)res.status);
-        ASSERT_EQ_INT(2, hook.calls);
         ASSERT_EQ_INT(2, (int)cloak_switchboard_conn_count(&sesh.sb));
 
         if (res.status == CLOAK_CLIENT_CONNECTOR_DONE) {
             cloak_session_destroy(&sesh);
         }
         cloak_client_connector_destroy(&c);
+        gate_close(&gate);
+        fixture_destroy(&fx);
+    }
+
+    /* ---- C: four connections, the corrupted one beyond the first pair -- */
+    {
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx));
+
+        gate_t gate;
+        ASSERT_EQ_INT(0, gate_open(&gate, fx.reactor, front_port(&fx)));
+        gate.stall_from = 3; /* hold the fourth connection to arrive */
+
+        cloak_session_t sesh;
+        conn_result_t res;
+        memset(&res, 0, sizeof(res));
+
+        cloak_client_connector_config_t cfg;
+        connector_config(&cfg, &fx, &sesh, SID_KEYFAR, cloak_listener_port(&gate.l), &res);
+        cfg.num_conn = FOUR;
+
+        cloak_client_connector_t c;
+        ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
+        ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+
+        int victim = -1;
+        /* At least index 2: three of the four are done, so the highest
+         * done index is always >= 2 whichever one the gate held. That is
+         * what makes a first-pair-only comparison fail here. */
+        if (force_key_disagreement(&fx, &gate, &c, &res, FOUR, 2, &victim) == 0) {
+            ASSERT_TRUE(victim >= 2);
+            ASSERT_EQ_INT(1, res.calls);
+            ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_FAILED, (int)res.status);
+            ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_ERR_KEY_MISMATCH, (int)res.error);
+            ASSERT_TRUE(res.session == NULL);
+            ASSERT_EQ_INT(FOUR, cloak_client_connector_attempts(&c));
+            ASSERT_EQ_INT(FOUR, fx.attached_calls);
+        }
+
+        cloak_client_connector_destroy(&c);
+        gate_close(&gate);
         fixture_destroy(&fx);
     }
 }
@@ -1128,6 +1281,7 @@ static void test_connector_rejects_a_key_disagreement(void) {
 #define SID_TD_DIAL ((uint32_t)5107)
 #define SID_TD_HS ((uint32_t)5108)
 #define SID_TD_MIX ((uint32_t)5109)
+#define SID_TD_BACKOFF ((uint32_t)5115)
 
 /* The dial timeout / handshake deadline the teardown cases run with, and
  * the window they pump afterwards. TD_TIMER_MS is a thousand times longer
@@ -1154,6 +1308,21 @@ static int td_hs_active_is(void *ctx) {
     return n >= w->want;
 }
 
+/* A connection is in backoff when it holds a retry timer and nothing
+ * else: no dial, no handshake, no socket. */
+static int backoff_armed_is(void *ctx) {
+    struct td_wait *w = ctx;
+    int n = 0;
+    for (int i = 0; i < w->c->num_conn; i++) {
+        const cloak_client_connector_conn_t *cn = &w->c->conns[i];
+        if (cn->retry_timer != CLOAK_TIMER_INVALID && !cn->dial_active && !cn->hs_active &&
+            cn->fd < 0) {
+            n++;
+        }
+    }
+    return n >= w->want;
+}
+
 static int td_done_is(void *ctx) {
     struct td_wait *w = ctx;
     int n = 0;
@@ -1173,7 +1342,13 @@ static int td_done_is(void *ctx) {
 static void test_connector_destroy_mid_flight(void) {
     /* ---- A: during the dials ---- */
     {
+        /* A -1 here would make every fd comparison below read `-1 == -1`
+         * and pass vacuously. This technique is the only thing in the
+         * whole project that sees descriptor leaks at all -- LeakSanitizer
+         * tracks memory, not fds -- so it must fail loudly rather than
+         * quietly stop working on a system without /proc. */
         int fds_before = count_open_fds();
+        ASSERT_TRUE(fds_before >= 0);
         struct fixture fx;
         ASSERT_EQ_INT(0, fixture_init(&fx));
 
@@ -1226,7 +1401,13 @@ static void test_connector_destroy_mid_flight(void) {
 
     /* ---- B: during the handshakes ---- */
     {
+        /* A -1 here would make every fd comparison below read `-1 == -1`
+         * and pass vacuously. This technique is the only thing in the
+         * whole project that sees descriptor leaks at all -- LeakSanitizer
+         * tracks memory, not fds -- so it must fail loudly rather than
+         * quietly stop working on a system without /proc. */
         int fds_before = count_open_fds();
+        ASSERT_TRUE(fds_before >= 0);
         struct fixture fx;
         ASSERT_EQ_INT(0, fixture_init(&fx));
 
@@ -1274,7 +1455,13 @@ static void test_connector_destroy_mid_flight(void) {
 
     /* ---- C: after some connections have completed ---- */
     {
+        /* A -1 here would make every fd comparison below read `-1 == -1`
+         * and pass vacuously. This technique is the only thing in the
+         * whole project that sees descriptor leaks at all -- LeakSanitizer
+         * tracks memory, not fds -- so it must fail loudly rather than
+         * quietly stop working on a system without /proc. */
         int fds_before = count_open_fds();
+        ASSERT_TRUE(fds_before >= 0);
         struct fixture fx;
         ASSERT_EQ_INT(0, fixture_init(&fx));
 
@@ -1327,6 +1514,69 @@ static void test_connector_destroy_mid_flight(void) {
          * unnoticed. */
         pump_for_ms(fx.reactor, TD_PUMP_MS);
         ASSERT_EQ_INT(0, res.calls);
+
+        gate_close(&gate);
+        fixture_destroy(&fx);
+        ASSERT_EQ_INT(fds_before, count_open_fds());
+    }
+
+    /* ---- D: during the backoff between attempts ---- */
+    {
+        /* THE STATE THE OTHER THREE MISS. Here a connection holds no
+         * dial, no handshake and no socket -- only an armed retry_timer.
+         * It is the one point in the sequence at which conn_release has
+         * exactly one thing to do, so a teardown that forgot to cancel
+         * that timer passes every other case in this file and then fires
+         * on_retry into a freed c->conns. The header promises teardown at
+         * "ANY point ... or any mixture", so this is a gap against this
+         * module's own contract, not an extra. */
+        int fds_before = count_open_fds();
+        ASSERT_TRUE(fds_before >= 0);
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx));
+
+        gate_t gate;
+        ASSERT_EQ_INT(0, gate_open(&gate, fx.reactor, front_port(&fx)));
+        gate.refuse_first = 1000; /* every attempt dies, so every attempt backs off */
+
+        cloak_session_t sesh;
+        conn_result_t res;
+        memset(&res, 0, sizeof(res));
+
+        cloak_client_connector_config_t cfg;
+        connector_config(&cfg, &fx, &sesh, SID_TD_BACKOFF, cloak_listener_port(&gate.l), &res);
+        cfg.num_conn = 1;
+        cfg.max_attempts = 5;
+        /* The backoff itself is the window this case tears down inside, so
+         * it has to be long enough to land in reliably and short enough
+         * that the pump below outlives it. Jitter is +/-25%, so the real
+         * first delay is 750-1250 ms. */
+        cfg.retry_base_ms = TD_TIMER_MS;
+
+        cloak_client_connector_t c;
+        ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
+        ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+
+        struct td_wait tw = {&c, 1};
+        ASSERT_TRUE(pump_until(fx.reactor, backoff_armed_is, &tw, CONN_MAX_TURNS, CONN_TURN_MS));
+
+        /* Asserted, not assumed: the connection really is holding nothing
+         * but the timer. */
+        ASSERT_TRUE(c.conns[0].retry_timer != CLOAK_TIMER_INVALID);
+        ASSERT_EQ_INT(0, c.conns[0].dial_active);
+        ASSERT_EQ_INT(0, c.conns[0].hs_active);
+        ASSERT_EQ_INT(-1, c.conns[0].fd);
+        ASSERT_EQ_INT(0, c.conns[0].done);
+        ASSERT_EQ_INT(1, c.conns[0].attempts);
+        ASSERT_EQ_INT(0, res.calls);
+
+        cloak_client_connector_destroy(&c);
+        /* Past the retry deadline, so a timer this teardown failed to
+         * cancel fires into the freed array instead of going unnoticed. */
+        pump_for_ms(fx.reactor, TD_PUMP_MS + TD_TIMER_MS / 2u);
+        ASSERT_EQ_INT(0, res.calls);
+        /* And no further attempt was ever made. */
+        ASSERT_EQ_INT(1, gate.accepts);
 
         gate_close(&gate);
         fixture_destroy(&fx);
@@ -1564,6 +1814,173 @@ static void test_connector_falls_back_from_chrome_to_firefox(void) {
     }
 }
 
+/* ---- case 10: the two failure paths the first round left untested ------ */
+
+#define SID_BADTEMPLATE ((uint32_t)5116)
+#define SID_NOSERVER ((uint32_t)5117)
+
+/* CLOAK_CLIENT_CONNECTOR_ERR_SESSION, reached without any fault
+ * injection at all. The first round's report claimed this branch needed
+ * an allocation-failure seam; it does not. cloak_session_init validates
+ * conn_send_queue_cap and max_on_wire_size BEFORE it allocates anything,
+ * and this connector passes session_template through verbatim, so a
+ * zero queue cap reaches that rejection with every connection already
+ * handshaken and every socket already owned by the connector.
+ *
+ * WHICH MAKES THIS THE HARDEST TEARDOWN IN THE FILE, and the reason it is
+ * worth having: the failure lands after N keys agree and before a session
+ * exists, so N connected, authenticated sockets have to be closed by the
+ * connector itself with no session to hand them to -- the one ownership
+ * state no other case reaches. The fd count is what proves it. */
+static void test_connector_reports_a_rejected_session_template(void) {
+    int fds_before = count_open_fds();
+    ASSERT_TRUE(fds_before >= 0);
+
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    cloak_session_t sesh;
+    conn_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    cloak_client_connector_config_t cfg;
+    connector_config(&cfg, &fx, &sesh, SID_BADTEMPLATE, front_port(&fx), &res);
+    cfg.num_conn = 2;
+    cfg.session_template.conn_send_queue_cap = 0; /* rejected before any allocation */
+
+    cloak_client_connector_t c;
+    ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
+    ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+    ASSERT_TRUE(pump_until(fx.reactor, conn_fired, &res, CONN_MAX_TURNS, CONN_TURN_MS));
+
+    ASSERT_EQ_INT(1, res.calls);
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_FAILED, (int)res.status);
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_ERR_SESSION, (int)res.error);
+    ASSERT_TRUE(res.session == NULL);
+    /* It got all the way there: both connections handshook and agreed. */
+    ASSERT_EQ_INT(2, cloak_client_connector_attempts(&c));
+    ASSERT_EQ_INT(2, fx.attached_calls);
+
+    cloak_client_connector_destroy(&c);
+    /* The server notices both closes and unwinds before the count below. */
+    pump_for_ms(fx.reactor, 200u);
+    fixture_destroy(&fx);
+    ASSERT_EQ_INT(fds_before, count_open_fds());
+}
+
+/* CLOAK_CLIENT_CONNECTOR_ERR_DIAL: the attempt bound exhausted with
+ * nothing ever answering, as distinct from case 4 where something answers
+ * and the handshake dies. 127.0.0.1:1 is the address for it -- port 1 is
+ * below the ephemeral range on every Linux, so nothing can have drifted
+ * onto it, and binding it needs privileges this test does not have, so
+ * the "a recycled port might be listening" worry that rules out a
+ * just-closed port does not apply. */
+static void test_connector_reports_dial_exhaustion(void) {
+    int fds_before = count_open_fds();
+    ASSERT_TRUE(fds_before >= 0);
+
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    cloak_session_t sesh;
+    conn_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    cloak_client_connector_config_t cfg;
+    connector_config(&cfg, &fx, &sesh, SID_NOSERVER, 1, &res);
+    cfg.max_attempts = 3;
+    cfg.retry_base_ms = 20;
+    cfg.dial_timeout_ms = 2000;
+
+    cloak_client_connector_t c;
+    ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
+    ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+    ASSERT_TRUE(pump_until(fx.reactor, conn_fired, &res, CONN_MAX_TURNS, CONN_TURN_MS));
+
+    ASSERT_EQ_INT(1, res.calls);
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_FAILED, (int)res.status);
+    /* The dial is what failed, and the typed error says so rather than
+     * blaming the handshake that never started. */
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_ERR_DIAL, (int)res.error);
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_HANDSHAKE_ERR_NONE,
+                  (int)cloak_client_connector_handshake_error(&c));
+    ASSERT_EQ_INT(3, cloak_client_connector_attempts(&c));
+    ASSERT_EQ_INT(0, fx.attached_calls);
+
+    cloak_client_connector_destroy(&c);
+    fixture_destroy(&fx);
+    ASSERT_EQ_INT(fds_before, count_open_fds());
+}
+
+/* ---- case 9C: the fallback is PER CONNECTION --------------------------- */
+
+#define SID_MIXEDFP ((uint32_t)5118)
+
+/* The header claims one connection falling back "does not drag the others
+ * with it". Parts A and B both run at num_conn == 1, where that claim is
+ * unobservable -- a connector with a single SHARED fingerprint would pass
+ * both.
+ *
+ * Here the gate size-checks only the FIRST connection it accepts. So of
+ * two connections started together, one hits the oversized-ClientHello
+ * drop and falls back, and the other gets through as Chrome. A shared
+ * fingerprint would leave both on Firefox (or both on Chrome); only a
+ * per-connection one leaves exactly one of each.
+ *
+ * The assertion is on the MULTISET, not on a particular index: nothing
+ * guarantees which connector index the gate accepts first, and this test
+ * does not pretend otherwise. */
+static void test_the_fallback_is_per_connection(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    gate_t gate;
+    ASSERT_EQ_INT(0, gate_open(&gate, fx.reactor, front_port(&fx)));
+    gate.max_first_record = MTU_LIMIT;
+    gate.size_check_first = 1; /* only the first connection meets the middlebox */
+
+    cloak_session_t sesh;
+    conn_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    cloak_client_connector_config_t cfg;
+    connector_config(&cfg, &fx, &sesh, SID_MIXEDFP, cloak_listener_port(&gate.l), &res);
+    cfg.num_conn = 2;
+    cfg.browser = CLOAK_CLIENT_BROWSER_CHROME;
+    cfg.max_attempts = 3;
+    cfg.retry_base_ms = 20;
+
+    cloak_client_connector_t c;
+    ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
+    ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+    ASSERT_TRUE(pump_until(fx.reactor, conn_fired, &res, CONN_MAX_TURNS, CONN_TURN_MS));
+
+    ASSERT_EQ_INT(1, res.calls);
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_DONE, (int)res.status);
+    ASSERT_EQ_INT(1, gate.dropped_too_big);
+    /* Three attempts for two connections: one of them spent two. */
+    ASSERT_EQ_INT(3, cloak_client_connector_attempts(&c));
+
+    int chrome = 0;
+    int firefox = 0;
+    for (int i = 0; i < 2; i++) {
+        chrome += c.conns[i].browser == CLOAK_CLIENT_BROWSER_CHROME ? 1 : 0;
+        firefox += c.conns[i].browser == CLOAK_CLIENT_BROWSER_FIREFOX ? 1 : 0;
+    }
+    /* EXACTLY one of each: the fallback reached the connection that
+     * needed it and no further. */
+    ASSERT_EQ_INT(1, chrome);
+    ASSERT_EQ_INT(1, firefox);
+    ASSERT_EQ_INT(2, (int)cloak_switchboard_conn_count(&sesh.sb));
+
+    if (res.status == CLOAK_CLIENT_CONNECTOR_DONE) {
+        cloak_session_destroy(&sesh);
+    }
+    cloak_client_connector_destroy(&c);
+    gate_close(&gate);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
 test_connector_one_connection();
 test_connector_four_connections_one_session();
@@ -1574,4 +1991,7 @@ test_connector_destroy_mid_flight();
 test_connector_never_completes_from_inside_start();
 test_connector_rejects_bad_configs();
 test_connector_falls_back_from_chrome_to_firefox();
+test_the_fallback_is_per_connection();
+test_connector_reports_a_rejected_session_template();
+test_connector_reports_dial_exhaustion();
 TEST_MAIN_END()

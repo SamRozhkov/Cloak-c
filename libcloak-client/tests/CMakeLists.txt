@@ -48,6 +48,14 @@ set_tests_properties(test_client_e2e PROPERTIES TIMEOUT 60)
 # "four connections joined one session" and "four sessions were created",
 # which is the single assertion this file most depends on. The library
 # itself still links only cloak-common and cloak-mux.
+# test_client_connector.c #includes ../src/client_connector.c directly, so
+# that D4's key check can be forced from INSIDE the implementation's own
+# translation unit rather than through a hook in the shipped config struct
+# -- see that file's own top-of-file comment. The cloak-client link still
+# supplies client_transport.c and client_auth.c; it does not supply
+# client_connector.c.o, because an archive member is only pulled in to
+# resolve an undefined symbol and every connector symbol is already
+# defined in this executable.
 add_executable(test_client_connector test_client_connector.c)
 target_include_directories(test_client_connector PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_client_connector PRIVATE cloak-client cloak-server)

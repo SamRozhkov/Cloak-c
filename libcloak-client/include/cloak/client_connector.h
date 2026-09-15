@@ -89,18 +89,31 @@
  * why the fingerprint fallback takes effect on attempt 2 rather than
  * after the bound.
  *
- * THE BACKOFF: exponential from 500ms, doubling, capped at 8000ms, minus
- * a random jitter of up to half the interval. Delays are therefore
- * ~250-500, ~500-1000, ~1000-2000, ~2000-4000 ms. Flat 3s (Go's) is
- * simultaneously too slow for the common case (a server that restarted
+ * THE BACKOFF: exponential from 500ms, doubling, capped at 8000ms, with
+ * each interval jittered uniformly by +/-25% AROUND that value. Nominal
+ * delays are therefore 500, 1000, 2000 and 4000 ms -- about 7.5s of
+ * backoff across the 5 attempts, plus or minus a quarter. Flat 3s (Go's)
+ * is simultaneously too slow for the common case (a server that restarted
  * in 200ms is not reachable again for 3s) and, repeated forever without
- * growth, too aggressive against one that is genuinely down. The jitter
- * is a divergence from Go worth stating: N connections of one session
- * fail at nearly the same instant (they share a route, a server, and a
- * middlebox), so an unjittered backoff has all N retry in lockstep --
- * each round a small synchronised burst at exactly the moment the far end
- * is least able to absorb it, and a distinctive traffic signature
- * besides. Halving the interval at random decorrelates them at no cost.
+ * growth, too aggressive against one that is genuinely down.
+ *
+ * The jitter is a divergence from Go, and its justification is narrower
+ * than it might look. It is NOT a traffic-shape argument: N simultaneous
+ * SYNs to one host is a weak signal to begin with, and both Go and this
+ * port already open all N connections in lockstep on attempt 1 with no
+ * jitter at all -- a louder synchronised burst than any retry round.
+ * It is a thundering-herd argument and only that: the N connections of
+ * one session fail at nearly the same instant, because they share a
+ * route, a server and a middlebox, so an unjittered backoff has all N
+ * retrying together at exactly the moment the far end is least able to
+ * absorb it. Decorrelating them costs nothing.
+ *
+ * It is symmetric rather than one-sided ON PURPOSE. Jittering only
+ * DOWNWARD (an earlier version of this code) decorrelates just as well
+ * but shifts the mean to 0.75x, making every retry strictly more
+ * aggressive than the schedule documented here and the real span ~5.6s
+ * rather than ~7.5s. A +/-25% window decorrelates equally and preserves
+ * the mean, so the numbers above are the numbers that happen.
  *
  * Both are overridable per invocation (config::max_attempts,
  * config::retry_base_ms), because a test needs them small and a caller
@@ -192,22 +205,6 @@ typedef void (*cloak_client_connector_cb)(cloak_client_connector_t *c,
  * every pass through its retry label. */
 typedef int64_t (*cloak_client_connector_now_fn)(void *userdata);
 
-/* TEST SEAM, and it exists for exactly one reason: to make D4's key check
- * testable. Called with each connection's recovered session key, by
- * index, immediately after it is copied out of the handshake and before
- * it is compared against the others -- so a test can corrupt one and
- * assert that the disagreement is caught. MUST be NULL in production;
- * there is no other legitimate use, and mutating a key here breaks the
- * session in exactly the way D4 exists to detect.
- *
- * A seam rather than a second server: forcing two connections of one
- * session to be answered by two different servers would need a splitting
- * proxy in front of a second full server stack, which tests the proxy
- * more than it tests this check. */
-typedef void (*cloak_client_connector_key_hook_fn)(int conn_index,
-                                                   uint8_t key[CLOAK_AEAD_KEY_LEN],
-                                                   void *userdata);
-
 typedef struct {
     cloak_reactor_t *reactor;
 
@@ -260,10 +257,6 @@ typedef struct {
 
     cloak_client_connector_cb on_done;
     void *on_done_userdata;
-
-    /* Must be NULL outside tests -- see cloak_client_connector_key_hook_fn. */
-    cloak_client_connector_key_hook_fn key_hook;
-    void *key_hook_userdata;
 } cloak_client_connector_config_t;
 
 /* One underlying connection's whole life: a dial, then a handshake, then
@@ -376,9 +369,6 @@ struct cloak_client_connector {
     /* 1 once on_done has fired, so it fires exactly once no matter how
      * many terminal conditions are reached in one dispatch. */
     int notified;
-
-    cloak_client_connector_key_hook_fn key_hook;
-    void *key_hook_userdata;
 
     cloak_client_connector_cb on_done;
     void *on_done_userdata;
