@@ -804,7 +804,7 @@ static void test_close_mid_reply(void) {
  * CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY is accepted (the machine moves
  * on to READ_RECORD_BODY and waits), one byte more is rejected. Widening
  * or narrowing the real bound by a single byte breaks one of the two. */
-static void run_declared_length_case(size_t declared, int expect_reject) {
+static void run_declared_length_case(uint8_t content_type, size_t declared, int expect_reject) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
     fake_server_t fs;
@@ -831,7 +831,8 @@ static void run_declared_length_case(size_t declared, int expect_reject) {
     }
     ASSERT_TRUE(fs.hello_parsed);
 
-    uint8_t header[5] = {0x16, 0x03, 0x03, (uint8_t)(declared >> 8), (uint8_t)(declared & 0xff)};
+    uint8_t header[5] = {content_type, 0x03, 0x03, (uint8_t)(declared >> 8),
+                         (uint8_t)(declared & 0xff)};
     fake_server_push_raw(&fs, header, sizeof(header));
     for (int i = 0; i < 40 && res.calls == 0; i++) {
         cloak_reactor_run_once(r, 5);
@@ -854,11 +855,17 @@ static void run_declared_length_case(size_t declared, int expect_reject) {
 }
 
 static void test_record_length_bound(void) {
-    run_declared_length_case(CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY, 0);
-    run_declared_length_case(CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY + 1, 1);
+    run_declared_length_case(0x16, CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY, 0);
+    run_declared_length_case(0x16, CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY + 1, 1);
     /* A ServerHello too short to carry both halves of the sealed session
      * key is rejected at its header, before any of it is read. */
-    run_declared_length_case(CLOAK_CLIENT_HANDSHAKE_SERVERHELLO_PREFIX - 1, 1);
+    run_declared_length_case(0x16, CLOAK_CLIENT_HANDSHAKE_SERVERHELLO_PREFIX - 1, 1);
+    /* The first record must be a HANDSHAKE record. A perfectly sized
+     * application-data record in the ServerHello's place is rejected --
+     * without this case the content-type check is uncovered, because
+     * every other fixture in this file pushes 0x16. */
+    run_declared_length_case(0x17, 122, 1);
+    run_declared_length_case(0x14, 122, 1);
 }
 
 /* ---- case 5: the deadline, measured ------------------------------------- */
@@ -976,6 +983,29 @@ static void test_default_deadline_is_applied(void) {
 
 /* ---- case 6: "random" server names -------------------------------------- */
 
+/* Go Cloak's topLevelDomains, transcribed by hand from
+ * internal/client/TLS.go:33 and deliberately NOT derived from the
+ * library's own array. Checking a generated TLD against
+ * cloak_client_top_level_domains only ever proves the generator uses its
+ * own list; the property that actually matters is that the list IS Go's,
+ * because a Cloak client drawing from a different set than every other
+ * Cloak client is distinguishable from them. This literal is the only
+ * thing in the tree that pins that. */
+static const char *const go_top_level_domains[13] = {
+    "com", "net", "org", "it", "fr", "me", "ru", "cn", "es", "tr", "top", "xyz", "info",
+};
+
+static void test_tld_list_matches_go(void) {
+    ASSERT_EQ_INT(13, CLOAK_CLIENT_TLD_COUNT);
+    for (size_t i = 0; i < CLOAK_CLIENT_TLD_COUNT && i < 13; i++) {
+        ASSERT_TRUE(strcmp(cloak_client_top_level_domains[i], go_top_level_domains[i]) == 0);
+        if (strcmp(cloak_client_top_level_domains[i], go_top_level_domains[i]) != 0) {
+            fprintf(stderr, "  TLD %zu: have \"%s\", Go has \"%s\"\n", i,
+                    cloak_client_top_level_domains[i], go_top_level_domains[i]);
+        }
+    }
+}
+
 static int tld_is_listed(const char *tld) {
     for (size_t i = 0; i < CLOAK_CLIENT_TLD_COUNT; i++) {
         if (strcmp(tld, cloak_client_top_level_domains[i]) == 0) {
@@ -1000,19 +1030,28 @@ static void check_plausible_hostname(const char *name) {
 }
 
 static void test_random_server_name(void) {
-    /* Every draw is plausible, every label length in 3..12 occurs, and
-     * every listed TLD occurs -- so a generator stuck on one length or
-     * one TLD fails here rather than passing on a lucky sample. */
+    /* Every draw is plausible, every label length in 3..12 occurs, every
+     * listed TLD occurs, and the LETTERS VARY WITHIN a label -- so a
+     * generator stuck on one length, one TLD, or one letter per name
+     * fails here rather than passing on a lucky sample. The per-character
+     * check is not decoration: drawing a single letter and repeating it
+     * ("aaaaaa.com", "zzz.net") satisfies "every character is in a..z"
+     * while collapsing the label space from 26^n to 26, which across many
+     * connections is exactly the aggregate distinguisher
+     * randomServerName exists to avoid. */
     int len_seen[13];
     int tld_seen[CLOAK_CLIENT_TLD_COUNT];
+    int letter_seen[26];
     memset(len_seen, 0, sizeof(len_seen));
     memset(tld_seen, 0, sizeof(tld_seen));
+    memset(letter_seen, 0, sizeof(letter_seen));
 
     char first[CLOAK_CLIENT_RANDOM_SERVER_NAME_MAX];
     ASSERT_EQ_INT(0, cloak_client_random_server_name(first, sizeof(first)));
     check_plausible_hostname(first);
 
     int distinct = 0;
+    int mixed_label_seen = 0;
     for (int i = 0; i < 2000; i++) {
         char name[CLOAK_CLIENT_RANDOM_SERVER_NAME_MAX];
         ASSERT_EQ_INT(0, cloak_client_random_server_name(name, sizeof(name)));
@@ -1024,7 +1063,17 @@ static void test_random_server_name(void) {
         if (dot == NULL) {
             continue;
         }
-        len_seen[(size_t)(dot - name)] = 1;
+        size_t label_len = (size_t)(dot - name);
+        len_seen[label_len] = 1;
+        for (size_t c = 0; c < label_len; c++) {
+            int idx = name[c] - 'a';
+            if (idx >= 0 && idx < 26) {
+                letter_seen[idx] = 1;
+            }
+            if (name[c] != name[0]) {
+                mixed_label_seen = 1;
+            }
+        }
         for (size_t t = 0; t < CLOAK_CLIENT_TLD_COUNT; t++) {
             if (strcmp(dot + 1, cloak_client_top_level_domains[t]) == 0) {
                 tld_seen[t] = 1;
@@ -1038,6 +1087,16 @@ static void test_random_server_name(void) {
     for (size_t t = 0; t < CLOAK_CLIENT_TLD_COUNT; t++) {
         ASSERT_TRUE(tld_seen[t]);
     }
+    /* At least one label mixed two different letters, and the alphabet is
+     * covered: over 2000 draws averaging 7.5 letters each, a genuine
+     * uniform draw misses a given letter with probability ~(25/26)^15000,
+     * so requiring all 26 is not flaky. */
+    ASSERT_TRUE(mixed_label_seen);
+    int letters_used = 0;
+    for (int c = 0; c < 26; c++) {
+        letters_used += letter_seen[c];
+    }
+    ASSERT_EQ_INT(26, letters_used);
 
     /* Too small a buffer is refused rather than truncated. */
     char tiny[CLOAK_CLIENT_RANDOM_SERVER_NAME_MAX - 1];
@@ -1154,6 +1213,100 @@ static void test_all_browsers_authenticate(void) {
         close(fd);
         real_server_destroy(&rs);
         cloak_reactor_destroy(r);
+    }
+}
+
+/* Case 7's other half, and the one that stops it being one template run
+ * three times. test_all_browsers_authenticate proves each browser value
+ * produces a ClientHello the real server accepts -- but a template_for()
+ * that returned the Chrome template for all three would satisfy that
+ * completely, and the whole point of having three templates is that they
+ * are three different DPI fingerprints.
+ *
+ * The comparison is made on the cipher_suites block, which is the largest
+ * run of bytes in a ClientHello that is fixed by the template and
+ * untouched by everything cloak_clienthello_build randomises or shifts:
+ * it sits before the extensions (so the SNI-length and ECH-length shifts
+ * cannot move it) and after the session_id (so Cloak's own spliced
+ * fields cannot overwrite it). In the framed record it starts at offset
+ * 5 + 71 = 76; in the template's own byte array, at 71.
+ *
+ * Two assertions, and both are needed: the block must EQUAL the template
+ * the browser names (which is what pins the mapping), and the three
+ * blocks must be pairwise DIFFERENT (without which the equality could
+ * hold for three identical templates and prove nothing). */
+#define CS_BLOCK_OFF_IN_TEMPLATE 71
+#define CS_BLOCK_OFF_IN_RECORD (5 + CS_BLOCK_OFF_IN_TEMPLATE)
+
+static size_t cs_block_len(const uint8_t *at) {
+    return 2 + (((size_t)at[0] << 8) | (size_t)at[1]);
+}
+
+static void test_browser_templates_are_distinct(void) {
+    const cloak_client_browser_t browsers[3] = {CLOAK_CLIENT_BROWSER_CHROME,
+                                                CLOAK_CLIENT_BROWSER_FIREFOX,
+                                                CLOAK_CLIENT_BROWSER_SAFARI};
+    const cloak_clienthello_template_t *templates[3] = {
+        &cloak_clienthello_chrome, &cloak_clienthello_firefox, &cloak_clienthello_safari};
+
+    uint8_t captured[3][512];
+    size_t captured_len[3] = {0, 0, 0};
+
+    for (int b = 0; b < 3; b++) {
+        cloak_reactor_t *r = cloak_reactor_create();
+        ASSERT_TRUE(r != NULL);
+        fake_server_t fs;
+        ASSERT_EQ_INT(0, fake_server_start(&fs, r));
+        int fd = connect_nonblocking(fake_server_port(&fs));
+        ASSERT_TRUE(fd >= 0);
+
+        hs_result_t res;
+        memset(&res, 0, sizeof(res));
+        uint8_t uid[CLOAK_UID_LEN];
+        fill_uid(uid, (uint8_t)(0xc0 + b));
+        cloak_client_handshake_config_t cfg;
+        base_config(&cfg, r, fd, fs.pub, uid, (uint32_t)(300 + b), &res);
+        cfg.browser = browsers[b];
+
+        cloak_client_handshake_t h;
+        ASSERT_EQ_INT(0, cloak_client_handshake_init(&h, &cfg));
+        ASSERT_EQ_INT(0, cloak_client_handshake_start(&h));
+        pump_until_accepted(r, &fs);
+        for (int i = 0; i < 200 && !fs.hello_parsed; i++) {
+            cloak_reactor_run_once(r, 5);
+            fake_server_pull(&fs, 4096);
+        }
+        ASSERT_TRUE(fs.hello_parsed);
+
+        const uint8_t *tmpl_cs = templates[b]->bytes + CS_BLOCK_OFF_IN_TEMPLATE;
+        size_t len = cs_block_len(tmpl_cs);
+        ASSERT_TRUE(len <= sizeof(captured[0]));
+        ASSERT_TRUE(fs.in_len > CS_BLOCK_OFF_IN_RECORD + len);
+        if (len <= sizeof(captured[0]) && fs.in_len > CS_BLOCK_OFF_IN_RECORD + len) {
+            /* What went on the wire IS this browser's template. */
+            ASSERT_MEM_EQ(fs.in + CS_BLOCK_OFF_IN_RECORD, tmpl_cs, len);
+            memcpy(captured[b], fs.in + CS_BLOCK_OFF_IN_RECORD, len);
+            captured_len[b] = len;
+        }
+
+        cloak_client_handshake_destroy(&h);
+        close(fd);
+        fake_server_stop(&fs);
+        cloak_reactor_destroy(r);
+    }
+
+    /* Pairwise different, so the equalities above are not three copies of
+     * the same assertion. */
+    for (int i = 0; i < 3; i++) {
+        for (int j = i + 1; j < 3; j++) {
+            ASSERT_TRUE(captured_len[i] > 0 && captured_len[j] > 0);
+            int same = captured_len[i] == captured_len[j] &&
+                       memcmp(captured[i], captured[j], captured_len[i]) == 0;
+            ASSERT_TRUE(!same);
+            if (same) {
+                fprintf(stderr, "  browsers %d and %d produced identical cipher suites\n", i, j);
+            }
+        }
     }
 }
 
@@ -1299,9 +1452,11 @@ test_close_mid_reply();
 test_record_length_bound();
 test_deadline();
 test_default_deadline_is_applied();
+test_tld_list_matches_go();
 test_random_server_name();
 test_random_server_name_reaches_the_wire();
 test_all_browsers_authenticate();
+test_browser_templates_are_distinct();
 test_init_rejects_and_stays_safe();
 test_wrong_key_reply_is_rejected();
 TEST_MAIN_END()

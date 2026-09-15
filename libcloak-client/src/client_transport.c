@@ -253,6 +253,19 @@ static void feed(cloak_client_handshake_t *h, const uint8_t *data, size_t len) {
                     return;
                 }
             }
+            /* The total-reply ceiling this module's header promises a
+             * caller, checked rather than left as an arithmetic
+             * derivation a reader has to redo. It cannot fire while the
+             * per-record bound above holds and the reply is exactly
+             * CLOAK_CLIENT_HANDSHAKE_REPLY_RECORDS records -- 3 * (5 +
+             * 16640) is precisely the ceiling -- so it is a guard on
+             * those two constants rather than on the wire: change either
+             * of them inconsistently and this trips instead of silently
+             * making the documented bound a lie. */
+            if (h->reply_bytes + h->body_total > CLOAK_CLIENT_HANDSHAKE_MAX_REPLY_BYTES) {
+                fail(h, CLOAK_CLIENT_HANDSHAKE_ERR_PROTOCOL);
+                return;
+            }
             h->body_len = 0;
             h->state = CLOAK_CLIENT_HS_STATE_READ_RECORD_BODY;
             if (h->body_total == 0) {

@@ -38,10 +38,15 @@
  * speculative "fill the buffer" read.
  *
  * IT BOUNDS WHAT IT WILL READ, IN BOTH DIMENSIONS:
- *   - structurally, by CLOAK_CLIENT_HANDSHAKE_MAX_REPLY_BYTES: exactly
- *     three records, each with a body no larger than a legal TLS record
- *     (CLOAK_CONN_MAX_FRAME_LEN, the bound libcloak-mux already
- *     enforces on the data path);
+ *   - structurally: it reads exactly CLOAK_CLIENT_HANDSHAKE_REPLY_RECORDS
+ *     records and no more, each record's declared body length is checked
+ *     against CLOAK_CLIENT_HANDSHAKE_MAX_RECORD_BODY (the same legal TLS
+ *     record bound libcloak-mux enforces on the data path) as its header
+ *     completes, and the running total is checked against
+ *     CLOAK_CLIENT_HANDSHAKE_MAX_REPLY_BYTES at the same point. The last
+ *     of those three cannot fire while the first two hold -- it guards
+ *     the constants, not the wire -- but it is a real comparison rather
+ *     than arithmetic left to the reader;
  *   - temporally, by a deadline armed at cloak_client_handshake_start
  *     and covering the WHOLE handshake, write half included. A server
  *     that sends a perfectly valid ServerHello and then dribbles (or
@@ -92,13 +97,18 @@ extern const char *const cloak_client_top_level_domains[CLOAK_CLIENT_TLD_COUNT];
  * cloak_client_top_level_domains. cap must be at least
  * CLOAK_CLIENT_RANDOM_SERVER_NAME_MAX.
  *
- * Both draws are UNBIASED (rejection sampling), unlike the `% n` idiom
- * used elsewhere in this tree for random choices. That idiom is exact
- * only when n divides 256, which holds where it is used there (2 AEAD
- * ids, 4 ECH payload lengths) but not for 26 letters or 13 TLDs -- and
- * an SNI is the single most visible field this client emits, so a
- * skewed letter or TLD distribution across many connections is exactly
- * the sort of aggregate distinguisher this hostname exists to avoid.
+ * Both draws reduce a 64-bit random value modulo the range, rather than
+ * a single byte as the `% n` idiom used elsewhere in this tree does.
+ * That idiom is exact only when n divides 256, which holds where it is
+ * used there (2 AEAD ids, 4 ECH payload lengths) but not for 26 letters
+ * or 13 TLDs -- and an SNI is the single most visible field this client
+ * emits, so a skewed letter or TLD distribution across many connections
+ * is exactly the sort of aggregate distinguisher this hostname exists to
+ * avoid. Widening the draw to 64 bits leaves a residual bias below 2^-60,
+ * which is not exactly zero (rejection sampling would be) but is
+ * unobservable, and it keeps the code loop-free -- see the
+ * implementation's own comment for why that tradeoff was made in this
+ * particular module.
  *
  * Returns 0 on success, -1 if out is NULL or cap is too small (out is
  * left untouched in that case). */
