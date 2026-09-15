@@ -77,3 +77,19 @@ target_include_directories(test_client_piper PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_client_piper PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_piper COMMAND test_client_piper)
 set_tests_properties(test_client_piper PROPERTIES TIMEOUT 60)
+
+# cloak-server is a TEST-ONLY dependency here for the same reason every
+# other file in this directory uses it (see above), and singleplex is the
+# case where a mock would be least able to stand in: the single assertion
+# this file is built around is "two local connections produced TWO
+# sessions on the server, not one", read off cloak_server_registry_count
+# and the dispatcher's own created-session count. Only a real registry
+# distinguishes two sessions from one session carrying two streams, and
+# only a real dispatcher can refuse the deliberately-unauthenticatable
+# handshake case 3 needs. The library itself still links only
+# cloak-common and cloak-mux.
+add_executable(test_client_singleplex test_client_singleplex.c)
+target_include_directories(test_client_singleplex PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_client_singleplex PRIVATE cloak-client cloak-server)
+add_test(NAME test_client_singleplex COMMAND test_client_singleplex)
+set_tests_properties(test_client_singleplex PROPERTIES TIMEOUT 60)

@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 /* ---- intrusive list bookkeeping ----------------------------------------- */
@@ -46,8 +47,9 @@ static void piper_conn_unlink(cloak_client_piper_t *pp, cloak_client_piper_conn_
  * available. */
 
 /* Releases every resource one context holds, releases its stream back to
- * the session, unlinks the context and FREES IT. ctx must not be touched
- * after this returns. */
+ * its session, unlinks the context and FREES IT -- and, in singleplex,
+ * closes the session that existed only for this context. ctx must not be
+ * touched after this returns. */
 static void piper_conn_teardown(cloak_client_piper_conn_t *ctx) {
     cloak_client_piper_t *pp = ctx->pp;
 
@@ -58,6 +60,24 @@ static void piper_conn_teardown(cloak_client_piper_conn_t *ctx) {
     if (ctx->retry_timer != CLOAK_TIMER_INVALID) {
         cloak_reactor_cancel_timer(pp->cfg.reactor, ctx->retry_timer);
         ctx->retry_timer = CLOAK_TIMER_INVALID;
+    }
+    if (ctx->awaiting_session) {
+        /* SINGLEPLEX: A BRING-UP IS STILL IN FLIGHT FOR A CONTEXT THAT IS
+         * ABOUT TO BE FREED, and this is the only thing standing between
+         * that and a use-after-free of the worst kind -- the owner
+         * completing seconds later, through
+         * cloak_client_piper_conn_session_ready, against a pointer this
+         * line is about to free. It is reachable by three entirely
+         * ordinary routes: the deadline expiring, the local peer closing,
+         * and cloak_client_piper_destroy.
+         *
+         * Cleared BEFORE the callback so that an owner which (against the
+         * contract) answered from inside it would find nothing to answer
+         * rather than re-entering this walk. */
+        ctx->awaiting_session = 0;
+        if (pp->cfg.cancel_session != NULL) {
+            pp->cfg.cancel_session(ctx, pp->cfg.session_userdata);
+        }
     }
     if (ctx->relaying) {
         /* THE ORDER OF THESE TWO STEPS -- stop the relay HERE, release
@@ -89,19 +109,22 @@ static void piper_conn_teardown(cloak_client_piper_conn_t *ctx) {
         ctx->fd = -1;
     }
     if (ctx->stream != NULL) {
-        if (pp->sesh != NULL) {
+        if (ctx->sesh != NULL) {
             /* cloak_session_release_stream performs the active close
              * itself when the stream has not already been closed (by the
              * relay's own teardown, or by the peer), so there is no
              * separate cloak_session_close_stream call to make here.
              *
-             * THE GUARD IS NOT PARANOIA. pp->sesh is NULL once
-             * piper_on_broken has run, and a stream cannot be released
-             * against a session that is gone -- which is exactly why
-             * piper_on_broken walks every context BEFORE it clears the
-             * pointer, in the one window where the release is still
-             * legal. This branch is what that ordering buys. */
-            cloak_session_release_stream(pp->sesh, ctx->stream);
+             * THE GUARD IS NOT PARANOIA. ctx->sesh is NULL once
+             * piper_on_broken has run for this context's session, and a
+             * stream cannot be released against a session that is gone --
+             * which is exactly why piper_on_broken walks every context
+             * bound to the dying session BEFORE anything forgets it, in
+             * the one window where the release is still legal. This
+             * branch is what that ordering buys, and singleplex is where
+             * it is actually exercised: there the session really does die
+             * with one context. */
+            cloak_session_release_stream(ctx->sesh, ctx->stream);
         }
         ctx->stream = NULL;
         /* THE ONLY PLACE stream_count EVER FALLS, paired with the only
@@ -109,8 +132,32 @@ static void piper_conn_teardown(cloak_client_piper_conn_t *ctx) {
         pp->stream_count--;
     }
 
+    /* SINGLEPLEX'S OWN LINE, and Go's: RouteTCP's singleplex branch calls
+     * sesh.Close() when the stream it opened could not be used or has
+     * ended. CLOSE, NOT DESTROY -- this module has never owned a session's
+     * storage in either mode (cloak_client_piper_set_session says so for
+     * the shared one, and cloak_client_piper_conn_session_ready says the
+     * same for this one), and destroying here would additionally be
+     * illegal on most of the stacks that reach this function. Closing is
+     * legal from all of them (cloak/session.h), defers its teardown to the
+     * reactor, and fires on_broken -- which is this module's own walk,
+     * followed by cfg.chain, which is where the owner reaps.
+     *
+     * Read AFTER the stream release and applied AFTER the free, so that
+     * nothing this call sets in motion can reach a half-dismantled
+     * context. A session already closing answers -1 and is unharmed,
+     * which is exactly what happens when this runs from inside
+     * piper_on_broken. */
+    cloak_session_t *own = ctx->own_sesh ? ctx->sesh : NULL;
+    ctx->sesh = NULL;
+    ctx->own_sesh = 0;
+
     piper_conn_unlink(pp, ctx);
     free(ctx);
+
+    if (own != NULL) {
+        (void)cloak_session_close(own);
+    }
 }
 
 /* ---- relay start, with the retry the interface forces on us ------------- */
@@ -126,12 +173,12 @@ static void piper_on_retry_timer(cloak_reactor_t *r, void *userdata);
 static void piper_try_start_relay(cloak_client_piper_conn_t *ctx) {
     cloak_client_piper_t *pp = ctx->pp;
 
-    if (pp->sesh == NULL || ctx->stream == NULL || ctx->fd < 0) {
+    if (ctx->sesh == NULL || ctx->stream == NULL || ctx->fd < 0) {
         piper_conn_teardown(ctx);
         return;
     }
 
-    int rc = cloak_stream_relay_start(&ctx->relay, pp->cfg.reactor, pp->sesh, ctx->stream, ctx->fd,
+    int rc = cloak_stream_relay_start(&ctx->relay, pp->cfg.reactor, ctx->sesh, ctx->stream, ctx->fd,
                                       pp->cfg.relay_buf_cap, piper_on_relay_done, ctx);
     if (rc == 0) {
         /* Ownership of fd is the relay's from here; see this module's
@@ -254,10 +301,16 @@ static void piper_on_relay_done(cloak_stream_relay_t *sr, void *userdata) {
  *
  * The clamp uses the same two constants cloak_stream_init derives
  * max_payload_per_frame from, because there is no stream to ask yet: the
- * whole point of D6 is that none has been opened. */
-static size_t piper_first_read_cap(const cloak_client_piper_t *pp) {
+ * whole point of D6 is that none has been opened.
+ *
+ * IT READS THE CONTEXT'S SESSION, NOT THE PIPER'S, and that is what makes
+ * singleplex possible at all rather than merely tidy: in that mode there
+ * is no piper-wide session to ask, and the reason the first read is
+ * deferred until a session exists (see piper_on_local_readable's peek) is
+ * precisely that this clamp has nothing to compute from before then. */
+static size_t piper_first_read_cap(const cloak_client_piper_conn_t *ctx) {
     size_t overhead = (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
-    size_t wire = pp->sesh->max_on_wire_size;
+    size_t wire = ctx->sesh->max_on_wire_size;
     /* A session whose wire size cannot hold a header could not have been
      * created (cloak_stream_init rejects it), so this floor is a
      * guarantee that the cap is never 0, not a supported configuration:
@@ -291,7 +344,7 @@ static void piper_open_stream(cloak_client_piper_conn_t *ctx) {
         ctx->fd_registered = 0;
     }
 
-    ctx->stream = cloak_session_open_stream(pp->sesh, NULL);
+    ctx->stream = cloak_session_open_stream(ctx->sesh, NULL);
     if (ctx->stream == NULL) {
         /* The session closed under us, or an allocation failed. One local
          * connection dies; nothing else is touched. */
@@ -313,25 +366,129 @@ static void piper_on_deadline(cloak_reactor_t *r, void *userdata) {
     piper_conn_teardown(ctx);
 }
 
+/* SINGLEPLEX: leaves the first-byte window WITHOUT reading anything, and
+ * asks the owner for a session of this connection's own.
+ *
+ * THE DEADLINE IS DELIBERATELY LEFT ARMED. It was armed at accept and is
+ * cancelled in piper_open_stream -- i.e. when a stream actually opens, not
+ * when the first byte arrives -- so in this mode it bounds the session
+ * bring-up as well as the first-byte wait. That is the whole of the time
+ * half of the resource answer: an owner whose handshake hangs, or whose
+ * connector is grinding through its retry ladder, cannot pin this
+ * descriptor past first_byte_timeout_ms. Reusing the one timer rather
+ * than arming a second is not thrift: two timers would be two states to
+ * keep consistent across every teardown path in this file, which is the
+ * one place this module has already been burned.
+ *
+ * The descriptor is deregistered first, exactly as piper_open_stream
+ * deregisters it, and for the same reason: the eventual EPOLL_CTL_ADD is
+ * what re-reports the bytes still sitting in the socket. */
+static void piper_begin_session(cloak_client_piper_conn_t *ctx) {
+    cloak_client_piper_t *pp = ctx->pp;
+
+    if (ctx->fd_registered) {
+        cloak_reactor_remove_fd(pp->cfg.reactor, ctx->fd);
+        ctx->fd_registered = 0;
+    }
+    ctx->awaiting_session = 1;
+    pp->sessions_started++;
+    if (pp->cfg.new_session(ctx, pp->cfg.session_userdata) != 0) {
+        /* NOTHING WAS STARTED, so nothing may be cancelled: clearing the
+         * flag before the teardown is what stops this from firing
+         * cancel_session for a bring-up the owner just told us it never
+         * began. */
+        ctx->awaiting_session = 0;
+        piper_conn_teardown(ctx);
+    }
+}
+
 /* The first readable edge on a local connection. ONE read, matching Go's
  * io.ReadAtLeast(localConn, data, 1): one byte is enough to know this
  * connection is real, and draining to EAGAIN would buy nothing -- the
- * relay is about to take the descriptor and read the rest. */
+ * relay is about to take the descriptor and read the rest.
+ *
+ * IN SINGLEPLEX THIS FUNCTION RUNS TWICE for one connection: once with no
+ * session, where it only PEEKS, and once after the owner has handed a
+ * session over (cloak_client_piper_conn_session_ready re-registers the
+ * descriptor, and an EPOLL_CTL_ADD on an fd that is already readable
+ * reports it immediately), where it takes the ordinary capped read. The
+ * two passes are told apart by ctx->sesh, as everything else in this
+ * module is. */
 static void piper_on_local_readable(cloak_reactor_t *r, int fd, uint32_t events, void *userdata) {
     (void)r;
     (void)events;
     cloak_client_piper_conn_t *ctx = userdata;
     cloak_client_piper_t *pp = ctx->pp;
 
-    if (pp->sesh == NULL) {
-        /* The session died between the accept and the first byte. */
-        piper_conn_teardown(ctx);
+    if (ctx->sesh == NULL) {
+        if (!pp->cfg.singleplex) {
+            /* The shared session died between the accept and the first
+             * byte. */
+            piper_conn_teardown(ctx);
+            return;
+        }
+
+        /* SINGLEPLEX'S FIRST PASS: PEEK, DO NOT CONSUME.
+         *
+         * WHY A PEEK RATHER THAN THE READ Go DOES HERE, and this is the
+         * one deliberate divergence in this file. Go reads the first
+         * bytes into a 10 KiB buffer and only then opens its stream, which
+         * works because its session already exists by that point. Here it
+         * does not, and that has two consequences that both point the
+         * same way:
+         *
+         *  - THE READ CANNOT BE SIZED YET. piper_first_read_cap clamps to
+         *    one frame's payload, derived from the session's
+         *    max_on_wire_size, and there is no session to ask. Reading
+         *    with the unclamped 10 KiB constant instead would reintroduce
+         *    exactly the overrun that clamp exists to prevent, on a
+         *    session configured with a small wire size.
+         *  - IT WOULD PIN DATA FOR THE WHOLE HANDSHAKE. Copying bytes out
+         *    now means holding them for however long the bring-up takes --
+         *    seconds, legitimately, once the connector's retry ladder is
+         *    involved -- per waiting connection.
+         *
+         * MSG_PEEK answers the only question that actually has to be
+         * answered before spending a handshake ("did this connection say
+         * anything, or is it a scanner that connected and closed?")
+         * without consuming a byte. What it does NOT read stays in the
+         * kernel's receive buffer, which is a fixed size the OS bounds
+         * and which backpressures the local application through TCP's own
+         * window. See cloak_client_piper_buffered_bytes. */
+        uint8_t probe;
+        ssize_t got;
+        for (;;) {
+            got = recv(fd, &probe, 1, MSG_PEEK);
+            if (got < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (got < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* cloak/reactor.h folds EPOLLHUP/EPOLLERR into READABLE,
+                 * so a spurious edge is expected and is not a reason to
+                 * give up on a connection that may still speak. */
+                return;
+            }
+            piper_conn_teardown(ctx);
+            return;
+        }
+        if (got == 0) {
+            /* Connected and closed without saying anything. In this mode
+             * that saves a whole dial and handshake, not just a stream --
+             * which is why the session is requested here and not at
+             * accept time. */
+            piper_conn_teardown(ctx);
+            return;
+        }
+        piper_begin_session(ctx);
         return;
     }
 
     ssize_t n;
     for (;;) {
-        n = read(fd, ctx->first, piper_first_read_cap(pp));
+        n = read(fd, ctx->first, piper_first_read_cap(ctx));
         if (n < 0 && errno == EINTR) {
             continue;
         }
@@ -412,7 +569,6 @@ static void piper_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, v
 }
 
 static void piper_on_stream_data(cloak_session_t *sesh, cloak_stream_t *stream, void *userdata) {
-    (void)sesh;
     cloak_client_piper_t *pp = userdata;
     if (pp == NULL || stream == NULL) {
         return;
@@ -434,7 +590,19 @@ static void piper_on_stream_data(cloak_session_t *sesh, cloak_stream_t *stream, 
     cloak_client_piper_conn_t *ctx = pp->conns;
     while (ctx != NULL) {
         cloak_client_piper_conn_t *next = ctx->next;
-        if (ctx->stream == stream) {
+        /* THE SESSION IS PART OF THE KEY, and the honest status of that
+         * is stated rather than overclaimed: in singleplex this list
+         * holds contexts belonging to SEVERAL sessions at once, so the
+         * pair is the actual identity of a stream, but the stream pointer
+         * ALONE is already unambiguous given this module's own
+         * invariants -- a live context's stream belongs to a live
+         * session, and piper_on_broken NULLs it before its session can
+         * free it, so no two entries in this list can ever hold the same
+         * address. The pair is kept because it is free and because that
+         * invariant is the one an ABA bug would break silently, but a
+         * mutation dropping it is NOT caught by this branch's tests and
+         * the report says so. */
+        if (ctx->sesh == sesh && ctx->stream == stream) {
             /* A connection still waiting out a retry has no relay yet and
              * needs no notification: its data waits in its own receive
              * buffer and the relay's initial pump collects it. */
@@ -448,7 +616,6 @@ static void piper_on_stream_data(cloak_session_t *sesh, cloak_stream_t *stream, 
 }
 
 static void piper_on_writable(cloak_session_t *sesh, void *userdata) {
-    (void)sesh;
     cloak_client_piper_t *pp = userdata;
     if (pp == NULL) {
         return;
@@ -478,7 +645,14 @@ static void piper_on_writable(cloak_session_t *sesh, void *userdata) {
     cloak_client_piper_conn_t *ctx = pp->conns;
     while (ctx != NULL) {
         cloak_client_piper_conn_t *next = ctx->next;
-        if (ctx->relaying) {
+        /* Only the relays bound to the session that actually drained: in
+         * singleplex the others are on different pools entirely, so
+         * notifying them is wasted work and a misleading signal. It is
+         * not a CORRECTNESS guard -- cloak_stream_relay_notify_writable
+         * re-checks its own session's budget and does nothing if there is
+         * no room -- so, like the pair above, a mutation dropping it is
+         * not caught by this branch's tests. */
+        if (ctx->sesh == sesh && ctx->relaying) {
             cloak_stream_relay_notify_writable(&ctx->relay);
         }
         ctx = next;
@@ -498,26 +672,48 @@ static void piper_on_writable(cloak_session_t *sesh, void *userdata) {
  * The walk therefore runs BEFORE anything else, including before the
  * chain: cloak/session.h permits a callback in this position to call
  * cloak_session_destroy, and by the time the chain can do that every
- * relay must already be stopped. And pp->sesh is cleared only AFTER the
- * walk, because piper_conn_teardown legitimately needs a live session to
- * release its streams to -- this is the one window where that is still
- * possible. */
+ * relay must already be stopped. And the pointers to this session are
+ * cleared only AFTER the walk, because piper_conn_teardown legitimately
+ * needs a live session to release its streams to -- this is the one
+ * window where that is still possible.
+ *
+ * IT IS PER SESSION, NOT PER PIPER, and that is the structural change
+ * singleplex forces. One piper's context list can hold contexts belonging
+ * to many different sessions at once; a walk that tore down all of them
+ * because ONE session died would kill every unrelated local connection
+ * the client had, which is precisely the failure mode singleplex exists
+ * to prevent. So the walk is keyed on ctx->sesh, and contexts whose
+ * session is a different one -- or which have no session yet, because
+ * theirs is still handshaking -- are left entirely alone. In shared mode
+ * every live context matches, so this is the old walk unchanged. */
 static void piper_on_broken(cloak_session_t *sesh, void *userdata) {
     cloak_client_piper_t *pp = userdata;
     if (pp == NULL) {
         return;
     }
 
-    while (pp->conns != NULL) {
-        piper_conn_teardown(pp->conns);
+    cloak_client_piper_conn_t *ctx = pp->conns;
+    while (ctx != NULL) {
+        /* next is saved before the teardown for the ordinary reason: the
+         * teardown frees ctx. It can only unlink ctx itself -- no context
+         * tears down another -- so `next` stays valid. */
+        cloak_client_piper_conn_t *next = ctx->next;
+        if (ctx->sesh == sesh) {
+            piper_conn_teardown(ctx);
+        }
+        ctx = next;
     }
 
     /* THIS IS THE INSTANT pp->sesh STOPS BEING VALID, and clearing it
      * here is what makes the rule this module's header states true of the
-     * code rather than only of the comment -- including for singleplex,
-     * where the session genuinely dies before the piper does. Every later
-     * accept is closed on arrival from here on. */
-    pp->sesh = NULL;
+     * code rather than only of the comment. Guarded because in singleplex
+     * pp->sesh is NULL throughout and the session that just died belonged
+     * to one context, which the walk above has already forgotten; every
+     * later accept in that mode asks for a session of its own rather than
+     * being refused. */
+    if (pp->sesh == sesh) {
+        pp->sesh = NULL;
+    }
 
     if (pp->cfg.chain != NULL) {
         pp->cfg.chain(sesh, pp->cfg.chain_userdata);
@@ -537,6 +733,15 @@ int cloak_client_piper_init(cloak_client_piper_t *pp, const cloak_client_piper_c
     memset(pp, 0, sizeof(*pp));
 
     if (cfg == NULL || cfg->reactor == NULL) {
+        return -1;
+    }
+    if (cfg->singleplex && cfg->new_session == NULL) {
+        /* REJECTED HERE, NOT AT THE FIRST ACCEPT. A singleplex piper with
+         * no way to obtain a session can do exactly one thing with every
+         * connection it is handed -- close it -- and an operator whose
+         * client silently drops every connection has nothing to go on.
+         * The same argument cloak_client_connector_init makes for
+         * refusing an out-of-range num_conn rather than clamping it. */
         return -1;
     }
 
@@ -600,11 +805,16 @@ void cloak_client_piper_on_accept(cloak_listener_t *l, int fd, void *userdata) {
         return;
     }
 
-    if (pp->sesh == NULL) {
-        /* No session to open a stream on -- either one has never been set
-         * or it has broken. Closing immediately is the honest answer: an
-         * application that gets a connection and then silence cannot tell
-         * a dead tunnel from a slow one. */
+    if (!pp->cfg.singleplex && pp->sesh == NULL) {
+        /* No shared session to open a stream on -- either one has never
+         * been set or it has broken. Closing immediately is the honest
+         * answer: an application that gets a connection and then silence
+         * cannot tell a dead tunnel from a slow one.
+         *
+         * A SINGLEPLEX PIPER NEVER TAKES THIS BRANCH, and must not: it has
+         * no shared session by construction, and the session this
+         * connection will use does not exist yet and will not until the
+         * connection has said something. */
         close(fd);
         return;
     }
@@ -630,6 +840,11 @@ void cloak_client_piper_on_accept(cloak_listener_t *l, int fd, void *userdata) {
     ctx->fd = fd;
     ctx->deadline = CLOAK_TIMER_INVALID;
     ctx->retry_timer = CLOAK_TIMER_INVALID;
+    /* THE SESSION IS BOUND TO THE CONTEXT HERE, ONCE, and everything
+     * afterwards reads it from the context. In singleplex there is none
+     * to bind yet: NULL is this context's whole state until its own
+     * bring-up answers. */
+    ctx->sesh = pp->cfg.singleplex ? NULL : pp->sesh;
     piper_conn_link(pp, ctx);
 
     /* D6: NOTHING IS OPENED ON THE SESSION HERE. The connection is
@@ -651,6 +866,61 @@ void cloak_client_piper_on_accept(cloak_listener_t *l, int fd, void *userdata) {
          * rather than admit an unbounded one. */
         piper_conn_teardown(ctx);
     }
+}
+
+/* SINGLEPLEX: the owner's answer to config::new_session.
+ *
+ * WHY THIS RE-REGISTERS THE DESCRIPTOR INSTEAD OF READING IT. The first
+ * pass through piper_on_local_readable only peeked, so the connection's
+ * bytes are still in the kernel. Handing the fd back to the reactor makes
+ * the ordinary path run again -- and an EPOLL_CTL_ADD on a descriptor that
+ * is already readable reports it at once (cloak/reactor.h), which is the
+ * same property piper_open_stream relies on -- so the capped read, the
+ * stream open and the relay start are ONE code path shared by both modes
+ * rather than two that can drift. */
+void cloak_client_piper_conn_session_ready(cloak_client_piper_conn_t *ctx, cloak_session_t *sesh) {
+    if (ctx == NULL) {
+        return;
+    }
+    if (sesh == NULL) {
+        cloak_client_piper_conn_session_failed(ctx);
+        return;
+    }
+    if (!ctx->awaiting_session) {
+        /* Answered twice, or answered after cancel_session said not to.
+         * Both are contract violations; ignoring is the only safe reply,
+         * since the alternative interpretation of a stale ctx is a
+         * use-after-free this function could not detect anyway. */
+        return;
+    }
+    cloak_client_piper_t *pp = ctx->pp;
+    ctx->awaiting_session = 0;
+    /* own_sesh is set BEFORE the registration can fail, deliberately: from
+     * this instant the session is this context's responsibility, so even
+     * the failure path below must close it rather than leak it. */
+    ctx->sesh = sesh;
+    ctx->own_sesh = 1;
+
+    if (ctx->fd < 0 ||
+        cloak_reactor_add_fd(pp->cfg.reactor, ctx->fd, CLOAK_REACTOR_READABLE,
+                             piper_on_local_readable, ctx) != 0) {
+        piper_conn_teardown(ctx);
+        return;
+    }
+    ctx->fd_registered = 1;
+}
+
+void cloak_client_piper_conn_session_failed(cloak_client_piper_conn_t *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    if (!ctx->awaiting_session) {
+        return;
+    }
+    /* Cleared first so the teardown does not then fire cancel_session for
+     * a bring-up the owner has just finished telling us about. */
+    ctx->awaiting_session = 0;
+    piper_conn_teardown(ctx);
 }
 
 void cloak_client_piper_destroy(cloak_client_piper_t *pp) {
@@ -683,4 +953,23 @@ size_t cloak_client_piper_rejected_streams(const cloak_client_piper_t *pp) {
 
 size_t cloak_client_piper_retried_starts(const cloak_client_piper_t *pp) {
     return pp == NULL ? 0 : pp->retried_starts;
+}
+
+size_t cloak_client_piper_sessions_started(const cloak_client_piper_t *pp) {
+    return pp == NULL ? 0 : pp->sessions_started;
+}
+
+/* O(live connections), like piper_on_stream_data's scan and for the same
+ * reason: the count is a browser's worth, and a running total would be a
+ * second thing to keep in step with first_len across every teardown path
+ * -- which is the exact place this module is most fragile. */
+size_t cloak_client_piper_buffered_bytes(const cloak_client_piper_t *pp) {
+    if (pp == NULL) {
+        return 0;
+    }
+    size_t total = 0;
+    for (const cloak_client_piper_conn_t *ctx = pp->conns; ctx != NULL; ctx = ctx->next) {
+        total += ctx->first_len;
+    }
+    return total;
 }
