@@ -60,3 +60,9 @@ target_include_directories(test_valve_rate PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-
 target_link_libraries(test_valve_rate PRIVATE cloak-mux)
 add_test(NAME test_valve_rate COMMAND test_valve_rate)
 set_tests_properties(test_valve_rate PROPERTIES TIMEOUT 60)
+
+add_executable(test_conn_record test_conn_record.c)
+target_include_directories(test_conn_record PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_conn_record PRIVATE cloak-mux)
+add_test(NAME test_conn_record COMMAND test_conn_record)
+set_tests_properties(test_conn_record PROPERTIES TIMEOUT 60)

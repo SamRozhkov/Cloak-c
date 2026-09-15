@@ -234,9 +234,9 @@ static void test_direction_of_real_traffic(void) {
      * brackets it: header + tag + prefix at minimum, header + the maximum
      * extra + prefix at most. */
     int64_t tag_len = (int64_t)cloak_aead_overhead(CLOAK_AEAD_AES_256_GCM);
-    ASSERT_TRUE(c_tx >= (int64_t)(PAYLOAD_LEN + CLOAK_FRAME_HEADER_LEN + CLOAK_CONN_LEN_PREFIX_LEN) + tag_len);
+    ASSERT_TRUE(c_tx >= (int64_t)(PAYLOAD_LEN + CLOAK_FRAME_HEADER_LEN + CLOAK_CONN_RECORD_HEADER_LEN) + tag_len);
     ASSERT_TRUE(c_tx <= (int64_t)(PAYLOAD_LEN + CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN +
-                                   CLOAK_CONN_LEN_PREFIX_LEN));
+                                   CLOAK_CONN_RECORD_HEADER_LEN));
 
     cloak_session_release_stream(&client, client_stream);
     cloak_session_release_stream(&server, server_stream);

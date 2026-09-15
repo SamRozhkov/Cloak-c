@@ -876,7 +876,7 @@ static void test_broken_session_with_pending_dial(void) {
  *
  * The rejection is a GENUINE one, provoked by sizing exactly as
  * test_proxy_stream.c's retry test provokes it: at max_on_wire_size 16401
- * one worst-case frame costs 16403 bytes on the wire, so a pool of 16402
+ * one worst-case frame costs 16406 bytes on the wire, so a pool of 16402
  * can never satisfy cloak_stream_relay_start's start-time check and every
  * start attempt is rejected with -2. max_retries is left at the default
  * (400 * 50ms, twenty seconds), far longer than this test runs, so the

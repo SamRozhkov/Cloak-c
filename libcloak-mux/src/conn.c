@@ -131,24 +131,31 @@ static void conn_try_drain_send(cloak_conn_t *c) {
 }
 
 static void conn_extract_and_dispatch(cloak_conn_t *c) {
-    uint8_t prefix[CLOAK_CONN_LEN_PREFIX_LEN];
+    uint8_t header[CLOAK_CONN_RECORD_HEADER_LEN];
     for (;;) {
-        size_t peeked = cloak_bytequeue_peek(&c->recv_acc, prefix, CLOAK_CONN_LEN_PREFIX_LEN);
-        if (peeked < CLOAK_CONN_LEN_PREFIX_LEN) {
-            return; /* not even the length prefix has fully arrived yet */
+        size_t peeked = cloak_bytequeue_peek(&c->recv_acc, header, CLOAK_CONN_RECORD_HEADER_LEN);
+        if (peeked < CLOAK_CONN_RECORD_HEADER_LEN) {
+            return; /* not even the record header has fully arrived yet */
         }
-        uint16_t frame_len = (uint16_t)(((uint16_t)prefix[0] << 8) | (uint16_t)prefix[1]);
+        /* Bytes 0-2 (type and version) are read past WITHOUT being
+         * validated -- Go's common.TLSConn.Read does exactly the same, and
+         * cloak/conn.h gives the two reasons at length: being fussier than
+         * the reference implementation is itself a distinguisher, and the
+         * frame's own AEAD is the only authenticator that could actually
+         * stop anything. Deliberate; pinned by
+         * libcloak-mux/tests/test_conn_record.c. */
+        uint16_t frame_len = (uint16_t)(((uint16_t)header[3] << 8) | (uint16_t)header[4]);
         if ((size_t)frame_len > c->max_frame_len) {
             conn_mark_broken(c); /* protocol violation -- declared length too large for this conn */
             return;
         }
-        size_t envelope_len = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + frame_len;
+        size_t envelope_len = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + frame_len;
         if (cloak_bytequeue_len(&c->recv_acc) < envelope_len) {
             return; /* full envelope hasn't arrived yet */
         }
         cloak_bytequeue_read(&c->recv_acc, c->recv_scratch, envelope_len);
         if (c->on_envelope) {
-            c->on_envelope(c, c->recv_scratch + CLOAK_CONN_LEN_PREFIX_LEN, frame_len, c->on_envelope_userdata);
+            c->on_envelope(c, c->recv_scratch + CLOAK_CONN_RECORD_HEADER_LEN, frame_len, c->on_envelope_userdata);
         }
         if (c->broken) {
             return; /* the callback may have torn c down re-entrantly */
@@ -293,7 +300,7 @@ static void conn_handle_readable(cloak_conn_t *c) {
          * is what Go does too.
          *
          * Wire bytes: this includes each envelope's
-         * CLOAK_CONN_LEN_PREFIX_LEN prefix, matching what the sending
+         * CLOAK_CONN_RECORD_HEADER_LEN record header, matching what the sending
          * peer's TX side counted for the same envelope.
          *
          * rx/tx here are the SERVER's directions, NOT the user manager's
@@ -336,7 +343,7 @@ int cloak_conn_init(cloak_conn_t *c, int fd, cloak_reactor_t *reactor,
     c->fd = fd;
     c->reactor = reactor;
     c->max_frame_len = max_frame_len;
-    c->max_envelope_len = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + max_frame_len;
+    c->max_envelope_len = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + max_frame_len;
     c->on_envelope = on_envelope;
     c->on_envelope_userdata = on_envelope_userdata;
     c->on_closed = on_closed;
@@ -392,7 +399,7 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
     /* Checked directly against max_frame_len first, before the addition
      * below -- frame_len is always this module's own bounded chunking in
      * practice (never network-derived), but a caller bug passing a
-     * frame_len near SIZE_MAX would otherwise wrap CLOAK_CONN_LEN_PREFIX_LEN
+     * frame_len near SIZE_MAX would otherwise wrap CLOAK_CONN_RECORD_HEADER_LEN
      * + frame_len back into range and silently bypass the size check
      * entirely. Flagged as an open Minor by an earlier task review and
      * triaged (fixed, not deferred) during this plan's final
@@ -402,7 +409,7 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
         conn_mark_broken(c); /* caller/config bug: frame too large for this conn */
         return -1;
     }
-    size_t total = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + frame_len;
+    size_t total = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + frame_len;
     if (total > c->max_envelope_len) {
         conn_mark_broken(c); /* caller/config bug: frame too large for this conn */
         return -1;
@@ -411,10 +418,19 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
         conn_mark_broken(c); /* send queue's hard cap exceeded -- treated as a connection failure */
         return -1;
     }
-    uint8_t prefix[CLOAK_CONN_LEN_PREFIX_LEN];
-    prefix[0] = (uint8_t)((frame_len >> 8) & 0xff);
-    prefix[1] = (uint8_t)(frame_len & 0xff);
-    cloak_bytequeue_write(&c->send_q, prefix, CLOAK_CONN_LEN_PREFIX_LEN);
+    /* The five bytes a censor's DPI box sees before every frame. Byte for
+     * byte what Go's common.TLSConn.Write emits
+     * (/Users/sam/Cloak/internal/common/tls.go): application_data, the
+     * legacy record version TLS 1.3 puts on the wire, then the body length
+     * big-endian. See cloak/conn.h for why the three constant bytes are
+     * the point of this module and not overhead to be trimmed. */
+    uint8_t header[CLOAK_CONN_RECORD_HEADER_LEN];
+    header[0] = 0x17; /* ContentType application_data */
+    header[1] = 0x03; /* legacy_record_version 0x0303, high byte */
+    header[2] = 0x03; /* legacy_record_version 0x0303, low byte  */
+    header[3] = (uint8_t)((frame_len >> 8) & 0xff);
+    header[4] = (uint8_t)(frame_len & 0xff);
+    cloak_bytequeue_write(&c->send_q, header, CLOAK_CONN_RECORD_HEADER_LEN);
     cloak_bytequeue_write(&c->send_q, frame_bytes, frame_len);
     conn_try_drain_send(c);
     /* conn_try_drain_send may have discovered a hard write failure (e.g.

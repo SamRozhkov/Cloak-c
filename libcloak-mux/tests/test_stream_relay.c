@@ -1204,7 +1204,7 @@ static void test_start_rejects_when_no_connection_can_ever_fit_one_frame(void) {
     cloak_session_config_t cfg_a;
     fill_config(&cfg_a, &a, &obfs);
     /* max_on_wire_size 16401 (this file's own default) plus
-     * CLOAK_CONN_LEN_PREFIX_LEN means one worst-case frame costs 16403
+     * CLOAK_CONN_RECORD_HEADER_LEN means one worst-case frame costs 16406
      * on-wire bytes -- comfortably more than this 8192-byte cap, so no
      * connection in this one-connection pool could ever hold a single
      * full frame, no matter how empty it is. */

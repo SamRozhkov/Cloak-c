@@ -661,8 +661,9 @@ static void test_stack_carries_traffic_end_to_end(void) {
 /* ---- test 2: a frame buffered across the hand-off ----------------------- */
 
 /* One complete mux envelope exactly as cloak_conn_send puts it on the
- * wire: a big-endian u16 length prefix (CLOAK_CONN_LEN_PREFIX_LEN) around
- * the frame cloak_frame_obfuscate produces. Both are public, stateless
+ * wire: a TLS application-data record header
+ * (CLOAK_CONN_RECORD_HEADER_LEN -- 0x17 0x03 0x03 then a big-endian u16
+ * length) around the frame cloak_frame_obfuscate produces. Both are public, stateless
  * APIs -- cloak_frame_obfuscate takes the whole obfuscator by value and
  * nothing else, so a frame built here is indistinguishable from one
  * session.c built (session.c's own session-closing frame is composed with
@@ -686,15 +687,18 @@ static size_t build_wire_frame(const uint8_t key[CLOAK_AEAD_KEY_LEN], uint32_t s
     f.payload = payload;
     f.payload_len = payload_len;
 
-    long n = cloak_frame_obfuscate(&o, &f, out + CLOAK_CONN_LEN_PREFIX_LEN,
-                                   out_cap - CLOAK_CONN_LEN_PREFIX_LEN, 0);
+    long n = cloak_frame_obfuscate(&o, &f, out + CLOAK_CONN_RECORD_HEADER_LEN,
+                                   out_cap - CLOAK_CONN_RECORD_HEADER_LEN, 0);
     ASSERT_TRUE(n > 0);
     if (n <= 0) {
         return 0;
     }
-    out[0] = (uint8_t)(((unsigned long)n >> 8) & 0xff);
-    out[1] = (uint8_t)((unsigned long)n & 0xff);
-    return CLOAK_CONN_LEN_PREFIX_LEN + (size_t)n;
+    out[0] = 0x17;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    out[3] = (uint8_t)(((unsigned long)n >> 8) & 0xff);
+    out[4] = (uint8_t)((unsigned long)n & 0xff);
+    return CLOAK_CONN_RECORD_HEADER_LEN + (size_t)n;
 }
 
 /* The write shim consumes CLOAK_TEST_FORCE_PEER_PORT the instant it fakes
@@ -759,7 +763,7 @@ static void test_pipelined_frame_survives_handoff(void) {
      * average case fails on roughly one run in fifteen -- which is what it
      * did, found by the 50-run repeat loop rather than by the first
      * green run. */
-    uint8_t frame[CLOAK_CONN_LEN_PREFIX_LEN + CLOAK_FRAME_HEADER_LEN + 16 +
+    uint8_t frame[CLOAK_CONN_RECORD_HEADER_LEN + CLOAK_FRAME_HEADER_LEN + 16 +
                   CLOAK_FRAME_MAX_EXTRA_LEN];
     size_t frame_len = build_wire_frame(cs.session_key, PIPELINED_STREAM_ID, 0, "PIPELINED", 9,
                                         frame, sizeof(frame));

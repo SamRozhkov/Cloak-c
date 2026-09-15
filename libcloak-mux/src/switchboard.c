@@ -128,16 +128,17 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
          * divergence from Go, and one that loses the bytes of a frame
          * still queued when a connection dies.
          *
-         * CLOAK_CONN_LEN_PREFIX_LEN is included because cloak_conn_send
-         * adds that prefix to every frame, so it genuinely crosses the
+         * CLOAK_CONN_RECORD_HEADER_LEN is included because cloak_conn_send
+         * adds that record header to every frame, so it genuinely crosses the
          * socket: the count is the whole on-wire envelope, which is also
-         * exactly what the peer's RX side counts for the same frame. In
-         * Go the equivalent framing lives inside the transport conn
-         * (a TLS record header), below the point either counter sees.
+         * exactly what the peer's RX side counts for the same frame. These
+         * are the same five bytes Go's own transport conn adds
+         * (common.TLSConn.Write), below the point either counter sees, so
+         * the two ports bill an identical frame identically.
          *
          * rx/tx here are the SERVER's directions, NOT the user manager's
          * up/down -- see cloak/valve.h before touching this line. */
-        cloak_valve_add_tx(sb->valve, (int64_t)(CLOAK_CONN_LEN_PREFIX_LEN + frame_len));
+        cloak_valve_add_tx(sb->valve, (int64_t)(CLOAK_CONN_RECORD_HEADER_LEN + frame_len));
     }
     return rc;
 }

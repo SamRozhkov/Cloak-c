@@ -327,12 +327,13 @@ static void test_data_callback_fires_on_protocol_violation(void) {
      * forges one directly on the wire instead: a hand-obfuscated frame
      * (built with cloak_frame_obfuscate, the same shared obfuscator both
      * sessions use) reusing stream_id/seq 0 -- the seq the real first
-     * frame already consumed -- length-prefixed exactly as cloak_conn_send
-     * would (CLOAK_CONN_LEN_PREFIX_LEN, big-endian), and written straight
+     * frame already consumed -- wrapped in a TLS application-data record
+     * exactly as cloak_conn_send would (CLOAK_CONN_RECORD_HEADER_LEN:
+     * 0x17 0x03 0x03 then a big-endian length), and written straight
      * onto the raw socket fd. This is still "driving it from outside", not
      * reaching into cloak_stream_t/cloak_session_t internals: everything
      * used here (cloak_frame_t, cloak_frame_obfuscate,
-     * CLOAK_CONN_LEN_PREFIX_LEN) is public API, and it's exactly what an
+     * CLOAK_CONN_RECORD_HEADER_LEN) is public API, and it's exactly what an
      * on-path attacker replaying a captured frame would produce. */
     int fds[2];
     ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
@@ -388,16 +389,19 @@ static void test_data_callback_fires_on_protocol_violation(void) {
     dup.payload = dup_payload;
     dup.payload_len = sizeof(dup_payload) - 1;
 
-    uint8_t wire[CLOAK_CONN_LEN_PREFIX_LEN + CLOAK_FRAME_HEADER_LEN + 64 + CLOAK_FRAME_MAX_EXTRA_LEN];
-    long written = cloak_frame_obfuscate(&obfs, &dup, wire + CLOAK_CONN_LEN_PREFIX_LEN,
-                                          sizeof(wire) - CLOAK_CONN_LEN_PREFIX_LEN, 0);
+    uint8_t wire[CLOAK_CONN_RECORD_HEADER_LEN + CLOAK_FRAME_HEADER_LEN + 64 + CLOAK_FRAME_MAX_EXTRA_LEN];
+    long written = cloak_frame_obfuscate(&obfs, &dup, wire + CLOAK_CONN_RECORD_HEADER_LEN,
+                                          sizeof(wire) - CLOAK_CONN_RECORD_HEADER_LEN, 0);
     ASSERT_TRUE(written > 0);
     if (written <= 0) {
         return;
     }
-    wire[0] = (uint8_t)(((size_t)written >> 8) & 0xffu);
-    wire[1] = (uint8_t)((size_t)written & 0xffu);
-    size_t envelope_len = (size_t)CLOAK_CONN_LEN_PREFIX_LEN + (size_t)written;
+    wire[0] = 0x17;
+    wire[1] = 0x03;
+    wire[2] = 0x03;
+    wire[3] = (uint8_t)(((size_t)written >> 8) & 0xffu);
+    wire[4] = (uint8_t)((size_t)written & 0xffu);
+    size_t envelope_len = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + (size_t)written;
     ASSERT_EQ_INT((int)envelope_len, (int)write(fds[0], wire, envelope_len));
 
     for (int i = 0; i < 50 && b.data_calls == 0; i++) {
