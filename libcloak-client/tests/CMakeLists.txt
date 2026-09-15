@@ -61,3 +61,19 @@ target_include_directories(test_client_connector PRIVATE ${CMAKE_SOURCE_DIR}/lib
 target_link_libraries(test_client_connector PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_connector COMMAND test_client_connector)
 set_tests_properties(test_client_connector PROPERTIES TIMEOUT 60)
+
+# cloak-server is a TEST-ONLY dependency here for the same reason every
+# other file in this directory uses it (see above), and for this file it
+# is the sharpest form of it: cloak_client_piper_t is the exact mirror of
+# cloak_proxy_t, so the assertions that actually carry these cases are
+# read off the SERVER -- cloak_proxy_stream_count and the upstream
+# socket's own byte count. A mock could not tell "the piper opened a
+# stream before any byte arrived" (D6's whole point) from "it waited",
+# because both look the same from the local peer's side; only the
+# server's stream context count separates them. The library itself still
+# links only cloak-common and cloak-mux.
+add_executable(test_client_piper test_client_piper.c)
+target_include_directories(test_client_piper PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_client_piper PRIVATE cloak-client cloak-server)
+add_test(NAME test_client_piper COMMAND test_client_piper)
+set_tests_properties(test_client_piper PROPERTIES TIMEOUT 60)
