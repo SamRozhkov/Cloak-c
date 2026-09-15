@@ -24,3 +24,19 @@ target_include_directories(test_client_transport PRIVATE ${CMAKE_SOURCE_DIR}/lib
 target_link_libraries(test_client_transport PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_transport COMMAND test_client_transport)
 set_tests_properties(test_client_transport PROPERTIES TIMEOUT 60)
+
+# cloak-server is a TEST-ONLY dependency here for the same reason
+# test_client_auth and test_client_transport use it (see above), taken to
+# its conclusion: this file drives the WHOLE merged server -- server
+# state, user manager, user panel, registry, proxy, dispatcher and a
+# listener -- against a real cloak_client_handshake_t and a real
+# client-side cloak_session_t, so both halves of the protocol are library
+# code for the first time. No sqlite3 link of its own is needed on top of
+# the transitive one cloak-server already provides: cloak/usermanager.h
+# keeps cloak_usermanager_t opaque and never includes sqlite3.h, and this
+# file only opens and closes the manager.
+add_executable(test_client_e2e test_client_e2e.c)
+target_include_directories(test_client_e2e PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_client_e2e PRIVATE cloak-client cloak-server)
+add_test(NAME test_client_e2e COMMAND test_client_e2e)
+set_tests_properties(test_client_e2e PROPERTIES TIMEOUT 60)
