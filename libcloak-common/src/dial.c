@@ -3,6 +3,8 @@
 
 #include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +19,15 @@ static int set_err(char *err, size_t err_cap, const char *fmt, ...) {
         va_end(ap);
     }
     return -1;
+}
+
+/* See cloak/net.h for why this exists and why its result is ignored. */
+void cloak_net_set_tcp_nodelay(int fd, int socktype) {
+    if (fd < 0 || socktype != SOCK_STREAM) {
+        return;
+    }
+    int one = 1;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
 int cloak_net_resolve(const char *addr, int is_udp, cloak_addr_t *out,
@@ -163,6 +174,7 @@ int cloak_dial_start(cloak_dial_t *d, cloak_reactor_t *r, const cloak_addr_t *ad
         return set_err(err, err_cap, "dial: socket: %s", strerror(errno));
     }
     d->fd = fd;
+    cloak_net_set_tcp_nodelay(fd, addr->socktype);
 
     int rc = connect(fd, (const struct sockaddr *)&addr->ss, addr->len);
     if (rc == 0) {

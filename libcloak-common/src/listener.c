@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -122,6 +123,12 @@ static void listener_on_readable(cloak_reactor_t *r, int fd, uint32_t events, vo
              * to the listener -- stop draining and wait for the next edge. */
             return;
         }
+        /* Set HERE, before the descriptor is handed on, so that every
+         * accepted connection in this project has it regardless of which
+         * module takes ownership -- see cloak_net_set_tcp_nodelay.
+         * cloak_listener_open always binds SOCK_STREAM (below), so an
+         * accepted fd is always TCP. */
+        cloak_net_set_tcp_nodelay(conn, SOCK_STREAM);
         /* cloak_listener_open rejects cb == NULL, so on_accept is always
          * set on a listener that made it this far -- no NULL fallback
          * needed here. */

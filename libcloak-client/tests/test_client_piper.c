@@ -2013,6 +2013,108 @@ static void test_server_opened_streams_are_refused(void) {
     logcap_close(&lc);
 }
 
+/* ---- case 7D: a small write is not held by Nagle ------------------------ */
+
+#define SID_NODELAY ((uint32_t)6116)
+
+/* A REAL DEFECT THIS BRANCH SHIPPED WITH: no socket anywhere in this
+ * project set TCP_NODELAY. Go's net.TCPConn sets NoDelay(true) by
+ * default, so the reference implementation has it on every socket and
+ * this port had it on none -- a silent divergence, invisible to every
+ * functional assertion in the suite because Nagle costs latency and never
+ * correctness.
+ *
+ * THE SHAPE THAT TRIGGERS IT, which is why this case looks like case 7:
+ * Nagle holds a small write whenever a small segment is still
+ * un-acknowledged, so it takes at least TWO small frames in flight before
+ * a third is delayed. Two refused streams are the cheapest way to put two
+ * of them on the session's connection; any pair of small frames would do.
+ * The third write then waits for the peer's delayed ACK -- measured at
+ * 36-40 ms on Linux loopback, every time, at every refusal count from two
+ * upward.
+ *
+ * MEASURED IN WALL-CLOCK TIME, DELIBERATELY, and with its own loop rather
+ * than pump_until: what is being asserted here is a duration, so a bound
+ * counted in reactor turns would not be asserting it. The budget sits
+ * about a third of the delay it excludes, and the observed time with the
+ * fix in place is under a millisecond -- so this is not a tight race
+ * being called a test. A run that exceeds the CEILING has not merely been
+ * slow, it has not completed at all, and fails on the completion
+ * assertion instead. */
+#define NAGLE_BUDGET_MS 12u
+#define NAGLE_CEILING_MS 2000u
+
+static void test_small_writes_are_not_nagle_delayed(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    client_t cl;
+    cloak_client_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    ASSERT_EQ_INT(0, client_up(&cl, &fx, SID_NODELAY, &pcfg, 262144));
+
+    local_peer_t lp;
+    ASSERT_EQ_INT(0, lp_open(&lp, fx.reactor, cl.local_port));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &lp, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    static const uint8_t first[] = "first";
+    lp_send(&lp, first, sizeof(first) - 1);
+    struct up_wait uw = {&fx.up, 0, sizeof(first) - 1};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw, PIPER_MAX_TURNS, PIPER_TURN_MS));
+
+    cloak_session_t *server_sesh = cloak_server_registry_find(&fx.registry, fx.uid, SID_NODELAY);
+    ASSERT_TRUE(server_sesh != NULL);
+    if (server_sesh == NULL) {
+        lp_destroy(&lp);
+        client_down(&cl);
+        fixture_destroy(&fx);
+        return;
+    }
+
+    /* TWO small frames onto the wire, and settled before the measurement
+     * starts -- so what is timed below is one write, not this pair. */
+    server_sesh->next_stream_id = 0x50000000u;
+    for (int i = 0; i < 2; i++) {
+        cloak_stream_t *st = open_rogue(server_sesh);
+        if (st != NULL) {
+            cloak_session_release_stream(server_sesh, st);
+        }
+    }
+    struct piper_wait pw = {&cl.piper, 2};
+    ASSERT_TRUE(pump_until(fx.reactor, piper_rejected_streams_at_least, &pw, PIPER_MAX_TURNS,
+                           PIPER_TURN_MS));
+
+    /* THE MEASUREMENT: one small write, timed end to end. */
+    static const uint8_t small[] = "ping";
+    const size_t small_len = sizeof(small) - 1;
+    uw.want = (sizeof(first) - 1) + small_len;
+    uint64_t start = monotonic_ms();
+    lp_send(&lp, small, small_len);
+    int arrived = 0;
+    uint64_t elapsed = 0;
+    for (;;) {
+        if (up_has_len(&uw)) {
+            arrived = 1;
+            break;
+        }
+        elapsed = monotonic_ms() - start;
+        if (elapsed >= NAGLE_CEILING_MS) {
+            break;
+        }
+        cloak_reactor_run_once(fx.reactor, 1);
+    }
+    elapsed = monotonic_ms() - start;
+
+    ASSERT_TRUE(arrived);
+    ASSERT_MEM_EQ(fx.up.conns[0].in + sizeof(first) - 1, small, small_len);
+    /* Without TCP_NODELAY this is 36-40 ms and this assertion is the only
+     * thing in the suite that notices. */
+    ASSERT_TRUE(elapsed < NAGLE_BUDGET_MS);
+
+    lp_destroy(&lp);
+    client_down(&cl);
+    fixture_destroy(&fx);
+}
+
 /* ---- case 7B: and the refusals are BOUNDED ------------------------------ */
 
 /* The ceiling, asserted on BOTH sides of it: at K-1 refusals the session
@@ -2729,6 +2831,7 @@ test_local_close_closes_the_stream();
 test_stream_end_closes_the_local_socket();
 test_a_broken_session_stops_every_relay();
 test_server_opened_streams_are_refused();
+test_small_writes_are_not_nagle_delayed();
 test_refusals_are_bounded();
 test_the_refusal_ceiling_is_per_session();
 test_the_local_connection_cap();
