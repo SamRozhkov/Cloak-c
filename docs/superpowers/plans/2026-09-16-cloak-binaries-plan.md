@@ -264,3 +264,124 @@ And two lessons about where the real defects came from:
 - **Type consistency:** `cloak_server_stack_t` is produced in Task 1 and consumed in Task 4; `cloak_client_stack_t` in Task 2 and consumed in Task 5; `cloak_signalfd_t` and the keygen helpers in Task 3 and consumed in both. Counts chain 58 → 59 → 60 → 61 → 62 → 63.
 - **The riskiest thing here** is Task 1, because it is the first code that has to get the four-link chain and the teardown order right *without* a test fixture's freedom to special-case, and because every module that came before it found its worst bug in that exact area.
 - **The most consequential thing here** is that after this plan the project has something a person can run. Everything so far has been libraries and tests; a bug that only appears when the program is actually started — a signal race, a teardown order, a config path — has had nowhere to show itself until now.
+
+---
+
+## What this branch left for the next ones
+
+### The prediction at the top of this plan was right, and here is the measurement
+
+"A bug that only appears when the program is actually started has had nowhere to show itself
+until now." It showed itself immediately, and one measurement settles the argument: mutating the
+**server's** `MAX_ON_WIRE_SIZE` from 16401 to 8192 fails the end-to-end case **and nothing else in
+the 63-test suite**. Five modules of library tests could not see it, for the reason this project
+already knew and kept paying for anyway — *both ends of every library test are our own code*. The
+same shape produced the record-layer defect that dropped the TLS disguise one round trip into every
+connection and survived five modules.
+
+That single assertion survived three fix rounds and four independent attempts to blunt it. Keep it.
+
+### Defects this branch found that were real
+
+- **Neither binary disabled SIGPIPE.** A running `ck-server` sent `kill -PIPE` died with status 141.
+  `dispatcher.c` held the tree's only socket write without `MSG_NOSIGNAL`, in a retry loop on a
+  peer-controlled descriptor. **Go's runtime ignores SIGPIPE for non-stdio descriptors by default,
+  so not doing it was a divergence from the original, not a missing precaution.** The race itself
+  was never reproduced — 840 RST-after-ClientHello replays across a 0–1600 µs sweep all survived,
+  because loopback finishes the reply in one write. Fixed anyway: latent is not absent.
+- **The config parser accepted a 255-character `ServerName` while the connector capped it at 253.**
+  253 is correct — RFC 1035/4343 give 255 octets on the wire, 253 presentation characters, and
+  RFC 6066 requires a valid DNS hostname. Go bounds it nowhere, so neither number was "Go's". The
+  symptom was an operator with a 254-character name getting an exit code whose own contract says
+  retrying may help, so a supervisor keyed on it would restart forever over a typo.
+- **`AlternativeNames` had the same unbounded defect**, and nobody had named it. Because the SNI is
+  drawn per session, an over-long alternative name would have failed **intermittently** — the worst
+  shape a bug can take here.
+- **`-a` silently zeroed `Singleplex`**, which Go's admin branch does not, and which made the
+  `admin_session` guard unreachable from the only binary that sets the field.
+- **A fourth bug in the Go original.** `parseSSBindAddr`'s R3 writes the SS address over an existing
+  entry *and* sets `shouldAppend`, so `["0.0.0.0:P"]` + `::|0.0.0.0` yields `[":P", ":P"]`, the
+  second `net.Listen` dies EADDRINUSE, and it resurrects appends R1/R2 had suppressed. Confirmed
+  independently. The port implements it correctly.
+- **Go's server cannot accept inline configuration** — `ParseConfig` unmarshals the empty buffer it
+  failed to fill — so its own flag help is false. Go's *client* fails differently: the literal takes
+  the ReadFile branch. Inline config is a deliberate superset on **both** binaries here.
+
+### The methodological result, stated as plainly as it can be
+
+**A mutation log written by the author of the code is the least reliable document in the repository,
+because the author picks mutations they expect to die.** The evidence on this branch alone:
+
+| | self-reported | found by an outside reviewer |
+|---|---|---|
+| `ck-server` (Task 4) | 11 of 11 caught, 0 escaped | **15 of 26 escaped** |
+| `ck-client` (Task 5) | 14 applied, none escaped | 4 of 17 escaped |
+| whole branch | — | 6 of 26 escaped |
+
+Task 4 mutated only itself. Task 5 mutated the **server** to test the client — an outside oracle —
+and had a quarter of the escape rate. That is the whole difference, and it is reproducible advice:
+**where an outside oracle exists, use it.**
+
+Among the fifteen that escaped `ck-server`: a **hardcoded constant valid key pair passed the entire
+suite.** In a circumvention tool, key generation that silently returns a constant means every user
+of that build shares one key.
+
+And the fix round's headline: **`main.c` did not change.** All eight ordered items were test gaps.
+The server was correct and nothing proved it.
+
+### Two rulings worth inheriting
+
+**"Repairing this would unpin that test" is not an argument.** It was offered here in good faith,
+for the `ServerName` mismatch, and overruled. It is this project's most expensive recurring pattern
+said out loud — a test green from a path other than the one it names, six instances across seven
+branches. When a working alternative sits in the same file (`RLIMIT_NOFILE`, bracket 4→3, 5→4,
+6→ready), a defect kept alive for a test's convenience is never the trade.
+
+**An honestly declared equivalent mutant beats a manufactured kill.** Three were declared on this
+branch — the client piper's callback clears, the client's `default:` arm, the server's — and all
+three held up under independent proof. Declaring one costs nothing and is checkable; inflating a
+count is neither.
+
+### Gaps handed on, by owner
+
+- **`keep_alive_sec` is parsed, carried, and consumed by nobody.** Both binaries now warn at
+  startup. **It must not survive the session module unrecorded.**
+- **Reconnect-after-server-restart through the binaries is unasserted**, while being the stated
+  justification for there being no sixth exit code. Whoever adds the sixth code, or argues again
+  that five suffice, owes this test.
+- **UDP end-to-end** is module 9's, **CDN** module 8's; both are refused at open today.
+- `cloak_server_stack_upload_now`'s *library* coverage was always there; only the binary's call was
+  missing, and the whole-branch view is what made the cost visible (one billing interval lost per
+  restart). Per-task review structurally cannot see that class.
+- `read_whole_file` and `ck_err` are duplicated verbatim in the two mains. Thirty lines did not
+  justify a shared unit at the end of a branch. **If a third binary appears, it does.**
+
+### The suite is now a resource, and module 8 inherits a budget
+
+Debug 62.4 s serial / 17.7 s at `-j4`; ASan 207.5 s / 75.7 s. The two CLI files are ~94 s of the
+ASan total, almost entirely LeakSanitizer's exit scans on forked children (measured at ~0.93 s per
+child). `test_ck_client_cli` sits at 54 s against a 120 s bound — a margin that fell from 2.7× to
+2.3× in a single round.
+
+**Module 8, in this order:** take the children-only `detect_leaks=0` win *before* adding any case to
+those files; use ephemeral ports everywhere (two fixed-port defects were introduced and removed on
+this branch alone, one of them one commit after the other was fixed); reuse a server process rather
+than starting another; and **stop raising `TIMEOUT`** — make a slow case cheaper instead. Raising it
+was correct exactly once here, when a fix replaced a timeout with named assertions and the failing
+run needed room to print them.
+
+### Three process notes that cost real results
+
+- **Revert a mutation with `cp`, never `mv`.** `mv` preserves mtime, the build skips, and the test
+  "passes" against the un-reverted binary — a manufactured kill. Warned about in three separate
+  dispatches; still landed twice.
+- **Run through `ctest`, never the test binary directly**, or `LD_PRELOAD` is absent and the shims
+  do not load. Three results lost that way.
+- **A mutating reviewer is not file-disjoint even when its findings are.** Two agents in one
+  worktree collided once on this branch; after that, reviewers got their own worktree and the
+  collisions stopped.
+
+### Tally
+
+Thirty-three coverage defects across six branches became **fifty-eight across seven**. Every one was
+found by measuring or mutating. **None was found by reading.**
