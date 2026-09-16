@@ -22,3 +22,12 @@ target_link_libraries(cloak-client PUBLIC cloak-mux)
 # Appended rather than folded in above for the same reason the connector
 # was: the original dependency statement stays where a reader looks for it.
 target_sources(cloak-client PRIVATE src/client_piper.c)
+
+# cloak_client_stack_t: the client's only supported wiring -- the piper,
+# one connector and one session per bring-up, the singleplex seam and the
+# reconnect loop. It links nothing new: the connector's cloak-mux
+# dependency above already supplies everything a session needs. Appended
+# rather than folded in above for the same reason the connector and the
+# piper were: the original dependency statement stays where a reader
+# looks for it.
+target_sources(cloak-client PRIVATE src/client_stack.c)
