@@ -1,6 +1,7 @@
-/* Test-only LD_PRELOAD shim for test_dispatcher_auth: intercepts write(2)
- * so a test can deterministically force the dispatcher's step-10 reply
- * write to see EAGAIN or a real error, without needing genuine kernel
+/* Test-only LD_PRELOAD shim for test_dispatcher_auth: intercepts send(2)
+ * (and, for a second and unrelated protocol, write(2)/pwrite(2)) so a test
+ * can deterministically force the dispatcher's step-10 reply write to see
+ * EAGAIN or a real error, without needing genuine kernel
  * socket-buffer backpressure -- which is not achievable for a reply this
  * small (CLOAK_SERVER_AUTH_REPLY_MAX_BYTES is 256 bytes; this container's
  * (and any ordinary Linux system's) minimum SO_RCVBUF/SO_SNDBUF floors are
@@ -20,20 +21,24 @@
  * test it serves always run in the very same process, since the
  * dispatcher-under-test and the test's own "client" socket both live in
  * this one executable) to the TCP port number of the client-side socket
- * whose CORRESPONDING SERVER-SIDE accepted fd's next write() call should
+ * whose CORRESPONDING SERVER-SIDE accepted fd's next reply write should
  * be faked, and optionally CLOAK_TEST_FORCE_MODE to "error" (the default,
- * absent or anything else, is "eagain"). The FIRST write() call this
- * process makes on any fd whose peer port matches is faked (errno set to
+ * absent or anything else, is "eagain"). The FIRST such call this process
+ * makes on any fd whose peer port matches is faked (errno set to
  * ECONNRESET for "error", EAGAIN otherwise; -1 returned either way) and
  * CLOAK_TEST_FORCE_PEER_PORT is immediately unset -- so only that one
- * call is affected, and every other write() everywhere else in the
+ * call is affected, and every other write everywhere else in the
  * process (including the client's own send of its ClientHello, and every
  * other test in this same binary that never sets this variable) passes
- * straight through to the real write().
+ * straight through to the real call.
+ *
+ * "Such a call" means, exactly, send(fd, ..., MSG_NOSIGNAL). Not write(),
+ * and not a send() without the flag. That narrowness is deliberate and is
+ * itself an assertion -- see cloak_force_socket_failure.
  *
  * Optionally, CLOAK_TEST_FORCE_STICKY=1 keeps CLOAK_TEST_FORCE_PEER_PORT
  * set across a forced failure instead of consuming it, so EVERY
- * subsequent write() to the matching peer keeps failing (CLOAK_TEST_
+ * subsequent matching send() to that peer keeps failing (CLOAK_TEST_
  * FORCE_MODE still governs which errno) until the test itself calls
  * unsetenv on it. This exists for one reason: proving a bounded deadline
  * actually fires against a reply write that never drains, which requires
@@ -83,7 +88,57 @@
 #include <unistd.h>
 
 typedef ssize_t (*cloak_real_write_fn)(int, const void *, size_t);
+typedef ssize_t (*cloak_real_send_fn)(int, const void *, size_t, int);
 typedef ssize_t (*cloak_real_pwrite_fn)(int, const void *, size_t, off_t);
+
+/* The socket protocol's decision, shared by write() and send().
+ *
+ * THE SOCKET PROTOCOL IS ON send() ONLY, AND ONLY WITH MSG_NOSIGNAL, AND
+ * THAT IS AN ASSERTION IN DISGUISE. The dispatcher's step-10 reply write
+ * must be `send(fd, ..., MSG_NOSIGNAL)`: it writes to a socket whose peer
+ * is an unauthenticated stranger who may have vanished between two writes
+ * of one reply, and a plain write() there raises SIGPIPE, whose default
+ * disposition terminates the server. That property is otherwise untested
+ * -- the race cannot be constructed on loopback, where the ~6 KB reply
+ * always leaves in a single write -- so the shim makes it structural
+ * instead: force ONLY a send, and only one carrying MSG_NOSIGNAL. A
+ * dispatcher that went back to write(), or that dropped the flag, stops
+ * being forced at all, and test_dispatcher_auth's step-10 EAGAIN and
+ * ECONNRESET cases fail by name (five and six named assertions) instead
+ * of silently exercising the ordinary path. The file-path protocol below
+ * is unaffected and still covers write/pwrite/pwrite64.
+ *
+ * Returns 1 having set errno, meaning "fake a failure now"; 0 to let the
+ * call through. */
+static int cloak_force_socket_failure(int fd) {
+    const char *port_str = getenv("CLOAK_TEST_FORCE_PEER_PORT");
+    struct sockaddr_in peer;
+    socklen_t plen = sizeof(peer);
+    const char *sticky;
+    const char *mode;
+
+    if (port_str == NULL || *port_str == '\0') {
+        return 0;
+    }
+    if (getpeername(fd, (struct sockaddr *)&peer, &plen) != 0 || peer.sin_family != AF_INET ||
+        ntohs(peer.sin_port) != (uint16_t)atoi(port_str)) {
+        return 0;
+    }
+    sticky = getenv("CLOAK_TEST_FORCE_STICKY");
+    if (sticky == NULL || strcmp(sticky, "1") != 0) {
+        /* One-shot (default): consume the trigger before returning, so a
+         * retry on this same fd (the whole point of the resume path under
+         * test) goes through to the real call rather than looping forever
+         * on the fake failure. */
+        unsetenv("CLOAK_TEST_FORCE_PEER_PORT");
+    }
+    /* Sticky: CLOAK_TEST_FORCE_PEER_PORT stays set, so every subsequent
+     * write to this same peer keeps failing until the test itself clears
+     * it -- see this file's own top-of-file comment. */
+    mode = getenv("CLOAK_TEST_FORCE_MODE");
+    errno = (mode != NULL && strcmp(mode, "error") == 0) ? ECONNRESET : EAGAIN;
+    return 1;
+}
 
 /* True when CLOAK_TEST_FAIL_WRITE_PATH is set and fd names a file whose
  * path contains it. Resolved through /proc/self/fd rather than tracked
@@ -150,33 +205,36 @@ ssize_t write(int fd, const void *buf, size_t count) {
         }
     }
 
-    const char *port_str = getenv("CLOAK_TEST_FORCE_PEER_PORT");
-    if (port_str != NULL && *port_str != '\0') {
-        struct sockaddr_in peer;
-        socklen_t plen = sizeof(peer);
-        if (getpeername(fd, (struct sockaddr *)&peer, &plen) == 0 && peer.sin_family == AF_INET &&
-            ntohs(peer.sin_port) == (uint16_t)atoi(port_str)) {
-            const char *sticky = getenv("CLOAK_TEST_FORCE_STICKY");
-            if (sticky == NULL || strcmp(sticky, "1") != 0) {
-                /* One-shot (default): consume the trigger before
-                 * returning, so a retry on this same fd (the whole point
-                 * of the resume path under test) goes through to the real
-                 * write() rather than looping forever on the fake
-                 * failure. */
-                unsetenv("CLOAK_TEST_FORCE_PEER_PORT");
-            }
-            /* Sticky: CLOAK_TEST_FORCE_PEER_PORT stays set, so every
-             * subsequent write() to this same peer keeps failing until
-             * the test itself clears it -- see this file's own
-             * top-of-file comment. */
+    /* NO socket-protocol check here: see cloak_force_socket_failure's
+     * comment. write() serves only the file-path (EIO) protocol now, so
+     * that the step-10 tests force a reply write ONLY when that write is
+     * the send(..., MSG_NOSIGNAL) it is required to be. */
+    return real_write(fd, buf, count);
+}
 
-            const char *mode = getenv("CLOAK_TEST_FORCE_MODE");
-            errno = (mode != NULL && strcmp(mode, "error") == 0) ? ECONNRESET : EAGAIN;
+/* The same socket protocol, on send(2). See cloak_force_socket_failure. */
+ssize_t send(int fd, const void *buf, size_t count, int flags) {
+    static cloak_real_send_fn real_send = NULL;
+
+    if (cloak_fail_this_fd(fd)) {
+        errno = EIO;
+        return -1;
+    }
+    if (real_send == NULL) {
+        real_send = (cloak_real_send_fn)dlsym(RTLD_NEXT, "send");
+        if (real_send == NULL) {
+            errno = ENOSYS;
             return -1;
         }
     }
 
-    return real_write(fd, buf, count);
+    /* MSG_NOSIGNAL is part of the match, deliberately -- it is how this
+     * shim pins the flag on the dispatcher's reply write. */
+    if ((flags & MSG_NOSIGNAL) != 0 && cloak_force_socket_failure(fd)) {
+        return -1;
+    }
+
+    return real_send(fd, buf, count, flags);
 }
 
 /* pwrite is the call SQLite's unix VFS names on Linux (os_unix.c's

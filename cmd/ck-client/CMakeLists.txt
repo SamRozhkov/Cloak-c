@@ -17,7 +17,14 @@ target_link_libraries(ck-client PRIVATE cloak-client cloak-common cjson)
 add_executable(test_ck_client_cli tests/test_ck_client_cli.c)
 target_include_directories(test_ck_client_cli
     PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
-target_link_libraries(test_ck_client_cli PRIVATE cloak-common)
+# cloak-server, for cloak_usermanager_* ONLY. The billing case
+# (test_shutdown_bills_the_last_interval) reads the user database back out
+# after ck-server has exited, through the same API the server wrote it
+# with, rather than re-implementing the SQLite schema in the test or
+# standing up a second server and an admin request to ask.
+target_link_libraries(test_ck_client_cli PRIVATE cloak-common cloak-server)
+target_include_directories(test_ck_client_cli
+    PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-server/include)
 target_compile_definitions(test_ck_client_cli
     PRIVATE CK_CLIENT_PATH="$<TARGET_FILE:ck-client>"
             CK_SERVER_PATH="$<TARGET_FILE:ck-server>")
@@ -33,8 +40,18 @@ add_test(NAME test_ck_client_cli COMMAND test_ck_client_cli)
 #
 # Almost all of the runtime is process startup and LeakSanitizer's exit
 # scan across the ck-server and ck-client processes this file spawns, not
-# the transfers it measures: with the cases added by the fix round it sits
-# at 45.0 s idle here, so the margin is 2.7x rather than the 1.8x that was
-# not enough. 120 also matches test_ck_server_cli, which was raised for
-# the same reason, so the two binaries' tests carry one bound and not two.
+# the transfers it measures. 120 also matches test_ck_server_cli, which was
+# raised for the same reason, so the two binaries' tests carry one bound
+# and not two.
+#
+# RE-MEASURED AFTER THE FINAL FIX WAVE: 53.1 s idle under ASan+UBSan
+# (39.8 s for test_ck_server_cli), against 45.0 s before it -- the wave
+# added seven subprocesses across the SIGPIPE, ServerName, admin-singleplex,
+# plugin-detection and billing cases. The margin is therefore 2.3x, not
+# 2.7x, and THE BOUND WAS DELIBERATELY NOT RAISED AGAIN: a third raise
+# would be the point at which nobody runs the sanitizer build before
+# pushing. The next module that wants to add cases to this file should
+# first take the win the whole-branch review measured and costed --
+# ASAN_OPTIONS=detect_leaks=0 on the forked CHILDREN only, which is most
+# of this number and which the parent's own check does not need.
 set_tests_properties(test_ck_client_cli PROPERTIES TIMEOUT 120)

@@ -101,9 +101,36 @@
  * it had a datagram path. The config key "UDP": true is refused too, for
  * the same reason and with the configuration exit code rather than the
  * usage one -- two different wrong inputs, two different classes.
+ *
+ * ---------------------------------------------------------------------
+ * THREE SMALLER THINGS, recorded here because a reader comparing the two
+ * implementations will reach for this block and not for a report. Two of
+ * them are places where this file and ck-server differ from EACH OTHER,
+ * which looks like an inconsistency and is Go's own shape in both.
+ *
+ * P1. -verbosity IS HONOURED IN PLUGIN MODE HERE, and is IGNORED in
+ *     ck-server's. In Go's client log.SetLevel sits outside the if/else
+ *     and applies to both modes; in Go's server it sits inside the
+ *     standalone branch. Each port follows its own original, so
+ *     `-verbosity error` silences a plugin-mode ck-client and does not
+ *     silence a plugin-mode ck-server.
+ *
+ * P2. AN UNKNOWN FLAG IS REFUSED BY NAME IN PLUGIN MODE HERE, and is
+ *     ignored in ck-server's plugin mode, which looks at no argv token at
+ *     all. Same reason: Go's client registers a (small) flag set in
+ *     plugin mode and Go's server registers none.
+ *
+ * P3. ADMIN MODE LOGS ONE LINE MORE THAN GO. Go logs "API base is %v" in
+ *     the admin branch and "Listening on %v %v for %v client" only in the
+ *     non-admin one; this file logs its admin line AND then the
+ *     "listening on TCP ... for ... client" line unconditionally, because
+ *     that second line reports the BOUND port (which matters when
+ *     LocalPort is "0") and an admin operator needs it just as much. An
+ *     extra informational line, deliberately.
  */
 
 #include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -693,6 +720,19 @@ static int parse_args(int argc, char **argv, int plugin_mode, ck_args_t *a, char
 int main(int argc, char **argv) {
     char err[CK_ERR_LEN] = {0};
 
+    /* SIGPIPE IS IGNORED, AND THAT IS FIDELITY TO GO, NOT A PRECAUTION.
+     * Go's runtime installs a handler that swallows SIGPIPE for every
+     * descriptor that is not stdout/stderr, so Go Cloak has never been
+     * able to die this way and a C port that leaves the default
+     * disposition in place is DIVERGING. The default disposition
+     * TERMINATES the process, and this client writes to a socket whose far
+     * end is a server it does not control and to local sockets an
+     * application may close at any moment. Every socket write in the tree
+     * also passes MSG_NOSIGNAL (see relay.c's note); this is the second of
+     * the two, and it is the one that covers a write somebody adds later.
+     * ck-server does exactly the same thing, for the same reason. */
+    signal(SIGPIPE, SIG_IGN);
+
     /* Go's client: SS_LOCAL_HOST alone. See this file's opening for why
      * that differs from ck-server's two-variable test. */
     const char *ss_local_host = getenv("SS_LOCAL_HOST");
@@ -843,10 +883,32 @@ int main(int argc, char **argv) {
     }
 
     /* -a, exactly as Go: the admin UID replaces the config's, the session
-     * id becomes 0 and NumConn becomes 1. The session id is the half a
-     * caller cannot supply on its own -- see
-     * cloak_client_stack_config_t::admin_session, and the server's
-     * `is_admin = admin uid AND session id 0`. */
+     * id becomes 0 and NumConn becomes 1. THREE ASSIGNMENTS, WHICH IS
+     * GO'S COUNT (ck-client.go, the `if adminUID != nil` branch) -- the
+     * session id is the half a caller cannot supply on its own, see
+     * cloak_client_stack_config_t::admin_session and the server's
+     * `is_admin = admin uid AND session id 0`.
+     *
+     * SINGLEPLEX IS DELIBERATELY NOT TOUCHED, and this is the one part of
+     * this block worth reading twice. There was a fourth assignment here,
+     * `cfg.singleplex = 0`, and it was wrong in both directions at once.
+     * Go does not make it. And by making it, this binary pre-satisfied
+     * cloak_client_stack_config_t::admin_session's documented ERR_CONFIG
+     * guard, so the guard could never fire from the only program that sets
+     * the field -- while the operator's configuration was rewritten
+     * underneath them in total silence, in a file that WARNs about an
+     * ignored KeepAlive precisely because a silently ignored setting is a
+     * bug only packet capture finds.
+     *
+     * What an operator sees now: both parsers, Go's and this one, turn
+     * NumConn <= 0 into "NumConn 1, singleplex", so a config that omits
+     * NumConn IS a singleplex config. Go runs admin mode on it anyway and
+     * hands every local connection a fresh session id, which the server
+     * admits only at id 0 -- broken, silently. Here the stack refuses it
+     * with exit 2 and a message naming the remedy ("NumConn": 1), which
+     * is the same thing that makes Go's admin mode work. Refusing is the
+     * faithful choice AND the better one; that is not usually true, so it
+     * is written down. */
     int admin_session = 0;
     if (args.admin_uid != NULL && args.admin_uid[0] != '\0') {
         uint8_t uid[CLOAK_UID_LEN];
@@ -860,7 +922,6 @@ int main(int argc, char **argv) {
         }
         memcpy(cfg.uid, uid, CLOAK_UID_LEN);
         cfg.num_conn = 1;
-        cfg.singleplex = 0;
         admin_session = 1;
         CLOAK_LOGI("admin mode: serving the admin api on the local address "
                    "(session id 0, NumConn 1)");

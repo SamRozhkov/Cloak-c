@@ -89,8 +89,18 @@ extern const char *const cloak_client_top_level_domains[CLOAK_CLIENT_TLD_COUNT];
  * cloak_clienthello_build accepts. A longer one is rejected by
  * cloak_client_handshake_init as CLOAK_CLIENT_HANDSHAKE_ERR_CONFIG
  * rather than truncated -- a truncated SNI would reach a different host
- * than the operator configured. */
-#define CLOAK_CLIENT_SERVER_NAME_MAX 253
+ * than the operator configured.
+ *
+ * DEFINED FROM cloak/config.h's CONSTANT, NOT AS A SECOND LITERAL. It was
+ * a second literal, and cloak_client_config_t's parser had a different
+ * one: 254- and 255-character ServerNames parsed cleanly and were then
+ * refused here, which reached an operator as exit 4 ("runtime failure,
+ * retrying may help") for a permanent configuration error naming no
+ * field. cloak/client_stack.h makes exactly this argument for the
+ * TEMPLATE arm -- "re-deriving the mux layer's bounds here would be a
+ * second copy of them that could disagree with the first" -- and this is
+ * that rule applied to the bound it was written about. */
+#define CLOAK_CLIENT_SERVER_NAME_MAX CLOAK_MAX_DNS_NAME_LEN
 
 /* Generates a plausible random hostname the way Go's randomServerName
  * does: 3 to 12 lowercase ASCII letters, a dot, and one of

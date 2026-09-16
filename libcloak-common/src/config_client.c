@@ -58,11 +58,16 @@ static int parse_alt_names(const cJSON *root, cloak_client_config_t *cfg, char *
                                         "AlternativeNames has more than %d entries",
                                         CLOAK_MAX_ALT_NAMES);
         }
+        /* The SAME bound as ServerName, and for the same reason: client_stack.c's
+         * stack_pick_server_name chooses between server_name and these per
+         * round, so an alt name the parser accepted and the connector would
+         * not is the ServerName defect with an INTERMITTENT trigger -- one
+         * round in seventeen. */
         size_t len = strlen(item->valuestring);
-        if (len + 1 > CLOAK_MAX_HOST_LEN) {
-            return cloak_config_set_err(err, err_cap,
-                                        "AlternativeNames entry is too long (%zu bytes)",
-                                        len);
+        if (len > CLOAK_MAX_DNS_NAME_LEN) {
+            return cloak_config_set_err(
+                err, err_cap, "AlternativeNames entry is too long (%zu bytes, limit %d)",
+                len, CLOAK_MAX_DNS_NAME_LEN);
         }
         memcpy(cfg->alt_names[cfg->num_alt_names], item->valuestring, len + 1);
         cfg->num_alt_names++;
@@ -83,8 +88,16 @@ int cloak_client_config_from_cjson(const cJSON *root, cloak_client_config_t *cfg
 
     int found = 0;
 
+    /* CLOAK_MAX_DNS_NAME_LEN + 1, NOT sizeof(server_name). The buffer is
+     * 256 bytes; the LIMIT is 253 characters, because this string becomes
+     * the SNI. Passing the smaller capacity here makes the existing "%s is
+     * too long (%zu bytes, limit %zu)" message carry the right limit and
+     * keeps the whole bound in one check, so 254, 255 and 256 are all
+     * refused identically and all name the field. Before this, 254 and 255
+     * parsed and then died inside the connector as exit 4 with a message
+     * naming nothing. */
     if (cloak_config_get_string(root, "ServerName", cfg->server_name,
-                                sizeof(cfg->server_name), &found, err, err_cap) != 0) {
+                                CLOAK_MAX_DNS_NAME_LEN + 1, &found, err, err_cap) != 0) {
         return -1;
     }
     if (!found || cfg->server_name[0] == '\0') {

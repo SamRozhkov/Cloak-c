@@ -26,6 +26,12 @@ add_test(NAME test_ck_server_cli COMMAND test_ck_server_cli)
 # with leak detection and 0.11 s without). A passing run is therefore ~0.2 s
 # in Debug and ~40 s under ASan.
 #
+# RE-MEASURED AFTER THE FINAL FIX WAVE: 39.8 s under ASan+UBSan, against
+# ~38.9 s before it. Case 5 no longer binds the global ports 443 and 80 (it
+# runs one descriptor short of the listener instead), so two concurrent
+# runs of this suite on one host no longer collide and the file is safe
+# under `ctest -j`.
+#
 # What this number has to accommodate is a run in which the shutdown path
 # is broken: thirteen cases signal a child and reap it, each bounded by the
 # test's own SHUTDOWN_MS of 2 s, so the worst failing run is ~40 + 26 s.

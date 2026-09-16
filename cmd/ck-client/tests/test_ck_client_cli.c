@@ -51,6 +51,7 @@
 #include "cloak/base64.h"
 #include "cloak/config.h"
 #include "cloak/crypto.h"
+#include "cloak/usermanager.h"
 #include "test_framework.h"
 
 #include <arpa/inet.h>
@@ -247,6 +248,13 @@ static int child_wait_for(child_t *c, const char *marker, int timeout_ms) {
 }
 
 static int child_reap(child_t *c, int timeout_ms) {
+    /* Already reaped -- by child_survives_signal, which reaps a child that
+     * died when it should not have. Without this guard a later kill() in
+     * the same case would carry a pid of 0 and signal the whole process
+     * GROUP, so one failed assertion would take the test runner with it. */
+    if (c->pid <= 0) {
+        return -1;
+    }
     uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
     for (;;) {
         int status = 0;
@@ -274,6 +282,49 @@ static int child_reap(child_t *c, int timeout_ms) {
             return -1;
         }
         child_drain(c, 20);
+    }
+}
+
+/* SIGPIPE MUST NOT KILL THE CLIENT, and this is the only part of that
+ * claim a test can assert directly.
+ *
+ * The race it protects against -- a write to a socket whose peer has gone
+ * -- is not constructible on loopback, but the SIGNAL DISPOSITION is
+ * directly observable: send a running client a real SIGPIPE and see
+ * whether it is still there afterwards.
+ *
+ * For FIDELITY, not as a precaution: Go's runtime installs a SIGPIPE
+ * handler that ignores the signal for every descriptor that is not
+ * stdout/stderr, so a Go ck-client survives this and a C port that leaves
+ * the default disposition in place is DIVERGING from Go.
+ *
+ * Returns 0 if the child is still running after settle_ms, and otherwise
+ * the wait status it died with -- 128 + SIGPIPE == 141 for the failure
+ * this exists to catch, so the assertion prints the signal number. */
+static int child_survives_signal(child_t *c, int signo, int settle_ms) {
+    kill(c->pid, signo);
+    uint64_t deadline = now_ms() + (uint64_t)settle_ms;
+    for (;;) {
+        int status = 0;
+        pid_t r = waitpid(c->pid, &status, WNOHANG);
+        if (r == c->pid) {
+            while (child_drain(c, 10) == 0) {
+                /* flush whatever it managed to say */
+            }
+            if (c->fd >= 0) {
+                close(c->fd);
+            }
+            c->fd = -1;
+            c->pid = 0;
+            if (WIFSIGNALED(status)) {
+                return 128 + WTERMSIG(status);
+            }
+            return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        if (now_ms() >= deadline) {
+            return 0;
+        }
+        child_drain(c, 10);
     }
 }
 
@@ -444,10 +495,12 @@ static int fd_census(pid_t pid) {
  * silently stopped matching would make every end-to-end case fail with
  * "the tunnel carried nothing", which is the least diagnosable failure
  * this file can produce. */
-static const char PRIV_B64[] = "SN6EG6BhjnLLpGCMqrLzZuSNmEWXOJgEnqN0uaPihgs=";
+/* Macros rather than arrays so they can be pasted into a JSON literal at
+ * compile time (make_server_config_bypass wants "\"" UID_B64 "\""). */
+#define PRIV_B64 "SN6EG6BhjnLLpGCMqrLzZuSNmEWXOJgEnqN0uaPihgs="
 /* Two distinct 16-byte UIDs: one ordinary, one for the admin API. */
-static const char UID_B64[] = "MTIzNDU2Nzg5MGFiY2RlZg==";       /* "1234567890abcdef" */
-static const char ADMIN_UID_B64[] = "QURNSU5hZG1pbjAxMjM0NQ=="; /* "ADMINadmin012345" */
+#define UID_B64       "MTIzNDU2Nzg5MGFiY2RlZg=="   /* "1234567890abcdef" */
+#define ADMIN_UID_B64 "QURNSU5hZG1pbjAxMjM0NQ==" /* "ADMINadmin012345" */
 
 static void derive_pub_b64(char *out, size_t cap) {
     uint8_t priv[CLOAK_X25519_KEY_LEN];
@@ -466,21 +519,31 @@ static void derive_pub_b64(char *out, size_t cap) {
 /* Config fixtures                                                      */
 /* ------------------------------------------------------------------ */
 
-/* extra is spliced in verbatim, so a case can add or replace any key. */
-static void make_server_config(char *out, size_t cap, int bind_port, const char *proxy_addr,
-                               const char *extra) {
+/* extra is spliced in verbatim, so a case can add or replace any key.
+ * bypass_json is the CONTENTS of the BypassUID array, also verbatim: every
+ * case but one passes the ordinary UID, and the metering case passes ""
+ * because a bypassed user is not metered at all (the dispatcher never
+ * reaches the database for one) and metering is the whole of what it
+ * measures. */
+static void make_server_config_bypass(char *out, size_t cap, int bind_port,
+                                      const char *proxy_addr, const char *bypass_json,
+                                      const char *extra) {
     snprintf(out, cap,
              "{"
              "\"ProxyBook\":{\"shadowsocks\":[\"tcp\",\"%s\"]},"
              "\"BindAddr\":[\"127.0.0.1:%d\"],"
-             "\"BypassUID\":[\"%s\"],"
+             "\"BypassUID\":[%s],"
              "\"RedirAddr\":\"127.0.0.1:1\","
              "\"PrivateKey\":\"%s\","
              "%s"
              "\"KeepAlive\":0"
              "}",
-             proxy_addr, bind_port, UID_B64, PRIV_B64, extra);
+             proxy_addr, bind_port, bypass_json, PRIV_B64, extra);
 }
+
+/* (The ordinary "bypass the UID" form is pair_start_server below, which is
+ * the only caller there has ever been; there is no second wrapper here
+ * because an unused one is a warning, not documentation.) */
 
 static void make_client_config(char *out, size_t cap, const char *pub_b64, const char *extra) {
     snprintf(out, cap,
@@ -531,7 +594,8 @@ static void pair_init(pair_t *p) {
 
 /* Starts ck-server with the given extra config keys and an upstream that
  * this process owns. Returns 0 when the server logged that it is ready. */
-static int pair_start_server(pair_t *p, const char *server_extra) {
+static int pair_start_server_bypass(pair_t *p, const char *server_extra,
+                                    const char *bypass_json) {
     p->upstream_fd = listen_on(&p->upstream_port);
     if (p->upstream_fd < 0) {
         return -1;
@@ -543,13 +607,18 @@ static int pair_start_server(pair_t *p, const char *server_extra) {
     char upstream[64];
     snprintf(upstream, sizeof(upstream), "127.0.0.1:%d", p->upstream_port);
     char cfg[2048];
-    make_server_config(cfg, sizeof(cfg), p->server_port, upstream, server_extra);
+    make_server_config_bypass(cfg, sizeof(cfg), p->server_port, upstream, bypass_json,
+                              server_extra);
 
     char *const argv[] = {(char *)"ck-server", (char *)"-c", cfg, NULL};
     if (child_spawn(&p->server, CK_SERVER_PATH, argv, NULL) != 0) {
         return -1;
     }
     return child_wait_for(&p->server, "ck-server ready", BOOT_MS);
+}
+
+static int pair_start_server(pair_t *p, const char *server_extra) {
+    return pair_start_server_bypass(p, server_extra, "\"" UID_B64 "\"");
 }
 
 /* Starts ck-client against that server. client_extra goes into the JSON;
@@ -1102,7 +1171,22 @@ static void test_sigterm_is_clean_and_leaks_no_descriptor(void) {
         ASSERT_TRUE(after >= 0 && after <= before);
     }
 
-    kill(p.client.pid, SIGTERM);
+    /* SIGPIPE DOES NOT KILL IT, and neither does it kill the SERVER this
+     * case already has running. Both are asserted here so neither costs a
+     * process: see child_survives_signal for why the disposition is
+     * assertable even though the race that provokes it is not, and why
+     * ignoring SIGPIPE is FIDELITY to Go rather than a precaution. Before
+     * the two main()s ignored it, both of these returned 141. */
+    ASSERT_EQ_INT(0, child_survives_signal(&p.client, SIGPIPE, 200));
+    ASSERT_EQ_INT(0, child_survives_signal(&p.server, SIGPIPE, 200));
+    /* And both are still doing their jobs: the local listener still
+     * accepts, which means the client's reactor is still turning. */
+    ASSERT_EQ_INT(0, can_connect(p.local_port));
+
+    ASSERT_TRUE(p.client.pid > 0);
+    if (p.client.pid > 0) {
+        kill(p.client.pid, SIGTERM);
+    }
     ASSERT_EQ_INT(0, child_reap(&p.client, EXIT_MS));
     ASSERT_TRUE(strstr(p.client.out, "received signal 15") != NULL);
     ASSERT_TRUE(strstr(p.client.out, "ck-client stopped") != NULL);
@@ -1269,8 +1353,217 @@ static void test_admin_flag_reaches_the_admin_api(void) {
     /* And it is NOT the request coming back. */
     ASSERT_TRUE(strstr(resp, "GET /admin/users") == NULL);
 
+    /* -a DOES NOT SILENTLY REPAIR A SINGLEPLEX CONFIG; IT IS REFUSED.
+     *
+     * Go's admin branch sets exactly three things -- UID, SessionId and
+     * NumConn -- and leaves Singleplex alone (ck-client.go:159-163, read
+     * directly). This port used to set a FOURTH, zeroing singleplex, which
+     * no comment declared and nothing tested: a reviewer deleted the line
+     * and all 63 tests passed. Two things were wrong with it. It discarded
+     * an operator's setting in total silence, in a binary that WARNs about
+     * an ignored KeepAlive on the argument that a silently ignored setting
+     * is the shape of bug only a packet capture finds. And it
+     * pre-satisfied cloak_client_stack_config_t::admin_session's own
+     * ERR_CONFIG guard, so that guard -- documented, and pinned by
+     * test_client_stack.c -- could never fire from the only binary that
+     * sets the field.
+     *
+     * Note which way fidelity points, because it is not the obvious way.
+     * Both parsers, Go's (internal/client/state.go:212-217) and this one,
+     * turn NumConn <= 0 into "NumConn 1, Singleplex true" -- so a config
+     * that simply omits NumConn IS a singleplex config, in both. Go then
+     * runs admin mode on it and every local connection gets a fresh
+     * session id, while the server admits an admin session only at id 0:
+     * Go's own admin mode is quietly broken for that config. Refusing is
+     * therefore BOTH the faithful choice (no fourth assignment) and the
+     * better one (Go's silent breakage becomes exit 2 with a message that
+     * names the remedy). The remedy is "NumConn": 1, which is exactly what
+     * makes Go's admin mode work as well.
+     *
+     * Costs no server: the guard is a configuration check inside
+     * cloak_client_stack_open, reached before anything is resolved or
+     * bound. */
+    {
+        char cfg[2048];
+        snprintf(cfg, sizeof(cfg),
+                 "{\"ServerName\":\"www.bing.com\",\"ProxyMethod\":\"shadowsocks\","
+                 "\"EncryptionMethod\":\"aes-gcm\",\"UID\":\"%s\",\"PublicKey\":\"%s\","
+                 "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"%d\","
+                 "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\"}",
+                 UID_B64, p.pub_b64, p.server_port);
+        char *const a[] = {(char *)"ck-client", (char *)"-c",  cfg,
+                           (char *)"-a",        (char *)ADMIN_UID_B64, NULL};
+        child_t c;
+        ASSERT_EQ_INT(2, run_to_exit(&c, CK_CLIENT_PATH, a, NULL, EXIT_MS));
+        /* The typed edge and the reason, so this cannot pass on some other
+         * configuration error: the parenthesised strerror name plus the
+         * guard's own wording. */
+        ASSERT_TRUE(strstr(c.out, "(client config)") != NULL);
+        ASSERT_TRUE(strstr(c.out, "admin mode requires NumConn 1 and no singleplex") != NULL);
+        ASSERT_TRUE(strstr(c.out, "with singleplex") != NULL);
+        /* It did NOT come up: no listener, no session, no silent repair. */
+        ASSERT_TRUE(strstr(c.out, "ck-client ready") == NULL);
+    }
+
     pair_teardown(&p);
     unlink("ck_client_test_admin.db");
+}
+
+/* ------------------------------------------------------------------ */
+/* Case 7b: ck-server BILLS THE LAST INTERVAL before it exits           */
+/* ------------------------------------------------------------------ */
+
+/* THE SEAM A PER-TASK REVIEW CANNOT SEE: the library does the thing, and
+ * nothing checked that the program asks it to.
+ * cloak_server_stack_upload_now is well covered at library level
+ * (test_server_stack.c), and a reviewer DELETED ck-server's call to it
+ * from main's shutdown path with all 63 tests still passing. What
+ * silently stops happening is the trade cloak/server_stack.h:408,422
+ * documents: cloak_server_stack_close does NOT upload what the panel has
+ * queued, so without that call the last metering interval is dropped on
+ * every clean restart. The default interval is 60 s
+ * (CLOAK_USERPANEL_DEFAULT_UPLOAD_INTERVAL_MS), so on a server restarted
+ * more often than that, NOTHING is ever billed -- and nobody finds that
+ * class of bug until an invoice is wrong.
+ *
+ * WHY IT IS IN THE CLIENT'S FILE. Metering comes off the session data
+ * path, so producing a single billable byte needs a real client talking
+ * to a real server -- which is exactly what this file already has and
+ * test_ck_server_cli.c has no way to build. The case reuses the pair
+ * machinery rather than growing a third subprocess harness.
+ *
+ * HOW IT IS OBSERVED. This test process opens the same SQLite file the
+ * server used, through the same cloak_usermanager_* API the server does,
+ * AFTER the server has exited. No admin API, no second server, no
+ * parsing: the credit the database holds is the credit the panel
+ * settled.
+ *
+ * THREE THINGS MAKE THE ASSERTION MEAN WHAT IT SAYS:
+ *   - the UID is NOT in BypassUID, so it is a metered database user and
+ *     not a bypass one (a bypass user has no valve at all);
+ *   - the credit is seeded far above the transfer, so the user is never
+ *     terminated mid-run and the drop measured is metering and not
+ *     eviction;
+ *   - the periodic upload timer is 60 s away and this case finishes in
+ *     well under a second, so the only cycle that can have run is the
+ *     one main() asks for at shutdown. */
+/* SMALL ON PURPOSE, and the reason is another test's diagnostic. Case 5
+ * above is the suite's sharpest single signal: mutating the server's
+ * CLOAK_SERVER_STACK_DEFAULT_MAX_ON_WIRE_SIZE from 16401 to 8192 fails
+ * case 5's two byte-count assertions AND NOTHING ELSE IN 63 TESTS, which
+ * is what makes it point at the record size rather than at "the tunnel is
+ * broken". Any case moving a payload larger than the mutated limit joins
+ * that failure and blunts it. 4096 bytes, framing included, stays inside
+ * even a halved record, so this case measures metering and leaves case
+ * 5's signal alone -- and 4096 is far more than enough to see a credit
+ * move, which is all that is asserted here. */
+#define BILLED_PAYLOAD 4096
+#define BILLED_CREDIT  (1024 * 1024 * 64)
+
+static void test_shutdown_bills_the_last_interval(void) {
+    const char *db = "ck_client_test_billing.db";
+    unlink(db);
+    unlink("ck_client_test_billing.db-wal");
+    unlink("ck_client_test_billing.db-shm");
+
+    uint8_t uid[CLOAK_UID_LEN];
+    size_t uid_len = 0;
+    ASSERT_EQ_INT(0, cloak_base64_decode(UID_B64, uid, sizeof(uid), &uid_len));
+    ASSERT_EQ_INT(CLOAK_UID_LEN, (long long)uid_len);
+
+    { /* seed the user, with credit far above what the transfer moves */
+        cloak_usermanager_t *m = NULL;
+        char err[256] = {0};
+        ASSERT_EQ_INT(0, cloak_usermanager_open(&m, db, NULL, NULL, err, sizeof(err)));
+        if (m == NULL) {
+            printf("  [case 7b] could not open %s: %s\n", db, err);
+            return;
+        }
+        cloak_user_info_t info;
+        memset(&info, 0, sizeof(info));
+        memcpy(info.uid, uid, CLOAK_UID_LEN);
+        info.sessions_cap = 16;
+        info.up_credit = BILLED_CREDIT;
+        info.down_credit = BILLED_CREDIT;
+        info.expiry_time = (int64_t)time(NULL) + 3600;
+        ASSERT_EQ_INT(0, cloak_usermanager_write(m, &info, CLOAK_USER_FIELD_ALL));
+        cloak_usermanager_close(m);
+    }
+
+    pair_t p;
+    pair_init(&p);
+    char extra[256];
+    snprintf(extra, sizeof(extra), "\"DatabasePath\":\"%s\",", db);
+    /* EMPTY BypassUID: this user must go through the database. */
+    ASSERT_EQ_INT(0, pair_start_server_bypass(&p, extra, ""));
+    ASSERT_EQ_INT(0, pair_start_client(&p, "", NULL));
+    ASSERT_EQ_INT(0, child_wait_for(&p.client, "session up", BOOT_MS));
+
+    uint8_t *send_buf = malloc(BILLED_PAYLOAD);
+    uint8_t *reply_buf = malloc(BILLED_PAYLOAD);
+    ASSERT_TRUE(send_buf != NULL && reply_buf != NULL);
+    if (send_buf == NULL || reply_buf == NULL) {
+        free(send_buf);
+        free(reply_buf);
+        pair_teardown(&p);
+        return;
+    }
+    fill_payload(send_buf, BILLED_PAYLOAD, 0xB111u);
+    int app = dial(p.local_port);
+    ASSERT_TRUE(app >= 0);
+    size_t seen = 0;
+    size_t got = exchange(app, p.upstream_fd, send_buf, BILLED_PAYLOAD, 0xA5, reply_buf,
+                          BILLED_PAYLOAD, &seen, XFER_MS);
+    close(app);
+    /* The traffic really happened, in both directions -- otherwise there
+     * would be nothing to bill and the assertion below would be vacuous. */
+    ASSERT_EQ_INT((long long)BILLED_PAYLOAD, (long long)seen);
+    ASSERT_EQ_INT((long long)BILLED_PAYLOAD, (long long)got);
+    free(send_buf);
+    free(reply_buf);
+
+    /* The client goes first, then the SERVER is signalled and REAPED --
+     * the reap is what guarantees the database file is complete before it
+     * is read, rather than racing a process still in cloak_userpanel_close. */
+    ASSERT_EQ_INT(0, child_stop(&p.client));
+    p.client.pid = 0;
+    ASSERT_TRUE(p.server.pid > 0);
+    if (p.server.pid > 0) {
+        kill(p.server.pid, SIGTERM);
+    }
+    ASSERT_EQ_INT(0, child_reap(&p.server, EXIT_MS));
+    p.server.pid = 0;
+    pair_teardown(&p);
+
+    { /* what the database actually holds now */
+        cloak_usermanager_t *m = NULL;
+        char err[256] = {0};
+        ASSERT_EQ_INT(0, cloak_usermanager_open(&m, db, NULL, NULL, err, sizeof(err)));
+        if (m == NULL) {
+            printf("  [case 7b] could not reopen %s: %s\n", db, err);
+            return;
+        }
+        cloak_user_info_t after;
+        memset(&after, 0, sizeof(after));
+        ASSERT_EQ_INT(0, cloak_usermanager_get(m, uid, &after));
+        printf("  [case 7b] credit after %d bytes each way: up %lld, down %lld "
+               "(seeded %lld)\n",
+               BILLED_PAYLOAD, (long long)after.up_credit, (long long)after.down_credit,
+               (long long)BILLED_CREDIT);
+        /* BOTH DIRECTIONS, and both STRICTLY below the seed. A shutdown
+         * that never uploaded leaves both exactly at BILLED_CREDIT, which
+         * is what the deleted call produced. The bound is >= the payload
+         * rather than == it, because the tunnel's own framing is billed
+         * too and counting it here would be asserting the mux's overhead,
+         * not the upload. */
+        ASSERT_TRUE(after.up_credit <= (int64_t)BILLED_CREDIT - (int64_t)BILLED_PAYLOAD);
+        ASSERT_TRUE(after.down_credit <= (int64_t)BILLED_CREDIT - (int64_t)BILLED_PAYLOAD);
+        cloak_usermanager_close(m);
+    }
+
+    unlink(db);
+    unlink("ck_client_test_billing.db-wal");
+    unlink("ck_client_test_billing.db-shm");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1340,6 +1633,38 @@ static void test_plugin_mode_takes_an_ssv_string(void) {
         child_t c;
         ASSERT_EQ_INT(1, run_to_exit(&c, CK_CLIENT_PATH, badargv, env, EXIT_MS));
         ASSERT_TRUE(strstr(c.out, "plugin mode") != NULL);
+    }
+
+    /* SS_LOCAL_HOST ALONE *IS* PLUGIN MODE FOR THE CLIENT, which is the
+     * one plugin-mode difference between the two binaries this branch
+     * claims is deliberate. Go, verbatim:
+     *
+     *   ck-client.go:  ssPluginMode := os.Getenv("SS_LOCAL_HOST") != ""
+     *   ck-server.go:  if os.Getenv("SS_LOCAL_HOST") != "" &&
+     *                     os.Getenv("SS_LOCAL_PORT") != "" {
+     *
+     * Both ports are faithful and NEITHER WAS PINNED: a reviewer
+     * strengthened this binary's test to require SS_LOCAL_PORT as well and
+     * all 63 tests passed, because every plugin case in both suites sets
+     * both variables and the distinguishing environment -- host set, port
+     * unset -- was never constructed. test_ck_server_cli.c's
+     * test_ss_local_host_alone_is_not_plugin_mode is the mirror, asserting
+     * the OPPOSITE outcome from the same environment; the two together are
+     * what make the asymmetry a tested property rather than a comment.
+     *
+     * ONE PROCESS, and -s is the whole discriminator: plugin mode refuses
+     * it by name, standalone mode accepts it and goes on to fail over a
+     * config file nobody named. The two outcomes differ in exit code AND
+     * in message. */
+    {
+        const char *const host_only[] = {"SS_LOCAL_HOST=127.0.0.1", NULL};
+        char *const argv2[] = {(char *)"ck-client", (char *)"-s", (char *)"127.0.0.1", NULL};
+        child_t c;
+        ASSERT_EQ_INT(1, run_to_exit(&c, CK_CLIENT_PATH, argv2, host_only, EXIT_MS));
+        ASSERT_TRUE(strstr(c.out, "unknown flag \"-s\" in shadowsocks plugin mode") != NULL);
+        /* A standalone client would have got as far as its configuration,
+         * and would have failed there instead. */
+        ASSERT_TRUE(strstr(c.out, "configuration error") == NULL);
     }
 
     pair_teardown(&p);
@@ -1544,7 +1869,7 @@ static void test_defaults_fill_in_the_omitted_fields(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Case 12: exit 4, on both of the paths that can produce it            */
+/* Case 12: exit 4, and the ServerName bound that used to be exit 4     */
 /* ------------------------------------------------------------------ */
 
 /* EXIT 4 IS THE ONE AN OPERATOR CANNOT AFFORD TO HAVE WRONG, and it was
@@ -1554,13 +1879,14 @@ static void test_defaults_fill_in_the_omitted_fields(void) {
  * success loses a client silently, because a supervisor with
  * restart-on-failure sees a clean exit and stops.
  *
- * There are exactly two ways ck-client can reach 4, and both are pinned
- * here, because they run through different code:
+ * There is exactly ONE way ck-client can still reach 4, and this case
+ * pins it with both of its neighbours:
  *
  *   (a) main's own `return CK_EXIT_RUNTIME` when cloak_signalfd_create
  *       fails -- reached by RLIMIT_NOFILE below.
- *   (b) exit_code_for_stack_err's DEFAULT ARM, reached by an open failure
- *       whose code is none of CONFIG/TEMPLATE/RESOLVE/LISTEN.
+ *   (b) exit_code_for_stack_err's DEFAULT ARM is now UNREACHABLE from any
+ *       configuration, and part (b) of this case is what documents and
+ *       enforces that, rather than pretending otherwise. See below.
  *
  * ---- (a) THE DESCRIPTOR BUDGET -------------------------------------
  *
@@ -1580,10 +1906,10 @@ static void test_defaults_fill_in_the_omitted_fields(void) {
  * epoll, the listener, the signalfd -- which is the same number case 6's
  * census arrives at from the other direction.
  *
- * ---- (b) THE DEFAULT ARM -------------------------------------------
+ * ---- (b) THE DEFAULT ARM, AND WHY IT IS NOW DEAD --------------------
  *
- * The default arm covers three codes. Two of them cannot be reached from
- * this binary at all, and the proof is short enough to write down:
+ * The default arm covers three codes, and none of them can be reached
+ * from this binary. The proof is short enough to write down:
  *
  *   ERR_ARG      cloak_client_stack_open returns it only for a NULL out,
  *                cfg, reactor or config, or for its own calloc failing.
@@ -1592,24 +1918,38 @@ static void test_defaults_fill_in_the_omitted_fields(void) {
  *                -1 only for a NULL pp/cfg/reactor, or for singleplex
  *                with a NULL new_session. The stack always supplies its
  *                own reactor and its own stack_new_session.
+ *   ERR_CONNECTOR  cloak_client_connector_init's config checks are now
+ *                all strictly weaker than the parser's, so a config that
+ *                parses cannot fail them. What is left is allocation.
  *
- * The third IS reachable, from the configuration, and that is what this
- * sub-case uses. ERR_CONNECTOR means round 1 could not be STARTED, and
- * cloak_client_connector_init refuses a ServerName longer than
- * CLOAK_CLIENT_SERVER_NAME_MAX (253) -- while cloak_client_config_t holds
- * up to CLOAK_MAX_HOST_LEN - 1 (255) and the parser accepts it. So a
- * 254-character ServerName parses, opens, resolves, listens, and then
- * fails to start its first round. MEASURED BRACKET, both sides:
+ * THE THIRD USED TO BE REACHABLE, AND THAT WAS A DEFECT, NOT COVERAGE.
+ * cloak_client_connector_init refuses a server_name longer than
+ * CLOAK_CLIENT_SERVER_NAME_MAX (253) while the parser used to accept up
+ * to CLOAK_MAX_HOST_LEN - 1 (255), so a 254-character ServerName parsed,
+ * opened, resolved, listened, and then died with exit 4 and a message
+ * naming no field -- and exit 4's own contract says retrying may help, so
+ * a supervisor keyed on these codes restarted forever over a typo. 253 is
+ * the correct bound (RFC 1035 sec. 2.3.4 with RFC 4343 give 255 OCTETS on
+ * the wire, which is 253 presentation characters once the first label's
+ * length prefix and the root's zero length are taken off; RFC 6066 sec. 3
+ * requires the SNI HostName to be a valid DNS hostname, and Go bounds it
+ * nowhere -- so fidelity does not decide it and the DNS limit does). The
+ * PARSER moved, to 253, and an over-long name is now a CONFIGURATION
+ * error that names the field.
  *
- *   253 characters -> the client starts             -> ready
- *   254 characters -> ERR_CONNECTOR                 -> exit 4
+ * MEASURED BRACKET, all four rungs asserted below:
  *
- * (That gap is itself worth recording: the stack could reject an
- * over-long ServerName at open with a message naming the field, instead
- * of reporting "the first round could not be started". It is a
- * diagnosability gap, not a correctness one, and it is noted in the fix
- * report rather than repaired here -- repairing it would move this path
- * to ERR_CONFIG and leave the default arm unpinned again.) */
+ *   253 characters -> the client starts                        -> ready
+ *   254 characters -> "ServerName is too long (254 bytes...)"  -> exit 2
+ *   255 characters -> the same, from the same check            -> exit 2
+ *   256 characters -> the same, from cloak_config_get_string's
+ *                     own capacity check                       -> exit 2
+ *
+ * The 256 rung matters: it is the bound that was ALREADY there, and
+ * asserting it alongside 254 is what shows the two checks now say the
+ * same thing rather than one shadowing the other. And the case asserts
+ * that "(first bring-up)" is ABSENT, because that string is exactly what
+ * the defect used to print. */
 static void test_runtime_exit_code_and_the_descriptor_budget(void) {
     char pub[64];
     derive_pub_b64(pub, sizeof(pub));
@@ -1637,11 +1977,25 @@ static void test_runtime_exit_code_and_the_descriptor_budget(void) {
         ASSERT_EQ_INT(0, child_stop(&c));
     }
 
-    /* (b) the default arm, and its bracket. */
-    char name[CLOAK_MAX_HOST_LEN];
+    /* (b) the ServerName bound, four rungs, one process each.
+     *
+     * 253 RUNS -- so the bound is not merely "rejects long things", it is
+     * placed exactly where the connector's is. The other three are refused
+     * as CONFIGURATION errors naming the field, which is the whole point:
+     * exit 2 tells a supervisor to stop, and the message tells the
+     * operator which key to shorten. The three refusals run with NO
+     * descriptor limit on purpose, even though it would be cheaper: with
+     * one, a regression that put the old 255 bound back would fail the
+     * listener first and report exit 3, and this case would then be
+     * pinning the wrong thing. Without one it reproduces the defect's own
+     * measurement exactly -- exit 4 and "(first bring-up)" -- which is
+     * what both of the assertions below are written against. They cost
+     * nothing in a correct build, because the config is rejected before
+     * the reactor is ever created. */
+    char name[CLOAK_MAX_HOST_LEN + 8];
     memset(name, 'a', sizeof(name));
     {
-        name[253] = '\0'; /* 253 characters: the connector's own maximum */
+        name[253] = '\0'; /* 253 characters: the DNS presentation limit */
         char c253[2048];
         snprintf(c253, sizeof(c253),
                  "{\"ServerName\":\"%s\",\"ProxyMethod\":\"shadowsocks\","
@@ -1655,22 +2009,56 @@ static void test_runtime_exit_code_and_the_descriptor_budget(void) {
         ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
         ASSERT_EQ_INT(0, child_stop(&c));
     }
-    {
-        name[253] = 'a';
-        name[254] = '\0'; /* 254: one over, and the round cannot start */
-        char c254[2048];
-        snprintf(c254, sizeof(c254),
+    for (size_t len = 254; len <= 256; len++) {
+        memset(name, 'a', sizeof(name));
+        name[len] = '\0';
+        char over[2048];
+        snprintf(over, sizeof(over),
                  "{\"ServerName\":\"%s\",\"ProxyMethod\":\"shadowsocks\","
                  "\"EncryptionMethod\":\"aes-gcm\",\"UID\":\"%s\",\"PublicKey\":\"%s\","
                  "\"NumConn\":2,\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\","
                  "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\"}",
                  name, UID_B64, pub);
-        char *const a[] = {(char *)"ck-client", (char *)"-c", c254, NULL};
+        char *const a[] = {(char *)"ck-client", (char *)"-c", over, NULL};
         child_t c;
-        ASSERT_EQ_INT(4, run_to_exit(&c, CK_CLIENT_PATH, a, NULL, EXIT_MS));
-        /* The TYPED edge, parenthesised, so the assertion cannot be
-         * satisfied by some other line that happens to say "bring-up". */
-        ASSERT_TRUE(strstr(c.out, "(first bring-up)") != NULL);
+        ASSERT_EQ_INT(2, run_to_exit(&c, CK_CLIENT_PATH, a, NULL, EXIT_MS));
+        /* The FIELD is named, and the length is the one that was given --
+         * an operator gets told what to shorten and by how much. */
+        char expect[64];
+        snprintf(expect, sizeof(expect), "ServerName is too long (%zu bytes", len);
+        ASSERT_TRUE(strstr(c.out, expect) != NULL);
+        /* And it is NOT the old defect's line. "(first bring-up)" is the
+         * typed edge exit 4 used to print for exactly this input. */
+        ASSERT_TRUE(strstr(c.out, "(first bring-up)") == NULL);
+    }
+
+    /* AlternativeNames feeds the SAME connector field -- client_stack.c's
+     * stack_pick_server_name chooses between ServerName and the alt names
+     * per round, at RANDOM -- so an alt name the parser accepted and the
+     * connector would not is the same defect with an intermittent trigger.
+     * It is bounded at 253 too, and this is what says so.
+     *
+     * THIS one runs one descriptor short of the listener, unlike the three
+     * above, and the reason is the randomness: with the old bound restored
+     * the client would accept the alt name, pick ServerName on most rounds
+     * and then RUN, so an unlimited child would sit there until the reap
+     * deadline killed it. Starved of the listener it fails in
+     * milliseconds, and the exit code still separates 2 from 3. */
+    {
+        memset(name, 'b', sizeof(name));
+        name[254] = '\0';
+        char alt[2048];
+        snprintf(alt, sizeof(alt),
+                 "{\"ServerName\":\"www.bing.com\",\"AlternativeNames\":[\"%s\"],"
+                 "\"ProxyMethod\":\"shadowsocks\","
+                 "\"EncryptionMethod\":\"aes-gcm\",\"UID\":\"%s\",\"PublicKey\":\"%s\","
+                 "\"NumConn\":2,\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\","
+                 "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\"}",
+                 name, UID_B64, pub);
+        char *const a[] = {(char *)"ck-client", (char *)"-c", alt, NULL};
+        child_t c;
+        ASSERT_EQ_INT(2, run_to_exit_limited(&c, CK_CLIENT_PATH, a, NULL, EXIT_MS, 4));
+        ASSERT_TRUE(strstr(c.out, "AlternativeNames entry is too long (254 bytes") != NULL);
     }
 }
 
@@ -1777,6 +2165,7 @@ TEST_MAIN_BEGIN()
     test_end_to_end_through_both_binaries();
     test_sigterm_is_clean_and_leaks_no_descriptor();
     test_admin_flag_reaches_the_admin_api();
+    test_shutdown_bills_the_last_interval();
     test_plugin_mode_takes_an_ssv_string();
     test_exit_codes_are_distinct();
     test_config_from_a_file_and_from_ssv();

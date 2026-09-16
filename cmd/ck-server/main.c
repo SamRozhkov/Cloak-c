@@ -71,11 +71,50 @@
  * program whose entire purpose is not being noticed, is not a debugging
  * convenience worth having. -d is recognised and rejected with that
  * reason rather than silently ignored, so a script carrying it over from
- * Go Cloak fails loudly instead of quietly losing its profiler.
+ * Go Cloak fails loudly instead of quietly losing its profiler. (Go's
+ * flag.Usage lists -d and usage() below does not, so an operator learns
+ * why it is refused by trying it rather than by reading --help.)
+ *
+ * ---------------------------------------------------------------------
+ * FOUR SMALLER THINGS THAT ARE NOT DIVERGENCES BUT LOOK LIKE THEM, and
+ * were true of this file for a whole branch without being written down.
+ * They are here because a reader comparing the two implementations will
+ * reach for this comment block and not for a report.
+ *
+ * P1. PLUGIN MODE IGNORES -verbosity, AND STANDALONE MODE HONOURS IT --
+ *     faithfully, and the opposite way round from ck-client. In Go's
+ *     server, log.SetLevel sits INSIDE the standalone `else` branch; in
+ *     Go's client it sits outside the if/else and applies to both modes.
+ *     Each port follows its own original. The visible consequence is that
+ *     `-verbosity error` silences a plugin-mode ck-client and does not
+ *     silence a plugin-mode ck-server, while usage() advertises
+ *     -verbosity unconditionally.
+ *
+ * P2. PLUGIN MODE IGNORES EVERY ARGV TOKEN, including a misspelt one --
+ *     also Go's ("Go does not look at argv at all in plugin mode"), and
+ *     also the opposite of ck-client, which refuses an unknown flag in
+ *     plugin mode by name and lists what it does accept. A launcher that
+ *     passes ck-server a typo in plugin mode gets no complaint from
+ *     either implementation.
+ *
+ * P3. AN EMPTY SS_REMOTE_HOST IS FATAL HERE AND IS FINE IN GO.
+ *     merge_ss_bind_addr refuses the one-sided environment; Go's
+ *     parseSSBindAddr takes net.JoinHostPort("", port) -> ":port", which
+ *     resolves and listens on the wildcard. Refusing is the better
+ *     behaviour -- a half-populated SS environment is a broken launcher
+ *     and should say so rather than silently listening somewhere the
+ *     launcher did not ask for -- and it is tested
+ *     (test_plugin_one_sided_remote_env_is_refused). It is a real
+ *     divergence and was simply never declared.
+ *
+ * P4. -v PRINTS A TRAILING NEWLINE; Go's fmt.Printf("ck-server %s",
+ *     version) does not. Cosmetic, deliberate, and recorded so nobody
+ *     "fixes" a diff that is not a defect.
  */
 
 #include <errno.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -706,6 +745,22 @@ static int parse_args(int argc, char **argv, ck_args_t *a, char *err, size_t err
 int main(int argc, char **argv) {
     char err[CK_ERR_LEN] = {0};
 
+    /* SIGPIPE IS IGNORED, AND THAT IS FIDELITY TO GO, NOT A PRECAUTION.
+     * Go's runtime installs a handler that swallows SIGPIPE for every
+     * descriptor that is not stdout/stderr (runtime.sigpipe / os/signal's
+     * "SIGPIPE ... on any other file descriptor ... is ignored"), so Go
+     * Cloak has never been able to die this way and a C port that leaves
+     * the default disposition in place is DIVERGING.
+     *
+     * What it costs us to get wrong: this server writes to sockets whose
+     * peer is an unauthenticated stranger, and the default disposition of
+     * SIGPIPE is to terminate the process. That is a remotely-triggerable
+     * death in a program whose whole purpose is to stay up. Every socket
+     * write in the tree also passes MSG_NOSIGNAL (see relay.c's note);
+     * this is the second of the two, and it is the one that covers a write
+     * somebody adds later. */
+    signal(SIGPIPE, SIG_IGN);
+
     const char *ss_local_host = getenv("SS_LOCAL_HOST");
     const char *ss_local_port = getenv("SS_LOCAL_PORT");
     int plugin_mode = (ss_local_host != NULL && ss_local_host[0] != '\0' &&
@@ -785,6 +840,23 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < cfg.num_proxy_entries; i++) {
         CLOAK_LOGI("proxy book: %s -> %s %s", cfg.proxy_book[i].name,
                    cfg.proxy_book[i].is_udp ? "udp" : "tcp", cfg.proxy_book[i].addr);
+    }
+
+    /* A GAP, MADE AUDIBLE RATHER THAN LEFT SILENT -- AND THE SAME WORDS
+     * ck-client USES. cloak_server_config_t::keep_alive_sec is parsed and
+     * has no readers anywhere in libcloak-server or in this file; no
+     * socket in this build sets SO_KEEPALIVE at all, which is the same gap
+     * ck-client already warned about. The two programs are meant to be
+     * read side by side, and a setting that one of them calls out and the
+     * other ignores in silence is worse than either choice made twice: an
+     * operator who moved a KeepAlive from their client config to their
+     * server config would have watched the warning disappear and concluded
+     * the server honours it. (The parser stores -1 for "unset", so this
+     * fires only when an operator actually wrote one.) */
+    if (cfg.keep_alive_sec > 0) {
+        CLOAK_LOGW("KeepAlive %d is configured but no socket in this build sets "
+                   "SO_KEEPALIVE; the setting is ignored",
+                   cfg.keep_alive_sec);
     }
 
     cloak_reactor_t *reactor = cloak_reactor_create();

@@ -504,6 +504,20 @@ typedef struct {
  *              network condition). A network condition is NOT this: it
  *              is a round that fails later, on the ladder.
  *
+ *              THAT CLAIM WAS FALSE ONCE AND IS TRUE NOW, which is worth
+ *              recording because it is the shape of thing headers get
+ *              wrong. cloak_client_connector_init also refuses a
+ *              server_name over CLOAK_CLIENT_SERVER_NAME_MAX, and the
+ *              parser used to accept two characters more than that -- so
+ *              a CONFIGURATION error arrived here, as a runtime one, with
+ *              a message naming no field. The parser now bounds
+ *              ServerName and AlternativeNames at the same
+ *              CLOAK_MAX_DNS_NAME_LEN the connector uses (the connector's
+ *              constant is now DEFINED from it), so every config check
+ *              this arm could fail is strictly weaker than one the parser
+ *              already made, and allocation is genuinely all that is
+ *              left.
+ *
  * ON ANY FAILURE everything built so far is torn down before this
  * returns, in the same order cloak_client_stack_close uses -- a rejected
  * open leaks nothing and holds no descriptor -- and *out is left NULL.

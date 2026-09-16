@@ -116,9 +116,19 @@ static int pump_read(cloak_relay_t *rl, int i) {
  * send() with MSG_NOSIGNAL, not write() -- cloak_relay_t splices two
  * sockets in a proxy, so a peer disconnecting mid-write is the ordinary
  * case, not a rare one, and writing to a socket whose peer already closed
- * raises SIGPIPE, which by default kills the whole process. There is no
- * SIGPIPE handler anywhere in this tree; conn.c documents hitting this
- * exact bug for real during an earlier plan and fixed it the same way. */
+ * raises SIGPIPE, which by default kills the whole process. conn.c
+ * documents hitting this exact bug for real during an earlier plan and
+ * fixed it the same way.
+ *
+ * ck-server and ck-client now ALSO ignore SIGPIPE at startup, which is
+ * what Go's runtime does for every descriptor that is not stdout/stderr
+ * -- so a library used by those two binaries is no longer one signal away
+ * from a dead process. MSG_NOSIGNAL stays, and stays required, for two
+ * reasons: this library has other callers (every test binary in this
+ * tree, and whatever embeds it next), and a per-call flag is a local
+ * property that cannot be undone by a process-wide disposition somebody
+ * changes later. Belt and braces, deliberately, and each is load-bearing
+ * on its own. */
 static int pump_write(cloak_relay_t *rl, int i) {
     uint8_t buf[RELAY_CHUNK];
     for (;;) {

@@ -28,9 +28,10 @@
  *   3. A config path that does not exist: exit 2, and the message names
  *      the path.
  *   4. Inline JSON as -c's value, which Go's server cannot do (D3).
- *   5. No BindAddr at all -> :443 and :80, in that order. SEE THAT CASE'S
- *      COMMENT for which of the two possible outcomes this environment
- *      produces and how the case decides.
+ *   5. No BindAddr at all -> :443 and :80, in that order, reached without
+ *      BINDING either (see that case's comment); plus the "listening on"
+ *      lines pairing each listener with its own address, and the
+ *      KeepAlive warning both binaries owe an operator.
  *   6. SIGTERM: exit 0, within a bound, having logged the signal.
  *   7. Plugin mode, eight sub-cases: the ProxyBook injection and all three
  *      of parseSSBindAddr's rules, its exactly-one-pipe test, its IPv6
@@ -252,6 +253,13 @@ static int child_wait_for(child_t *c, const char *marker, int timeout_ms) {
 /* Reaps the child, draining output meanwhile. Returns the exit status
  * (>= 0) or -1 if it did not exit inside the bound. */
 static int child_reap(child_t *c, int timeout_ms) {
+    /* Already reaped -- by child_survives_signal, which reaps a child that
+     * died when it should not have. Without this guard a later kill() in
+     * the same case would carry a pid of 0 and signal the whole process
+     * GROUP, so one failed assertion would take the test runner with it. */
+    if (c->pid <= 0) {
+        return -1;
+    }
     uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
     for (;;) {
         int status = 0;
@@ -304,6 +312,9 @@ static uint64_t shutdown_max_ms = 0;
  * bound is one constant rather than a dozen literals, and so the measured
  * latency is collected from all of them. */
 static int signal_and_reap(child_t *c, int signo) {
+    if (c->pid <= 0) {
+        return -1;
+    }
     uint64_t start = now_ms();
     kill(c->pid, signo);
     int rc = child_reap(c, SHUTDOWN_MS);
@@ -312,6 +323,49 @@ static int signal_and_reap(child_t *c, int signo) {
         shutdown_max_ms = took;
     }
     return rc;
+}
+
+/* SIGPIPE MUST NOT KILL THE SERVER, and this is the only part of that
+ * claim a test can assert directly.
+ *
+ * The race it protects against is not constructible on loopback -- a
+ * reviewer replayed 840 RSTs after a real ClientHello across a 0-1600 us
+ * sweep and the ~6 KB reply completed in a single write() every time --
+ * but the SIGNAL DISPOSITION is directly observable: send a running
+ * server a real SIGPIPE and see whether it is still there afterwards.
+ *
+ * For FIDELITY, not as a precaution: Go's runtime installs a SIGPIPE
+ * handler that ignores the signal for every descriptor that is not
+ * stdout/stderr, so a Go ck-server survives this and a C port that leaves
+ * the default disposition in place is DIVERGING from Go, not being
+ * careful.
+ *
+ * Returns 0 if the child is still running after settle_ms, and otherwise
+ * the wait status it died with -- 128 + SIGPIPE == 141 for the failure
+ * this exists to catch, so the assertion prints the signal number. */
+static int child_survives_signal(child_t *c, int signo, int settle_ms) {
+    kill(c->pid, signo);
+    uint64_t deadline = now_ms() + (uint64_t)settle_ms;
+    for (;;) {
+        int status = 0;
+        pid_t r = waitpid(c->pid, &status, WNOHANG);
+        if (r == c->pid) {
+            while (child_drain(c, 10) == 0) {
+                /* flush whatever it managed to say */
+            }
+            close(c->fd);
+            c->fd = -1;
+            c->pid = 0;
+            if (WIFSIGNALED(status)) {
+                return 128 + WTERMSIG(status);
+            }
+            return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        if (now_ms() >= deadline) {
+            return 0;
+        }
+        child_drain(c, 10);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -479,23 +533,11 @@ static int connect_keep(int port) {
     return fd;
 }
 
-/* Can THIS process bind 127.0.0.1:port? Case 5 asks before it asserts. */
-static int can_bind(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return -1;
-    }
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    a.sin_port = htons((uint16_t)port);
-    int rc = bind(fd, (struct sockaddr *)&a, sizeof(a));
-    close(fd);
-    return rc == 0 ? 0 : -1;
-}
+/* There was a can_bind() here, asked by case 5 before it decided which of
+ * two outcomes to assert. It is gone with the branch it served: a case
+ * that measures its environment and then asserts less in some of them is
+ * a case that can be green for the wrong reason, and case 5 now asserts
+ * one unconditional outcome instead. */
 
 /* ------------------------------------------------------------------ */
 /* Config fixtures                                                     */
@@ -863,6 +905,15 @@ static void test_inline_json_starts_and_sigterm_stops(void) {
     ASSERT_EQ_INT(idle.eventpolls, got.eventpolls);
     ASSERT_EQ_INT(idle.signalfds, got.signalfds);
 
+    /* SIGPIPE DOES NOT KILL IT. Asserted on this already-running child so
+     * it costs no process: see child_survives_signal for why the
+     * disposition is assertable even though the race that provokes it is
+     * not, and why ignoring SIGPIPE is FIDELITY to Go rather than a
+     * precaution. Before main() ignored it, this returned 141. */
+    ASSERT_EQ_INT(0, child_survives_signal(&c, SIGPIPE, 200));
+    /* And it is still the same server: it still accepts. */
+    ASSERT_EQ_INT(0, can_connect(port));
+
     /* Case 6: SIGTERM, cleanly, inside the bound. */
     ASSERT_EQ_INT(0, signal_and_reap(&c, SIGTERM));
     ASSERT_TRUE(strstr(c.out, "received signal 15") != NULL);
@@ -914,55 +965,118 @@ static void test_config_from_a_file(void) {
 /* Case 5: no BindAddr -> :443 and :80                                  */
 /* ------------------------------------------------------------------ */
 
-/* WHICH OUTCOME THIS ENVIRONMENT PRODUCES. Ports 443 and 80 are
- * privileged, so whether ck-server can bind them is a property of the
- * process, not of ck-server. This case therefore MEASURES that property
- * first -- by trying the bind itself, from this process, which is subject
- * to exactly the same rules -- and then asserts ONE specific outcome:
+/* NOTHING HERE BINDS 443 OR 80, AND THAT IS THE POINT.
  *
- *   binding is permitted  -> the server starts, and BOTH 443 and 80
- *                            accept a connection. (This is what the
- *                            project's Docker dev image produces: it runs
- *                            as uid 0 and has
- *                            net.ipv4.ip_unprivileged_port_start = 0.)
- *   binding is refused    -> the server exits 3, the bind-failure code,
- *                            and says which address it could not open.
+ * This case used to. It asked `can_bind(443) && can_bind(80)` first and
+ * then took one of two branches, which made its coverage conditional on
+ * two FIXED GLOBAL PORTS being free: under the project's Docker image
+ * (uid 0, ip_unprivileged_port_start = 0) it took the eight-assertion
+ * branch, and on a developer's laptop with anything on :80 it silently
+ * degraded to two assertions with nothing to say so. Worse, two
+ * overlapping runs of this suite on one host COLLIDE on those ports --
+ * a reviewer hit exactly that -- which is what would block running the
+ * suite under `ctest -j`. This is the same defect ck-client's case 11 was
+ * rewritten to remove one commit earlier, and the remedy is the one that
+ * worked there: starve the child of descriptors instead.
  *
- * It is not a case that shrugs and accepts either: each branch pins a
- * different, complete outcome, and the run prints which branch it took. */
+ * (a) THE DEFAULTS. Run one descriptor short of the first listener, the
+ * server names BOTH defaults in Go's order and then fails to open the
+ * first of them -- so the defaults, their order and the bind exit code
+ * are all asserted, unconditionally, in every environment, and nothing
+ * global is touched. MEASURED BRACKET, in both builds:
+ *
+ *   3 descriptors -> execv cannot load the binary            -> 127
+ *   4 descriptors -> the first listener cannot be opened     -> exit 3
+ *   5 descriptors -> the signalfd cannot be created          -> exit 4
+ *
+ * -- the same ladder case 10 pins from the other end, which is why this
+ * case asserts 4 and leaves the neighbours to it.
+ *
+ * (b) THE "listening on" INDEX PAIRING, which this case's comment used to
+ * claim and did not have. A reviewer changed main's loop from
+ * cfg.bind_addr[i] to cfg.bind_addr[0], so every listener reported the
+ * FIRST address, and all 63 tests passed: the old assertions only ever
+ * looked at the "bind address:" lines, which are printed from the config
+ * before anything binds. Two listeners on two different ephemeral ports,
+ * each asserted as a COMPLETE line pairing its own address with its own
+ * bound port, is what that claim actually costs. */
 static void test_default_bind_addresses(void) {
-    char cfg[1024];
-    make_config(cfg, sizeof(cfg), "");
+    { /* (a) the two defaults, named in order, without binding them */
+        char cfg[1024];
+        /* KeepAlive rides along here rather than in a case of its own:
+         * ck-server, like ck-client, must SAY that it is ignoring it (see
+         * the warning's own comment in main.c), and this child already
+         * runs and exits in milliseconds. */
+        make_config(cfg, sizeof(cfg), "\"KeepAlive\":30,");
+        char *const argv[] = {(char *)"ck-server", (char *)"-c", cfg, NULL};
+        child_t c;
+        ASSERT_EQ_INT(3, run_to_exit_limited(&c, argv, NULL, EXIT_MS, 4));
 
-    int privileged = (can_bind(443) == 0 && can_bind(80) == 0);
-    printf("case 5: privileged ports are %s in this environment\n",
-           privileged ? "bindable" : "refused");
-
-    char *const argv[] = {(char *)"ck-server", (char *)"-c", cfg, NULL};
-    child_t c;
-    ASSERT_EQ_INT(0, child_spawn(&c, argv, NULL));
-
-    if (privileged) {
-        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-server ready", BOOT_MS));
-        /* The defaults really are :443 and :80, in that order, and they
-         * really are listening. THE ORDER IS ASSERTED, not just described:
-         * both lines are printed before anything binds, so a swapped
-         * default changes which port an unprivileged operator sees refused
-         * first and which listener index maps to which port in the
-         * "listening on" lines -- and it is Go's order (":443" then ":80")
-         * that this port claims to keep. */
+        /* The defaults really are :443 and :80, in Go's order ("in case
+         * the user hasn't specified any local address to bind to, we
+         * listen on 443 and 80"). THE ORDER IS ASSERTED, not described. */
         const char *at443 = strstr(c.out, "bind address: :443");
         const char *at80 = strstr(c.out, "bind address: :80");
         ASSERT_TRUE(at443 != NULL);
         ASSERT_TRUE(at80 != NULL);
         ASSERT_TRUE(at443 != NULL && at80 != NULL && at443 < at80);
-        ASSERT_EQ_INT(2, (long long)count_occurrences(c.out, "bind address: "));
-        ASSERT_EQ_INT(0, can_connect(443));
-        ASSERT_EQ_INT(0, can_connect(80));
+        /* "INFO bind address: " and not "bind address: ", because the
+         * LISTEN error text says "bind address: BindAddr[0] ..." too and
+         * would otherwise be counted as a third entry. */
+        ASSERT_EQ_INT(2, (long long)count_occurrences(c.out, "INFO bind address: "));
+        /* The TYPED edge, and the address it failed on -- which is the
+         * FIRST default, so the order is pinned twice over. */
+        ASSERT_TRUE(strstr(c.out, "(bind address)") != NULL);
+        ASSERT_TRUE(strstr(c.out, "BindAddr[0] \":443\"") != NULL);
+        ASSERT_TRUE(strstr(c.out, "ck-server ready") == NULL);
+        /* And it said so about KeepAlive, in the same words ck-client
+         * uses. Both binaries, one behaviour. */
+        ASSERT_TRUE(strstr(c.out, "KeepAlive 30") != NULL);
+        ASSERT_TRUE(strstr(c.out, "SO_KEEPALIVE") != NULL);
+    }
+
+    { /* (b) each listener reports ITS OWN address with ITS OWN port */
+        int p1 = free_port();
+        int p2 = free_port();
+        for (int tries = 0; tries < 8 && p2 == p1; tries++) {
+            p2 = free_port();
+        }
+        ASSERT_TRUE(p1 > 0 && p2 > 0 && p1 != p2);
+
+        char bind_json[192];
+        snprintf(bind_json, sizeof(bind_json),
+                 "\"BindAddr\":[\"127.0.0.1:%d\",\"127.0.0.1:%d\"],", p1, p2);
+        char cfg[1024];
+        make_config(cfg, sizeof(cfg), bind_json);
+        char *const argv[] = {(char *)"ck-server", (char *)"-c", cfg, NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, argv, NULL));
+        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-server ready", BOOT_MS));
+
+        /* WHOLE LINES, not substrings: "listening on <addr> (port <port>)"
+         * pairs the configured address with the port the listener actually
+         * bound, and it is the pairing that a loop indexing the wrong
+         * element breaks. A case that asserted only that both ports appear
+         * somewhere would not notice. */
+        char l1[128];
+        char l2[128];
+        snprintf(l1, sizeof(l1), "listening on 127.0.0.1:%d (port %d)", p1, p1);
+        snprintf(l2, sizeof(l2), "listening on 127.0.0.1:%d (port %d)", p2, p2);
+        const char *at1 = strstr(c.out, l1);
+        const char *at2 = strstr(c.out, l2);
+        ASSERT_TRUE(at1 != NULL);
+        ASSERT_TRUE(at2 != NULL);
+        /* In config order, so listener 0 is the config's first entry. */
+        ASSERT_TRUE(at1 != NULL && at2 != NULL && at1 < at2);
+        ASSERT_EQ_INT(2, (long long)count_occurrences(c.out, "listening on "));
+        ASSERT_TRUE(strstr(c.out, "ck-server ready, 2 listener(s)") != NULL);
+        ASSERT_EQ_INT(0, can_connect(p1));
+        ASSERT_EQ_INT(0, can_connect(p2));
+        /* No KeepAlive in this config, and therefore no warning: the
+         * warning must be about a value an operator wrote, not noise at
+         * every startup. */
+        ASSERT_TRUE(strstr(c.out, "KeepAlive") == NULL);
         ASSERT_EQ_INT(0, signal_and_reap(&c, SIGTERM));
-    } else {
-        ASSERT_EQ_INT(3, child_reap(&c, EXIT_MS));
-        ASSERT_TRUE(strstr(c.out, ":443") != NULL);
     }
 }
 
@@ -1280,6 +1394,49 @@ static void test_plugin_one_sided_remote_env_is_refused(void) {
     }
 }
 
+/* SS_LOCAL_HOST ALONE IS NOT PLUGIN MODE FOR THE SERVER, and that is the
+ * one plugin-mode difference between the two binaries this branch claims
+ * is deliberate. Go, verbatim:
+ *
+ *   ck-server.go:  if os.Getenv("SS_LOCAL_HOST") != "" &&
+ *                     os.Getenv("SS_LOCAL_PORT") != "" {
+ *   ck-client.go:  ssPluginMode := os.Getenv("SS_LOCAL_HOST") != ""
+ *
+ * Both ports are faithful and NEITHER WAS PINNED: a reviewer reduced this
+ * binary's test to SS_LOCAL_HOST alone and all 63 tests passed, because
+ * every plugin case in both suites sets both variables and the
+ * distinguishing environment -- host set, port unset -- was never
+ * constructed. The mirror case lives in test_ck_client_cli.c and asserts
+ * the opposite outcome from the same environment; the two together are
+ * what make the asymmetry a tested property rather than a comment.
+ *
+ * ONE PROCESS, and the environment is the whole of the test: a server
+ * that took the plugin branch here would read its configuration from an
+ * unset SS_PLUGIN_OPTIONS and format a NULL SS_LOCAL_PORT through "%s",
+ * so it never reaches "ready". A server that took the standalone branch
+ * reads -c, binds what it names, and says which mode it is in. */
+static void test_ss_local_host_alone_is_not_plugin_mode(void) {
+    int port = free_port();
+    ASSERT_TRUE(port > 0);
+    char bind_json[128];
+    snprintf(bind_json, sizeof(bind_json), "\"BindAddr\":[\"127.0.0.1:%d\"],", port);
+    char cfg[1024];
+    make_config(cfg, sizeof(cfg), bind_json);
+
+    /* SS_LOCAL_HOST, and deliberately NO SS_LOCAL_PORT. */
+    const char *const env[] = {"SS_LOCAL_HOST=127.0.0.1", NULL};
+    char *const argv[] = {(char *)"ck-server", (char *)"-c", cfg, NULL};
+    child_t c;
+    ASSERT_EQ_INT(0, child_spawn(&c, argv, env));
+    ASSERT_EQ_INT(0, child_wait_for(&c, "ck-server ready", BOOT_MS));
+    ASSERT_TRUE(strstr(c.out, "starting standalone mode") != NULL);
+    ASSERT_TRUE(strstr(c.out, "shadowsocks plugin mode") == NULL);
+    /* argv was read, which plugin mode does not do: the port -c named is
+     * the one that is listening. */
+    ASSERT_EQ_INT(0, can_connect(port));
+    ASSERT_EQ_INT(0, signal_and_reap(&c, SIGTERM));
+}
+
 /* ------------------------------------------------------------------ */
 /* Case 9: BindAddr is RESOLVED, not copied                             */
 /* ------------------------------------------------------------------ */
@@ -1566,6 +1723,7 @@ TEST_MAIN_BEGIN()
     test_plugin_ipv6_ss_host_is_bracketed();
     test_plugin_two_pipes_is_not_a_family_pair();
     test_plugin_one_sided_remote_env_is_refused();
+    test_ss_local_host_alone_is_not_plugin_mode();
     test_bind_addresses_are_resolved_not_copied();
     test_runtime_exit_code_and_the_descriptor_budget();
     test_a_flag_missing_its_value_is_a_usage_error();
