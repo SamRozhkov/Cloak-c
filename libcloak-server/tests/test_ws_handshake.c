@@ -711,8 +711,15 @@ static void test_a_request_filling_the_firstpacket_buffer_still_parses(void) {
 static void test_host_target_and_http_version_are_not_checked(void) {
     /* The Go server reads none of these, and being fussier than the
      * reference is itself a distinguisher -- the argument conn.h makes
-     * about not validating record type bytes. Each of these was measured
-     * as 101 against live gorilla. */
+     * about not validating record type bytes.
+     *
+     * EACH OF THE SIX REQUEST LINES BELOW, AND THE REWRITTEN Host, WAS
+     * MEASURED AS 101 against live gorilla, `GET * HTTP/1.1` included.
+     * THE ONE CASE THAT IS NOT is the last one, a request with no Host
+     * header at all: see the note on it below. An earlier version of this
+     * comment claimed the measurement covered that case too. It did not,
+     * and a false "measured" is worse than no claim, because it stops the
+     * next reader from checking. */
     cloak_ws_hs_t hs;
     static const char *const lines[] = {
         "GET / HTTP/1.1",
@@ -728,11 +735,45 @@ static void test_host_target_and_http_version_are_not_checked(void) {
         r.request_line = lines[i];
         ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_built(r, &hs));
     }
-    /* Host rewritten, and Host absent entirely. */
+    /* Host rewritten to the origin's internal name, which is what a CDN
+     * does. Measured: 101. */
     memset(&hs, 0, sizeof(hs));
     req_t rewritten = {0};
     rewritten.host = "10.0.0.7:8080";
     ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_built(rewritten, &hs));
+
+    /* Host present but EMPTY. Measured: 101 -- Go requires the field to
+     * be there and does not care what is in it. */
+    memset(&hs, 0, sizeof(hs));
+    req_t emptyhost = {0};
+    emptyhost.host = "";
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_built(emptyhost, &hs));
+
+    /* No Host header at all, on HTTP/1.0. Measured: 101. */
+    memset(&hs, 0, sizeof(hs));
+    req_t nohost_10 = {0};
+    nohost_10.request_line = "GET /ws/path HTTP/1.0";
+    nohost_10.host = OMIT;
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_built(nohost_10, &hs));
+
+    /* No Host header at all, on HTTP/1.1. THIS PARSER ACCEPTS IT AND GO
+     * DOES NOT: measured, `HTTP/1.1 400 Bad Request: missing required
+     * Host header`, refused by net/http before the handler ever runs
+     * (RFC 9112 3.2 requires the field on HTTP/1.1, and only there --
+     * hence the 1.0 case above, which is 101).
+     *
+     * The permissive direction is kept deliberately, on the same grounds
+     * as everything else in this function: the Cloak server reads Host
+     * nowhere, requiring a field we never look at would refuse traffic
+     * for a reason the reference implementation's own protocol layer
+     * happens to impose rather than one Cloak has, and any CDN or client
+     * that reaches this origin sends Host anyway. It is also unreachable
+     * as a distinguisher -- a prober has no valid `Hidden`, so it sees
+     * the cover site either way.
+     *
+     * What matters here is the LABEL, not the behaviour: this one case
+     * is a deliberate divergence, not a measurement, and the comment now
+     * says which it is. */
     memset(&hs, 0, sizeof(hs));
     req_t nohost = {0};
     nohost.host = OMIT;
@@ -968,8 +1009,9 @@ static void test_malformed_requests(void) {
         "GET /ws/path FTP/1.1\r\nHost: x\r\n\r\n",
         " GET /ws/path HTTP/1.1\r\nHost: x\r\n\r\n",
         /* Header lines Go's own textproto refuses: no colon, a space
-         * before the colon, and a name that is not an RFC 7230 token.
-         * All three were measured as 400 with the request never reaching
+         * before the colon, a name that is not an RFC 7230 token (both
+         * the '{' and the '"' spellings), and an empty name. All four
+         * kinds were measured as 400, with the request never reaching
          * the handler. */
         "GET / HTTP/1.1\r\ngarbage-line\r\n\r\n",
         "GET / HTTP/1.1\r\nHidden : x\r\n\r\n",

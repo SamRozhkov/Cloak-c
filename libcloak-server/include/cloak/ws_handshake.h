@@ -77,10 +77,18 @@
  *     fails ONLY in production. Every name comparison here is
  *     ASCII-case-insensitive.
  *   - UNKNOWN HEADERS ARE INJECTED. X-Forwarded-For, CF-Connecting-IP,
- *     CF-RAY, CDN-Loop, Accept-Encoding, Via, ... A bare Go client sends
- *     335 bytes; a Cloudflare-shaped request measured 630. 3000 still
- *     holds, but it has stopped being theoretical, and overflowing it
- *     silently redirects the connection to the cover site.
+ *     CF-RAY, CDN-Loop, Accept-Encoding, Via, ... Go's own client sends
+ *     335 bytes (measured: exactly what websocket.NewClient wrote, and
+ *     the golden request in test_ws_handshake.c). The Cloudflare-shaped
+ *     request in that same file -- nineteen header lines, the target and
+ *     Host rewritten -- is 631 bytes, and live gorilla answered it 101.
+ *     TREAT 631 AS A SCALE, NOT A CONSTANT: it is a property of the
+ *     particular headers chosen, and an independent reviewer measuring
+ *     its own plausible Cloudflare set got 627. The load-bearing fact is
+ *     the one both numbers agree on -- a fronted request is roughly
+ *     double a bare one, so CLOAK_FIRSTPACKET_MAX (3000) still holds
+ *     while having stopped being theoretical. Overflowing it silently
+ *     redirects the connection to the cover site.
  *   - `Connection` IS REWRITTEN. `Upgrade, keep-alive` and
  *     `keep-alive, Upgrade` are both real and both must be accepted. This
  *     is token-list matching, not equality.
@@ -144,12 +152,26 @@ typedef enum {
     /* `Hidden` absent, empty, not standard base64, or not exactly
      * CLOAK_WS_HS_HIDDEN_LEN bytes once decoded. */
     CLOAK_WS_HS_ERR_BAD_HIDDEN,
-    /* Not a request we can parse at all: no CRLFCRLF inside the supplied
-     * bytes, a request line that is not exactly METHOD SP TARGET SP
-     * HTTP/x.y, a header line with no colon, a header name that is not an
-     * RFC 7230 token, or a header value carrying a control byte. Every
-     * one of those is refused by Go's own net/http too (measured: 400,
-     * with the request never reaching the handler). */
+    /* Not a request we can parse at all. Two kinds, and they are not the
+     * same kind of claim:
+     *
+     *   - A request line that is not exactly METHOD SP TARGET SP
+     *     HTTP/x.y, a header line with no colon, a header name that is
+     *     not an RFC 7230 token, or a header value carrying a control
+     *     byte. Each of those is refused by Go's own net/http too
+     *     (measured: 400, with the request never reaching the handler).
+     *   - NO CRLFCRLF INSIDE THE SUPPLIED BYTES, which is THIS PARSER'S
+     *     OWN DECISION and not Go's behaviour. Measured: Go answers a
+     *     truncated request with NOTHING AT ALL -- it blocks waiting for
+     *     the rest, which is exactly why cloak_firstpacket_t documents a
+     *     15-second deadline as a caller obligation. There is no third
+     *     answer available to a one-shot function over a complete
+     *     buffer: "wait for more" is not in this function's vocabulary,
+     *     and reporting a half-read request as anything other than
+     *     unparseable would hand the caller a value the peer had not
+     *     finished sending. The caller that owns the waiting is
+     *     cloak_firstpacket_t, which only ever calls this once the
+     *     blank line has arrived. */
     CLOAK_WS_HS_ERR_MALFORMED,
     /* The SHA-1 digest failed. Not reachable from any input: EVP_Digest
      * over 60 bytes fails only if OpenSSL cannot allocate a context or
