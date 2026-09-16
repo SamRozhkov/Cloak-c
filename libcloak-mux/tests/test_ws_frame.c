@@ -48,10 +48,59 @@
 
 #include "cloak/ws_frame.h"
 
+#include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "cloak/common.h"
 #include "test_framework.h"
+
+/* ------------------------------------------------------------------ */
+/* Interposition on cloak_random_bytes                                 */
+/* ------------------------------------------------------------------ */
+
+/* This binary supplies its OWN cloak_random_bytes, and that is not an
+ * accident of linking -- it is the only way to test the property that
+ * actually matters about a key generator.
+ *
+ * Every statistical check on generated keys has the same blind spot: it
+ * tests the OUTPUT, so any source whose output looks random enough passes,
+ * however predictable it is to someone who knows the algorithm. An
+ * independent reviewer demonstrated this by replacing the draw with an
+ * incrementing counter, and a linear congruential generator defeats a
+ * stride check the same way. What the header actually promises is not "the
+ * keys look random" but "the keys come from cloak_random_bytes", and only
+ * an interposed definition can observe that.
+ *
+ * How it resolves: cloak-mux and cloak-common are STATIC archives, so the
+ * linker takes this object's definition first and then never has an
+ * unresolved cloak_random_bytes left for libcloak-common's random.o to
+ * satisfy -- so random.o is not pulled in and there is no duplicate
+ * symbol. Nothing else in this binary draws random bytes; if that ever
+ * changes, this file will fail to link rather than silently divert
+ * somebody else's entropy, which is the failure mode to prefer.
+ *
+ * The bytes handed back are still OpenSSL's, from the same RAND_bytes
+ * libcloak-common calls, so the statistical checks further down remain
+ * meaningful rather than testing a fixture. */
+static int rng_calls;
+static size_t rng_last_len;
+static uint8_t rng_last[64];
+
+void cloak_random_bytes(uint8_t *buf, size_t len) {
+    if (len == 0) {
+        return;
+    }
+    if (RAND_bytes(buf, (int)len) != 1) {
+        fprintf(stderr, "test: RAND_bytes failed\n");
+        abort();
+    }
+    rng_calls++;
+    rng_last_len = len;
+    if (len <= sizeof(rng_last)) {
+        memcpy(rng_last, buf, len);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -792,8 +841,34 @@ static void test_masking(void) {
     }
 
     /* A zero-length call touches nothing and is safe on a NULL payload --
-     * an empty frame's payload pointer is legitimately one-past-the-end. */
-    ASSERT_EQ_INT(cloak_ws_frame_mask(NULL, 0, key, 1), 1);
+     * an empty frame's payload pointer is legitimately one-past-the-end.
+     *
+     * The contract is "returns pos & 3, ALWAYS", including on this
+     * early-out path -- not "returns whatever you passed in, which happens
+     * to work because the next call reduces on the way in". The two are
+     * indistinguishable for pos in 0..3, which is why an earlier version
+     * of this test, whose zero-length cases all used pos 1 and 2, let a
+     * mutation that dropped the reduction here escape. Every case below
+     * uses a pos ABOVE 3, where the two differ. */
+    {
+        uint8_t scratch[4];
+        memset(scratch, 0, sizeof(scratch));
+        /* len == 0, via each of the three conditions that take the
+         * early-out: zero length with a real buffer, a NULL payload, and a
+         * NULL key. All three must reduce. */
+        ASSERT_EQ_INT(cloak_ws_frame_mask(scratch, 0, key, 4), 0);
+        ASSERT_EQ_INT(cloak_ws_frame_mask(scratch, 0, key, 7), 3);
+        ASSERT_EQ_INT(cloak_ws_frame_mask(scratch, 0, key, 4002), 2);
+        ASSERT_EQ_INT(cloak_ws_frame_mask(NULL, 0, key, 4002), 2);
+        ASSERT_EQ_INT(cloak_ws_frame_mask(NULL, 9, key, 4002), 2);
+        ASSERT_EQ_INT(cloak_ws_frame_mask(scratch, 4, NULL, 4002), 2);
+        /* The low-pos cases the old test had, kept: they pin that the
+         * reduction does not disturb an already-reduced pos. */
+        ASSERT_EQ_INT(cloak_ws_frame_mask(NULL, 0, key, 1), 1);
+        ASSERT_EQ_INT(cloak_ws_frame_mask(NULL, 0, key, 0), 0);
+        /* Nothing was written on any of those paths. */
+        ASSERT_MEM_EQ(scratch, "\0\0\0\0", 4);
+    }
 
     /* Masking runs over exactly len bytes: the byte after the region is
      * untouched. Checked on an exact-sized heap buffer so ASan catches the
@@ -897,32 +972,90 @@ static void test_round_trip(void) {
     }
 }
 
+#define MASK_KEY_DRAWS 64
+
 static void test_mask_key_source(void) {
     /* cloak_ws_frame_mask_key draws from cloak_random_bytes (OpenSSL
      * RAND_bytes), where gorilla draws from math/rand. Randomness itself
-     * has no unit test, but the failure mode this project has actually
-     * shipped -- a hardcoded constant that passes an entire suite -- does:
-     * sixteen draws that are all identical is a 2^-480 event for a real
-     * source and a certainty for a constant. */
-    uint8_t keys[16][4];
+     * has no unit test, but three specific failure modes do, and all three
+     * have actually been shipped by somebody:
+     *
+     *   (1) a hardcoded constant -- the exact defect that passed an entire
+     *       suite on the previous branch;
+     *   (2) a generator that fills fewer than four bytes;
+     *   (3) a PREDICTABLE generator that is nevertheless fresh every call
+     *       -- a counter, or an LCG. This is the one an earlier version of
+     *       this test missed: an independent reviewer's incrementing
+     *       counter passed the all-identical check while producing keys an
+     *       observer can extrapolate, which is precisely what RFC 6455
+     *       section 5.3 forbids ("the masking key MUST be derived from a
+     *       strong source of entropy"). A predictable mask key is a cheap
+     *       DPI distinguisher, and DPI is this project's threat model.
+     *
+     * (3) is pinned two ways, because a counter can be built to defeat
+     * either one alone:
+     *
+     *   - No constant stride. Read each key as a big-endian u32 and take
+     *     the differences between consecutive draws: if EVERY difference
+     *     is the same value, the source is an arithmetic progression. That
+     *     kills any `key += k` counter, including `+= 0x01010101`, which
+     *     varies every byte position and would survive the check below.
+     *   - Variety in every byte position. Over 64 draws each of the four
+     *     byte positions must take at least 8 distinct values. A counter
+     *     of modest stride leaves its high bytes nearly constant, which
+     *     kills it here even though its low byte marches through 64
+     *     values. For a real source the expected count is about 57 of a
+     *     possible 256, and the chance of landing at 8 or below is far
+     *     past any rate this suite could ever flake at.
+     *
+     * Both of those are still OUTPUT checks, though, and an output check
+     * cannot see a predictable source whose output happens to look fine:
+     * a linear congruential generator walks straight through both. That
+     * was measured, not assumed. So they are the second line of defence,
+     * not the first -- check (0) below interposes on cloak_random_bytes
+     * and pins that the key is DERIVED from it, which is what the header
+     * actually promises and what no statistical test can establish. The
+     * statistical checks are kept anyway: they also cover the shape of
+     * what gets copied out, and a future edit that drops the
+     * interposition should not drop all the coverage with it. */
+    uint8_t keys[MASK_KEY_DRAWS][4];
+    uint32_t words[MASK_KEY_DRAWS];
     int i, all_same = 1;
 
     memset(keys, 0, sizeof(keys));
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < MASK_KEY_DRAWS; i++) {
+        /* (0) DERIVATION, the check the three below cannot make: every
+         * draw is exactly one cloak_random_bytes call, for exactly four
+         * bytes, and the key IS those bytes. A constant, a counter and an
+         * LCG all fail at rng_calls == 0, whatever their output looks
+         * like; a generator that asks for three bytes fails on the length;
+         * one that draws four and then doctors one fails on the compare.
+         * See the interposition at the top of this file. */
+        rng_calls = 0;
+        rng_last_len = 0;
+        memset(rng_last, 0, sizeof(rng_last));
         cloak_ws_frame_mask_key(keys[i]);
+        ASSERT_EQ_INT(rng_calls, 1);
+        ASSERT_EQ_INT(rng_last_len, 4);
+        ASSERT_MEM_EQ(keys[i], rng_last, 4);
+
+        words[i] = ((uint32_t)keys[i][0] << 24) | ((uint32_t)keys[i][1] << 16) |
+                   ((uint32_t)keys[i][2] << 8) | (uint32_t)keys[i][3];
     }
-    for (i = 1; i < 16; i++) {
+
+    /* (1) Not a constant. */
+    for (i = 1; i < MASK_KEY_DRAWS; i++) {
         if (memcmp(keys[i], keys[0], 4) != 0) {
             all_same = 0;
         }
     }
     ASSERT_EQ_INT(all_same, 0);
 
-    /* And that it fills all four bytes: a generator that writes three and
+    /* (2) All four bytes are filled: a generator that writes three and
      * leaves the fourth alone leaves a zero in every key. */
     {
         int b, nonzero[4] = {0, 0, 0, 0};
-        for (i = 0; i < 16; i++) {
+        for (i = 0; i < MASK_KEY_DRAWS; i++) {
             for (b = 0; b < 4; b++) {
                 if (keys[i][b] != 0) {
                     nonzero[b] = 1;
@@ -933,6 +1066,240 @@ static void test_mask_key_source(void) {
             ASSERT_EQ_INT(nonzero[b], 1);
         }
     }
+
+    /* (3a) Not an arithmetic progression. Unsigned wraparound is defined,
+     * so a counter that rolls over is caught the same as one that does
+     * not. */
+    {
+        uint32_t stride = words[1] - words[0];
+        int constant_stride = 1;
+        for (i = 2; i < MASK_KEY_DRAWS; i++) {
+            if ((uint32_t)(words[i] - words[i - 1]) != stride) {
+                constant_stride = 0;
+            }
+        }
+        ASSERT_EQ_INT(constant_stride, 0);
+    }
+
+    /* (3b) Every byte position varies. */
+    {
+        int b;
+        for (b = 0; b < 4; b++) {
+            unsigned char seen[256];
+            int distinct = 0;
+            memset(seen, 0, sizeof(seen));
+            for (i = 0; i < MASK_KEY_DRAWS; i++) {
+                if (!seen[keys[i][b]]) {
+                    seen[keys[i][b]] = 1;
+                    distinct++;
+                }
+            }
+            ASSERT_TRUE(distinct >= 8);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 12. Non-minimal length encodings are ACCEPTED, deliberately         */
+/* ------------------------------------------------------------------ */
+
+static void test_non_minimal_lengths_accepted(void) {
+    /* RFC 6455 section 5.2 says the minimal number of bytes MUST be used
+     * to encode a length. gorilla v1.5.3 does not enforce that on receipt,
+     * and neither does this parser -- ON PURPOSE, and this test is what
+     * stops a later "hardening" pass from quietly undoing it.
+     *
+     * The reasoning is cloak/conn.h's, applied here: a peer that is
+     * FUSSIER than the reference implementation is itself a behavioural
+     * distinguisher. If a censor can send `82 fe 00 05 ...` and watch
+     * cbeuw/Cloak accept it while this port hangs up, the two are
+     * telling apart by a single probe -- which is the exact class of leak
+     * the whole product exists to close. Being permissive costs nothing
+     * here, because the AEAD one layer up is the real authenticator.
+     *
+     * This is not an assumption about gorilla. All four frames below were
+     * fed to a live gorilla v1.5.3 server, which accepted the first three
+     * (type=2, len 5 / 5 / 0) and rejected the fourth with
+     * "len > 125 for control" -- the same four verdicts asserted here.
+     *
+     * The encoder never emits a non-minimal form; see
+     * test_length_brackets_encode, which pins every ceiling as a literal.
+     * Accepting one on receive and emitting only the minimal one on send
+     * is the combination that matches gorilla in both directions. */
+    cloak_ws_frame_header_t h;
+
+    /* The 126 form declaring 5 -- a length that would fit inline. */
+    {
+        const uint8_t b[] = {0x82, 0xfe, 0x00, 0x05, 0x37, 0xfa, 0x21, 0x3d};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 8);
+        ASSERT_EQ_INT(h.payload_len, 5);
+        ASSERT_EQ_INT(h.header_len, 8);
+        ASSERT_EQ_INT(h.opcode, CLOAK_WS_OP_BINARY);
+        ASSERT_EQ_INT(h.masked, 1);
+    }
+    /* The 126 form declaring 0. */
+    {
+        const uint8_t b[] = {0x82, 0xfe, 0x00, 0x00, 0x37, 0xfa, 0x21, 0x3d};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 8);
+        ASSERT_EQ_INT(h.payload_len, 0);
+        ASSERT_EQ_INT(h.header_len, 8);
+    }
+    /* The 126 form declaring 125 -- the last length the inline form could
+     * have carried, so the two brackets touch. */
+    {
+        const uint8_t b[] = {0x82, 0x7e, 0x00, 0x7d};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 4);
+        ASSERT_EQ_INT(h.payload_len, 125);
+        ASSERT_EQ_INT(h.header_len, 4);
+    }
+    /* The 127 form declaring 5 -- a length two forms too wide. */
+    {
+        const uint8_t b[] = {0x82, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                             0x00, 0x05, 0x37, 0xfa, 0x21, 0x3d};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 14);
+        ASSERT_EQ_INT(h.payload_len, 5);
+        ASSERT_EQ_INT(h.header_len, 14);
+    }
+    /* The 127 form declaring 65535 -- the last length the u16 form could
+     * have carried. The other side of the same bracket. */
+    {
+        const uint8_t b[] = {0x82, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                             0xff, 0xff};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 10);
+        ASSERT_EQ_INT(h.payload_len, 65535);
+        ASSERT_EQ_INT(h.header_len, 10);
+    }
+    /* The counter-bracket, and the subtle half of the rule: permissiveness
+     * about the FORM does not extend to control frames, because the
+     * control-length rule is applied to the 7-bit field rather than to the
+     * decoded value. A ping declaring 5 bytes in the 126 form is rejected
+     * -- by gorilla and by us -- even though 5 is a legal control payload.
+     * Without this case, "accept non-minimal forms" could have been
+     * implemented as "skip the control-length check when the form is
+     * extended", which gorilla would not match. */
+    {
+        const uint8_t b[] = {0x89, 0xfe, 0x00, 0x05, 0x37, 0xfa, 0x21, 0x3d};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), -1);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 13. This layer does not bound payload_len -- the caller owes it      */
+/* ------------------------------------------------------------------ */
+
+static void test_payload_len_is_not_bounded_here(void) {
+    /* A DECLARED length is reported as declared, however large. Nothing in
+     * this file compares payload_len against CLOAK_CONN_MAX_FRAME_LEN
+     * (16640) or against anything else, and that is deliberate: this layer
+     * has no buffer, so it cannot know what the caller can hold, and a
+     * parser that silently rejected a large declaration would hide a
+     * hostile peer instead of reporting it.
+     *
+     * The consequence is an obligation, not an absence: whoever buffers
+     * the payload -- the CDN-path conn in task 2 -- must compare
+     * payload_len against CLOAK_CONN_MAX_FRAME_LEN itself. The existing
+     * enforcement points (cloak_conn_init, cloak_session_init,
+     * cloak_switchboard_init) are all on the DIRECT TLS-record path and do
+     * not see a byte of this one.
+     *
+     * A measured bracket around the bound that is NOT applied here: 16640
+     * is CLOAK_CONN_MAX_FRAME_LEN itself and 16641 is one past it, and
+     * both parse identically. A well-meaning "hardening" edit that added
+     * the check to this layer would fail on 16641 -- and it should fail,
+     * because it would be enforcing a mimicry bound in a place that cannot
+     * report it to the layer that has to act on it. */
+    cloak_ws_frame_header_t h;
+
+    /* 16640 == CLOAK_CONN_MAX_FRAME_LEN, written as a literal u16. */
+    {
+        const uint8_t b[] = {0x82, 0x7e, 0x41, 0x00};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 4);
+        ASSERT_EQ_INT(h.payload_len, 16640);
+    }
+    /* 16641 == one past it. Parsed exactly the same way. */
+    {
+        const uint8_t b[] = {0x82, 0x7e, 0x41, 0x01};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 4);
+        ASSERT_EQ_INT(h.payload_len, 16641);
+    }
+    /* And far past it, in the 64-bit form: 4 GiB. */
+    {
+        const uint8_t b[] = {0x82, 0x7f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+                             0x00, 0x00};
+        memset(&h, 0, sizeof(h));
+        ASSERT_EQ_INT(parse_exact(b, sizeof(b), &h), 10);
+        ASSERT_TRUE(h.payload_len == UINT64_C(4294967296));
+    }
+    /* The encoder is equally unbounded: it will frame a 4 GiB payload if
+     * asked. Only the RFC's own high-bit rule stops it, and that is
+     * asserted in test_u64_high_bit. */
+    ASSERT_EQ_INT(write_exact(NULL, 14, CLOAK_WS_OP_BINARY, 1, NULL,
+                              UINT64_C(4294967296)), 10);
+}
+
+/* ------------------------------------------------------------------ */
+/* 14. The NULL-argument contract                                      */
+/* ------------------------------------------------------------------ */
+
+static void test_null_arguments(void) {
+    /* The header promises -1, and the difference between -1 and 0 is not
+     * cosmetic: 0 means "call me again with more bytes", so a caller
+     * looping on 0 against a NULL buffer spins forever. These are the only
+     * calls in this file that do not go through parse_exact/write_exact,
+     * because the whole point of them is that there is no buffer; the
+     * one case that does pass a buffer gets a heap-exact one anyway, so
+     * the file's "every input is allocated to exactly its length"
+     * discipline is unbroken. */
+    cloak_ws_frame_header_t h;
+    cloak_ws_frame_header_t untouched;
+    uint8_t *two;
+
+    memset(&h, 0x5a, sizeof(h));
+    memset(&untouched, 0x5a, sizeof(untouched));
+
+    /* NULL buf, with a length that would otherwise be a complete header,
+     * and with zero length. Both -1, never 0. */
+    ASSERT_EQ_INT(cloak_ws_frame_parse_header(NULL, 8, &h), -1);
+    ASSERT_MEM_EQ(&h, &untouched, sizeof(h));
+    ASSERT_EQ_INT(cloak_ws_frame_parse_header(NULL, 0, &h), -1);
+    ASSERT_MEM_EQ(&h, &untouched, sizeof(h));
+
+    /* NULL out, with a buffer holding a perfectly good header: still -1,
+     * and nothing is dereferenced. */
+    two = (uint8_t *)malloc(2);
+    ASSERT_TRUE(two != NULL);
+    two[0] = 0x82;
+    two[1] = 0x00;
+    ASSERT_EQ_INT(cloak_ws_frame_parse_header(two, 2, NULL), -1);
+    /* Both NULL at once. */
+    ASSERT_EQ_INT(cloak_ws_frame_parse_header(NULL, 2, NULL), -1);
+    /* The same buffer with both arguments valid still parses, so the four
+     * rejections above are attributable to the NULLs and not to the
+     * input. */
+    memset(&h, 0, sizeof(h));
+    ASSERT_EQ_INT(cloak_ws_frame_parse_header(two, 2, &h), 2);
+    ASSERT_EQ_INT(h.payload_len, 0);
+    free(two);
+
+    /* write_header's NULL buffer, for each of the two directions and at a
+     * capacity that would otherwise be ample. */
+    ASSERT_EQ_INT(cloak_ws_frame_write_header(NULL, 14, CLOAK_WS_OP_BINARY, 1,
+                                              NULL, 5), -1);
+    ASSERT_EQ_INT(cloak_ws_frame_write_header(NULL, 14, CLOAK_WS_OP_BINARY, 1,
+                                              rfc_key, 5), -1);
+    /* ...and with zero capacity, where the capacity check would also have
+     * refused: the NULL must be what decides it, so this is only a
+     * consistency check, not the bracket. */
+    ASSERT_EQ_INT(cloak_ws_frame_write_header(NULL, 0, CLOAK_WS_OP_BINARY, 1,
+                                              NULL, 5), -1);
 }
 
 TEST_MAIN_BEGIN()
@@ -948,4 +1315,7 @@ TEST_MAIN_BEGIN()
     test_write_header_capacity();
     test_round_trip();
     test_mask_key_source();
+    test_non_minimal_lengths_accepted();
+    test_payload_len_is_not_bounded_here();
+    test_null_arguments();
 TEST_MAIN_END()

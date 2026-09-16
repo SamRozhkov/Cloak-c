@@ -61,10 +61,47 @@
  *   - It does not answer pings. A CDN pings idle WebSocket connections and
  *     closes them when no pong comes, so that is load-bearing in
  *     production -- and it belongs where the send path is.
- *   - It does not bound payload_len. CLOAK_CONN_MAX_FRAME_LEN already
- *     bounds what this stack will accept, and it is enforced where the
- *     payload is actually buffered. A parser that silently rejected large
- *     lengths would hide, rather than report, a peer asking for one. */
+ *   - It does not bound payload_len, AND NOTHING ELSE ON THIS PATH DOES
+ *     EITHER YET. See the warning below; it is an obligation you inherit,
+ *     not a check that has already happened somewhere else. */
+
+/* THE PAYLOAD LENGTH BOUND IS OWED BY THE CALLER. READ THIS BEFORE USING
+ * cloak_ws_frame_parse_header FOR ANYTHING.
+ *
+ * payload_len is reported exactly as the peer DECLARED it. This file never
+ * compares it against CLOAK_CONN_MAX_FRAME_LEN (cloak/conn.h, 16640) or
+ * against any other limit, and a hostile peer can legitimately get a
+ * successful parse out of this function declaring 0x7FFFFFFFFFFFFFFF.
+ *
+ * That is the right division of labour -- this layer owns no buffer, so it
+ * cannot know what the caller can hold, and a parser that silently
+ * rejected a large declaration would hide a hostile peer rather than
+ * report one -- but it means the check has to happen somewhere, and THAT
+ * SOMEWHERE DOES NOT EXIST YET.
+ *
+ * Concretely, as of this file being written: the three places that enforce
+ * CLOAK_CONN_MAX_FRAME_LEN today are cloak_conn_init, cloak_session_init
+ * and cloak_switchboard_init, and ALL THREE are on the direct
+ * TLS-record path. Not one of them sees a byte that arrived through a
+ * WebSocket frame. An earlier revision of this comment said
+ * CLOAK_CONN_MAX_FRAME_LEN "already bounds what this stack will accept",
+ * which was false for exactly this path and is the sort of sentence that
+ * gets a bound skipped: the next implementer reads it, believes the check
+ * is handled downstream, and nobody ever writes it.
+ *
+ * So, for whoever builds the CDN-path receive loop on top of this: compare
+ * payload_len against CLOAK_CONN_MAX_FRAME_LEN YOURSELF, before you size
+ * or fill any buffer from it, and treat a larger declaration the way
+ * cloak_conn does -- a protocol violation that breaks the connection, not
+ * a value to clamp. It is a MIMICRY bound as much as a memory one (see
+ * CLOAK_CONN_MAX_FRAME_LEN's own comment in cloak/conn.h: one oversized
+ * record is a single-probe distinguisher), so it is not optional on this
+ * path merely because this path is newer.
+ *
+ * libcloak-mux/tests/test_ws_frame.c pins the absence deliberately: 16640
+ * and 16641 parse identically here, and so does 4 GiB. If you add the
+ * check to THIS file those assertions will fail, and they are meant to --
+ * the bound belongs where the buffer is. */
 
 /* The longest header RFC 6455 admits: 2 fixed bytes + 8 extended-length
  * bytes + 4 mask bytes. Every header is 2, 4, 6, 8, 10 or 14 bytes. */
