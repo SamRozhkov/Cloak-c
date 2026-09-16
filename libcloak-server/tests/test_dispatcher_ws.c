@@ -39,18 +39,17 @@
  *      connection was redirected" is true for a dozen reasons that have
  *      nothing to do with whether a user was made active.
  *
- * AND ON THE METER. cloak_switchboard_send used to bill every frame the
- * TLS record header's five bytes regardless of what the connection
- * actually put on the wire. On a CDN connection the envelope is two or
- * four bytes, so an interactive ~30-byte frame was over-charged by
- * roughly 8.6% -- 88 MiB per GiB of a metered user's credit. The last
- * two cases in this file bracket the charge against the real envelope in
- * BOTH framing modes, at the 125/126 boundary where the WebSocket
- * extended-length form appears. They live here, rather than in
- * libcloak-mux's own suite, because this is the commit that made the
- * CDN framing mode reachable from a server at all and therefore the
- * commit in which the mis-billing became a live defect rather than a
- * latent one.
+ * THE TX METER'S OWN FIX IS NOT TESTED HERE, and that is deliberate.
+ * cloak_switchboard_send used to bill every frame the TLS record
+ * header's five bytes regardless of what the connection actually put on
+ * the wire; the CDN envelope is two or four (six or eight from the
+ * client, whose mask key is another four). The bracket that pins it
+ * lives in libcloak-mux/tests/test_switchboard.c, next to the code it
+ * describes, so that anyone editing libcloak-mux and running only its
+ * suite sees a regression in cloak_conn_envelope_len. An earlier
+ * revision kept it here, on the argument that this is the commit which
+ * made the CDN framing mode reachable from a server; true, but it made
+ * the regression invisible to the suite that owns the function.
  *
  * EVERY WAIT IS BOUNDED BY THE CLOCK, never by an iteration count, and
  * every port is ephemeral -- the two disciplines this project's test
@@ -68,10 +67,8 @@
 #include "cloak/server_auth.h"
 #include "cloak/session.h"
 #include "cloak/stream.h"
-#include "cloak/switchboard.h"
 #include "cloak/usermanager.h"
 #include "cloak/userpanel.h"
-#include "cloak/valve.h"
 #include "cloak/ws_handshake.h"
 #include "test_framework.h"
 
@@ -1133,23 +1130,34 @@ static void test_replayed_cdn_request_is_refused(void) {
  * not a test. What is asserted instead is two falsifiable claims:
  *
  *   (a) BYTE-STREAM EQUALITY. For identical cover-site input -- the
- *       fixed banner, written at accept -- the three rejection paths
- *       produce byte-identical output at the client, and nothing after
- *       it. The positive control is the successful upgrade in case 1,
- *       whose first byte already differs, so the assertion demonstrably
- *       can fail.
+ *       fixed banner, written at accept -- every rejection path produces
+ *       byte-identical output at the client, and nothing after it, on
+ *       every sample rather than on the first. The positive control is
+ *       the successful upgrade in case 1, whose first byte already
+ *       differs, so the assertion demonstrably can fail.
  *
- *   (b) A MEASURED TIMING BRACKET. The spread between the three medians
- *       over WS_TIMING_RUNS samples is below WS_TIMING_BOUND_US, a
- *       literal justified by the measurement recorded beside it rather
- *       than by taste.
+ *   (b) A MEASURED TIMING BRACKET. The spread between the four step-1
+ *       medians over WS_TIMING_RUNS samples -- and the same spread over
+ *       the four MINIMA -- is below WS_TIMING_BOUND_US, a literal
+ *       justified by the measurement recorded beside it rather than by
+ *       taste.
  *
- * All three arms are the SAME LENGTH, to the byte. That is load-bearing:
- * the WebSocket first-packet path reads one byte at a time, so a shorter
+ * WHAT (b) IS NOT, and this is worth being exact about because an
+ * earlier revision of this file over-claimed it: the bracket is a bound
+ * on how different these refusals may look, not the detector for a
+ * wrongly ordered validation. It cannot see a same-bytes branch costing
+ * under about 600 us (measured, by this commit's reviewer, with a
+ * deliberately delayed arm), and the ratio that COULD see one flaked on
+ * an unmutated tree -- see WS_TIMING_BOUND_US. The ordering is caught by
+ * two clock-free assertions instead: the session_aborted counter in
+ * case 4 and the replay-cache check in case 4b.
+ *
+ * EVERY ARM IS THE SAME LENGTH, to the byte. That is load-bearing: the
+ * WebSocket first-packet path reads one byte at a time, so a shorter
  * request would be faster for a reason that has nothing to do with which
  * check refused it, and the bracket would be measuring request length. */
 
-/* The three arms, each built to the same total length:
+/* The arms, each built to the same total length:
  *   - BAD_HIDDEN:   a valid upgrade whose `Hidden` is not base64 of 96
  *                   bytes (one character replaced). Refused by the parse.
  *   - BAD_UPGRADE:  a valid `Hidden` for an AUTHORISED UID -- the one
@@ -1338,18 +1346,33 @@ static int cmp_u64(const void *a, const void *b) {
  * dial to the cover site, relay, banner) swings by a factor of four with
  * machine load, and the spread swings with it.
  *
- * WS_STEP6_RATIO_* is deliberately a RATIO, and it is the assertion that
- * actually detects the defect this task exists to prevent. It compares
- * two DIFFERENT code paths through the same probe, so the noise that
- * moves one moves the other, and a ratio is exactly the right shape:
- * observed at most 0.65 (BAD_UPGRADE against UNAUTHORISED) across every
- * run, clean or loaded, and it would be >= 1.0 the moment the upgrade
- * were validated after the UID -- because BAD_UPGRADE would then pay
- * everything UNAUTHORISED pays and more. 0.8 sits between. */
+ * THE STEP-6 RATIO BELOW IS MEASURED, PRINTED, AND NOT ASSERTED. It was
+ * an assertion (BAD_UPGRADE's median against 0.8x UNAUTHORISED's), and
+ * on paper it is the sharpest detector in the file: it would read >= 1.0
+ * the moment the upgrade were validated after the UID. In practice it
+ * FLAKED ON THE UNMUTATED TREE -- 1 failure in 50 isolated Debug runs
+ * here (0.807 against the 0.8 bound), 3 in 50 for this commit's reviewer
+ * (0.831, 0.933, 0.954). The reason is structural rather than fixable by
+ * widening: the step-6 path's extra work is ~100-130 us, while the
+ * probe's own cost -- connect, a 512-byte request read one byte at a
+ * time, a TCP dial to the cover site, a relay, a banner -- swings from
+ * ~190 us to ~800 us with machine load. The denominator is mostly probe,
+ * not path, so a loaded run can eat the whole margin. Widening the bound
+ * to cover that would put it past the signal it is meant to detect.
+ *
+ * SO IT IS A DIAGNOSTIC, AND THAT IS THE RIGHT SHAPE HERE rather than a
+ * retreat, for one specific reason: it is REDUNDANT AS A DETECTOR. Go's
+ * ordering is caught deterministically, twice over and without a clock,
+ * by the session_aborted counter across all five malformed-upgrade arms
+ * and by test_refused_upgrade_does_not_burn_the_ephemeral_key. A
+ * non-deterministic assertion that adds no detection only adds a way for
+ * a green tree to go red, and this project treats a flaky test as a bug
+ * rather than as noise to be re-run. The number is still worth having on
+ * every run: it is how a future reader sees that the step-6 refusal
+ * really does cost more, and by how much, which is the measurement the
+ * side-channel note in dispatcher.c's step 6 depends on. */
 #define WS_TIMING_RUNS 31
 #define WS_TIMING_BOUND_US 1000
-#define WS_STEP6_RATIO_NUM 4
-#define WS_STEP6_RATIO_DEN 5
 
 static void test_three_refusals_are_indistinguishable(void) {
     struct fixture fx;
@@ -1447,16 +1470,17 @@ static void test_three_refusals_are_indistinguishable(void) {
      * BAD_HIDDEN, and its median sits inside the same bracket, so the
      * dispatcher demonstrably does not branch on the failure code. */
 
-    /* THE STATEMENT THAT ACTUALLY DETECTS THE WRONG ORDER. If
-     * `Connection`, `Sec-WebSocket-Key` and `Sec-WebSocket-Version` were
-     * checked AFTER the UID were authorised -- which is what Go does --
-     * the BAD_UPGRADE arm would first pay everything the UNAUTHORISED
-     * arm pays (replay check, X25519, AES-GCM open, the user lookup) and
-     * then some (a session created and unwound). So it must come in
-     * measurably CHEAPER than the step-6 refusal, not merely "close to"
-     * the other three. */
-    ASSERT_TRUE(med[ARM_BAD_UPGRADE] * WS_STEP6_RATIO_DEN <
-                med[ARM_UNAUTHORISED] * WS_STEP6_RATIO_NUM);
+    /* The step-6 ratio: recorded, never asserted. See WS_TIMING_BOUND_US's
+     * own comment for why a number this informative is still the wrong
+     * thing to fail a build on, and which two clock-free assertions do
+     * the detecting instead. Typical quiet-run value is 550-650; a run
+     * reading 1000 or more would mean BAD_UPGRADE had started paying
+     * everything UNAUTHORISED pays, which is Go's ordering -- worth
+     * looking at by eye, not worth failing a suite on. */
+    fprintf(stderr, "[timing] step6 ratio (bad_upgrade/unauthorised): %llu/1000\n",
+            (unsigned long long)(med[ARM_UNAUTHORISED] == 0
+                                     ? 0
+                                     : med[ARM_BAD_UPGRADE] * 1000u / med[ARM_UNAUTHORISED]));
 
     fixture_destroy(&fx);
 }
@@ -1739,6 +1763,31 @@ static void test_firstpacket_max_bracket(void) {
     struct fixture fx;
     ASSERT_EQ_INT(0, fixture_init(&fx));
 
+    /* THE CONSTANT ITSELF, BRACKETED ON BOTH SIDES, because everything
+     * else in this test derives its probe size FROM the constant and so
+     * cannot notice the constant moving. (Measured: changing 3000 to
+     * 1500 leaves every assertion below satisfied; only the unrelated
+     * test_dispatcher_limits notices, and only incidentally.)
+     *
+     * The lower bound is the operational claim cloak/firstpacket.h
+     * makes: a bare Go client's upgrade request measures 335 bytes and a
+     * Cloudflare-shaped one measured 631, so 3000 "holds comfortably".
+     * Four times the measured CDN-shaped request is what "comfortably"
+     * is worth asserting as -- a CDN that added another 1900 bytes of
+     * its own headers would silently redirect every connection to the
+     * cover site with no diagnostic anywhere, so the margin is the
+     * warning.
+     *
+     * The upper bound is the other cost: this buffer is embedded in
+     * cloak_dispatch_conn_t, one per UNAUTHENTICATED connection, and
+     * cloak/dispatcher.h's cap reasoning is written around "~3KB of heap
+     * per unauthenticated connection". A constant that grew past 4096
+     * would quietly change what max_pending_conns costs an operator in
+     * memory, which is a decision, not a tweak. */
+    ASSERT_EQ_INT(3000, CLOAK_FIRSTPACKET_MAX);
+    ASSERT_TRUE(CLOAK_FIRSTPACKET_MAX >= 4 * 631);
+    ASSERT_TRUE(CLOAK_FIRSTPACKET_MAX <= 4096);
+
     for (int over = 0; over <= 1; over++) {
         char hidden[CLOAK_WS_HS_HIDDEN_B64_LEN + 1];
         uint8_t shared[CLOAK_AEAD_KEY_LEN];
@@ -1791,149 +1840,6 @@ static void test_firstpacket_max_bracket(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 7-8. The TX meter bills the envelope it actually emitted             */
-/* ------------------------------------------------------------------ */
-
-/* THE DEFECT THIS PINS. cloak_switchboard_send billed
- * CLOAK_CONN_RECORD_HEADER_LEN + frame_len unconditionally -- five bytes
- * of TLS record header regardless of what the connection put on the
- * wire. A WS_SERVER connection emits two bytes below 126 and four at or
- * above it, so an interactive ~30-byte frame was over-charged by about
- * 8.6% (88 MiB per GiB) and a 16401-byte bulk frame under-charged by
- * about 0.018%. Over-charging a metered user is a real defect, not a
- * rounding difference, and a valve's counter is what bills their credit.
- *
- * THE BRACKET IS MEASURED IN BOTH MODES AND ACROSS THE 125/126
- * BOUNDARY, where the WebSocket extended-length form appears -- a fix
- * that hardcoded "2" instead of consulting the framing would pass at 30
- * bytes and fail at 200, and a fix that kept the TLS constant fails
- * everywhere on the CDN side.
- *
- * A socketpair, not a loopback socket: this measures what the SENDER
- * billed, and no reactor turn is needed for cloak_conn_send to have
- * enqueued (and, at these sizes, written) the bytes. */
-typedef struct {
-    int seen;
-} sb_sink_t;
-
-static void sb_on_envelope(cloak_switchboard_t *sb, const uint8_t *bytes, size_t len,
-                           void *userdata) {
-    (void)sb;
-    (void)bytes;
-    (void)len;
-    sb_sink_t *s = userdata;
-    s->seen++;
-}
-
-static void sb_on_broken(cloak_switchboard_t *sb, void *userdata) {
-    (void)sb;
-    (void)userdata;
-}
-
-/* Sends one frame of frame_len bytes through a switchboard holding a
- * single connection in `framing`, and returns what the valve was
- * charged. */
-static int64_t billed_for(cloak_reactor_t *r, cloak_conn_framing_t framing, size_t frame_len) {
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        ASSERT_TRUE(0);
-        return -1;
-    }
-
-    sb_sink_t sink = {0};
-    cloak_switchboard_t sb;
-    ASSERT_EQ_INT(0, cloak_switchboard_init(&sb, r, 16401, 262144, sb_on_envelope, &sink,
-                                            sb_on_broken, NULL));
-    ASSERT_EQ_INT(0, cloak_switchboard_add_conn_framed(&sb, sv[0], framing));
-
-    cloak_valve_t valve;
-    memset(&valve, 0, sizeof(valve));
-    cloak_switchboard_set_valve(&sb, &valve);
-
-    uint8_t *frame = malloc(frame_len);
-    ASSERT_TRUE(frame != NULL);
-    if (frame == NULL) {
-        cloak_switchboard_destroy(&sb);
-        close(sv[1]);
-        return -1;
-    }
-    memset(frame, 0x5a, frame_len);
-    ASSERT_EQ_INT(0, cloak_switchboard_send(&sb, frame, frame_len));
-    free(frame);
-
-    int64_t billed = cloak_valve_tx(&valve);
-
-    /* The valve must not outlive the pool that points at it. */
-    cloak_switchboard_set_valve(&sb, NULL);
-    cloak_switchboard_destroy(&sb);
-    close(sv[1]);
-    return billed;
-}
-
-static void test_tx_meter_bills_the_real_envelope(void) {
-    cloak_reactor_t *r = cloak_reactor_create();
-    ASSERT_TRUE(r != NULL);
-    if (r == NULL) {
-        return;
-    }
-
-    /* The TLS path is unchanged and is asserted so, because a fix that
-     * broke it would be a silent under-count on every existing
-     * deployment. 5 + n, at every size. */
-    ASSERT_EQ_INT(35, (int)billed_for(r, CLOAK_CONN_FRAMING_TLS_RECORD, 30));
-    ASSERT_EQ_INT(130, (int)billed_for(r, CLOAK_CONN_FRAMING_TLS_RECORD, 125));
-    ASSERT_EQ_INT(131, (int)billed_for(r, CLOAK_CONN_FRAMING_TLS_RECORD, 126));
-    ASSERT_EQ_INT(205, (int)billed_for(r, CLOAK_CONN_FRAMING_TLS_RECORD, 200));
-    ASSERT_EQ_INT(16406, (int)billed_for(r, CLOAK_CONN_FRAMING_TLS_RECORD, 16401));
-
-    /* The CDN server direction: two header bytes below 126, four at or
-     * above it, and never a mask key -- RFC 6455 section 5.1 forbids a
-     * server masking. */
-    ASSERT_EQ_INT(32, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_SERVER, 30));
-    ASSERT_EQ_INT(127, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_SERVER, 125));
-    ASSERT_EQ_INT(130, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_SERVER, 126));
-    ASSERT_EQ_INT(204, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_SERVER, 200));
-    ASSERT_EQ_INT(16405, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_SERVER, 16401));
-
-    /* The CDN client direction, which this port also builds (the ck-client
-     * side of the same transport): four more bytes of mask key, which is
-     * why its envelope is the LARGEST of the three and not the smallest. */
-    ASSERT_EQ_INT(36, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_CLIENT, 30));
-    ASSERT_EQ_INT(131, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_CLIENT, 125));
-    ASSERT_EQ_INT(134, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_CLIENT, 126));
-    ASSERT_EQ_INT(208, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_CLIENT, 200));
-    ASSERT_EQ_INT(16409, (int)billed_for(r, CLOAK_CONN_FRAMING_WS_CLIENT, 16401));
-
-    cloak_reactor_destroy(r);
-}
-
-/* The over-charge this fix removes, stated as the arithmetic an operator
- * would do, so that a future change which quietly reintroduces the flat
- * +5 fails with a number rather than with a diff. */
-static void test_tx_meter_overcharge_is_gone(void) {
-    cloak_reactor_t *r = cloak_reactor_create();
-    ASSERT_TRUE(r != NULL);
-    if (r == NULL) {
-        return;
-    }
-    /* The switchboard's own comment uses a ~30-byte interactive frame.
-     * The flat +5 billed 35 for what a WS_SERVER conn puts 32 bytes of
-     * on the wire: 3 bytes in 32, i.e. 9.4% of the true figure and 8.6%
-     * of the charged one. */
-    int64_t ws30 = billed_for(r, CLOAK_CONN_FRAMING_WS_SERVER, 30);
-    ASSERT_EQ_INT(32, (int)ws30);
-    ASSERT_TRUE(ws30 != 35);
-
-    /* And the bulk end, where the old figure was too SMALL: a 16401-byte
-     * frame costs 16405 on the wire, not 16406. */
-    int64_t ws_bulk = billed_for(r, CLOAK_CONN_FRAMING_WS_SERVER, 16401);
-    ASSERT_EQ_INT(16405, (int)ws_bulk);
-    ASSERT_TRUE(ws_bulk != 16406);
-
-    cloak_reactor_destroy(r);
-}
-
-/* ------------------------------------------------------------------ */
 
 TEST_MAIN_BEGIN()
 test_cdn_upgrade_establishes_a_session();
@@ -1945,6 +1851,4 @@ test_panel_is_untouched_by_a_malformed_upgrade();
 test_refused_upgrade_does_not_burn_the_ephemeral_key();
 test_bare_get_still_reaches_the_cover_site();
 test_firstpacket_max_bracket();
-test_tx_meter_bills_the_real_envelope();
-test_tx_meter_overcharge_is_gone();
 TEST_MAIN_END()

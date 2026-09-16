@@ -233,8 +233,18 @@ long cloak_server_auth_compose_reply(const uint8_t shared_secret[CLOAK_AEAD_KEY_
  * connection; session_key is the freshly chosen frame-encryption key the
  * client is being told about.
  *
- * Returns 0 on success, -1 on a NULL argument or an AEAD failure, in
- * which case `out` is unspecified. */
+ * Returns 0 on success, -1 on a NULL argument or an AEAD failure.
+ *
+ * ON FAILURE `out` IS NOT WRITTEN AT ALL -- not partially, not with a
+ * nonce, not with anything. That is a contract and not an accident: the
+ * sealing happens into a local buffer of known size and only a
+ * fixed-length memcpy ever touches `out`, after the sealed length has
+ * been checked. cloak_aead_seal takes no output capacity, so a caller
+ * that handed it `out` directly could only DETECT a wrong-sized cipher
+ * output after it had already written past the end; this function's
+ * caller keeps a 60-byte buffer inside a live connection struct, and a
+ * -1 must leave it exactly as the caller left it rather than full of
+ * plausible-looking reply bytes it must not send. */
 int cloak_server_auth_compose_ws_reply(uint8_t out[CLOAK_SERVER_AUTH_WS_REPLY_LEN],
                                         const uint8_t session_key[CLOAK_AEAD_KEY_LEN],
                                         const uint8_t shared_secret[CLOAK_AEAD_KEY_LEN]);

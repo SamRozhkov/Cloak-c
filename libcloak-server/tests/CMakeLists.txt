@@ -8,6 +8,28 @@ target_include_directories(test_server_auth PRIVATE ${CMAKE_SOURCE_DIR}/libcloak
 target_link_libraries(test_server_auth PRIVATE cloak-server)
 add_test(NAME test_server_auth COMMAND test_server_auth)
 
+# -Wl,--wrap lets this binary interpose on cloak_aead_seal -- a function
+# of its OWN static archive, which LD_PRELOAD cannot reach (calls between
+# objects inside one executable are direct, never through the PLT) and
+# which a competing definition in this file cannot override (that is a
+# duplicate symbol at link time, not a preemption).
+#
+# It exists for one test: cloak_aead_seal takes no output capacity, so
+# cloak_server_auth_compose_ws_reply's "the sealed length really was 48"
+# check can only be exercised by a cipher that reports a different one,
+# and no real AES-256-GCM ever does. Without this the check is an
+# unreachable line that merely looks like safety -- the thing this tree's
+# cloak/http.h argues against -- and the mutation that deletes it is
+# indistinguishable from the original.
+#
+# GNU ld / lld only, which matches this project's GCC-on-Linux build (the
+# same assumption the ASan block below already documents). --wrap on a
+# symbol nothing references is silently harmless, so a future refactor
+# that stops calling cloak_aead_seal here degrades to a no-op rather than
+# a build failure; test_compose_ws_reply_round_trips asserts the
+# interposition actually fired, which is what catches that.
+target_link_options(test_server_auth PRIVATE -Wl,--wrap=cloak_aead_seal)
+
 add_executable(test_replay_cache test_replay_cache.c)
 target_include_directories(test_replay_cache PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_replay_cache PRIVATE cloak-server)

@@ -177,8 +177,10 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
          * eight from the client, whose mask key is another four). The
          * error was not academic: on the ~30-byte interactive frames this
          * comment's own example uses, +5 against a true +2 OVER-CHARGED a
-         * metered user by about 8.6% -- 88 MiB per GiB -- and on a
-         * 16401-byte bulk frame it under-charged by about 0.018%.
+         * metered user by about 8.6% -- 3 bytes in 35 charged, 88 MiB per
+         * charged GiB -- and on a 16401-byte bulk frame in the CLIENT
+         * direction it under-charged by about 0.018% (3 bytes of mask key
+         * in 16409: 196 kB per GiB).
          * Over-charging is the half that matters, because this counter is
          * what spends a user's credit. cloak_conn_envelope_len is the
          * same arithmetic cloak_conn_send performs before it enqueues, so

@@ -313,11 +313,41 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     exactly the path an unrecognised protocol takes. No logging, no
  *     early close, no distinct branch: a prober holding no valid
  *     credentials must not be able to tell "no such user" from "not a
- *     Cloak server". The one difference an attacker could in principle
- *     measure is that the get_user path runs a SQLite lookup an
- *     unparseable first packet never reaches -- inherent to having a
- *     user database at all (Go pays the same cost on the same path), and
- *     not something a branch here creates.
+ *     Cloak server".
+ *
+ *     THE ONE DIFFERENCE THAT REMAINS IS A TIMING ONE, AND IT IS
+ *     MEASURED RATHER THAN HAND-WAVED. A refusal HERE runs an X25519
+ *     shared secret, an AES-GCM open and a SQLite lookup that a refusal
+ *     at step 1 (an unparseable first packet, a rewritten `Connection`
+ *     header) never reaches. On an idle host the two groups separate
+ *     cleanly: step-1 refusals cluster at 175-205 us with a 3-9 us
+ *     spread between them, while a step-6 refusal sits at 300-340 us --
+ *     a ~130 us gap against a ~6 us intra-group spread. Under load they
+ *     overlap entirely. libcloak-server/tests/test_dispatcher_ws.c
+ *     prints both figures on every run.
+ *
+ *     IT IS INHERENT, and Go pays the same cost on the same path: any
+ *     server with a user database does work for a plausible UID that it
+ *     does not do for a malformed request. What bounds it is not the
+ *     code but WHO CAN SEE IT. This transport's only leg is behind a
+ *     CDN, so a remote prober's measurement passes through the CDN's own
+ *     queuing, connection reuse and TLS variance -- orders of magnitude
+ *     above 130 us, and not something more samples average away, because
+ *     the noise is not independent of the probe. An attacker positioned
+ *     to time the ORIGIN directly has already found the origin, which is
+ *     the thing this transport exists to hide; at that point the side
+ *     channel is not the exposure.
+ *
+ *     THE OBVIOUS CLOSURE IS A TRADE, NOT AN IMPROVEMENT, and is
+ *     deliberately not taken: a jittered floor on conn_start_redirect's
+ *     dial (say uniform 0-2 ms) would submerge the signal for a timer
+ *     and no work, and unlike the other obvious idea -- running the
+ *     database lookup on every refusal -- it hands an attacker no free
+ *     query per junk byte. But it would also stop the origin's latency
+ *     distribution looking like the web server it is pretending to be,
+ *     which may be a worse fingerprint than the one it fixes. Nobody
+ *     should add it without first measuring what the cover site's own
+ *     distribution looks like.
  *
  *     WHAT STEP 6 OWES THE PANEL: cloak_userpanel_get_user makes the
  *     user ACTIVE, and cloak/userpanel.h requires that user to acquire

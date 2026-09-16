@@ -413,10 +413,12 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
  * cloak_switchboard_send billed CLOAK_CONN_RECORD_HEADER_LEN + frame_len
  * for every frame regardless of what the connection put on the wire,
  * which on a CDN connection over-charged an interactive ~30-byte frame
- * by about 8.6% -- 88 MiB per GiB of a metered user's credit -- and
- * under-charged a 16401-byte bulk frame by about 0.018%. The
- * over-charging half is the one that matters: it bills a user for bytes
- * nobody sent.
+ * by about 8.6% -- 3 bytes in 35 charged, i.e. 88 MiB per charged GiB of
+ * a metered user's credit -- and, in the CLIENT direction, under-charged
+ * a 16401-byte bulk frame by about 0.018% (the 3 bytes of mask key in
+ * 16409: 196 kB per GiB, which is 191.7 KiB -- the units are worth
+ * getting right in a comment about billing). The over-charging half is
+ * the one that matters: it bills a user for bytes nobody sent.
  *
  * It is exactly the same arithmetic cloak_conn_send itself performs
  * before it enqueues, deliberately so: one function decides what an
