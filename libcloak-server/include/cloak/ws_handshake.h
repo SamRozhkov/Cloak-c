@@ -109,6 +109,54 @@
  *     RECEIVED, never over one stored anywhere: the CDN computes the
  *     client's accept from the client's key, and the origin's leg is its
  *     own handshake.
+ *   - `Origin` MAY BE INJECTED, AND THIS PARSER DOES NOT READ IT. This is
+ *     a DELIBERATE DIVERGENCE FROM GORILLA, and it is the last of the
+ *     three named triggers of the Go wedge described above. Details in
+ *     the paragraph below, because it is the one accept decision here
+ *     that gorilla would refuse.
+ *
+ * `Origin`: THE DIVERGENCE THAT IS AN ACCEPT RATHER THAN A REFUSAL.
+ *
+ * Go builds its upgrader as `websocket.Upgrader{}`
+ * (internal/server/websocketAux.go:130). A zero-value Upgrader has a nil
+ * CheckOrigin, and gorilla substitutes its own checkSameOrigin, which
+ * refuses any request whose `Origin` host differs from `Host`. MEASURED
+ * against live gorilla v1.5.3 in this project's dev image, same harness as
+ * every other constant in this file:
+ *
+ *   origin absent                -> reaches the hijack (accepted)
+ *   origin "http://example.com"  -> reaches the hijack (accepted, Host matched)
+ *   origin "http://evil.example.com"
+ *                                -> 403, "request origin not allowed by
+ *                                   Upgrader.CheckOrigin"
+ *
+ * In Go that 403 is the WEDGE: internal/server/websocket.go:50-53 returns
+ * from ServeHTTP without sending on `finished`, and the `<-handler.finished`
+ * that follows blocks forever, with its goroutine, its socket and its
+ * ActiveUser bookkeeping -- after the UID has already been authorised.
+ *
+ * THIS PORT ACCEPTS IT. Nothing in this file, in ws_handshake.c, or in the
+ * dispatcher reads `Origin` at all. MEASURED at the built ck-server, 200
+ * connections carrying a genuinely authorised `Hidden` and a cross-site
+ * `Origin`: 200 x `HTTP/1.1 101 Switching Protocols`, 0 closed without an
+ * answer, 0 hung. The two other triggers (no `Connection: Upgrade`, a
+ * malformed `Sec-WebSocket-Key`) are refused here and redirect to the cover
+ * site, 200 x `HTTP/1.1 200 OK`, also 0 hung.
+ *
+ * WHY ACCEPTING IS RIGHT, and not merely convenient. Same-origin policy is
+ * a BROWSER defence against a page on one site opening a socket to another
+ * on the user's credentials. The peer here is not a browser; it is a
+ * pluggable transport that never sends `Origin` at all. Checking it buys
+ * nothing and costs everything, because a CDN is entitled to add the
+ * header on the origin leg -- and a CDN that does would wedge EVERY Go
+ * connection through it while this port proceeds. That is not a
+ * hypothetical: it is trigger 3 of the leak this file's ordering fix
+ * exists to close, reachable by configuration rather than by an attacker.
+ *
+ * PINNED, so that "restoring gorilla parity" cannot quietly re-import it:
+ * test_ws_handshake.c's test_cross_origin_is_accepted_unlike_gorilla and
+ * test_dispatcher_ws.c's cross-origin case both fail if anyone adds an
+ * `Origin` check here.
  */
 
 /* Decoded length of the `Hidden` payload: randPubKey[0:32] ||

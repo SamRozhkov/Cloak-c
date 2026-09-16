@@ -65,7 +65,29 @@ set(_cloak_go_help
     "yourself, or configure with -DCLOAK_REQUIRE_GO=OFF -- which REMOVES "
     "test_ws_interop and drops the suite from 68 tests to 67.")
 
-find_program(CLOAK_GO_EXECUTABLE NAMES go HINTS /usr/local/go/bin)
+# CLEARING `PATH` DOES NOT SIMULATE A MISSING TOOLCHAIN, AND ANYONE WHO
+# "VERIFIES" THE DIAGNOSTIC BELOW THAT WAY HAS VERIFIED NOTHING.
+# `HINTS /usr/local/go/bin` is not a last resort: find_program searches
+# HINTS ahead of the environment, so `env PATH= cmake ...` finds the dev
+# image's Go anyway and configure SUCCEEDS. The hint has to stay -- it is
+# what makes this configure outside a login shell -- so the escape is an
+# explicit switch instead, and it is here ONLY so that the one state this
+# guard exists for can be reached without uninstalling Go from the machine:
+#
+#     cmake -DCLOAK_GO_FORCE_ABSENT=ON ...   -> the FATAL_ERROR below
+#
+# It is not a way to build without Go. That is -DCLOAK_REQUIRE_GO=OFF, which
+# removes test_ws_interop and says so; this one makes the build FAIL, which
+# is the whole point of exercising it.
+option(CLOAK_GO_FORCE_ABSENT
+       "Pretend no Go toolchain exists, to exercise the missing-toolchain diagnostic" OFF)
+if(CLOAK_GO_FORCE_ABSENT)
+    # A normal variable, shadowing any cache entry a previous configure
+    # left behind, so this works in an already-configured build tree too.
+    set(CLOAK_GO_EXECUTABLE "")
+else()
+    find_program(CLOAK_GO_EXECUTABLE NAMES go HINTS /usr/local/go/bin)
+endif()
 if(NOT CLOAK_GO_EXECUTABLE)
     # Loud rather than silent. A skipped test in a suite whose count is
     # part of its contract (67 -> 68 in this module) is indistinguishable

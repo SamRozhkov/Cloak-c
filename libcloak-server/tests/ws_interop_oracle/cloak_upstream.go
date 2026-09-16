@@ -41,7 +41,13 @@
 //      x/crypto v0.37.0, which is the exact version Cloak's go.mod pins.
 //      Not reimplemented: the C side's Salsa20 has only round-trip tests
 //      of its own, so a hand-written Go one would have been a second
-//      unverified implementation rather than an oracle.
+//      unverified implementation rather than an oracle. internal/README
+//      is the provenance record for that copy -- upstream, version,
+//      licence, the one import-path edit, what was stripped and what was
+//      deliberately kept -- and it lives IN the vendored directory,
+//      because a reader who opens internal/salsa20/ first must not have
+//      to find this file two levels up to learn that they are looking at
+//      modified third-party crypto.
 //  E3. import "golang.org/x/crypto/chacha20poly1305" is dropped along with
 //      the EncryptionMethodChaha20Poly1305 arm of MakeObfuscator's switch,
 //      which this oracle never selects (it speaks aes-gcm, the method the

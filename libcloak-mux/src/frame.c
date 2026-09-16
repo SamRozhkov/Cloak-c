@@ -40,10 +40,36 @@ static size_t tag_len_for_method(cloak_aead_method_t method) {
     return cloak_aead_overhead(method);
 }
 
+/* Uniform over [0, max_inclusive], REJECTION-SAMPLED, because this value
+ * is an on-wire length and nothing else in this file is allowed to be a
+ * distinguisher.
+ *
+ * Go: `padLen = common.RandInt(maxExtraLen - tagLen + 1)`
+ * (internal/multiplex/obfs.go:77), and common.RandInt is crypto/rand.Int
+ * over a big.Int bound -- unbiased. This port drew ONE byte and took
+ * `b % 240` for five modules. 256 = 240 + 16, so the sixteen smallest pad
+ * lengths came out twice as often as the other 224: MEASURED over 200,000
+ * frames, P(pad in [0,15]) was 12.547 % here against Go's 6.667 %, a
+ * per-value ratio of 2.009.
+ *
+ * That is not a rounding wart. `useful_len = 14 + payload_len + pad_len +
+ * tag_len`, so pad_len is added straight into the length of the first
+ * CLOAK_FRAME_PAD_FIRST_N_FRAMES frames of every stream, in both
+ * directions, on both transports -- and a passive observer aggregating
+ * first-five-frame lengths across sessions separated this port from the
+ * reference implementation on a 2x effect over 6.25 % of the length space.
+ * In the padding whose stated purpose, in Go's own comment above the draw,
+ * is "Pad to avoid size side channel leak".
+ *
+ * It survived because it is the AAD defect's exact shape: both ends of
+ * every round-trip test are our own code, so both agree, and the Go
+ * interop oracle checks that frames DECODE, never how long they are.
+ * cloak_random_below is the fix and libcloak-mux/tests/test_frame.c's
+ * test_first_frame_pad_length_is_uniform is the assertion that now fails
+ * if anyone reintroduces it -- a chi-square, because "the lengths vary"
+ * and "every length appears" both pass under a 2x bias. */
 static uint8_t random_pad_len(size_t max_inclusive) {
-    uint8_t b;
-    cloak_random_bytes(&b, 1);
-    return (uint8_t)(b % (max_inclusive + 1));
+    return (uint8_t)cloak_random_below((uint32_t)(max_inclusive + 1));
 }
 
 long cloak_frame_obfuscate(const cloak_obfuscator_t *o, const cloak_frame_t *frame,
@@ -141,6 +167,27 @@ long cloak_frame_obfuscate(const cloak_obfuscator_t *o, const cloak_frame_t *fra
          *     -- the value is bounds-checked, so there is no
          *     memory-safety or confidentiality consequence.
          *
+         *     WHICH HALVES OF THAT ARE MEASURED, AND THE ONE THAT WAS
+         *     WRONG. Measured on this tree by keyless on-wire XOR of
+         *     header byte 13, 64-byte payload: 16 -> 17 delivers 63 bytes
+         *     of the 64 sent and 16 -> 20 delivers 60 (TRUNCATION, two
+         *     sided); seq 0 with 181 -> 16 delivers 229 bytes for 64 sent
+         *     (PADDING-AS-DATA). Both hold.
+         *
+         *     "BOTH IMPLEMENTATIONS ... SLICE IT" DOES NOT, and an earlier
+         *     version of this comment said it did. cloak_frame_deobfuscate
+         *     below applies an `extra_len >= tag_len_for_method()` FLOOR
+         *     that Go has no counterpart for: measured here, 16 -> 15,
+         *     16 -> 0 and 16 -> -1 all return rc -1, whereas obfs.go:135-150
+         *     (read, not measured -- no Go harness reaches this path) at
+         *     extraLen 15 computes usefulPayloadLen = len - 15, opens
+         *     successfully into len - 16 bytes, and slices ONE BYTE PAST
+         *     the opened region, handing the application a raw tag byte as
+         *     stream data. The divergence is C being stricter, i.e. the
+         *     safe direction, and it is a REJECTION where Go delivers --
+         *     not a wire-format difference, since no honest peer ever
+         *     sends an extra_len below the tag size.
+         *
          * What IS still protected: the payload ciphertext and its tag;
          * bytes 0-11 (stream_id and seq), because they are the AEAD nonce,
          * which RFC 5116 section 2.1 authenticates internally; and the
@@ -154,7 +201,33 @@ long cloak_frame_obfuscate(const cloak_obfuscator_t *o, const cloak_frame_t *fra
          * that behaves differently from the reference implementation under
          * a bit-flip probe, which is a behavioural distinguisher in the
          * one product that cannot afford one. If the format is to be
-         * fixed, it is fixed upstream and on both sides at once. */
+         * fixed, it is fixed upstream and on both sides at once.
+         *
+         * WHAT THE FIX COST, AND IT IS NOT NOTHING: THIS IS A WIRE-FORMAT
+         * BREAK WITH OUR OWN PRIOR BUILDS. The per-task notes accompanying
+         * the CDN work say "the direct path is provably untouched". That
+         * is true of libcloak-mux/src/conn.c and
+         * libcloak-server/src/dispatcher.c, which really do branch on the
+         * transport. IT IS NOT TRUE OF THIS FILE. frame.c has no framing
+         * branch -- it is pure mux, below the transport -- so the AAD
+         * change above is UNCONDITIONAL and altered the direct TLS path's
+         * bytes exactly as much as the CDN path's.
+         *
+         * MEASURED, same key, same stream/seq, same 32-byte payload, seq
+         * >= CLOAK_FRAME_PAD_FIRST_N_FRAMES so the length is
+         * deterministic: a new-AAD frame (tag acc18821) deobfuscates rc=0
+         * here; the old-AAD frame for the same inputs (tag d71f6aba) is
+         * REFUSED, rc=-1. So a pre-fix build of this port cannot exchange
+         * ONE FRAME with a post-fix build of this port, on EITHER
+         * transport -- not the CDN path, not the direct TLS path.
+         *
+         * That is deliberate and it is the right trade: the break is with
+         * five modules of our own binaries, none of them released, and it
+         * is what buys compatibility with every real Cloak peer that
+         * exists. But both halves belong in the record, because a reader
+         * who takes "the direct path is untouched" at face value will
+         * conclude a module-7 client still talks to a module-8 server, and
+         * it does not. */
         int rc = cloak_aead_seal(o->method, o->session_key, nonce,
                                   NULL, 0,
                                   payload_region, frame->payload_len + pad_len,

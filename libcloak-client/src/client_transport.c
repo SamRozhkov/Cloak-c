@@ -23,7 +23,18 @@ const char *const cloak_client_top_level_domains[CLOAK_CLIENT_TLD_COUNT] = {
  * exactly unbiased but would introduce an unbounded loop (and a retry
  * branch no test can reach) into a module whose entire design premise is
  * that everything is bounded. Drawing 8 bytes instead of 1 buys the same
- * property with straight-line code. */
+ * property with straight-line code.
+ *
+ * KEPT AS A LOCAL FUNCTION rather than replaced by cloak_random_below,
+ * which was added later and rejection-samples exactly as Go's RandInt
+ * does. The two differ only in whether the last 1e-18 of bias is removed
+ * or merely bounded, and this file's argument for straight-line code in
+ * the handshake path is the one that decides it. NOTE THE ARGUMENT'S
+ * SCOPE, because two other sites in this tree got it wrong: it works here
+ * ONLY because the draw is 8 bytes. The same reasoning applied to a ONE
+ * byte draw produced a 2x bias in an on-wire frame length -- see
+ * cloak/common.h. If this ever shrinks to one byte, it must become
+ * cloak_random_below. */
 static unsigned random_below(unsigned n) {
     uint8_t b[8];
     cloak_random_bytes(b, sizeof(b));

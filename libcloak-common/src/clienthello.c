@@ -546,9 +546,14 @@ long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
     size_t chosen_ech_payload_len = 0;
     int has_ech_payload_resize = (tmpl->ech_payload_candidate_count > 0);
     if (has_ech_payload_resize) {
-        uint8_t r;
-        cloak_random_bytes(&r, 1);
-        size_t idx = (size_t)r % tmpl->ech_payload_candidate_count;
+        /* cloak_random_below rather than a byte modulo the count. The
+         * only template with candidates today has exactly 4 of them and 4
+         * divides 256, so the old `r % count` happened to be unbiased --
+         * BY ACCIDENT OF THE CONSTANT, not by construction. Adding a fifth
+         * candidate would have skewed an ON-WIRE length silently, which is
+         * the precise shape of the frame-padding defect this project spent
+         * a review round on (cloak/common.h). */
+        size_t idx = (size_t)cloak_random_below((uint32_t)tmpl->ech_payload_candidate_count);
         chosen_ech_payload_len = tmpl->ech_payload_candidate_lens[idx];
         ech_payload_delta = (long)chosen_ech_payload_len
                             - (long)tmpl->ech_payload_candidate_lens[0];

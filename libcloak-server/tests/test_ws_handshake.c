@@ -777,6 +777,78 @@ static void test_cdn_injected_headers_are_skipped(void) {
     ASSERT_EQ_INT(631, (int)(sizeof(cf) - 1));
 }
 
+/* `Origin` IS NEVER READ, AND THE WHOLE POINT IS THAT gorilla WOULD HAVE
+ * REFUSED THIS.
+ *
+ * gorilla's Upgrader{} has a nil CheckOrigin and therefore uses
+ * checkSameOrigin, which compares the Origin's host to the request's Host
+ * and refuses a mismatch. MEASURED against live gorilla v1.5.3 in this
+ * project's dev image, the same harness every other constant in this file
+ * came from:
+ *
+ *   origin absent                   -> accepted
+ *   origin "http://example.com"     -> accepted (matches Host)
+ *   origin "http://evil.example.com"
+ *       -> 403, "request origin not allowed by Upgrader.CheckOrigin"
+ *
+ * So this is the ONE accept decision in this file that deliberately
+ * differs from the oracle, and it is the third of the three triggers of
+ * the Go wedge -- the 403 leaves websocket.go blocked on a channel
+ * nothing will ever send on, after the UID has been authorised.
+ * cloak/ws_handshake.h's `Origin` paragraph is the reasoning. This is the
+ * tripwire: every arm below must parse OK and produce the SAME accept as
+ * the bare golden request, so a future "restore gorilla parity" edit that
+ * adds an Origin check fails here rather than in production behind a CDN
+ * that injects one.
+ *
+ * Every plausible CDN shape is covered, because a check added later would
+ * most likely key off just one of them: absent (what Cloak's own client
+ * sends), same-site, cross-site, the canonical "null" a sandboxed origin
+ * sends, lowercased as an HTTP/2-fronted edge would deliver it, a
+ * syntactically broken value, and two Origin lines at once. The accept
+ * being unchanged across all of them also proves `Origin` is not fed into
+ * the SHA-1, which a naive "just hash the whole request" refactor would
+ * do. */
+static void test_cross_origin_is_accepted_unlike_gorilla(void) {
+    static const char *const origin_lines[] = {
+        NULL, /* absent: the Cloak client is not a browser and sends none */
+        "Origin: https://cdn.example.com:443\r\n",   /* same-site: gorilla accepts too */
+        "Origin: https://evil.example.com\r\n",      /* gorilla: 403 */
+        "Origin: http://evil.example.com:8080\r\n",  /* gorilla: 403 */
+        "Origin: null\r\n",                          /* gorilla: 403 */
+        "origin: https://evil.example.com\r\n",      /* HTTP/2-fronted, lowercased */
+        "Origin: not a url at all\r\n",              /* unparseable value */
+        "Origin: https://a.example\r\nOrigin: https://b.example\r\n", /* two at once */
+    };
+
+    for (size_t i = 0; i < sizeof(origin_lines) / sizeof(origin_lines[0]); i++) {
+        req_t r = {0};
+        r.extra = origin_lines[i];
+        cloak_ws_hs_t hs;
+        memset(&hs, 0, sizeof(hs));
+        ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_built(r, &hs));
+        assert_hidden_ok(&hs);
+        /* Byte-identical to the accept the SAME request without any
+         * Origin produces -- gorilla's own, captured. */
+        ASSERT_TRUE(strcmp(ACCEPT_GO, hs.accept) == 0);
+    }
+
+    /* And the parsed result carries no trace of the header: the struct
+     * has no origin field to carry one, so the only observable is that
+     * the cross-site request and the bare golden request are
+     * indistinguishable in everything this parser returns. */
+    cloak_ws_hs_t bare;
+    cloak_ws_hs_t crossed;
+    memset(&bare, 0, sizeof(bare));
+    memset(&crossed, 0, sizeof(crossed));
+    req_t r0 = {0};
+    req_t r1 = {0};
+    r1.extra = "Origin: https://evil.example.com\r\n";
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_built(r0, &bare));
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_built(r1, &crossed));
+    ASSERT_MEM_EQ(&bare, &crossed, sizeof(bare));
+}
+
 static void test_high_bytes_in_a_header_value_are_accepted(void) {
     /* Go allows any byte from 0x80 up in a header value and refuses
      * everything below 0x20 except HTAB. Refusing high bytes would refuse
@@ -1581,6 +1653,7 @@ test_connection_is_matched_as_a_token_list();
 test_upgrade_is_matched_as_a_token_list();
 test_method_must_be_get();
 test_cdn_injected_headers_are_skipped();
+test_cross_origin_is_accepted_unlike_gorilla();
 test_high_bytes_in_a_header_value_are_accepted();
 test_a_request_filling_the_firstpacket_buffer_still_parses();
 test_host_target_and_http_version_are_not_checked();

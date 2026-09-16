@@ -686,6 +686,14 @@ typedef struct {
     const char *key;          /* default KEY_GO */
     const char *version;      /* default "13" */
     const char *upgrade;      /* default "websocket" */
+    /* `Origin`, omitted when NULL -- which is what a real Cloak client
+     * sends, since it is not a browser. Present so that a CDN-injected
+     * cross-site Origin can be driven through the whole dispatcher: this
+     * port never reads the header, gorilla's default CheckOrigin refuses
+     * it with a 403, and that 403 is trigger 3 of the Go wedge described
+     * at the top of this file. See cloak/ws_handshake.h's `Origin`
+     * paragraph and test_cross_origin_upgrade_is_accepted below. */
+    const char *origin;
     size_t pad;               /* bytes of X-Pad value to append, 0 for none */
     /* Rewrite every line ending except the terminating CRLFCRLF as a
      * bare LF. Go's net/http accepts such a request and answers 101
@@ -732,6 +740,7 @@ static size_t build_ws_request(char *buf, size_t cap, ws_req_t r) {
     app_hdr(buf, cap, &n, "Host", "cdn.example.com:443");
     app(buf, cap, &n, "User-Agent: Go-http-client/1.1\r\n");
     app_hdr(buf, cap, &n, "Connection", r.conn != NULL ? r.conn : "Upgrade");
+    app_hdr(buf, cap, &n, "Origin", r.origin); /* omitted when NULL */
     app_hdr(buf, cap, &n, r.hidden_name != NULL ? r.hidden_name : "Hidden", r.hidden);
     app_hdr(buf, cap, &n, "Sec-WebSocket-Key", r.key != NULL ? r.key : KEY_GO);
     app_hdr(buf, cap, &n, "Sec-WebSocket-Version", r.version != NULL ? r.version : "13");
@@ -828,15 +837,16 @@ static int ws_reply_session_key(const uint8_t *reply, size_t reply_len,
 
 /* Drives one complete CDN upgrade and returns the connected fd (still
  * owned by the caller) with the reply in *out_rd. */
-static int ws_handshake(struct fixture *fx, const uint8_t uid[CLOAK_UID_LEN],
-                        const char *proxy_method, uint32_t session_id, reader_t *out_rd,
-                        uint8_t out_shared[CLOAK_AEAD_KEY_LEN]) {
+static int ws_handshake_origin(struct fixture *fx, const uint8_t uid[CLOAK_UID_LEN],
+                               const char *proxy_method, uint32_t session_id, const char *origin,
+                               reader_t *out_rd, uint8_t out_shared[CLOAK_AEAD_KEY_LEN]) {
     char hidden[CLOAK_WS_HS_HIDDEN_B64_LEN + 1];
     make_hidden(fx->server_pub, uid, proxy_method, session_id, hidden, out_shared);
 
     char req[4096];
     ws_req_t r = {0};
     r.hidden = hidden;
+    r.origin = origin;
     size_t req_len = build_ws_request(req, sizeof(req), r);
 
     int fd = client_connect(front_port(fx));
@@ -852,6 +862,14 @@ static int ws_handshake(struct fixture *fx, const uint8_t uid[CLOAK_UID_LEN],
     out_rd->want = WS_REPLY_TOTAL;
     ASSERT_TRUE(pump_until(fx->reactor, reader_has, out_rd, WS_PUMP_BUDGET_MS, 1));
     return fd;
+}
+
+/* The ordinary case: no `Origin` at all, which is what Cloak's own client
+ * sends. */
+static int ws_handshake(struct fixture *fx, const uint8_t uid[CLOAK_UID_LEN],
+                        const char *proxy_method, uint32_t session_id, reader_t *out_rd,
+                        uint8_t out_shared[CLOAK_AEAD_KEY_LEN]) {
+    return ws_handshake_origin(fx, uid, proxy_method, session_id, NULL, out_rd, out_shared);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1749,7 +1767,85 @@ static void test_bare_get_still_reaches_the_cover_site(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 6. The first-packet bound, now that it actually binds                */
+/* 6. `Origin` IS NOT READ, AND THAT IS THE DIVERGENCE, NOT AN OMISSION  */
+/* ------------------------------------------------------------------ */
+
+/* THE THIRD TRIGGER OF THE GO WEDGE, ACCEPTED HERE ON PURPOSE.
+ *
+ * The other two triggers this file already pins -- a rewritten
+ * `Connection` and a malformed `Sec-WebSocket-Key` -- are REFUSALS in this
+ * port: test_panel_is_untouched_by_a_malformed_upgrade drives them to the
+ * cover site with the panel untouched. `Origin` is not. gorilla's
+ * zero-value Upgrader substitutes checkSameOrigin, which answers
+ * `403 request origin not allowed by Upgrader.CheckOrigin` to the request
+ * below (measured against live gorilla v1.5.3 in this project's image),
+ * and in Go that 403 wedges the connection forever. This port has no
+ * `Origin` code at all, so the upgrade completes.
+ *
+ * That was true before anyone wrote it down, which is the problem this
+ * test exists to fix: `grep -ri origin` over ws_handshake.c,
+ * ws_handshake.h and the three CDN test files returned NOTHING about the
+ * header, so the behaviour read as an oversight and the next reader
+ * "restoring gorilla parity" would have re-imported the wedge. The
+ * reasoning is in cloak/ws_handshake.h's `Origin` paragraph; this is the
+ * assertion that fails if the code stops matching it.
+ *
+ * It asserts the WHOLE upgrade, not just a status line: 101, gorilla's
+ * own accept, a session in the registry holding the key the client
+ * recovered, and the user made active exactly once -- i.e. that a
+ * cross-Origin request is treated as completely ordinary. A dispatcher
+ * that grew an Origin check would fail at the very first of those.
+ *
+ * MEASURED at the built ck-server as well, 200 connections each carrying
+ * an authorised `Hidden` and this Origin: 200 x 101, 0 closed without an
+ * answer, 0 hung at a 3 s deadline. */
+static void test_cross_origin_upgrade_is_accepted(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    reader_t rd;
+    /* Host is cdn.example.com:443, so this Origin is cross-site by
+     * gorilla's rule (it compares the Origin's host to the request's
+     * Host, case-insensitively, and refuses on any difference). */
+    int fd = ws_handshake_origin(&fx, fx.uid_ok, "ss", 7301, "https://evil.example.com", &rd,
+                                 shared);
+    ASSERT_TRUE(fd >= 0);
+    if (fd < 0) {
+        fixture_destroy(&fx);
+        return;
+    }
+
+    ASSERT_EQ_INT(WS_REPLY_TOTAL, (int)rd.len);
+    ASSERT_MEM_EQ(rd.buf, "HTTP/1.1 101 Switching Protocols\r\n", 34);
+    {
+        static const char want[] = "Sec-WebSocket-Accept: " ACCEPT_GO "\r\n";
+        int found = 0;
+        for (size_t i = 0; i + sizeof(want) - 1 <= CLOAK_WS_HS_101_LEN; i++) {
+            if (memcmp(rd.buf + i, want, sizeof(want) - 1) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        ASSERT_TRUE(found);
+    }
+
+    uint8_t recovered[CLOAK_AEAD_KEY_LEN];
+    ASSERT_EQ_INT(0, ws_reply_session_key(rd.buf, rd.len, shared, recovered));
+
+    cloak_session_t *sesh = cloak_server_registry_find(&fx.registry, fx.uid_ok, 7301);
+    ASSERT_TRUE(sesh != NULL);
+    if (sesh != NULL) {
+        ASSERT_MEM_EQ(sesh->obfuscator.session_key, recovered, CLOAK_AEAD_KEY_LEN);
+    }
+    ASSERT_EQ_INT(1, (int)cloak_userpanel_active_count(fx.panel));
+
+    close(fd);
+    fixture_destroy(&fx);
+}
+
+/* ------------------------------------------------------------------ */
+/* 7. The first-packet bound, now that it actually binds                */
 /* ------------------------------------------------------------------ */
 
 /* A two-sided bracket on CLOAK_FIRSTPACKET_MAX. Until this commit the
@@ -1850,5 +1946,6 @@ test_three_refusals_are_indistinguishable();
 test_panel_is_untouched_by_a_malformed_upgrade();
 test_refused_upgrade_does_not_burn_the_ephemeral_key();
 test_bare_get_still_reaches_the_cover_site();
+test_cross_origin_upgrade_is_accepted();
 test_firstpacket_max_bracket();
 TEST_MAIN_END()

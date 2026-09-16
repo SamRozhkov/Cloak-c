@@ -428,6 +428,80 @@ static void test_deobfuscate_rejects_extra_len_below_minimum(void) {
     ASSERT_EQ_INT(rc, -1);
 }
 
+/* THE ON-WIRE QUANTITY, NOT THE HELPER. libcloak-common/tests/test_random.c
+ * pins cloak_random_below's distribution; this pins the thing an observer
+ * on the network actually sees, end to end through cloak_frame_obfuscate --
+ * because the defect that made this test necessary was not in a sampler
+ * anybody had written down, it was `b % 240` inlined into the padding draw,
+ * and the length it produced went straight onto the wire.
+ *
+ * useful_len = CLOAK_FRAME_HEADER_LEN(14) + payload_len(10) + pad_len +
+ * tag_len(16 for AES-GCM), so pad_len = n - 40 and the observable range is
+ * [0, 239] -- exactly CLOAK_FRAME_MAX_EXTRA_LEN - 16 + 1 = 240 values.
+ * seq < CLOAK_FRAME_PAD_FIRST_N_FRAMES, because that is when padding is
+ * applied at all.
+ *
+ * MEASURED BRACKET, in the dev image, 40 runs of each sampler at 200,000
+ * draws (the same measurement test_random.c records, since the same
+ * function is underneath):
+ *
+ *   rejection    chi2 202.6 .. 292.7      pad in [0,15]: 13103 .. 13592
+ *   `b % 240`    chi2 10260.4 .. 11724.5  pad in [0,15]: 24513 .. 25297
+ *
+ * with the threshold at 420.0 in the gap. Watched to fail end to end:
+ * with the byte-modulo restored, THIS test -- the one that goes through
+ * cloak_frame_obfuscate rather than through the sampler -- printed
+ * "chi2 = 10989.1, not < 420.0" and "24908 not in [12664, 14003]".
+ * See test_random.c for why that threshold, and for why "the lengths
+ * vary" and "every length appears" are not assertions. */
+#define PAD_DIST_FRAMES 200000ul
+#define PAD_DIST_BINS 240
+#define PAD_DIST_CHI2_THRESHOLD 420.0
+
+static void test_first_frame_pad_length_is_uniform(void) {
+    cloak_obfuscator_t o;
+    o.method = CLOAK_AEAD_AES_256_GCM;
+    cloak_random_bytes(o.session_key, sizeof(o.session_key));
+
+    const uint8_t payload[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    const long base = CLOAK_FRAME_HEADER_LEN + (long)sizeof(payload) + 16;
+
+    static unsigned long counts[PAD_DIST_BINS];
+    memset(counts, 0, sizeof(counts));
+
+    uint8_t buf[CLOAK_FRAME_HEADER_LEN + sizeof(payload) + CLOAK_FRAME_MAX_EXTRA_LEN];
+    int out_of_range = 0;
+    for (unsigned long i = 0; i < PAD_DIST_FRAMES; i++) {
+        cloak_frame_t frame;
+        frame.stream_id = 3;
+        frame.seq = i % CLOAK_FRAME_PAD_FIRST_N_FRAMES; /* always a padded frame */
+        frame.closing = CLOAK_FRAME_CLOSING_NOTHING;
+        frame.payload = payload;
+        frame.payload_len = sizeof(payload);
+        long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+        long pad = n - base;
+        if (n <= 0 || pad < 0 || pad >= PAD_DIST_BINS) {
+            out_of_range++;
+            continue;
+        }
+        counts[pad]++;
+    }
+    ASSERT_EQ_INT(out_of_range, 0);
+
+    ASSERT_UNIFORM_CHI_SQUARE(counts, PAD_DIST_BINS, PAD_DIST_FRAMES, PAD_DIST_CHI2_THRESHOLD);
+
+    /* The defect named rather than merely detected: the sixteen shortest
+     * padded frames must carry 16/240 = 6.667 % of the mass. The shipped
+     * byte-modulo gave them 12.547 %. Expected 13333.3 with sigma 111.5;
+     * the bracket is +/- 6 sigma, the fixed build measured 13103..13592
+     * over 40 runs and the biased one 24513..25297. */
+    unsigned long low = 0;
+    for (int v = 0; v < 16; v++) {
+        low += counts[v];
+    }
+    ASSERT_COUNT_IN_RANGE("first-five-frame pad lengths in [0,15]", low, 12664ul, 14003ul);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_plain();
     test_padding_varies_for_first_n_frames_only();
@@ -444,4 +518,5 @@ TEST_MAIN_BEGIN()
     test_closing_byte_tamper_matches_go_and_is_not_detected();
     test_obfuscate_rejects_payload_larger_than_buf_cap();
     test_deobfuscate_rejects_extra_len_below_minimum();
+    test_first_frame_pad_length_is_uniform();
 TEST_MAIN_END()

@@ -443,7 +443,11 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     TLS: cloak_server_auth_compose_reply with a fresh nonce, a fresh
  *     pad4, and a cert length chosen uniformly from
  *     cloak_server_auth_cert_lens (a DPI-plausibility measure -- a fixed
- *     length would itself be a fingerprint). The 60 bytes that actually
+ *     length would itself be a fingerprint). "Uniformly" is accurate as
+ *     of the cloak_random_below fix and was not before it: the pick was a
+ *     random byte modulo 7, skewed 1.028x, while the word said otherwise
+ *     in two places in this file. The distribution is pinned by
+ *     libcloak-common/tests/test_random.c. The 60 bytes that actually
  *     matter are SCATTERED across a fake ServerHello and followed by two
  *     more records.
  *
@@ -729,9 +733,19 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
         cloak_random_bytes(reply_nonce, sizeof(reply_nonce));
         cloak_random_bytes(pad4, sizeof(pad4));
 
-        uint8_t cert_pick;
-        cloak_random_bytes(&cert_pick, 1);
-        size_t cert_len = cloak_server_auth_cert_lens[cert_pick % CLOAK_SERVER_AUTH_CERT_LEN_COUNT];
+        /* cloak_random_below, not `one_random_byte % 7`. Go picks with
+         * possibleCertLengths[common.RandInt(len(possibleCertLengths))]
+         * (internal/server/TLS.go:48), which is uniform; 256 = 7*36 + 4,
+         * so the byte-modulo this line used to be drew four of the seven
+         * lengths 37/256 = 14.453 % of the time and the other three
+         * 36/256 = 14.063 %. A 1.028x ratio -- visible only to a prober
+         * willing to collect tens of thousands of cover-site replies, and
+         * fixed here anyway because it is the same defect as
+         * libcloak-mux/src/frame.c's padding length (2.009x, and that one
+         * mattered) and the word "uniformly" appears twice in this file's
+         * own prose above. See cloak/common.h. */
+        size_t cert_len =
+            cloak_server_auth_cert_lens[cloak_random_below(CLOAK_SERVER_AUTH_CERT_LEN_COUNT)];
         uint8_t fake_cert[DISPATCHER_MAX_FAKE_CERT_LEN];
         cloak_random_bytes(fake_cert, cert_len);
 
