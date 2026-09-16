@@ -333,3 +333,13 @@ target_link_libraries(test_server_stack PRIVATE cloak-client)
 # produce that failure. See test_write_shim.c's own top-of-file comment.
 set_tests_properties(test_server_stack PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+# The CDN upgrade parser. No sqlite3 and no client_harness.h: this is a
+# pure function over a byte buffer with no session, no reactor and no
+# socket anywhere near it, which is the same shape (and the same reason)
+# as libcloak-mux's test_ws_frame.
+add_executable(test_ws_handshake test_ws_handshake.c)
+target_include_directories(test_ws_handshake PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_ws_handshake PRIVATE cloak-server)
+add_test(NAME test_ws_handshake COMMAND test_ws_handshake)
+set_tests_properties(test_ws_handshake PROPERTIES TIMEOUT 120)
