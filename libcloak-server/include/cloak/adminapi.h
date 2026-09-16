@@ -71,6 +71,14 @@
  * load rather than at startup. Each link naming the next makes the
  * cleanup the default and the owner's own hook the addition.
  *
+ *
+ * A BINARY SHOULD NOT DO ANY OF THIS BY HAND. cloak/server_stack.h
+ * assembles this module together with the other eight, owns the whole
+ * broken-session chain and the teardown order, and validates what it
+ * can -- it is the supported wiring for an executable. Hand-wiring
+ * remains legal and is what every test in this module does, because a
+ * test that builds a partial graph is exactly what a test is for.
+ *
  * LIFETIME: one heap context per session prepared, one per stream in
  * flight, both reactor/session callback userdata and therefore never
  * moved. THE ADMINAPI MUST OUTLIVE EVERY SESSION IT EVER PREPARED A

@@ -306,3 +306,19 @@ foreach(_cloak_harness_test
         test_admin_e2e)
     target_link_libraries(${_cloak_harness_test} PRIVATE cloak-client)
 endforeach()
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_adminapi.c and
+# test_admin_e2e.c do: this file builds a stack over a REAL user database
+# (so the manager, the panel and the admin API are all the production
+# objects) and cloak-server's PRIVATE sqlite3 link deliberately does not
+# propagate the include path its implementation uses.
+add_executable(test_server_stack test_server_stack.c)
+target_include_directories(test_server_stack PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_server_stack PRIVATE cloak-server sqlite3)
+add_test(NAME test_server_stack COMMAND test_server_stack)
+set_tests_properties(test_server_stack PROPERTIES TIMEOUT 60)
+
+# client_harness.h, for the same reason the nine tests in the foreach
+# above need it: this file drives the real cloak_client_handshake_t.
+target_link_libraries(test_server_stack PRIVATE cloak-client)
