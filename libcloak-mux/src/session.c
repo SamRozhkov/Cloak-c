@@ -470,10 +470,24 @@ void cloak_session_destroy(cloak_session_t *sesh) {
 }
 
 int cloak_session_add_conn(cloak_session_t *sesh, int fd) {
+    return cloak_session_add_conn_framed(sesh, fd, CLOAK_CONN_FRAMING_TLS_RECORD);
+}
+
+int cloak_session_add_conn_framed(cloak_session_t *sesh, int fd,
+                                   cloak_conn_framing_t framing) {
     if (sesh->closed) {
         return -1;
     }
-    return cloak_switchboard_add_conn(&sesh->sb, fd);
+    /* The framing check is NOT repeated here. It lives in
+     * cloak_switchboard_add_conn_framed and in cloak_conn_init_cfg, and a
+     * third copy would be defensive code that no test can distinguish
+     * from its own absence: removing it changes no observable behaviour,
+     * so nothing pins it, so it rots. (Measured, not assumed -- a
+     * mutation that deleted the duplicate left the whole suite green,
+     * which is exactly the signal that a check is redundant rather than
+     * load-bearing.) CLOAK_CONN_ERR_INVALID_FRAMING is propagated
+     * verbatim from below. */
+    return cloak_switchboard_add_conn_framed(&sesh->sb, fd, framing);
 }
 
 cloak_stream_t *cloak_session_open_stream(cloak_session_t *sesh, uint32_t *out_id) {

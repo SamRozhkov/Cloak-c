@@ -84,6 +84,18 @@ void cloak_switchboard_destroy(cloak_switchboard_t *sb) {
 }
 
 int cloak_switchboard_add_conn(cloak_switchboard_t *sb, int fd) {
+    return cloak_switchboard_add_conn_framed(sb, fd, CLOAK_CONN_FRAMING_TLS_RECORD);
+}
+
+int cloak_switchboard_add_conn_framed(cloak_switchboard_t *sb, int fd,
+                                       cloak_conn_framing_t framing) {
+    /* Rejected BEFORE the pool array is grown and before a conn is
+     * allocated, so an invalid framing mode leaves the pool exactly as it
+     * was and leaves fd with its caller -- the failure a zeroed config is
+     * meant to produce is a clean refusal, not a half-built pool. */
+    if (framing == CLOAK_CONN_FRAMING_INVALID) {
+        return CLOAK_CONN_ERR_INVALID_FRAMING;
+    }
     if (sb->broken) {
         return -1;
     }
@@ -100,11 +112,26 @@ int cloak_switchboard_add_conn(cloak_switchboard_t *sb, int fd) {
     if (c == NULL) {
         return -1;
     }
-    if (cloak_conn_init(c, fd, sb->reactor, sb->max_frame_len, sb->conn_send_queue_cap,
-                         switchboard_conn_envelope_adapter, sb,
-                         switchboard_conn_closed_adapter, sb) != 0) {
+    cloak_conn_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fd = fd;
+    cfg.reactor = sb->reactor;
+    cfg.max_frame_len = sb->max_frame_len;
+    cfg.send_queue_cap = sb->conn_send_queue_cap;
+    cfg.framing = framing;
+    cfg.on_envelope = switchboard_conn_envelope_adapter;
+    cfg.on_envelope_userdata = sb;
+    cfg.on_closed = switchboard_conn_closed_adapter;
+    cfg.on_closed_userdata = sb;
+    int rc = cloak_conn_init_cfg(c, &cfg);
+    if (rc != 0) {
         free(c);
-        return -1;
+        /* Propagated verbatim rather than flattened to -1: a framing
+         * value outside the enum entirely (a truncated read, an
+         * uninitialised byte pattern) is caught here rather than by the
+         * INVALID test above, and the caller should still get the
+         * diagnosis that names the field. */
+        return rc;
     }
     cloak_conn_set_drained_cb(c, switchboard_conn_drained_adapter, sb);
     cloak_conn_set_valve(c, sb->valve); /* NULL if this pool is unmetered */
