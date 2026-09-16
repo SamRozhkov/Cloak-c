@@ -117,3 +117,29 @@ target_include_directories(test_client_full_e2e PRIVATE ${CMAKE_SOURCE_DIR}/libc
 target_link_libraries(test_client_full_e2e PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_full_e2e COMMAND test_client_full_e2e)
 set_tests_properties(test_client_full_e2e PROPERTIES TIMEOUT 60)
+
+# cloak-server is a TEST-ONLY dependency here for the same reason every
+# other file in this directory uses it (see above), and this file takes it
+# one step further: the far end is assembled by cloak/server_stack.h, the
+# sibling helper, so the two stacks face each other exactly as ck-client
+# and ck-server will. That is not convenience -- case 2's whole claim is
+# that a replacement session uses a DIFFERENT id, and the only trustworthy
+# witness is the id the SERVER gave the session it created, read off the
+# dispatcher's attach callback that cloak_server_stack_config_t exposes.
+# A mock could report whatever the client asked for. No sqlite3 link of
+# its own is needed on top of the transitive one cloak-server already
+# provides: this file uses the VOID user manager (no DatabasePath) and
+# never includes sqlite3.h.
+# test_client_stack.c #includes ../src/client_stack.c directly, as
+# test_client_connector.c does, so that the backoff ladder and the
+# session-id predicate can be evaluated as the functions of numbers they
+# are rather than inferred from how long something took -- see that file's
+# own top-of-file comment. The cloak-client link still supplies the rest
+# of the library; it does not supply client_stack.c.o, because an archive
+# member is only pulled in to resolve an undefined symbol and every stack
+# symbol is already defined in this executable.
+add_executable(test_client_stack test_client_stack.c)
+target_include_directories(test_client_stack PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_client_stack PRIVATE cloak-client cloak-server)
+add_test(NAME test_client_stack COMMAND test_client_stack)
+set_tests_properties(test_client_stack PROPERTIES TIMEOUT 60)

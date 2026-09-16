@@ -43,3 +43,12 @@ target_link_libraries(cloak-server PRIVATE cjson)
 # it consumes cloak/http.h, cloak/user_json.h, cloak/base64.h and
 # cloak/usermanager.h, all of which this target already provides.
 target_sources(cloak-server PRIVATE src/adminapi.c)
+
+# The server's only supported wiring: cloak_server_stack_t assembles the
+# nine objects, the four-link broken-session chain and the teardown order
+# that a ck-server binary would otherwise have to reproduce by hand.
+# Appended for the same reason src/http.c, src/user_json.c and
+# src/adminapi.c are -- this file's existing content stays byte-identical
+# -- and it needs no new link dependency: it consumes only headers this
+# target already provides.
+target_sources(cloak-server PRIVATE src/server_stack.c)

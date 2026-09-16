@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -809,7 +810,18 @@ static void conn_reply_write_failed(cloak_dispatch_conn_t *c) {
 static void conn_continue_reply_write(cloak_dispatch_conn_t *c) {
     while (c->reply_sent < c->reply_len) {
         size_t remaining = c->reply_len - c->reply_sent;
-        ssize_t n = write(c->fd, c->reply + c->reply_sent, remaining);
+        /* send() with MSG_NOSIGNAL, not write(): c->fd is a socket whose
+         * peer is an unauthenticated stranger who may have gone away
+         * between the two writes of a reply that did not fit in one, and
+         * writing to a socket whose peer has closed raises SIGPIPE --
+         * which at default disposition kills the whole server. The rule is
+         * cloak/relay.c's and this was the one socket write in the tree
+         * that broke it. Both mains additionally ignore SIGPIPE (which is
+         * what Go's runtime does for every non-stdio descriptor), so this
+         * is the belt to that pair of braces; it is also what makes
+         * conn_reply_write_failed reachable for EPIPE at all, instead of
+         * the signal arriving before errno is ever inspected. */
+        ssize_t n = send(c->fd, c->reply + c->reply_sent, remaining, MSG_NOSIGNAL);
         if (n > 0) {
             c->reply_sent += (size_t)n;
             continue;

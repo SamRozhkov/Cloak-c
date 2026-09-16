@@ -306,3 +306,30 @@ foreach(_cloak_harness_test
         test_admin_e2e)
     target_link_libraries(${_cloak_harness_test} PRIVATE cloak-client)
 endforeach()
+
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_adminapi.c and
+# test_admin_e2e.c do: this file builds a stack over a REAL user database
+# (so the manager, the panel and the admin API are all the production
+# objects) and cloak-server's PRIVATE sqlite3 link deliberately does not
+# propagate the include path its implementation uses.
+add_executable(test_server_stack test_server_stack.c)
+target_include_directories(test_server_stack PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_server_stack PRIVATE cloak-server sqlite3)
+add_test(NAME test_server_stack COMMAND test_server_stack)
+set_tests_properties(test_server_stack PROPERTIES TIMEOUT 60)
+
+# client_harness.h, for the same reason the nine tests in the foreach
+# above need it: this file drives the real cloak_client_handshake_t.
+target_link_libraries(test_server_stack PRIVATE cloak-client)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for the same reason test_dispatcher_limits,
+# test_proxy_teardown, test_server_e2e and test_dispatcher_users do: this
+# file's abandoned-handshake case needs the dispatcher's step-10 reply
+# write to fail deterministically, which is the only way to reach the
+# post-creation unwind that fires session_aborted -- and the reply is far
+# smaller than any socket buffer floor, so genuine backpressure cannot
+# produce that failure. See test_write_shim.c's own top-of-file comment.
+set_tests_properties(test_server_stack PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")

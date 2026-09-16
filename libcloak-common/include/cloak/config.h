@@ -25,6 +25,27 @@
 #define CLOAK_MAX_PORT_LEN 16
 #define CLOAK_MAX_PATH_LEN 512
 
+/* THE LONGEST DNS HOSTNAME IN PRESENTATION FORM, and the bound on every
+ * field of this config that becomes an SNI.
+ *
+ * RFC 1035 sec. 2.3.4 caps a name at 255 OCTETS in wire format, clarified
+ * by RFC 4343; two of those octets -- the first label's length prefix and
+ * the root label's zero length -- have no character in the dotted text
+ * form, so the presentation limit is 253. RFC 6066 sec. 3 requires the
+ * HostName in a TLS server_name extension to be "a fully qualified DNS
+ * hostname", which makes the DNS limit the operative one even though the
+ * extension's own length field is 16 bits.
+ *
+ * CLOAK_MAX_HOST_LEN above is a BUFFER SIZE and is deliberately not this
+ * number: the two mean different things and conflating them is what put a
+ * 254-character ServerName past this parser and into the connector, which
+ * refused it -- a permanent configuration error arriving as a retryable
+ * runtime failure. Go bounds ServerName nowhere at all, so neither number
+ * is Go's and the RFCs decide it. libcloak-client's
+ * CLOAK_CLIENT_SERVER_NAME_MAX is defined from this constant so the
+ * parser and its consumer cannot disagree again. */
+#define CLOAK_MAX_DNS_NAME_LEN 253
+
 /* The wire auth payload carries the proxy method in a fixed 12-byte field
  * (see the Go original's authentication payload layout), so a longer name
  * could never reach the server. Configs are rejected rather than

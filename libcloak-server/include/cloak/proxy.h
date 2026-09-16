@@ -59,6 +59,14 @@
  * prepare_session has a use-after-free and a leak, not a working
  * server.
  *
+ *
+ * A BINARY SHOULD NOT DO ANY OF THIS BY HAND. cloak/server_stack.h
+ * assembles this module together with the other eight, owns the whole
+ * broken-session chain and the teardown order, and validates what it
+ * can -- it is the supported wiring for an executable. Hand-wiring
+ * remains legal and is what every test in this module does, because a
+ * test that builds a partial graph is exactly what a test is for.
+ *
  * LIFETIME: the proxy holds a heap-allocated context for every session it
  * ever prepared, and each of those holds a heap-allocated context for
  * every stream that session currently has in flight. Both are reactor and

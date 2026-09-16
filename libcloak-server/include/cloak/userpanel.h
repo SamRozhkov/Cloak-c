@@ -60,6 +60,14 @@
  * cloak_userpanel_config_t::chain for where an OWNER's own bookkeeping
  * goes now that the proxy's chain slot is the admin API's.
  *
+ *
+ * A BINARY SHOULD NOT DO ANY OF THIS BY HAND. cloak/server_stack.h
+ * assembles this module together with the other eight, owns the whole
+ * broken-session chain and the teardown order, and validates what it
+ * can -- it is the supported wiring for an executable. Hand-wiring
+ * remains legal and is what every test in this module does, because a
+ * test that builds a partial graph is exactly what a test is for.
+ *
  * D6 -- THE REGISTRY IS THE ONLY SESSION STORE. Go's ActiveUser.sessions
  * map is deliberately NOT ported. A cloak_userpanel_user_t owns a valve, a
  * bypass flag and the rates it authenticated with; it does not own, count
