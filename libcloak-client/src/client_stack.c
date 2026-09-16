@@ -231,6 +231,14 @@ static int stack_id_in_use(const cloak_client_stack_t *s, uint32_t id) {
  * bound is there so that a broken CSPRNG is a wrong id rather than a
  * hung reactor. */
 static uint32_t stack_pick_session_id(const cloak_client_stack_t *s) {
+    /* EXCEPT IN ADMIN MODE, where 0 is the whole point and is the one
+     * value the loop below can never return. cloak_client_stack_open has
+     * already established that this mode holds exactly one shared
+     * session, so the "distinct from every id in use" property the loop
+     * provides has nothing left to protect. */
+    if (s->cfg.admin_session) {
+        return 0;
+    }
     uint32_t id = 1;
     for (int i = 0; i < 64; i++) {
         uint32_t cand = 0;
@@ -832,6 +840,17 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
                   "client config: singleplex is set with NumConn %d; singleplex is one "
                   "connection per session",
                   c->num_conn);
+        cloak_client_stack_close(s);
+        return CLOAK_CLIENT_STACK_ERR_CONFIG;
+    }
+    if (s->cfg.admin_session && (c->num_conn != 1 || c->singleplex)) {
+        /* See cloak_client_stack_config_t::admin_session: every session
+         * in this mode carries id 0, so two live ones would be the same
+         * (uid, session id) key on the server. */
+        stack_err(err, err_cap,
+                  "client config: admin mode requires NumConn 1 and no singleplex, got "
+                  "NumConn %d%s",
+                  c->num_conn, c->singleplex ? " with singleplex" : "");
         cloak_client_stack_close(s);
         return CLOAK_CLIENT_STACK_ERR_CONFIG;
     }

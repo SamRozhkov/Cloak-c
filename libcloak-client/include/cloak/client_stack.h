@@ -382,6 +382,38 @@ typedef struct {
     uint64_t reconnect_base_ms;
     int max_rounds;
 
+    /* ADMIN MODE -- Go's `ck-client -a`. 1 makes every session this stack
+     * brings up carry SESSION ID 0 instead of the fresh random id edge E4
+     * otherwise requires.
+     *
+     * WHY THIS HAS TO BE A KNOB AND CANNOT BE THE CALLER'S BUSINESS. The
+     * server calls a session admin only when the uid is its AdminUID AND
+     * the session id is 0 (cloak/dispatcher.h, and src/dispatcher.c's
+     * `info.is_admin = cloak_server_is_admin(...) && info.session_id ==
+     * 0`). Both halves are needed, and the uid half is the only one a
+     * caller of this module could supply -- the id is drawn inside
+     * stack_pick_session_id, which deliberately EXCLUDES 0 for exactly
+     * this reason. Without this field an admin uid reaches the server on
+     * a non-zero id and is dispatched to the ordinary proxy, so `ck-client
+     * -a` could not reach the admin API at all. That is not a divergence
+     * a binary can work around; the stack is the supported wiring for one.
+     *
+     * REQUIRES num_conn == 1 AND singleplex == 0, and cloak_client_stack_
+     * open rejects anything else as ERR_CONFIG rather than accepting it.
+     * Go's own -a sets NumConn to 1 for the same reason the check exists:
+     * every session under this flag carries the SAME id, so two live ones
+     * would be keyed identically on the server's registry and attached to
+     * each other -- which is what singleplex, one session per local
+     * connection, would produce on the second connection. With one shared
+     * session there is only ever one.
+     *
+     * The reconnect ladder is unaffected: a replacement session after a
+     * break also carries id 0, which is correct here and is the one place
+     * where "a reconnect's id differs structurally from the id it
+     * replaces" does not apply -- there is only ever one such session and
+     * the server has already dropped the dead one. */
+    int admin_session;
+
     /* Piper sizing; 0 selects the piper's own CLOAK_CLIENT_PIPER_DEFAULT_*.
      * The first-byte deadline is NOT here: it comes from the config's
      * StreamTimeout, so the bound on a singleplex connection's session

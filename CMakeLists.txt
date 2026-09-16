@@ -23,3 +23,7 @@ add_subdirectory(libcloak-client)
 # file's existing content stays byte-identical; the libraries must be
 # declared first either way, since an executable links them.
 add_subdirectory(cmd/ck-server)
+
+# ck-client comes after ck-server because its test drives BOTH binaries
+# and names ck-server as a target dependency.
+add_subdirectory(cmd/ck-client)
