@@ -1115,12 +1115,36 @@ static void test_a_go_produced_frame_deobfuscates_byte_for_byte(void) {
 
     cloak_frame_t f;
     memset(&f, 0, sizeof(f));
-    ASSERT_EQ_INT(0, cloak_frame_deobfuscate(&o, &f, buf, n));
+    int rc = cloak_frame_deobfuscate(&o, &f, buf, n);
+    ASSERT_EQ_INT(0, rc);
+    /* THE GUARD IS NOT DEFENSIVE TIDINESS; IT IS WHAT KEEPS THE REST OF
+     * THIS FILE RUNNING UNDER THE ONE DEFECT IT EXISTS TO CATCH.
+     *
+     * cloak_frame_deobfuscate's contract leaves *out untouched on failure,
+     * so f.payload is still the NULL this function memset it to, and
+     * ASSERT_MEM_EQ below is a memcmp(NULL, ...). That is a SEGFAULT, and
+     * a segfault ends the process: cases 5 and 6 are called after this one
+     * in TEST_MAIN and would never run at all. Measured, with the AAD
+     * regression (mutation M9/M15) applied: ctest reported SEGFAULT and
+     * the last assertion printed was the payload_len one below -- a third
+     * of this file silently stopped executing in exactly the scenario it
+     * was written for.
+     *
+     * A crash that swallows later assertions is the same shape as a
+     * timeout that swallows them, which this project has ruled against
+     * twice. With the guard, the same regression reports six named
+     * assertions across three cases and still runs the other two. */
+    if (rc != 0) {
+        return;
+    }
     ASSERT_EQ_INT(1, (long long)f.stream_id);
     ASSERT_EQ_INT(10, (long long)f.seq);
     ASSERT_EQ_INT(CLOAK_FRAME_CLOSING_NOTHING, f.closing);
     ASSERT_EQ_INT((long long)strlen(GO_FRAME_PAYLOAD), (long long)f.payload_len);
-    ASSERT_MEM_EQ(f.payload, GO_FRAME_PAYLOAD, strlen(GO_FRAME_PAYLOAD));
+    ASSERT_TRUE(f.payload != NULL);
+    if (f.payload != NULL && f.payload_len == strlen(GO_FRAME_PAYLOAD)) {
+        ASSERT_MEM_EQ(f.payload, GO_FRAME_PAYLOAD, strlen(GO_FRAME_PAYLOAD));
+    }
 }
 
 /* ------------------------------------------------------------------ */

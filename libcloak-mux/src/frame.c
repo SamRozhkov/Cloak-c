@@ -106,12 +106,55 @@ long cloak_frame_obfuscate(const cloak_obfuscator_t *o, const cloak_frame_t *fra
          * (libcloak-server/tests/test_ws_interop.c, case 1, which is the
          * test that found this).
          *
-         * The frame header is not left unauthenticated by removing it.
-         * Bytes 0-11 are the AEAD NONCE, which RFC 5116 section 2.1
-         * authenticates internally -- that is exactly the guarantee Go's
-         * own comment above this call claims -- and bytes 12-13 are
-         * covered by the Salsa20 layer's key, whose nonce is the AEAD tag
-         * that a forger cannot produce. */
+         * WHAT THIS COSTS, STATED PLAINLY, BECAUSE AN EARLIER VERSION OF
+         * THIS COMMENT OVERSTATED IT AND THAT IS THE WORSE FAILURE. It
+         * claimed bytes 12-13 were "covered by the Salsa20 layer". THEY
+         * ARE NOT. Salsa20 is a raw XOR stream cipher and provides ZERO
+         * INTEGRITY: the unforgeable nonce stops an attacker fabricating a
+         * whole new frame, and does nothing at all to stop one flipping
+         * bits in an existing frame. Go's own comment above its Seal call
+         * ("Because the frame header ... is fed into the AEAD, it is also
+         * authenticated") is inaccurate for the same reason -- only
+         * header[:12] is the nonce, and only header[:12] is thereby
+         * authenticated.
+         *
+         * So: BYTES 12 AND 13 ARE UNAUTHENTICATED, exactly as in Go, and
+         * an on-path attacker WITHOUT THE SESSION KEY can XOR chosen bits
+         * into them. Concretely, and this is a real capability, not a
+         * theoretical one:
+         *
+         *   - byte 12, `closing`: setting CLOAK_FRAME_CLOSING_SESSION (2)
+         *     makes session.c's frame path run session_passive_close and
+         *     KILL THE WHOLE MUX SESSION, taking every stream with it.
+         *     This is NOT the same as a RST, which kills one TCP
+         *     connection of a multi-connection session and which the mux
+         *     survives by redialling; a forged closing=2 is above the
+         *     transport and the redial does not recover it. `closing` is 0
+         *     on essentially every data frame, so the attacker needs no
+         *     knowledge of the plaintext -- one blind bit-flip per
+         *     session, undetectable and unattributable.
+         *   - byte 13, `extra_len`: both implementations authenticate the
+         *     whole payload||padding||tag region and then SLICE it at
+         *     len - extra_len, so raising it silently truncates delivered
+         *     stream bytes and lowering it delivers random padding to the
+         *     application as stream data. Integrity and availability only
+         *     -- the value is bounds-checked, so there is no
+         *     memory-safety or confidentiality consequence.
+         *
+         * What IS still protected: the payload ciphertext and its tag;
+         * bytes 0-11 (stream_id and seq), because they are the AEAD nonce,
+         * which RFC 5116 section 2.1 authenticates internally; and the
+         * CONFIDENTIALITY of 12-13, which Salsa20 does provide.
+         *
+         * THIS IS INHERITED FIDELITY, NOT A DESIGN WE CHOSE. The Cloak
+         * frame format has a two-byte malleable region and this port has
+         * it because the reference implementation has it. Closing it
+         * unilaterally is what the AAD was, and the price was a peer that
+         * could not exchange one frame with Go -- and, separately, a peer
+         * that behaves differently from the reference implementation under
+         * a bit-flip probe, which is a behavioural distinguisher in the
+         * one product that cannot afford one. If the format is to be
+         * fixed, it is fixed upstream and on both sides at once. */
         int rc = cloak_aead_seal(o->method, o->session_key, nonce,
                                   NULL, 0,
                                   payload_region, frame->payload_len + pad_len,

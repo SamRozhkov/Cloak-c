@@ -399,24 +399,55 @@ set_tests_properties(test_dispatcher_ws PROPERTIES TIMEOUT 120)
 # CMakeLists.txt, after cmd/ck-server has been added. Same reason this
 # file appends cloak-client below rather than folding it in: the existing
 # content stays byte-identical, and CMake resolves both at generate time.
-#
-# Links sqlite3 directly, on top of the transitive link cloak-server
-# already provides, for the same reason test_dispatcher_ws.c does: the
-# two in-process cases raise a real cloak_userpanel_t over a real
-# cloak_usermanager_t, and cloak-server's PRIVATE sqlite3 link
-# deliberately does not propagate the include path.
-add_executable(test_ws_interop test_ws_interop.c)
-target_include_directories(test_ws_interop PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
-target_link_libraries(test_ws_interop PRIVATE cloak-server sqlite3)
-add_test(NAME test_ws_interop COMMAND test_ws_interop)
 
-# THE BOUND IS SET FROM THE WORST FAILING RUN, NOT THE PASSING ONE.
-# A passing run is ~4 s in Debug and ~20 s under ASan+UBSan (one
-# ASan-instrumented ck-server plus seven short-lived Go processes, and
-# ~335 in-process handshakes for the split-point case). What the number
-# has to accommodate is a run in which something never answers: every
-# wait inside the file is bounded by CLOCK_MONOTONIC, the longest single
-# one being CHILD_MS at 40 s, so a broken run reports its own named
-# assertion rather than being truncated as "***Timeout" with the
-# diagnosis cut off. This is a backstop, not the mechanism.
-set_tests_properties(test_ws_interop PROPERTIES TIMEOUT 120)
+# CLOAK_REQUIRE_GO IS DEFINED HERE, NOT AT THE TOP OF THE ROOT LIST FILE,
+# because this is the first place that needs it and because the root file
+# is only ever appended to in this tree. An option() call defines a cache
+# entry that every later directory can read -- and a `-DCLOAK_REQUIRE_GO=OFF`
+# on the command line sets that entry before any option() runs, so where
+# the call sits does not change what the user gets.
+#
+# WHEN IT IS OFF, THE TEST IS REMOVED, NOT SKIPPED. `ctest` prints a
+# skipped test and a passing test the same way, and this project has been
+# burned by exactly that: a skip branch is indistinguishable from
+# coverage. Turning this off drops the suite from 68 tests to 67, visibly,
+# which is a contract change a reader can see in one line of output. It
+# exists because a top-level FATAL_ERROR means a C library project cannot
+# be CONFIGURED at all without a Go toolchain, which blocks packagers and
+# minimal CI images; ON remains the default because the 67 -> 68 count is
+# part of module 8's contract and this is the only test in the tree whose
+# peer is not our own code.
+option(CLOAK_REQUIRE_GO
+       "Build test_ws_interop, which needs a Go toolchain and gorilla/websocket. \
+Turning this OFF removes that test: the suite becomes 67 tests, not 68." ON)
+
+if(CLOAK_REQUIRE_GO)
+    # Links sqlite3 directly, on top of the transitive link cloak-server
+    # already provides, for the same reason test_dispatcher_ws.c does: the
+    # two in-process cases raise a real cloak_userpanel_t over a real
+    # cloak_usermanager_t, and cloak-server's PRIVATE sqlite3 link
+    # deliberately does not propagate the include path.
+    add_executable(test_ws_interop test_ws_interop.c)
+    target_include_directories(test_ws_interop PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+    target_link_libraries(test_ws_interop PRIVATE cloak-server sqlite3)
+    add_test(NAME test_ws_interop COMMAND test_ws_interop)
+
+    # THE BOUND IS SET FROM THE WORST FAILING RUN, NOT THE PASSING ONE.
+    # A passing run is ~1 s in Debug and ~3 s under ASan+UBSan (one
+    # ASan-instrumented ck-server plus seven short-lived Go processes, and
+    # ~335 in-process handshakes for the split-point case). What the number
+    # has to accommodate is a run in which something never answers: every
+    # wait inside the file is bounded by CLOCK_MONOTONIC, the longest
+    # single one being CHILD_MS, which test_ws_interop.c sets to 10 s
+    # against seven children -- so even a wholly unresponsive run finishes
+    # inside this timeout and reports its own named assertions rather than
+    # being truncated as "***Timeout" with the diagnosis cut off. This is a
+    # backstop, not the mechanism.
+    set_tests_properties(test_ws_interop PROPERTIES TIMEOUT 120)
+else()
+    message(WARNING
+        "CLOAK_REQUIRE_GO=OFF: test_ws_interop is NOT built. The suite is 67 "
+        "tests, not 68, and NOTHING then measures this port against an "
+        "implementation it did not write -- which is how it once shipped a "
+        "frame format no Go peer could read. Turn this back on to restore it.")
+endif()

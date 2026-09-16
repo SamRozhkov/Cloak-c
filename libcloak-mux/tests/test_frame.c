@@ -313,19 +313,34 @@ static void test_wrong_key_rejected(void) {
  * case now asserts the behaviour Go has:
  *
  *   - Flipping the closing byte is NOT detected. An on-path attacker can
- *     do it without the session key, because Salsa20-XOR is malleable.
+ *     do it WITHOUT THE SESSION KEY, because Salsa20 is a raw XOR stream
+ *     cipher and provides no integrity whatsoever -- these two bytes are
+ *     unauthenticated, full stop, and this case is the demonstration.
  *     Go can be attacked in exactly the same way, which is the reason
  *     this port must be: a peer that is fussier than the reference
  *     implementation is a behavioural distinguisher, which is the one
  *     thing a circumvention tool cannot afford (the same argument
  *     cloak/conn.h makes for not validating the TLS record's type byte,
  *     and ws_handshake.c for reproducing gorilla's token-list quirks).
- *     The capability it grants -- killing a session -- is one an on-path
- *     attacker already has with a RST.
+ *
+ *     WHAT THE ATTACKER GAINS IS NOT SMALL, and an earlier version of
+ *     this comment said it was ("a capability an on-path attacker
+ *     already has with a RST"). That is wrong. The value flipped in
+ *     below is 0x02, which IS CLOAK_FRAME_CLOSING_SESSION, and
+ *     session.c's frame path answers it with session_passive_close --
+ *     the whole mux session, every stream on it, gone. A RST kills one
+ *     TCP connection of a multi-connection session and the mux redials
+ *     around it; this is above the transport and the redial does not
+ *     recover it. Flipping byte 13 (extra_len) instead truncates the
+ *     delivered stream or injects padding bytes into it as data. The
+ *     port inherits a real upstream weakness here, deliberately; it is
+ *     not covered by something else.
  *   - The PAYLOAD is still authenticated, and bytes 0-11 of the header
  *     still are: they are the AEAD nonce, which RFC 5116 section 2.1
  *     authenticates internally. test_tamper_detected_after_obfuscate
- *     above is what holds that half in place, and it is unchanged.
+ *     above is what holds that half in place, and it is unchanged. The
+ *     payload assertions at the end of this case hold it here too: the
+ *     malleability is exactly two bytes wide and this pins that width.
  *
  * If you are about to re-add the AAD: it will make this case and case 1
  * of test_ws_interop fail together, and the second of those is the one
