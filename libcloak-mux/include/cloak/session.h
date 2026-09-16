@@ -229,6 +229,26 @@ void cloak_session_destroy(cloak_session_t *sesh);
  * if sesh is closed or on failure adding to the switchboard. */
 int cloak_session_add_conn(cloak_session_t *sesh, int fd);
 
+/* The same, choosing the connection's framing mode explicitly. This is
+ * the public entry point for the CDN path: a WebSocket-fronted connection
+ * is added with CLOAK_CONN_FRAMING_WS_CLIENT (our end is the client, so
+ * it masks) or CLOAK_CONN_FRAMING_WS_SERVER (our end is the server, so it
+ * never does).
+ *
+ * cloak_session_add_conn keeps its signature and means
+ * CLOAK_CONN_FRAMING_TLS_RECORD, so the direct path's existing call sites
+ * are untouched -- and, more importantly, the new mode cannot be
+ * forgotten INTO the wrong framing. It can only be forgotten into a
+ * construction failure: see cloak_conn_framing_t for why its zero value
+ * is invalid and why that is a field on a config struct rather than a
+ * defaulted parameter.
+ *
+ * Returns 0 on success, CLOAK_CONN_ERR_INVALID_FRAMING if framing is not
+ * one of the three real modes (nothing is added and fd is NOT adopted),
+ * or -1 if sesh is closed or on failure adding to the switchboard. */
+int cloak_session_add_conn_framed(cloak_session_t *sesh, int fd,
+                                   cloak_conn_framing_t framing);
+
 /* Opens a new locally-initiated stream (Go's Session.OpenStream).
  * Returns the new stream and, if out_id is non-NULL, its id. Returns NULL
  * if sesh is closed or on allocation failure. See this file's own

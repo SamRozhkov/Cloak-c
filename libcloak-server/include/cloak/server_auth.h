@@ -189,4 +189,64 @@ long cloak_server_auth_compose_reply(const uint8_t shared_secret[CLOAK_AEAD_KEY_
                                       const uint8_t *fake_cert, size_t fake_cert_len,
                                       uint8_t *out, size_t out_cap);
 
+/* Bytes cloak_server_auth_compose_ws_reply writes: a 12-byte AES-GCM
+ * nonce followed by the 48 bytes that sealing a 32-byte session key under
+ * it produces (32 of ciphertext + CLOAK_AEAD_TAG_LEN of tag). */
+#define CLOAK_SERVER_AUTH_WS_REPLY_LEN 60
+
+/* THE CDN REPLY IS FLAT, AND THAT IS THE WHOLE DIFFERENCE. This writes
+ *
+ *     [12-byte nonce][48 bytes AES-GCM(session_key) + tag]
+ *
+ * contiguously -- exactly what Go builds at
+ * internal/server/websocket.go:52-62 (`reply := append(nonce,
+ * encryptedKey...)`, one Write onto a *websocket.Conn, which emits it as
+ * ONE unmasked binary message). The dispatcher puts the two-byte
+ * WebSocket header in front of it, so 60 bytes here are 62 on the wire.
+ *
+ * WHY THIS IS A SIBLING OF cloak_server_auth_compose_reply AND NOT A
+ * PARAMETER OF IT. That function takes the same 60 bytes and SCATTERS
+ * them across a fake TLS ServerHello -- the nonce at the ServerHello
+ * body's [6:18), ciphertext[0:20) at [18:38), ciphertext[20:48) inside
+ * the key_share extension at [84:112) -- and then emits two further
+ * records (ChangeCipherSpec, a fake Certificate) whose only purpose is
+ * to make an abbreviated TLS handshake look complete to a DPI box. None
+ * of that applies on the CDN leg, where the real TLS session lives
+ * between the CDN and this host and supplies its own records: a
+ * ServerHello inside a WebSocket message would be wire-incompatible with
+ * Go AND a perfect Cloak signature to anyone who can see inside the
+ * CDN's TLS. The two shapes share the sealing and nothing else, so they
+ * are two functions rather than one with a mode flag.
+ *
+ * THE NONCE IS DRAWN HERE, not taken from the caller, which is the one
+ * place this deviates from its sibling's shape. Go draws it at the same
+ * point (`common.RandRead(randSource, nonce)` inside the responder), and
+ * there is no second consumer of it the way there is on the TLS path --
+ * cloak_server_auth_compose_reply has to publish the nonce into the
+ * ServerHello's random field, so its caller has a reason to hold it,
+ * while here it is simply the first twelve bytes of `out`. It MUST be
+ * fresh per call and it is: cloak_random_bytes is OpenSSL RAND_bytes,
+ * which aborts rather than returning weak output. Reusing a nonce with
+ * the same shared_secret would break AES-GCM outright.
+ *
+ * shared_secret is what cloak_server_auth_decrypt derived for this
+ * connection; session_key is the freshly chosen frame-encryption key the
+ * client is being told about.
+ *
+ * Returns 0 on success, -1 on a NULL argument or an AEAD failure.
+ *
+ * ON FAILURE `out` IS NOT WRITTEN AT ALL -- not partially, not with a
+ * nonce, not with anything. That is a contract and not an accident: the
+ * sealing happens into a local buffer of known size and only a
+ * fixed-length memcpy ever touches `out`, after the sealed length has
+ * been checked. cloak_aead_seal takes no output capacity, so a caller
+ * that handed it `out` directly could only DETECT a wrong-sized cipher
+ * output after it had already written past the end; this function's
+ * caller keeps a 60-byte buffer inside a live connection struct, and a
+ * -1 must leave it exactly as the caller left it rather than full of
+ * plausible-looking reply bytes it must not send. */
+int cloak_server_auth_compose_ws_reply(uint8_t out[CLOAK_SERVER_AUTH_WS_REPLY_LEN],
+                                        const uint8_t session_key[CLOAK_AEAD_KEY_LEN],
+                                        const uint8_t shared_secret[CLOAK_AEAD_KEY_LEN]);
+
 #endif

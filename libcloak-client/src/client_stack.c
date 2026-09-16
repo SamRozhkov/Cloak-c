@@ -406,19 +406,23 @@ static cloak_client_browser_t stack_browser(cloak_browser_t b) {
  * and was consumed nowhere. The literal "random" ServerName is the only
  * configuration that was already varying, and it is not the default.
  *
- * One byte of randomness, reduced modulo a list of at most
- * CLOAK_MAX_ALT_NAMES + 1 == 17 entries. The modulo bias that leaves is
- * at most one part in fifteen between the first and last candidates, and
- * it is spent on exactly the quantity the connector's own backoff spends
- * a byte on: something that must merely not be constant. */
+ * cloak_random_below, i.e. REJECTION-SAMPLED. This used to draw one byte
+ * and take it modulo a list of at most CLOAK_MAX_ALT_NAMES + 1 == 17
+ * entries, with a comment conceding "at most one part in fifteen between
+ * the first and last candidates" on the grounds that the quantity must
+ * merely not be constant. That was the wrong standard for this one,
+ * because unlike a retry delay THE CHOSEN NAME GOES ON THE WIRE, in the
+ * SNI of every ClientHello -- and a name that appears 6.7 % more often
+ * than its neighbours is a property of THIS implementation that a censor
+ * aggregating handshakes can measure, which is the opposite of why
+ * alt_names exists. The same reasoning, at 2x rather than 1.07x, is
+ * spelled out at cloak/common.h and libcloak-mux/src/frame.c. */
 static const char *stack_pick_server_name(const cloak_client_config_t *c) {
     size_t n = c->num_alt_names + 1;
     if (n <= 1) {
         return c->server_name;
     }
-    uint8_t r = 0;
-    cloak_random_bytes(&r, 1);
-    size_t i = (size_t)r % n;
+    size_t i = (size_t)cloak_random_below((uint32_t)n);
     return i == 0 ? c->server_name : c->alt_names[i - 1];
 }
 

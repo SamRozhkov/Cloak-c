@@ -66,3 +66,15 @@ target_include_directories(test_conn_record PRIVATE ${CMAKE_SOURCE_DIR}/libcloak
 target_link_libraries(test_conn_record PRIVATE cloak-mux)
 add_test(NAME test_conn_record COMMAND test_conn_record)
 set_tests_properties(test_conn_record PROPERTIES TIMEOUT 60)
+
+add_executable(test_ws_frame test_ws_frame.c)
+target_include_directories(test_ws_frame PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_ws_frame PRIVATE cloak-mux)
+add_test(NAME test_ws_frame COMMAND test_ws_frame)
+set_tests_properties(test_ws_frame PROPERTIES TIMEOUT 120)
+
+add_executable(test_conn_ws_framing test_conn_ws_framing.c)
+target_include_directories(test_conn_ws_framing PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_conn_ws_framing PRIVATE cloak-mux)
+add_test(NAME test_conn_ws_framing COMMAND test_conn_ws_framing)
+set_tests_properties(test_conn_ws_framing PROPERTIES TIMEOUT 120)

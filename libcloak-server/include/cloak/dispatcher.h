@@ -612,6 +612,17 @@ struct cloak_dispatch_conn {
     uint32_t auth_session_id;
     cloak_server_clientinfo_t auth_info;
 
+    /* Which framing step 11 must hand this socket to the session in:
+     * CLOAK_CONN_FRAMING_TLS_RECORD for the direct path,
+     * CLOAK_CONN_FRAMING_WS_SERVER for a CDN connection. Set by the same
+     * successful dispatcher_authenticate that fills the four fields above
+     * and, like them, meaningless before that point -- its zero value is
+     * CLOAK_CONN_FRAMING_INVALID, which cloak_session_add_conn_framed
+     * refuses outright rather than defaulting, so a future path that
+     * reached the hand-off without setting it would fail loudly instead
+     * of quietly emitting TLS records inside WebSocket frames. */
+    cloak_conn_framing_t auth_framing;
+
     struct cloak_dispatch_conn *prev, *next; /* dispatcher's intrusive list */
 };
 

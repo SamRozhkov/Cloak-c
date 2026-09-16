@@ -52,3 +52,12 @@ target_sources(cloak-server PRIVATE src/adminapi.c)
 # -- and it needs no new link dependency: it consumes only headers this
 # target already provides.
 target_sources(cloak-server PRIVATE src/server_stack.c)
+
+# The CDN transport's server-side WebSocket upgrade parser and its 101
+# response. Appended for the same reason src/http.c, src/user_json.c,
+# src/adminapi.c and src/server_stack.c are -- this file's existing
+# content stays byte-identical -- and it needs no new link dependency: it
+# consumes cloak/base64.h, which cloak-common provides, and OpenSSL's
+# EVP_sha1 for the RFC 6455 accept token, which cloak-common already
+# propagates as a PUBLIC OpenSSL::Crypto link.
+target_sources(cloak-server PRIVATE src/ws_handshake.c)

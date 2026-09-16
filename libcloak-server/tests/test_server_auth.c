@@ -2,8 +2,63 @@
 #include "cloak/crypto.h"
 #include "test_framework.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+/* ------------------------------------------------------------------ */
+/* Interposition on cloak_aead_seal, via the linker                    */
+/* ------------------------------------------------------------------ */
+
+/* WHY THIS BINARY WRAPS ONE OF ITS OWN LIBRARY'S FUNCTIONS.
+ *
+ * cloak_aead_seal takes NO output capacity (cloak/crypto.h): it writes
+ * however many bytes the cipher produces into whatever buffer it is
+ * handed, and reports the count afterwards. Every caller in this tree
+ * therefore owes it a buffer sized for the exact output it expects, and
+ * a length check AFTER the call can only ever DETECT a mismatch -- by
+ * which time the write has happened.
+ *
+ * cloak_server_auth_compose_ws_reply's check is the one place where that
+ * distinction has a blast radius worth naming: it is handed the CALLER's
+ * 60-byte reply buffer. So the function now seals into a local of known
+ * size and copies only after validating, and the test below is what
+ * holds that in place. Making it testable needs a sealed length that is
+ * wrong, and no real AES-256-GCM ever produces one -- sealing 32 bytes
+ * always yields 48.
+ *
+ * -Wl,--wrap=cloak_aead_seal (see this directory's CMakeLists.txt) is
+ * what makes it reachable: the linker redirects every undefined
+ * reference to cloak_aead_seal -- including the one inside
+ * cloak-server's own server_auth.o -- to __wrap_cloak_aead_seal, and
+ * leaves __real_cloak_aead_seal pointing at the archive's definition.
+ * Disarmed (seal_lie_len < 0) this forwards verbatim, so every other
+ * case in this file still exercises the real cipher; the same
+ * "interpose, but forward by default, and prove the interposition
+ * actually fires" shape test_ws_handshake.c uses for EVP_Digest.
+ *
+ * IT LIES ABOUT THE LENGTH WITHOUT WRITING EXTRA BYTES, deliberately: a
+ * stub that actually overflowed would prove only that ASan works. What
+ * is under test is that the function refuses, and that it refuses
+ * BEFORE touching the caller's buffer. */
+static int seal_lie_len = -1;
+static int seal_calls;
+
+int __real_cloak_aead_seal(cloak_aead_method_t method, const uint8_t *key, const uint8_t *nonce,
+                           const uint8_t *aad, size_t aad_len, const uint8_t *plaintext,
+                           size_t plaintext_len, uint8_t *out, size_t *out_len);
+
+int __wrap_cloak_aead_seal(cloak_aead_method_t method, const uint8_t *key, const uint8_t *nonce,
+                           const uint8_t *aad, size_t aad_len, const uint8_t *plaintext,
+                           size_t plaintext_len, uint8_t *out, size_t *out_len) {
+    seal_calls++;
+    int rc = __real_cloak_aead_seal(method, key, nonce, aad, aad_len, plaintext, plaintext_len,
+                                    out, out_len);
+    if (rc == 0 && seal_lie_len >= 0 && out_len != NULL) {
+        *out_len = (size_t)seal_lie_len;
+    }
+    return rc;
+}
 
 static size_t hex_decode(const char *hex, uint8_t *out) {
     size_t n = 0;
@@ -236,6 +291,109 @@ static void test_null_key_share_rejected(void) {
     ASSERT_EQ_INT(rc, -1);
 }
 
+/* ------------------------------------------------------------------ */
+/* The CDN reply: flat, bounded, and refused without a partial write    */
+/* ------------------------------------------------------------------ */
+
+/* Composes into an allocation of EXACTLY CLOAK_SERVER_AUTH_WS_REPLY_LEN
+ * bytes, so a write past the declared length is an ASan redzone hit
+ * rather than a silent pass, and pre-poisons it so "did not write"
+ * is checkable. Returns the function's own result; the buffer's contents
+ * come back in copy_out. */
+static int compose_ws_exact(const uint8_t *session_key, const uint8_t *shared_secret,
+                            uint8_t copy_out[CLOAK_SERVER_AUTH_WS_REPLY_LEN]) {
+    uint8_t *heap = malloc(CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+    ASSERT_TRUE(heap != NULL);
+    if (heap == NULL) {
+        return -1;
+    }
+    memset(heap, 0x5a, CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+    int rc = cloak_server_auth_compose_ws_reply(heap, session_key, shared_secret);
+    memcpy(copy_out, heap, CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+    free(heap);
+    return rc;
+}
+
+static void test_compose_ws_reply_round_trips(void) {
+    uint8_t session_key[CLOAK_AEAD_KEY_LEN];
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    hex_decode(SESSION_KEY_HEX, session_key);
+    hex_decode(EXPECTED_SHARED_SECRET_HEX, shared);
+
+    uint8_t reply[CLOAK_SERVER_AUTH_WS_REPLY_LEN];
+    seal_calls = 0;
+    ASSERT_EQ_INT(0, compose_ws_exact(session_key, shared, reply));
+    /* The interposition really is in the call path -- a stub that was
+     * never called could not move this, and every refusal case below
+     * would then be proving nothing. */
+    ASSERT_TRUE(seal_calls > 0);
+
+    /* [0:12) nonce, [12:60) sealed session key. What a client does. */
+    uint8_t recovered[CLOAK_AEAD_KEY_LEN];
+    size_t out_len = 0;
+    ASSERT_EQ_INT(0, cloak_aead_open(CLOAK_AEAD_AES_256_GCM, shared, reply, NULL, 0,
+                                     reply + CLOAK_AEAD_NONCE_LEN,
+                                     CLOAK_SERVER_AUTH_WS_REPLY_LEN - CLOAK_AEAD_NONCE_LEN,
+                                     recovered, &out_len));
+    ASSERT_EQ_INT(CLOAK_AEAD_KEY_LEN, (int)out_len);
+    ASSERT_MEM_EQ(session_key, recovered, CLOAK_AEAD_KEY_LEN);
+
+    /* Fresh nonce per call: a constant one decrypts perfectly, so
+     * nothing above can see it. */
+    uint8_t reply2[CLOAK_SERVER_AUTH_WS_REPLY_LEN];
+    ASSERT_EQ_INT(0, compose_ws_exact(session_key, shared, reply2));
+    ASSERT_MEM_NE(reply, reply2, CLOAK_AEAD_NONCE_LEN);
+}
+
+/* THE NAMED ASSERTION FOR THE BOUNDED SEAL. A sealed length that is not
+ * exactly 48 must be refused, and -- this is the half that fails against
+ * an implementation which seals straight into the caller's buffer -- the
+ * caller's 60 bytes must be left exactly as they were. The old shape
+ * wrote the nonce and 48 ciphertext bytes into `out` and only then
+ * compared lengths, so a refusal handed the caller a buffer full of
+ * plausible-looking reply bytes that must not be sent. */
+static void test_compose_ws_reply_refuses_a_wrong_sealed_length(void) {
+    uint8_t session_key[CLOAK_AEAD_KEY_LEN];
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    hex_decode(SESSION_KEY_HEX, session_key);
+    hex_decode(EXPECTED_SHARED_SECRET_HEX, shared);
+
+    uint8_t poison[CLOAK_SERVER_AUTH_WS_REPLY_LEN];
+    memset(poison, 0x5a, sizeof(poison));
+
+    /* Both sides of 48: one short, one long. The long one is the case
+     * that would have overflowed a 60-byte caller buffer in the old
+     * shape had the cipher really produced it. */
+    static const int wrong[] = {47, 49, 0, 60};
+    for (size_t i = 0; i < sizeof(wrong) / sizeof(wrong[0]); i++) {
+        uint8_t reply[CLOAK_SERVER_AUTH_WS_REPLY_LEN];
+        seal_lie_len = wrong[i];
+        int rc = compose_ws_exact(session_key, shared, reply);
+        seal_lie_len = -1;
+        ASSERT_EQ_INT(-1, rc);
+        ASSERT_MEM_EQ(poison, reply, CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+    }
+
+    /* And the control: with the lie disarmed the same inputs succeed, so
+     * the refusals above are the length check and not something else
+     * this fixture broke. */
+    uint8_t ok_reply[CLOAK_SERVER_AUTH_WS_REPLY_LEN];
+    ASSERT_EQ_INT(0, compose_ws_exact(session_key, shared, ok_reply));
+    ASSERT_MEM_NE(poison, ok_reply, CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+}
+
+static void test_compose_ws_reply_rejects_null_arguments(void) {
+    uint8_t session_key[CLOAK_AEAD_KEY_LEN];
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    uint8_t reply[CLOAK_SERVER_AUTH_WS_REPLY_LEN];
+    hex_decode(SESSION_KEY_HEX, session_key);
+    hex_decode(EXPECTED_SHARED_SECRET_HEX, shared);
+
+    ASSERT_EQ_INT(-1, cloak_server_auth_compose_ws_reply(NULL, session_key, shared));
+    ASSERT_EQ_INT(-1, cloak_server_auth_compose_ws_reply(reply, NULL, shared));
+    ASSERT_EQ_INT(-1, cloak_server_auth_compose_ws_reply(reply, session_key, NULL));
+}
+
 TEST_MAIN_BEGIN()
     test_decrypt_matches_real_go_vector();
     test_timestamp_window_is_strict();
@@ -250,4 +408,7 @@ TEST_MAIN_BEGIN()
     test_null_session_id_rejected();
     test_wrong_length_session_id_rejected();
     test_null_key_share_rejected();
+    test_compose_ws_reply_round_trips();
+    test_compose_ws_reply_refuses_a_wrong_sealed_length();
+    test_compose_ws_reply_rejects_null_arguments();
 TEST_MAIN_END()

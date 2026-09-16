@@ -4,11 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cloak/conn.h" /* cloak_conn_framing_t, CLOAK_CONN_ERR_INVALID_FRAMING */
 #include "cloak/reactor.h"
 #include "cloak/valve.h"
 
 typedef struct cloak_switchboard cloak_switchboard_t;
-typedef struct cloak_conn cloak_conn_t;
 
 /* frame_bytes/len: an already record-header-stripped, still-obfuscated
  * frame's bytes, valid only for the duration of this call (points into
@@ -80,6 +80,25 @@ void cloak_switchboard_destroy(cloak_switchboard_t *sb);
  * Returns 0 on success, -1 if sb is already broken or on allocation/
  * cloak_conn_init failure. */
 int cloak_switchboard_add_conn(cloak_switchboard_t *sb, int fd);
+
+/* The same, with the connection's framing mode chosen explicitly --
+ * cloak_switchboard_add_conn is exactly this with
+ * CLOAK_CONN_FRAMING_TLS_RECORD.
+ *
+ * Framing is per CONNECTION, not per pool, because that is where it
+ * actually belongs: it describes what is wrapped around bytes on one
+ * socket. Nothing in this tree mixes modes within a pool today, and a
+ * pool-wide setting would have read more simply -- but it would also have
+ * made the mode something a conn inherits rather than something a conn
+ * is constructed with, which is exactly the property
+ * cloak_conn_framing_t's zero-value rule depends on.
+ *
+ * Returns 0 on success, CLOAK_CONN_ERR_INVALID_FRAMING if framing is not
+ * one of the three real modes (in which case NOTHING is added and fd is
+ * NOT adopted -- the caller still owns it), or -1 if sb is already broken
+ * or on allocation/cloak_conn_init_cfg failure. */
+int cloak_switchboard_add_conn_framed(cloak_switchboard_t *sb, int fd,
+                                       cloak_conn_framing_t framing);
 
 /* Picks one connection uniformly at random from the pool and sends
  * frame_bytes/frame_len through it (wrapped in a TLS record by that connection,

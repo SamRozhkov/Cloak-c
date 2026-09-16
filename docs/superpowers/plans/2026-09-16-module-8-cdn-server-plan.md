@@ -398,3 +398,144 @@ Both are pure functions over a byte buffer with no reactor, and both belong in m
 - **Type consistency:** `cloak_ws_frame_header_t` and the parse/mask/write triple are produced in Task 1 and consumed in Task 2; `cloak_conn_framing_t` and `cloak_session_add_conn_framed` in Task 2 and consumed in Task 4; `cloak_ws_hs_t` and `cloak_ws_handshake_parse` in Task 3 and consumed in Task 4; `cloak_server_auth_compose_ws_reply` in Task 4 and exercised in Task 5. Counts chain 63 → 64 → 65 → 66 → 67 → 68.
 - **The riskiest task is 2**, for the reason stated in it: it is the same *shape* as the defect that survived five modules, in the file whose header begs you not to change it carelessly, and the wrong mode is invisible to every round-trip test. Its mitigations are the raw-first-byte assertion, an enum whose zero value is invalid, and gorilla as an external decoder in Task 5.
 - **The most consequential thing here** is that Task 5 is the first time this port is tested against an implementation nobody here wrote. Every previous module's tests had our code on both ends.
+
+---
+
+## What this branch left for the next ones
+
+### The premise was right, and here is the measurement that proves it
+
+This plan's closing line said Task 5 would be the first time the port met an implementation nobody
+here wrote. It found, on that first meeting, that **this port could not exchange a single data frame
+with the Go implementation it is a port of.**
+
+`cloak_frame_obfuscate` passed header bytes 12-13 as AES-GCM associated data; Go passes nil. The tag
+covers the AAD, so every frame we produced was unopenable by Go and vice versa. Measured: the Go
+client completed the CDN handshake, derived the **correct session key**, sent frame one, and the
+server **dropped it silently**. Two arguments changed. The pre-fix tree fails **1 of 68 tests — the
+interop test and nothing else.**
+
+It survived five modules because **both ends of every test were our own code.** That is the same
+reason the record-framing defect survived five modules, and it is now the second time this exact
+blindness has shipped. The plan for the call had **no** AAD; it was added during implementation and
+then **pinned by a test**. A test can lock in a defect as firmly as it can protect against one.
+
+### The class had four members, and three were found by looking rather than by accident
+
+Asked to hunt for a second instance, the final review found one **one function above the first**:
+`frame.c` computed the padding length as `b % 240` on a single random byte where Go
+rejection-samples. Measured over 200,000 samples: sixteen of 240 values were **twice** as likely
+(low-16 mass 12.547 % against Go's 6.667 %). That length goes **straight into the on-wire frame
+length on the first five frames of every stream, on both transports** — a passive size-distribution
+distinguisher from Go, **inside the padding whose stated purpose is defeating a size side channel.**
+
+A grep for every `%` on a random draw then found two more, including the SNI `alt_names` pick
+(one byte modulo ≤ 17, skewed up to 6.7 %, on the wire). **After this branch no `%` on a one-byte
+random draw survives in the tree.** Two remain deliberately: an 8-byte draw whose bias is below
+1e-18, with a comment now stating the argument holds *only* at 8 bytes, and a 32-bit non-crypto draw
+matching Go's own pool.
+
+The lesson is not "we had a modulo bug". It is that **an oracle that checks frames *decode* cannot
+see how long they are.** Interop proves agreement on semantics, never on distributions.
+
+### The direct path is still tested only against itself, and that is module 9's opening task
+
+The mux layer is now transitively oracle-covered. The direct *transport* — ClientHello placement,
+the 5-byte record header, the ServerHello reply — and **the entire C client** are not, and that
+transport is where the first instance fired.
+
+The cost is measured, not estimated: Go's real `ck-client` and `ck-server` build from **unmodified
+upstream** with 13 modules and 114 MB of cache into ~10 MB binaries. So it is **one
+`go mod download` line in `Dockerfile.dev` plus one test file driving real binaries in both roles —
+zero copied lines — covering strictly more than the CDN oracle.** Do it first, not last.
+
+### A fifth bug in the Go original, and the ordering that avoids it
+
+A failed WebSocket upgrade **wedges the Go server forever**: `websocketAux.go` returns without
+sending on an unbuffered channel `websocket.go` then blocks on, leaking the goroutine, the socket
+and the ActiveUser bookkeeping. Three reachable triggers were reproduced with verbatim-copied Cloak
+types. It fires *after* the UID is authorised, so **a CDN that rewrites `Connection`, regenerates a
+malformed key, or injects `Origin` wedges every connection.**
+
+This port validates the upgrade *with* `Hidden`, before the UID. Verified at the built binary: 200
+connections per shape, **zero hung across all five**, and the cross-`Origin` case answers 101 where
+gorilla answers 403. Ignoring `Origin` is now declared and pinned, because it was correct by
+accident as far as any reader could tell.
+
+### Compatibility, stated plainly
+
+The AAD fix changed the **direct path's** wire bytes too — `frame.c` has no framing branch. An
+old-AAD tag is now refused. **A pre-fix C client cannot talk to a post-fix C server.** That break
+with our own prior builds was taken deliberately, to gain compatibility with Go.
+
+### What we gave up to get it
+
+Bytes 12-13 are now **unauthenticated, full stop** — Salsa20-XOR provides zero integrity. A keyless
+on-path attacker can blind-flip byte 12 to reach `session_passive_close` and **kill the mux session
+in a way a redial does not recover**, or flip byte 13 to truncate the stream or inject padding as
+data. Go has the identical hole. We inherit it on purpose; the alternative is not talking to Go.
+
+### Methodology: what changed this module
+
+- **The oracle has to exist before the plan depends on it.** Task 5 rested entirely on Go and
+  gorilla being available to `ctest`. They were not — `go` was on the host, absent from the image,
+  and a darwin binary cannot run in a Linux container. Found in the pre-flight scan; had it been
+  found during Task 5, four tasks would have been built on a promise. **Scan for the tools a plan
+  assumes, not just for conflicts between its tasks.**
+- **A self-written mutation log is the least reliable document in the repository.** Reviews this
+  module killed 25 of 27, 62 of 65, 17 of 19, 10 of 10 and 17 of 19 — strong — but the previous
+  branch reported "11 of 11 caught" against an outside reviewer's **15 live**.
+- **An equivalence claim can be a symptom of the defect it describes.** One mutant was honestly
+  declared equivalent during Task 4; after the seal fix it became **killable**. It had been
+  equivalent *because the code was wrong* — the seal wrote into the caller's buffer before the check
+  ran, so deleting the check changed nothing observable. **An equivalent mutant on a guard deserves
+  a second look at why the guard cannot matter.**
+- **A comment asserting a measurement needs a failing test behind it, or an admission.** This module
+  corrected **five**: a header telling the next task a bound was handled; a guard claiming to
+  *prevent* an overflow it could only detect; a security note claiming Salsa20 covered bytes it
+  cannot; and two more. A 45-claim sweep over one file pair found **three false** that a
+  read-and-check pass had missed — because re-reading a claim is the same act that produced it.
+  **Every false claim in that file shared one cause: a request literal with no `Host` header.** The
+  fix was to require it by construction, not to correct four sentences.
+- **Flakes are bugs.** A 1-in-8 ASan failure was traced to `gap + elapsed` being constant at
+  301-309 ms against a 300 ms deadline across 0-12 CPU hogs: the timer was never late, only the
+  pre-`t0` consumption moved, and ASan inflated that gap fourfold. Fixed by **moving the origin, not
+  widening the tolerance** — the tolerance was deleted. A second case with identical construction
+  and 21 ms of slack was fixed as latent and reported as latent.
+- **Isolate every shared surface, not the one that just bit you.** Two worktrees made the repository
+  safe; the shared scratchpad then cost an agent its mutation driver mid-round; then a fix round
+  entered a review worktree while the reviewer was still confirming it. **"Leave it byte-identical
+  and confirm it" is unsatisfiable if a second agent may enter before the confirmation is read.**
+
+### Costs and budgets for module 9
+
+- The suite is **68/68 in ~20 s Debug and ~60 s ASan at `-j4`**. Stop quoting serial figures.
+- `test_random`'s 2M-draw leg costs 3.05 s under ASan and the measurement shows it is load-bearing:
+  at 200,000 draws the biased 7-way statistic straddles the threshold and **the test would pass on a
+  biased build.** Sample size is a measurement, not a preference.
+- The two distribution tests are **statistical** — a ~1e-11 false-failure rate with clouds 30×
+  apart. Not a flake in any practical sense, but a different kind of test; whoever sees one fail
+  should know it was designed.
+- **Split fast/slow `ctest` tiers before adding another forking test.** The four slowest tests all
+  fork processes.
+- **`detect_leaks=0` for children: do not take it.** Measured here: this test forks nothing, `-j4`
+  was 0/12, and it would hide `ck-server`/`ck-client` exit-path leaks.
+- Add a **disk-space precondition** to the dev loop. The host hit 99 % twice and wedged the Docker
+  daemon, costing one review its ASan leg and one agent 17 minutes.
+- The build **hard-fails** without Go or the gorilla module, with `CLOAK_REQUIRE_GO=OFF` visibly
+  removing the test (68 → 67) rather than skipping it. Justified by a project-specific fact — the
+  suite count is part of the contract, so a skip here is invisible. **Do not cite it as a general
+  precedent.**
+
+### Out of scope, carried forward
+
+Module 8b is the client's CDN leg: Go's `WSOverTLS` does a real uTLS handshake, this tree links
+`libcrypto` without `libssl`, and the choice between an OpenSSL ClientHello and mimicking Chrome is
+a product decision about the fingerprint, not an engineering one. Also unverified: a Go **server**
+against our CDN client, HTTP/2 downgrade, and a real CDN's coalescing.
+
+### Tally
+
+Fifty-eight coverage defects across seven branches became **sixty-eight across eight**, plus one
+interoperability defect and four distribution biases that no coverage metric would have named. Every
+one was found by measuring or mutating. **None was found by reading.**

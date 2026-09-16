@@ -5,6 +5,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     libssl-dev \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# A Go toolchain, for one reason: module 8's tests need an implementation
+# nobody here wrote. Every test in the first seven modules had our code on
+# both ends, which is exactly how this port shipped a framing defect that
+# survived five modules -- a round-trip test cannot see a self-consistent
+# error. gorilla/websocket is a fussy, independently written RFC 6455
+# validator, and Go's own client is the reference this port is a port of.
+#
+# Debian bookworm's golang-go is 1.19, older than gorilla v1.5.3's floor,
+# so the official tarball is used instead. The module is pre-downloaded
+# into the image's module cache so the test build needs no network.
+ARG GO_VERSION=1.25.6
+ARG GORILLA_VERSION=v1.5.3
+RUN arch="$(dpkg --print-architecture)" \
+    && curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" \
+       -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:$PATH
+ENV GOPATH=/go GOMODCACHE=/go/pkg/mod GOFLAGS=-mod=mod
+RUN mkdir -p /go/src/oracle && cd /go/src/oracle \
+    && go mod init oracle >/dev/null \
+    && go get "github.com/gorilla/websocket@${GORILLA_VERSION}" \
+    && go mod download all
 
 WORKDIR /src

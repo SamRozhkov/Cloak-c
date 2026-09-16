@@ -11,6 +11,8 @@
 #include "cloak/clienthello_parse.h"
 #include "cloak/common.h"
 #include "cloak/crypto.h"
+#include "cloak/ws_frame.h"
+#include "cloak/ws_handshake.h"
 
 /* Forward-declared: armed both at accept (the first-packet read deadline)
  * and again in conn_on_firstpacket_done (the reply-write/hand-off
@@ -235,10 +237,45 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
 /* Steps 1-9 of the task-2 brief's authenticated path, in order, with the
  * reason each is where it is:
  *
- *  1. Only CLOAK_FIRSTPACKET_TRANSPORT_TLS proceeds --
- *     CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET has no consumer until the CDN
- *     module exists (cloak/firstpacket.h says so).
- *  2. cloak_clienthello_parse over the already-framed record.
+ *  1. THE TRANSPORT BRANCH, and -- on the CDN path -- THE WHOLE UPGRADE
+ *     VALIDATED IN ONE PASS BEFORE ANYTHING ELSE HAPPENS.
+ *
+ *     CLOAK_FIRSTPACKET_TRANSPORT_TLS takes step 2 below.
+ *     CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET takes cloak_ws_handshake_parse
+ *     instead, which extracts the auth material from the `Hidden` header
+ *     AND checks the method, `Connection`, `Upgrade`,
+ *     `Sec-WebSocket-Version` and `Sec-WebSocket-Key` -- all of it, here,
+ *     before step 6 authorises a UID or the panel is touched. Anything
+ *     else redirects, exactly as an unrecognised protocol does.
+ *
+ *     THE ORDER IS THE POINT, AND IT DIVERGES FROM GO DELIBERATELY. Go
+ *     splits the same work in two and runs it in the opposite order:
+ *     processFirstPacket (internal/server/websocket.go:22-41) reads
+ *     `hidden` and NOTHING else, dispatchConnection then authorises the
+ *     UID, makes the user active and calls finishHandshake -- and only
+ *     inside that does gorilla's Upgrader.Upgrade finally check
+ *     `Connection`, `Sec-WebSocket-Key` and `Origin`. When that last
+ *     check fails, websocketAux.go:129-138 returns WITHOUT sending on the
+ *     unbuffered `finished` channel that websocket.go:47-50 is already
+ *     blocked on, so the goroutine, the socket and the ActiveUser
+ *     bookkeeping leak PERMANENTLY. Three reachable triggers were
+ *     reproduced (module 8 scouting report, section 6.5): a CDN that
+ *     rewrites `Connection`, one that regenerates a malformed
+ *     `Sec-WebSocket-Key`, and one that injects an `Origin` header --
+ *     each of which wedges every connection through that CDN.
+ *
+ *     Validating here makes a malformed upgrade an ordinary redirect,
+ *     which is both the fix for that leak and the better mimicry: the
+ *     origin must look identically like a web server whether the GET
+ *     carried a bad `Hidden` or a bad `Upgrade`. Nothing below this point
+ *     may branch on WHICH check refused -- see step 6's own paragraph on
+ *     why every refusal on this path is one indistinguishable outcome.
+ *  2. cloak_clienthello_parse over the already-framed record. TLS PATH
+ *     ONLY; the CDN path has no ClientHello and gets the same three
+ *     32-byte quantities out of the decoded `Hidden` payload instead
+ *     (randPubKey || ciphertextWithTag, split 32/32/32 -- Go's own
+ *     unmarshalHidden, internal/server/websocket.go:76-99, feeding the
+ *     SAME decryption the TLS path uses at auth.go:37).
  *  3. cloak_server_check_replay against the RAW, not-yet-authenticated
  *     ch.random -- BEFORE any decryption, so a replayed handshake is
  *     rejected without the server doing any asymmetric work (both
@@ -276,11 +313,41 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     exactly the path an unrecognised protocol takes. No logging, no
  *     early close, no distinct branch: a prober holding no valid
  *     credentials must not be able to tell "no such user" from "not a
- *     Cloak server". The one difference an attacker could in principle
- *     measure is that the get_user path runs a SQLite lookup an
- *     unparseable first packet never reaches -- inherent to having a
- *     user database at all (Go pays the same cost on the same path), and
- *     not something a branch here creates.
+ *     Cloak server".
+ *
+ *     THE ONE DIFFERENCE THAT REMAINS IS A TIMING ONE, AND IT IS
+ *     MEASURED RATHER THAN HAND-WAVED. A refusal HERE runs an X25519
+ *     shared secret, an AES-GCM open and a SQLite lookup that a refusal
+ *     at step 1 (an unparseable first packet, a rewritten `Connection`
+ *     header) never reaches. On an idle host the two groups separate
+ *     cleanly: step-1 refusals cluster at 175-205 us with a 3-9 us
+ *     spread between them, while a step-6 refusal sits at 300-340 us --
+ *     a ~130 us gap against a ~6 us intra-group spread. Under load they
+ *     overlap entirely. libcloak-server/tests/test_dispatcher_ws.c
+ *     prints both figures on every run.
+ *
+ *     IT IS INHERENT, and Go pays the same cost on the same path: any
+ *     server with a user database does work for a plausible UID that it
+ *     does not do for a malformed request. What bounds it is not the
+ *     code but WHO CAN SEE IT. This transport's only leg is behind a
+ *     CDN, so a remote prober's measurement passes through the CDN's own
+ *     queuing, connection reuse and TLS variance -- orders of magnitude
+ *     above 130 us, and not something more samples average away, because
+ *     the noise is not independent of the probe. An attacker positioned
+ *     to time the ORIGIN directly has already found the origin, which is
+ *     the thing this transport exists to hide; at that point the side
+ *     channel is not the exposure.
+ *
+ *     THE OBVIOUS CLOSURE IS A TRADE, NOT AN IMPROVEMENT, and is
+ *     deliberately not taken: a jittered floor on conn_start_redirect's
+ *     dial (say uniform 0-2 ms) would submerge the signal for a timer
+ *     and no work, and unlike the other obvious idea -- running the
+ *     database lookup on every refusal -- it hands an attacker no free
+ *     query per junk byte. But it would also stop the origin's latency
+ *     distribution looking like the web server it is pretending to be,
+ *     which may be a worse fingerprint than the one it fixes. Nobody
+ *     should add it without first measuring what the cover site's own
+ *     distribution looks like.
  *
  *     WHAT STEP 6 OWES THE PANEL: cloak_userpanel_get_user makes the
  *     user ACTIVE, and cloak/userpanel.h requires that user to acquire
@@ -371,10 +438,41 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *         anywhere reports it.
  *     8c. Run the owner's prepare_session callback (if any), then
  *         cloak_server_registry_get_or_create.
- *  9. cloak_server_auth_compose_reply with a fresh nonce, a fresh pad4,
- *     and a cert length chosen uniformly from cloak_server_auth_cert_lens
- *     (a DPI-plausibility measure -- a fixed length would itself be a
- *     fingerprint).
+ *  9. THE REPLY, whose SHAPE is the other thing the transport decides.
+ *
+ *     TLS: cloak_server_auth_compose_reply with a fresh nonce, a fresh
+ *     pad4, and a cert length chosen uniformly from
+ *     cloak_server_auth_cert_lens (a DPI-plausibility measure -- a fixed
+ *     length would itself be a fingerprint). "Uniformly" is accurate as
+ *     of the cloak_random_below fix and was not before it: the pick was a
+ *     random byte modulo 7, skewed 1.028x, while the word said otherwise
+ *     in two places in this file. The distribution is pinned by
+ *     libcloak-common/tests/test_random.c. The 60 bytes that actually
+ *     matter are SCATTERED across a fake ServerHello and followed by two
+ *     more records.
+ *
+ *     CDN: the 101 response (cloak_ws_handshake_compose_101, over the
+ *     accept computed from the key this request carried) immediately
+ *     followed by ONE unmasked binary WebSocket frame carrying
+ *     cloak_server_auth_compose_ws_reply's flat 60 bytes -- 129 + 2 + 60
+ *     = 191 bytes in ONE c->reply buffer. That coalescing is deliberate
+ *     and it is safe for a measured reason, not a hopeful one: a gorilla
+ *     client handles a single write carrying both, because
+ *     http.ReadResponse reads the 101 from the same buffered reader the
+ *     frame reader then continues from. Step 10 does not care either way
+ *     -- it is a send() loop over an opaque byte buffer -- so the CDN
+ *     path needs no new write machinery, only different bytes.
+ *
+ *     But coalescing is an OPTIMISATION, not a correctness requirement,
+ *     and that distinction was measured rather than assumed: a gorilla
+ *     client also accepts the same bytes split 129|62 with a 5 ms gap,
+ *     split every 40 bytes with 5 ms gaps, and split 129|62 with a
+ *     100 ms gap. Only REVERSING the order fails, which is the control
+ *     that gives those passes meaning. So a future change that splits
+ *     this write -- a partial send(), a different buffer strategy -- is
+ *     not a protocol break. Do not read the paragraph above as a reason
+ *     the two pieces must travel together; they must only travel in
+ *     order.
  *
  * On success, fills c->reply/reply_len and c->auth_* (consumed by
  * conn_continue_reply_write and conn_handoff, steps 10-11) and returns 0.
@@ -395,30 +493,93 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
     cloak_dispatcher_t *d = c->d;
     cloak_server_t *srv = d->cfg.srv;
 
-    /* 1. Transport. */
-    if (c->fp.transport != CLOAK_FIRSTPACKET_TRANSPORT_TLS) {
-        return -1;
-    }
-
-    /* 2. Parse. */
+    /* 1+2. The transport branch, and with it everything the wire format
+     * decides. Both arms end with the same three 32-byte quantities --
+     * the value the replay cache registers and the two halves of the
+     * 64-byte ciphertext+tag -- so steps 3 through 8 below are literally
+     * the same code for both transports, which is the point of arranging
+     * it this way rather than forking the whole function. */
     cloak_clienthello_parsed_t ch;
-    if (cloak_clienthello_parse(cloak_firstpacket_data(&c->fp), cloak_firstpacket_len(&c->fp),
-                                &ch) != 0) {
+    cloak_ws_hs_t hs;
+    const uint8_t *auth_random;
+    const uint8_t *auth_session_id_field;
+    size_t auth_session_id_field_len;
+    const uint8_t *auth_key_share_field;
+
+    /* Zeroed, not left indeterminate: hs.accept is read at step 9 only
+     * on the CDN arm, and a reader should not have to re-derive that to
+     * know this is safe. It costs 125 bytes of memset per handshake. */
+    memset(&hs, 0, sizeof(hs));
+
+    if (c->fp.transport == CLOAK_FIRSTPACKET_TRANSPORT_TLS) {
+        if (cloak_clienthello_parse(cloak_firstpacket_data(&c->fp), cloak_firstpacket_len(&c->fp),
+                                    &ch) != 0) {
+            return -1;
+        }
+        auth_random = ch.random;
+        auth_session_id_field = ch.session_id;
+        auth_session_id_field_len = ch.session_id_len;
+        auth_key_share_field = ch.x25519_key_share;
+    } else if (c->fp.transport == CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET) {
+        /* THE WHOLE UPGRADE, HERE, BEFORE ANY UID IS AUTHORISED -- see
+         * this function's own step-1 comment for the Go leak this
+         * ordering exists to avoid.
+         *
+         * EVERY NON-OK CODE IS THE SAME OUTCOME, and that is a
+         * REQUIREMENT this comparison exists to satisfy, not a
+         * convenience. Do not turn it into a switch, a log line, a
+         * counter or an early close, however tempting a diagnosis
+         * becomes. cloak_ws_handshake_parse is deliberately STRICTER
+         * than Go in exactly one place -- it refuses bare-LF line
+         * endings that Go's net/http accepts and answers 101 to
+         * (measured; see test_ws_handshake.c's
+         * test_bare_lf_line_endings_are_refused) -- and that divergence
+         * was waived on the sole condition that nothing downstream can
+         * tell CLOAK_WS_HS_ERR_MALFORMED from CLOAK_WS_HS_ERR_BAD_HIDDEN.
+         * Bare LF is the one input class that separates them. The moment
+         * this branch distinguishes them, a prober can identify a Cloak
+         * origin by sending a bare-LF upgrade and comparing the answer
+         * to a plain web server's, and a harmless strictness becomes a
+         * live fingerprint. test_dispatcher_ws.c's
+         * test_three_refusals_are_indistinguishable carries a bare-LF
+         * arm for precisely this, and asserts its bytes and its timing
+         * against the others. */
+        if (cloak_ws_handshake_parse(cloak_firstpacket_data(&c->fp), cloak_firstpacket_len(&c->fp),
+                                     &hs) != CLOAK_WS_HS_OK) {
+            return -1;
+        }
+        /* Go's unmarshalHidden split (internal/server/websocket.go:76-99):
+         * hidden[0:32) is randPubKey -- both the ECDH input and the value
+         * the replay cache registers -- and hidden[32:96) is the 64-byte
+         * ciphertext+tag, which the TLS path happens to carry as two
+         * separate ClientHello fields. Passing it as the same two halves
+         * is what lets the SAME cloak_server_auth_decrypt serve both. */
+        auth_random = hs.hidden;
+        auth_session_id_field = hs.hidden + 32;
+        auth_session_id_field_len = 32;
+        auth_key_share_field = hs.hidden + 64;
+    } else {
+        /* CLOAK_FIRSTPACKET_TRANSPORT_UNKNOWN. Not reachable from
+         * cloak_firstpacket_t, which reports ERROR rather than DONE for
+         * an unrecognised first byte and never reaches this function --
+         * kept because "the enum grew a third real transport and this
+         * defaulted into one of the other two" is a strictly worse
+         * failure than a redirect. */
         return -1;
     }
 
     int64_t now = (int64_t)time(NULL);
 
     /* 3. Replay, against the raw random, before decrypting. */
-    if (cloak_server_check_replay(srv, ch.random, now)) {
+    if (cloak_server_check_replay(srv, auth_random, now)) {
         return -1;
     }
 
     /* 4. Decrypt. */
     cloak_server_clientinfo_t info;
     uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
-    if (cloak_server_auth_decrypt(ch.random, ch.session_id, ch.session_id_len,
-                                  ch.x25519_key_share, srv->cfg->private_key, now, &info,
+    if (cloak_server_auth_decrypt(auth_random, auth_session_id_field, auth_session_id_field_len,
+                                  auth_key_share_field, srv->cfg->private_key, now, &info,
                                   shared_secret) != 0) {
         return -1;
     }
@@ -534,21 +695,64 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
         }
     }
 
-    /* 9. Compose the reply: fresh nonce, fresh pad4, a uniformly chosen
-     * cert length. */
-    uint8_t reply_nonce[CLOAK_AEAD_NONCE_LEN];
-    uint8_t pad4[4];
-    cloak_random_bytes(reply_nonce, sizeof(reply_nonce));
-    cloak_random_bytes(pad4, sizeof(pad4));
+    /* 9. Compose the reply, in whichever of the two shapes this
+     * transport wants -- see this function's own step-9 comment. */
+    long n;
+    if (c->fp.transport == CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET) {
+        /* ONE BUFFER, TWO PIECES: the 101, then a single unmasked binary
+         * frame. Composed head-first so that a short c->reply (which
+         * cannot happen -- 191 against
+         * CLOAK_SERVER_AUTH_REPLY_MAX_BYTES' 256 -- but is still checked
+         * by each writer) refuses before anything is sealed. */
+        ssize_t r101 =
+            cloak_ws_handshake_compose_101(c->reply, sizeof(c->reply), hs.accept);
+        uint8_t ws_payload[CLOAK_SERVER_AUTH_WS_REPLY_LEN];
+        ssize_t hdr = -1;
+        if (r101 > 0 &&
+            cloak_server_auth_compose_ws_reply(ws_payload, session_key, shared_secret) == 0) {
+            /* The codec writes it, rather than this file spelling out
+             * 0x82 0x3C: one place decides what a Cloak WebSocket frame
+             * header looks like, and libcloak-mux/tests/test_ws_frame.c
+             * is where that decision is pinned against the RFC. NULL
+             * mask key -- RFC 6455 section 5.1 forbids a server masking,
+             * and gorilla hangs up on one that does. */
+            hdr = cloak_ws_frame_write_header(c->reply + r101, sizeof(c->reply) - (size_t)r101,
+                                              CLOAK_WS_OP_BINARY, 1, NULL,
+                                              CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+        }
+        if (r101 > 0 && hdr > 0 &&
+            (size_t)r101 + (size_t)hdr + CLOAK_SERVER_AUTH_WS_REPLY_LEN <= sizeof(c->reply)) {
+            memcpy(c->reply + r101 + hdr, ws_payload, CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+            n = (long)((size_t)r101 + (size_t)hdr + CLOAK_SERVER_AUTH_WS_REPLY_LEN);
+        } else {
+            n = -1;
+        }
+    } else {
+        uint8_t reply_nonce[CLOAK_AEAD_NONCE_LEN];
+        uint8_t pad4[4];
+        cloak_random_bytes(reply_nonce, sizeof(reply_nonce));
+        cloak_random_bytes(pad4, sizeof(pad4));
 
-    uint8_t cert_pick;
-    cloak_random_bytes(&cert_pick, 1);
-    size_t cert_len = cloak_server_auth_cert_lens[cert_pick % CLOAK_SERVER_AUTH_CERT_LEN_COUNT];
-    uint8_t fake_cert[DISPATCHER_MAX_FAKE_CERT_LEN];
-    cloak_random_bytes(fake_cert, cert_len);
+        /* cloak_random_below, not `one_random_byte % 7`. Go picks with
+         * possibleCertLengths[common.RandInt(len(possibleCertLengths))]
+         * (internal/server/TLS.go:48), which is uniform; 256 = 7*36 + 4,
+         * so the byte-modulo this line used to be drew four of the seven
+         * lengths 37/256 = 14.453 % of the time and the other three
+         * 36/256 = 14.063 %. A 1.028x ratio -- visible only to a prober
+         * willing to collect tens of thousands of cover-site replies, and
+         * fixed here anyway because it is the same defect as
+         * libcloak-mux/src/frame.c's padding length (2.009x, and that one
+         * mattered) and the word "uniformly" appears twice in this file's
+         * own prose above. See cloak/common.h. */
+        size_t cert_len =
+            cloak_server_auth_cert_lens[cloak_random_below(CLOAK_SERVER_AUTH_CERT_LEN_COUNT)];
+        uint8_t fake_cert[DISPATCHER_MAX_FAKE_CERT_LEN];
+        cloak_random_bytes(fake_cert, cert_len);
 
-    long n = cloak_server_auth_compose_reply(shared_secret, session_key, reply_nonce, ch.session_id,
-                                             pad4, fake_cert, cert_len, c->reply, sizeof(c->reply));
+        n = cloak_server_auth_compose_reply(shared_secret, session_key, reply_nonce, ch.session_id,
+                                            pad4, fake_cert, cert_len, c->reply,
+                                            sizeof(c->reply));
+    }
     if (n <= 0) {
         /* Unwind: this is the one failure in this function that can
          * happen AFTER step 8 created a session. created == 1 is the
@@ -577,6 +781,20 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
 
     c->reply_len = (size_t)n;
     c->reply_sent = 0;
+    /* WHAT STEP 11 MUST WRAP THIS SOCKET IN, decided here, where the
+     * transport is already in hand, rather than re-derived from
+     * c->fp.transport at the hand-off. Two reasons, and the second is
+     * the load-bearing one: there is then exactly one place in this file
+     * that maps a transport onto a framing mode, and the WRONG mapping
+     * is invisible to every round-trip test, because both ends agree
+     * whichever one they pick (cloak/conn.h's cloak_conn_framing_t says
+     * so at length). A TLS_RECORD conn on a WebSocket connection emits
+     * 0x17 0x03 0x03 <len> INSIDE a binary frame -- wire-incompatible
+     * with Go, and a perfect Cloak signature to anyone who can read
+     * inside the CDN's TLS. */
+    c->auth_framing = c->fp.transport == CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET
+                          ? CLOAK_CONN_FRAMING_WS_SERVER
+                          : CLOAK_CONN_FRAMING_TLS_RECORD;
     c->auth_created = created;
     c->auth_info = info;
     memcpy(c->auth_uid, info.uid, CLOAK_UID_LEN);
@@ -754,7 +972,14 @@ static void conn_handoff(cloak_dispatch_conn_t *c) {
         return;
     }
 
-    if (cloak_session_add_conn(sesh, fd) != 0) {
+    /* _framed, never cloak_session_add_conn: this connection's framing
+     * was decided at the end of dispatcher_authenticate (see the comment
+     * on c->auth_framing there), and the plain entry point would silently
+     * mean TLS records on a WebSocket socket. It is also the call whose
+     * zero value FAILS rather than defaulting, which is the one
+     * mechanical defence here that does not depend on anybody
+     * remembering anything -- see cloak/conn.h's cloak_conn_framing_t. */
+    if (cloak_session_add_conn_framed(sesh, fd, c->auth_framing) != 0) {
         /* The dispatcher still owns fd on failure (cloak_session_add_conn's
          * own contract). The client has already received a ServerHello by
          * this point -- the reply this connection just finished writing

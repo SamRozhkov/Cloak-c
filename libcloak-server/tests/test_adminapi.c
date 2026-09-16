@@ -1192,10 +1192,26 @@ static void test_large_response_is_delivered_completely(void) {
 /* Runs one listing request against a server pool of exactly `cap` bytes
  * and reports whether the response arrived complete. out_broken receives
  * the client session's broken flag, so a caller can tell "refused to
- * write" apart from "killed the connection". */
-static int listing_completes_at_cap(const char *tag, size_t cap, int *out_broken) {
+ * write" apart from "killed the connection".
+ *
+ * out_ran_out_of_time SEPARATES THE TWO WAYS A 0 CAN HAPPEN, because the
+ * bare return value cannot. An incomplete listing renders at the call
+ * site as `ASSERT_EQ_INT(1, ...) -> 1 != 0`, which reads as "the server
+ * gave the wrong answer" when it may equally mean "the pump budget
+ * expired while the server was still writing" -- and a failure whose text
+ * misdirects the next reader costs more than the bug it reports.
+ *
+ * The discriminator is evidence, not a threshold: a refusal writes
+ * NOTHING (the pool cap is too small to admit even one frame, so the
+ * response never starts and r.len stays 0), whereas a server that is
+ * merely slower than the budget has partial bytes on the wire. Measured
+ * on this image: the refusing cap yields 0 bytes, the passing cap yields
+ * 144927. No tolerance is involved in telling them apart. */
+static int listing_completes_at_cap(const char *tag, size_t cap, int *out_broken,
+                                    int *out_ran_out_of_time) {
     struct fixture fx;
     *out_broken = 0;
+    *out_ran_out_of_time = 0;
     if (fixture_init_opts(&fx, tag, cap, 0, 0, 0) != 0) {
         ASSERT_TRUE(0);
         return 0;
@@ -1229,7 +1245,22 @@ static int listing_completes_at_cap(const char *tag, size_t cap, int *out_broken
     ASSERT_EQ_INT((int)strlen(getreq),
                   (int)cloak_stream_write(st, (const uint8_t *)getreq, strlen(getreq)));
 
+    uint64_t pump_t0 = now_ms();
     int complete = pump_until(fx.reactor, resp_complete, &r, 1200, 5);
+    if (!complete) {
+        /* Say which of the two it was, in the output, at the moment the
+         * evidence still exists. r.len is gone by the time the caller's
+         * assertion prints. */
+        *out_ran_out_of_time = (r.len > 0);
+        fprintf(stderr,
+                "listing at cap \"%s\": no complete response after %llu ms of a 6000 ms "
+                "pump budget, with %zu response bytes read -- %s\n",
+                tag, (unsigned long long)(now_ms() - pump_t0), r.len,
+                r.len > 0 ? "the server was still WRITING, so this RAN OUT OF TIME "
+                            "rather than refusing"
+                          : "the server wrote NOTHING, so this is a REFUSAL rather "
+                            "than a timeout");
+    }
     if (complete) {
         /* Complete means INTACT, not merely terminated: a truncated or
          * gap-ridden body would satisfy a length check that only counted
@@ -1260,15 +1291,28 @@ static int listing_completes_at_cap(const char *tag, size_t cap, int *out_broken
 static void test_write_budget_boundary_is_exactly_one_worst_case_frame(void) {
     /* Exactly one worst-case frame: delivered, whole. */
     int broken_ok = 0;
-    ASSERT_EQ_INT(1, listing_completes_at_cap("budget-fits", BUDGET_ONE_FRAME, &broken_ok));
+    int fits_ran_out_of_time = 0;
+    ASSERT_EQ_INT(1, listing_completes_at_cap("budget-fits", BUDGET_ONE_FRAME, &broken_ok,
+                                              &fits_ran_out_of_time));
     ASSERT_EQ_INT(0, broken_ok);
+    /* Named so the FAIL line itself says which failure this was: if the
+     * listing did not arrive because the pump budget expired mid-write,
+     * that is a timing report about this machine, not a claim that the
+     * write budget is off by a frame. */
+    ASSERT_TRUE(!fits_ran_out_of_time);
 
     /* One byte short: refused. Not delivered, and -- the half that says
      * this is a refusal rather than a crash -- the session survives. */
     int broken_short = 0;
+    int short_ran_out_of_time = 0;
     ASSERT_EQ_INT(0, listing_completes_at_cap("budget-short", BUDGET_ONE_FRAME - 1u,
-                                              &broken_short));
+                                              &broken_short, &short_ran_out_of_time));
     ASSERT_EQ_INT(0, broken_short);
+    /* And the refusal must be a REFUSAL -- nothing written at all --
+     * rather than a write that merely lost a race with the budget. This
+     * strengthens the case: before, a slow-but-working server would have
+     * satisfied the expected 0 just as well as a refusing one. */
+    ASSERT_TRUE(!short_ran_out_of_time);
 }
 
 /* ---- 11. A stream abandoned mid-request is closed by its deadline -------- */
@@ -1295,11 +1339,31 @@ static void test_abandoned_stream_hits_its_deadline(void) {
     ASSERT_EQ_INT((int)strlen(half),
                   (int)cloak_stream_write(st, (const uint8_t *)half, strlen(half)));
 
+    /* THE ORIGIN IS TAKEN BEFORE THE STREAM CAN EXIST, and that is the
+     * entire reason this line sits above the pump rather than below it.
+     * The deadline is armed by cloak_reactor_add_timer at the moment the
+     * SERVER first sees the stream (src/adminapi.c), which happens inside
+     * the pump below. An origin taken after that pump therefore starts
+     * the stopwatch at an unknown point INSIDE the window it means to
+     * measure, and what it measures is DEADLINE_MS minus however long the
+     * server took to notice. A tolerance used to absorb that shortfall,
+     * and the shortfall outgrew it: measured on this image, the gap is
+     * 2-4 ms in Debug but 9-19 ms under ASan against a 20 ms allowance,
+     * and the sibling case below fired 6/6 under eight competing threads.
+     * Taken here, arming cannot precede t0, so `elapsed >= DEADLINE_MS`
+     * is exact and needs no allowance at all.
+     *
+     * This does not weaken the property. A stream reclaimed instantly by
+     * some other path leaves elapsed at the few milliseconds the setup
+     * costs, nowhere near DEADLINE_MS -- and the stream-count assertion
+     * between the two pumps independently proves the stream was still
+     * alive when the timed wait began. */
+    uint64_t t0 = now_ms();
+
     struct api_count_wait w = {&fx.api, 1};
     ASSERT_TRUE(pump_until(fx.reactor, api_streams_ge, &w, 400, 5));
     ASSERT_EQ_INT(1, (int)cloak_adminapi_stream_count(&fx.api));
 
-    uint64_t t0 = now_ms();
     w.want = 0;
     /* 400 turns of up to 5 ms is at least 2000 ms of budget, comfortably
      * more than DEADLINE_MS. */
@@ -1310,7 +1374,7 @@ static void test_abandoned_stream_hits_its_deadline(void) {
      * identically if the context were freed immediately for some other
      * reason -- and then it would be a test of nothing, named after a
      * deadline it never waited for. */
-    ASSERT_TRUE(elapsed + 20 >= (uint64_t)DEADLINE_MS);
+    ASSERT_TRUE(elapsed >= (uint64_t)DEADLINE_MS);
     ASSERT_EQ_INT(0, (int)cloak_adminapi_stream_count(&fx.api));
     /* The session context survives: one stream timing out is not the
      * session ending. */
@@ -1451,6 +1515,22 @@ static void test_deadline_bounds_the_write_half(void) {
     ASSERT_EQ_INT((int)strlen(req),
                   (int)cloak_stream_write(st, (const uint8_t *)req, strlen(req)));
 
+    /* Origin before the stream can exist, for the reason case 11 states
+     * at length -- and THIS is the case that proved it. Everything
+     * between arming and a later origin is charged against the deadline
+     * instead of against the test: here that is the server noticing the
+     * stream and composing an 800-user listing, which ASan slows by
+     * roughly 4x (2-4 ms in Debug, 9-19 ms under ASan). The old
+     * `elapsed + 20 >= WRITE_DEADLINE_MS` therefore ran with 4-13 ms of a
+     * 20 ms allowance left on an idle machine, and failed 6/6 with eight
+     * competing threads and 1/8 on a plain serial ASan suite run.
+     *
+     * The invariant that proved the server innocent, and that this
+     * rewrite preserves: gap + elapsed measured 301-309 ms against a
+     * 300 ms deadline across 0 to 12 competing threads. The timer is
+     * never late and never early; only the pre-origin consumption moved. */
+    uint64_t t0 = now_ms();
+
     /* Reach the stalled state, and prove it is stalled MID-RESPONSE
      * rather than mid-request -- a deadline that only covered the read
      * half would also reclaim a stream stuck before its headers ended,
@@ -1460,7 +1540,6 @@ static void test_deadline_bounds_the_write_half(void) {
     ASSERT_TRUE(pump_until(fx.reactor, server_mid_response, &fx, 300, 2));
     ASSERT_EQ_INT(1, server_mid_response(&fx));
 
-    uint64_t t0 = now_ms();
     w.want = 0;
     /* 400 turns of up to 5 ms is at least 2000 ms of budget, comfortably
      * more than WRITE_DEADLINE_MS. */
@@ -1470,8 +1549,10 @@ static void test_deadline_bounds_the_write_half(void) {
     /* THE DURATION IS THE ASSERTION, for the same reason it is in case
      * 11: without it this would pass identically if the context were
      * reclaimed immediately by some other path, and would then be a test
-     * of nothing, named after a deadline it never waited for. */
-    ASSERT_TRUE(elapsed + 20 >= (uint64_t)WRITE_DEADLINE_MS);
+     * of nothing, named after a deadline it never waited for. The
+     * server_mid_response assertion above is what proves the stream was
+     * still alive, and still mid-response, when the timed wait began. */
+    ASSERT_TRUE(elapsed >= (uint64_t)WRITE_DEADLINE_MS);
     ASSERT_EQ_INT(0, (int)cloak_adminapi_stream_count(&fx.api));
     /* The session survives: one stream timing out is not the session
      * ending. */

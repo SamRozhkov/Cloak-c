@@ -6,6 +6,26 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "cloak/ws_frame.h"
+
+/* How many payload bytes the client send path masks at a time on its way
+ * into send_q. The payload arrives as a const buffer the caller still
+ * owns, so it cannot be masked in place; it is copied through this stack
+ * chunk instead, which keeps the send path allocation-free.
+ *
+ * DELIBERATELY NOT A MULTIPLE OF FOUR. cloak/ws_frame.h singles out the
+ * running mask position as "the one thing implementations of this
+ * reliably get wrong": a loop that restarts the position at 0 for each
+ * chunk produces a frame whose first chunk decodes and whose every later
+ * chunk is garbage. If this constant were a multiple of 4 -- 1024, say --
+ * every chunk boundary would land on a key-cycle boundary, the bug would
+ * produce identical bytes, and NO TEST COULD EVER SEE IT. At 1022 the
+ * second chunk starts at key offset 2, so
+ * test_client_mask_position_runs_across_chunk_boundaries (which masks a
+ * 9001-byte payload and unmasks it by the RFC's absolute key[i & 3])
+ * fails immediately if the position stops running. */
+#define CONN_WS_MASK_CHUNK 1022u
+
 /* The interest mask this connection wants right now.
  *
  * READABLE is dropped for exactly one reason: the user's rx token bucket
@@ -130,7 +150,14 @@ static void conn_try_drain_send(cloak_conn_t *c) {
     }
 }
 
-static void conn_extract_and_dispatch(cloak_conn_t *c) {
+/* THE DIRECT PATH. Unchanged by the CDN work, and deliberately so: this
+ * function is what the 46-line comment at the top of cloak/conn.h is
+ * about, and libcloak-mux/tests/test_conn_record.c pins every byte of it.
+ * The WebSocket receive path below is a SEPARATE function reached through
+ * conn_extract_and_dispatch's switch, not a generalisation of this one --
+ * merging them would put the two disguises' logic in one place where a
+ * change to either could silently reach the other. */
+static void conn_tls_extract_and_dispatch(cloak_conn_t *c) {
     uint8_t header[CLOAK_CONN_RECORD_HEADER_LEN];
     for (;;) {
         size_t peeked = cloak_bytequeue_peek(&c->recv_acc, header, CLOAK_CONN_RECORD_HEADER_LEN);
@@ -160,6 +187,257 @@ static void conn_extract_and_dispatch(cloak_conn_t *c) {
         if (c->broken) {
             return; /* the callback may have torn c down re-entrantly */
         }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* The CDN path: RFC 6455 WebSocket framing                            */
+/* ------------------------------------------------------------------ */
+
+/* Enqueues one complete WebSocket frame: header written by the codec,
+ * payload copied (and masked, in the client direction) into send_q behind
+ * it. Shared by the data path (cloak_conn_send) and the control path
+ * (pong, close echo), because the masking rule is a property of which END
+ * we are, not of which opcode we are sending -- a control path that
+ * bypassed it would be rejected by gorilla exactly as a data frame would.
+ *
+ * Returns 0 if the whole frame was enqueued, -1 if it was refused. A
+ * refusal here always means the connection cannot carry what it was asked
+ * to carry, so every -1 path marks it broken; a partially-enqueued frame
+ * would be a corrupt stream, so the capacity check happens before the
+ * first byte is written and this function never enqueues part of one. */
+static int conn_ws_enqueue_frame(cloak_conn_t *c, cloak_ws_opcode_t op,
+                                 const uint8_t *payload, size_t payload_len) {
+    uint8_t key[4];
+    const uint8_t *keyp = NULL;
+    if (c->framing == CLOAK_CONN_FRAMING_WS_CLIENT) {
+        /* Fresh PER FRAME, from cloak_random_bytes. Not hoisted to a
+         * per-connection key: RFC 6455 section 5.3 requires a new one for
+         * every frame, and a reused key is invisible to any round-trip
+         * test because our own unmasking works just as well against a
+         * constant. */
+        cloak_ws_frame_mask_key(key);
+        keyp = key;
+    }
+    uint8_t header[CLOAK_WS_FRAME_MAX_HEADER_LEN];
+    ssize_t hn = cloak_ws_frame_write_header(header, sizeof(header), op, 1, keyp, payload_len);
+    if (hn < 0) {
+        conn_mark_broken(c);
+        return -1;
+    }
+    size_t total = (size_t)hn + payload_len;
+    if (cloak_bytequeue_free_space(&c->send_q) < total) {
+        conn_mark_broken(c); /* send queue's hard cap exceeded -- a connection failure */
+        return -1;
+    }
+    cloak_bytequeue_write(&c->send_q, header, (size_t)hn);
+    if (keyp == NULL) {
+        cloak_bytequeue_write(&c->send_q, payload, payload_len);
+    } else {
+        /* Masked BEFORE enqueueing, so send_q only ever holds finished
+         * bytes and a partial kernel write can never resume in the middle
+         * of a key cycle -- the shape cloak/ws_frame.h recommends. pos is
+         * threaded across chunks: it is the offset within the WHOLE
+         * payload, not within this chunk. See CONN_WS_MASK_CHUNK. */
+        uint8_t chunk[CONN_WS_MASK_CHUNK];
+        size_t pos = 0;
+        for (size_t off = 0; off < payload_len;) {
+            size_t n = payload_len - off;
+            if (n > sizeof(chunk)) {
+                n = sizeof(chunk);
+            }
+            memcpy(chunk, payload + off, n);
+            pos = cloak_ws_frame_mask(chunk, n, key, pos);
+            cloak_bytequeue_write(&c->send_q, chunk, n);
+            off += n;
+        }
+    }
+    return 0;
+}
+
+/* Reads one whole frame's worth of bytes out of recv_acc into dst, having
+ * already established that they are all present, and unmasks them if the
+ * peer masked. The mask position starts at 0 because dst holds the whole
+ * payload of THIS frame (a fragment's payload is masked from its own
+ * offset 0 -- masking is per frame, reassembly is per message). */
+static void conn_ws_take_payload(cloak_conn_t *c, const cloak_ws_frame_header_t *h,
+                                 uint8_t *dst, size_t payload_len) {
+    uint8_t skip[CLOAK_WS_FRAME_MAX_HEADER_LEN];
+    cloak_bytequeue_read(&c->recv_acc, skip, h->header_len);
+    if (payload_len > 0) {
+        cloak_bytequeue_read(&c->recv_acc, dst, payload_len);
+        if (h->masked) {
+            cloak_ws_frame_mask(dst, payload_len, h->mask_key, 0);
+        }
+    }
+}
+
+static void conn_ws_extract_and_dispatch(cloak_conn_t *c) {
+    /* Which way round the mask must be, from RFC 6455 section 5.1 and
+     * from gorilla's advanceFrame ("if c.isServer != mask": the same
+     * check, in the same place). A conn whose own end is the SERVER
+     * requires its peer -- a client -- to have masked. */
+    const int peer_must_mask = (c->framing == CLOAK_CONN_FRAMING_WS_SERVER);
+
+    for (;;) {
+        uint8_t hdrbuf[CLOAK_WS_FRAME_MAX_HEADER_LEN];
+        size_t peeked = cloak_bytequeue_peek(&c->recv_acc, hdrbuf, sizeof(hdrbuf));
+        cloak_ws_frame_header_t h;
+        ssize_t hn = cloak_ws_frame_parse_header(hdrbuf, peeked, &h);
+        if (hn == 0) {
+            return; /* header not complete yet -- wait for more bytes */
+        }
+        if (hn < 0) {
+            /* Malformed, NOT "incomplete". The codec reports an error as
+             * soon as the bytes that prove it are in hand precisely so
+             * that this branch exists: treating -1 as "wait for more"
+             * would let a peer pin the connection open forever with two
+             * bytes it has already invalidated. */
+            conn_mark_broken(c);
+            return;
+        }
+        if (h.masked != peer_must_mask) {
+            conn_mark_broken(c); /* RFC 6455 s5.1 -- gorilla's "bad MASK" */
+            return;
+        }
+
+        /* THE PAYLOAD LENGTH BOUND cloak/ws_frame.h says is owed by the
+         * caller, paid here, because this is the first layer on this path
+         * that owns a buffer.
+         *
+         * The codec reports payload_len EXACTLY AS THE PEER DECLARED IT
+         * and compares it to nothing: a header declaring
+         * 0x7FFFFFFFFFFFFFFF parses perfectly there, and its own tests
+         * pin that on purpose. The three pre-existing enforcers of
+         * CLOAK_CONN_MAX_FRAME_LEN -- cloak_conn_init,
+         * cloak_session_init, cloak_switchboard_init -- are all on the
+         * direct path and never see a byte that arrived through a
+         * WebSocket frame.
+         *
+         * Checked HERE, against the declaration alone, before a single
+         * payload byte is buffered on its behalf, and treated as a
+         * protocol violation rather than clamped -- exactly as the TLS
+         * path treats an over-long record length. It is a MIMICRY bound
+         * as much as a memory one (see CLOAK_CONN_MAX_FRAME_LEN's own
+         * comment): one oversized frame is a single-probe distinguisher.
+         *
+         * The comparison is in uint64_t, not size_t: payload_len is
+         * attacker-controlled and 64 bits wide even where size_t is 32,
+         * so narrowing first would truncate a hostile declaration into an
+         * acceptable one. */
+        if (h.payload_len > (uint64_t)c->max_frame_len) {
+            conn_mark_broken(c);
+            return;
+        }
+        size_t payload_len = (size_t)h.payload_len;
+        size_t total = h.header_len + payload_len;
+        if (cloak_bytequeue_len(&c->recv_acc) < total) {
+            return; /* the whole frame hasn't arrived yet */
+        }
+
+        if (h.opcode == CLOAK_WS_OP_PING || h.opcode == CLOAK_WS_OP_PONG ||
+            h.opcode == CLOAK_WS_OP_CLOSE) {
+            /* A control frame may be interleaved into a fragmented
+             * message (RFC 6455 s5.4), so its payload goes to a buffer of
+             * its own and the reassembly state above is left untouched.
+             * The codec has already refused any control frame longer than
+             * 125 bytes or lacking FIN, so this buffer cannot overflow. */
+            uint8_t ctl[CLOAK_WS_FRAME_MAX_CONTROL_PAYLOAD];
+            conn_ws_take_payload(c, &h, ctl, payload_len);
+            if (h.opcode == CLOAK_WS_OP_PING) {
+                /* A CDN pings idle WebSocket connections and hangs up
+                 * when no pong comes back, so this is load-bearing in
+                 * production and invisible in a lab. RFC 6455 s5.5.3: the
+                 * pong carries the ping's application data verbatim. */
+                if (conn_ws_enqueue_frame(c, CLOAK_WS_OP_PONG, ctl, payload_len) != 0) {
+                    return; /* already marked broken */
+                }
+                conn_try_drain_send(c);
+                if (c->broken) {
+                    return;
+                }
+                continue;
+            }
+            if (h.opcode == CLOAK_WS_OP_PONG) {
+                continue; /* unsolicited pongs are legal and carry nothing we want */
+            }
+            /* CLOSE. RFC 6455 s5.5.1 asks the receiving endpoint to send
+             * a Close in response; the status code is echoed back, which
+             * is what gorilla's default close handler does too. Enqueued
+             * and flushed BEFORE the connection is marked broken, since
+             * conn_mark_broken deregisters the fd and nothing would drain
+             * it afterwards. Best effort: a peer that has already gone
+             * away simply makes the write fail, which is the same outcome
+             * as the close itself. The frame is never delivered as
+             * session data -- a two-byte status code handed to the
+             * deobfuscator is a decryption failure reported as a corrupt
+             * peer rather than as a clean hang-up. */
+            (void)conn_ws_enqueue_frame(c, CLOAK_WS_OP_CLOSE, ctl, payload_len);
+            if (!c->broken) {
+                conn_try_drain_send(c);
+            }
+            conn_mark_broken(c);
+            return;
+        }
+
+        /* A data frame: BINARY, TEXT or CONTINUATION.
+         *
+         * TEXT is accepted as data rather than refused. Cloak only ever
+         * SENDS binary (cloak/ws_frame.h: the first header byte of every
+         * Cloak message is 0x82), but Go's WSOverTLS.Read takes whatever
+         * NextReader hands it and never inspects the message type, so
+         * refusing TEXT here would make this port fussier than the
+         * reference implementation -- itself a behavioural
+         * distinguisher, the same argument cloak/conn.h makes for not
+         * validating the TLS record's type byte. */
+        if (h.opcode == CLOAK_WS_OP_CONTINUATION) {
+            if (!c->ws_msg_active) {
+                conn_mark_broken(c); /* gorilla: "continuation after final frame" */
+                return;
+            }
+        } else if (c->ws_msg_active) {
+            conn_mark_broken(c); /* a new data message interleaved into an unfinished one */
+            return;
+        }
+
+        /* The bound again, on the REASSEMBLED total. The per-frame check
+         * above is not sufficient: three fragments of 200 bytes each
+         * individually satisfy a max_frame_len of 300 and together
+         * declare 600, which is the classic shape of a reassembly
+         * overflow. recv_scratch holds max_recv_envelope_len bytes, which
+         * is comfortably more than max_frame_len, but the bound enforced
+         * here is max_frame_len because that is the mimicry limit -- and
+         * because one WebSocket message is exactly one mux frame, so a
+         * longer message is not a frame this session could carry anyway. */
+        if (payload_len > c->max_frame_len - c->ws_msg_len) {
+            conn_mark_broken(c);
+            return;
+        }
+
+        conn_ws_take_payload(c, &h, c->recv_scratch + c->ws_msg_len, payload_len);
+        c->ws_msg_len += payload_len;
+        if (!h.fin) {
+            c->ws_msg_active = 1;
+            continue;
+        }
+
+        size_t msg_len = c->ws_msg_len;
+        c->ws_msg_len = 0;
+        c->ws_msg_active = 0;
+        if (c->on_envelope) {
+            c->on_envelope(c, c->recv_scratch, msg_len, c->on_envelope_userdata);
+        }
+        if (c->broken) {
+            return; /* the callback may have torn c down re-entrantly */
+        }
+    }
+}
+
+static void conn_extract_and_dispatch(cloak_conn_t *c) {
+    if (c->framing == CLOAK_CONN_FRAMING_TLS_RECORD) {
+        conn_tls_extract_and_dispatch(c);
+    } else {
+        conn_ws_extract_and_dispatch(c);
     }
 }
 
@@ -332,31 +610,109 @@ static void conn_reactor_cb(cloak_reactor_t *r, int fd, uint32_t events, void *u
     }
 }
 
+/* The number of framing bytes one frame of payload_len costs, in the
+ * given direction. RFC 6455 section 5.2: two fixed bytes, plus the
+ * extended length (none for 0..125, two for 126..65535 -- an 8-byte form
+ * exists but max_frame_len can never reach it, since
+ * CLOAK_CONN_MAX_FRAME_LEN is 16640), plus four for the mask key when the
+ * frame is masked.
+ *
+ * One function for both directions and both purposes -- the send
+ * envelope, the receive envelope -- so that the two cannot drift. An
+ * earlier draft of this file sized the receive buffer off the SEND
+ * envelope, which is short by exactly the four mask bytes on a WS_SERVER
+ * conn: that is not an overflow but a deadlock, since a
+ * maximum-size incoming frame never completes, so nothing is consumed, so
+ * room never appears. */
+static size_t conn_ws_envelope_len(size_t payload_len, int masked) {
+    size_t n = 2;
+    if (payload_len > CLOAK_WS_FRAME_MAX_CONTROL_PAYLOAD) {
+        n += 2;
+    }
+    if (masked) {
+        n += 4;
+    }
+    return n + payload_len;
+}
+
 int cloak_conn_init(cloak_conn_t *c, int fd, cloak_reactor_t *reactor,
                      size_t max_frame_len, size_t send_queue_cap,
                      cloak_conn_envelope_cb on_envelope, void *on_envelope_userdata,
                      cloak_conn_closed_cb on_closed, void *on_closed_userdata) {
+    /* The direct path's constructor, kept at its original signature so
+     * that every existing call site is untouched by the CDN work and
+     * cannot be forgotten INTO the wrong mode -- only into a construction
+     * failure, which is what the config form below is for. */
+    cloak_conn_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.fd = fd;
+    cfg.reactor = reactor;
+    cfg.max_frame_len = max_frame_len;
+    cfg.send_queue_cap = send_queue_cap;
+    cfg.framing = CLOAK_CONN_FRAMING_TLS_RECORD;
+    cfg.on_envelope = on_envelope;
+    cfg.on_envelope_userdata = on_envelope_userdata;
+    cfg.on_closed = on_closed;
+    cfg.on_closed_userdata = on_closed_userdata;
+    return cloak_conn_init_cfg(c, &cfg);
+}
+
+int cloak_conn_init_cfg(cloak_conn_t *c, const cloak_conn_config_t *cfg) {
     memset(c, 0, sizeof(*c));
+    /* FIRST, before any other validation. A zeroed config is invalid in
+     * several ways at once (max_frame_len 0, send_queue_cap 0), and the
+     * diagnosis a caller gets should name the field they actually forgot
+     * rather than whichever one happened to be checked first. Ordering
+     * pinned by test_zeroed_config_fails_with_the_named_error case (a). */
+    if (cfg->framing != CLOAK_CONN_FRAMING_TLS_RECORD &&
+        cfg->framing != CLOAK_CONN_FRAMING_WS_CLIENT &&
+        cfg->framing != CLOAK_CONN_FRAMING_WS_SERVER) {
+        return CLOAK_CONN_ERR_INVALID_FRAMING;
+    }
+    int fd = cfg->fd;
+    cloak_reactor_t *reactor = cfg->reactor;
+    size_t max_frame_len = cfg->max_frame_len;
+    size_t send_queue_cap = cfg->send_queue_cap;
     if (max_frame_len == 0 || max_frame_len > CLOAK_CONN_MAX_FRAME_LEN || send_queue_cap == 0) {
         return -1;
     }
     c->fd = fd;
     c->reactor = reactor;
+    c->framing = cfg->framing;
     c->max_frame_len = max_frame_len;
-    c->max_envelope_len = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + max_frame_len;
-    c->on_envelope = on_envelope;
-    c->on_envelope_userdata = on_envelope_userdata;
-    c->on_closed = on_closed;
-    c->on_closed_userdata = on_closed_userdata;
+    if (cfg->framing == CLOAK_CONN_FRAMING_TLS_RECORD) {
+        c->max_envelope_len = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + max_frame_len;
+        c->max_recv_envelope_len = c->max_envelope_len;
+    } else {
+        /* We mask iff we are the client; our peer masks iff we are the
+         * server. The two envelopes therefore differ by the four mask
+         * bytes, in opposite directions -- which is why a WS_CLIENT
+         * conn's SEND envelope (16648 at CLOAK_CONN_MAX_FRAME_LEN) is
+         * larger than the TLS one (16645) while a WS_SERVER conn's
+         * (16644) is smaller. */
+        int we_mask = (cfg->framing == CLOAK_CONN_FRAMING_WS_CLIENT);
+        c->max_envelope_len = conn_ws_envelope_len(max_frame_len, we_mask);
+        c->max_recv_envelope_len = conn_ws_envelope_len(max_frame_len, !we_mask);
+    }
+    c->on_envelope = cfg->on_envelope;
+    c->on_envelope_userdata = cfg->on_envelope_userdata;
+    c->on_closed = cfg->on_closed;
+    c->on_closed_userdata = cfg->on_closed_userdata;
 
-    if (cloak_bytequeue_init(&c->recv_acc, 2 * c->max_envelope_len) != 0) {
+    if (cloak_bytequeue_init(&c->recv_acc, 2 * c->max_recv_envelope_len) != 0) {
         return -1;
     }
     if (cloak_bytequeue_init(&c->send_q, send_queue_cap) != 0) {
         cloak_bytequeue_destroy(&c->recv_acc);
         return -1;
     }
-    c->recv_scratch = (uint8_t *)malloc(c->max_envelope_len);
+    /* Sized off the RECEIVE envelope, which on a WS conn is the larger of
+     * the two and is also what an incoming frame's payload is bounded by.
+     * On the WS path this buffer holds the reassembled MESSAGE (at most
+     * max_frame_len bytes, enforced in conn_ws_extract_and_dispatch)
+     * rather than one envelope, and max_recv_envelope_len exceeds
+     * max_frame_len by the framing bytes in every mode. */
+    c->recv_scratch = (uint8_t *)malloc(c->max_recv_envelope_len);
     if (c->recv_scratch == NULL) {
         cloak_bytequeue_destroy(&c->recv_acc);
         cloak_bytequeue_destroy(&c->send_q);
@@ -409,6 +765,44 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
         conn_mark_broken(c); /* caller/config bug: frame too large for this conn */
         return -1;
     }
+    if (c->framing != CLOAK_CONN_FRAMING_TLS_RECORD) {
+        /* The CDN path. NO TLS RECORD HEADER: the real TLS session is
+         * outside this WebSocket, between us and the CDN, and supplies
+         * its own records. Emitting 0x17 0x03 0x03 <len> inside a
+         * WebSocket binary frame would be wire-incompatible with Go's
+         * WSOverTLS and, to anyone who can see inside the CDN's TLS, a
+         * perfect Cloak signature. See cloak_conn_framing_t.
+         *
+         * NO SECOND CEILING ON THE ENVELOPE HERE, and the omission is
+         * deliberate rather than forgotten -- a reader comparing this
+         * branch with the TLS one below will notice the asymmetry. A
+         * first draft did check conn_ws_envelope_len(frame_len, ...)
+         * against max_envelope_len, and that check could not fire:
+         * frame_len <= max_frame_len is established immediately above,
+         * conn_ws_envelope_len is monotonic in payload_len, and
+         * max_envelope_len IS conn_ws_envelope_len(max_frame_len, ...)
+         * for this same mode and the same we-mask expression. Deleting it
+         * left all 65 tests passing, which is the definition of a check
+         * nothing can pin -- and an unpinnable bound is exactly what
+         * cloak/conn.h warns rots into a false guarantee, the same
+         * reasoning that removed the redundant cancel in
+         * conn_mark_broken. The send queue's hard cap is still enforced,
+         * inside conn_ws_enqueue_frame, where the real header length is
+         * already known. (The TLS branch's equivalent ceiling is now
+         * equally unreachable, for the same reason: it predates the
+         * frame_len check above, which is what made it dead. It stays put
+         * because that path is byte-for-byte pinned by
+         * test_conn_record.c and is not this task's to disturb.) */
+        if (conn_ws_enqueue_frame(c, CLOAK_WS_OP_BINARY, frame_bytes, frame_len) != 0) {
+            return -1; /* already marked broken */
+        }
+        conn_try_drain_send(c);
+        /* Same reasoning as the TLS path below: a hard write failure
+         * discovered during THIS call means the bytes just enqueued will
+         * never be delivered, and reporting success would silently drop
+         * them. */
+        return c->broken ? -1 : 0;
+    }
     size_t total = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + frame_len;
     if (total > c->max_envelope_len) {
         conn_mark_broken(c); /* caller/config bug: frame too large for this conn */
@@ -445,6 +839,22 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
      * project's recurring UAF class) that happened to also exercise this
      * return-value path for the first time. */
     return c->broken ? -1 : 0;
+}
+
+size_t cloak_conn_envelope_len(const cloak_conn_t *c, size_t frame_len) {
+    if (c == NULL) {
+        return 0;
+    }
+    if (c->framing == CLOAK_CONN_FRAMING_TLS_RECORD) {
+        return (size_t)CLOAK_CONN_RECORD_HEADER_LEN + frame_len;
+    }
+    /* The same conn_ws_envelope_len cloak_conn_send uses to decide
+     * whether the frame fits, asked in the same direction (we mask iff
+     * we are the client). Sharing the function is the point: a meter
+     * that recomputed the envelope would be free to drift from the
+     * bytes actually emitted, which is precisely the failure this
+     * function exists to end. */
+    return conn_ws_envelope_len(frame_len, c->framing == CLOAK_CONN_FRAMING_WS_CLIENT);
 }
 
 void cloak_conn_set_valve(cloak_conn_t *c, cloak_valve_t *v) {

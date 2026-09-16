@@ -1,0 +1,75 @@
+THIRD-PARTY CODE, COPIED AND MODIFIED. READ THIS BEFORE TRUSTING ANYTHING
+UNDER THIS DIRECTORY.
+
+Upstream:   golang.org/x/crypto
+Version:    v0.37.0
+            (the exact version cbeuw/Cloak's own go.mod pins, which is the
+            point -- the oracle must run the Salsa20 the reference
+            implementation runs, not a nearby one)
+Licence:    BSD-3-Clause, ./LICENSE, plus ./PATENTS. Both are upstream's
+            own files, unmodified. Per-file copyright headers are intact
+            and must stay intact.
+Source:     https://cs.opensource.google/go/x/crypto/+/v0.37.0
+
+Packages copied, in full apart from the edit below:
+
+    ./salsa20          <- golang.org/x/crypto/salsa20
+    ./salsa20/salsa    <- golang.org/x/crypto/salsa20/salsa
+    ./alias            <- golang.org/x/crypto/internal/alias
+                          (pulled in because salsa20.go imports it;
+                          upstream's path has an extra `internal/` segment
+                          that this module cannot spell)
+
+THE ONE EDIT, and there is exactly one:
+
+    import "golang.org/x/crypto/internal/alias"   -> "oracle/internal/alias"
+    import "golang.org/x/crypto/salsa20/salsa"    -> "oracle/internal/salsa20/salsa"
+
+both in ./salsa20/salsa20.go. Nothing else was changed: no logic, no
+constants, no build tags, no file was renamed. `diff -r` against the
+upstream tarball for v0.37.0 should show those two lines and the removals
+noted below and nothing more.
+
+WHAT WAS REMOVED, and why that is not an edit to the crypto:
+
+    salsa20/salsa20_test.go        (139 lines)
+    salsa20/salsa/salsa_test.go     (54 lines)
+
+The CMake rule that builds this oracle only ever runs `go build`; `go test`
+is never run against this directory by anything in this repository. Those
+two files therefore ran nowhere, and a reader who found them would
+reasonably mistake them for coverage this tree does not have. No non-test
+file was touched.
+
+WHAT WAS DELIBERATELY *NOT* REMOVED:
+
+    salsa20/salsa/salsa20_amd64.s   (880 lines of assembly)
+    salsa20/salsa/salsa20_amd64.go
+
+This project's dev image is aarch64 (`go version` reports linux/arm64), so
+salsa20_noasm.go is what compiles here and the amd64 assembly is dead ON
+THIS MACHINE ONLY. It is live on any amd64 CI runner or contributor laptop.
+Deleting it would make a vendored cryptographic package silently
+architecture-dependent -- i.e. it would be a real modification to
+third-party crypto, disguised as tidying -- which is a strictly worse
+failure than carrying 880 lines nobody reads here.
+
+WHY A COPY AT ALL, rather than a module dependency. The dev image's module
+cache (GOMODCACHE=/go/pkg/mod) is populated by Dockerfile.dev with
+github.com/gorilla/websocket and nothing else, and the image has no
+network at build time, so `require golang.org/x/crypto v0.37.0` does not
+resolve. Adding it to the `go mod download` in Dockerfile.dev would remove
+this whole directory (~1,500 lines) for one line of Dockerfile, and that
+is the right long-term shape; it is recorded here as the alternative a
+reader should reach for rather than as a defence of the copy.
+
+WHY A COPY RATHER THAN A REIMPLEMENTATION -- which is the load-bearing
+reason and is not about convenience. This directory exists to be an
+ORACLE: an implementation of Cloak's wire format that this project did not
+write. The C side's Salsa20 has only round-trip tests of its own, so a
+hand-written Go Salsa20 would have been a second unverified implementation
+agreeing with the first, which is precisely the defect class the oracle was
+built to catch. Upstream's own bytes are the property being bought here.
+
+See ../cloak_upstream.go's edit list (E2) for how this package is reached
+from the oracle's own code.

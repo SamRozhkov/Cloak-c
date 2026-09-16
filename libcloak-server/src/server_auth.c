@@ -1,4 +1,9 @@
 #include "cloak/server_auth.h"
+/* cloak_random_bytes, for cloak_server_auth_compose_ws_reply's nonce --
+ * the one thing in this file that is not a pure function of its
+ * arguments. See that function's own header comment for why the nonce is
+ * drawn here rather than by the caller. */
+#include "cloak/common.h"
 #include "cloak/crypto.h"
 
 #include <string.h>
@@ -199,4 +204,66 @@ long cloak_server_auth_compose_reply(const uint8_t shared_secret[CLOAK_AEAD_KEY_
     p += 5 + fake_cert_len;
 
     return (long)(p - out);
+}
+
+int cloak_server_auth_compose_ws_reply(uint8_t out[CLOAK_SERVER_AUTH_WS_REPLY_LEN],
+                                        const uint8_t session_key[CLOAK_AEAD_KEY_LEN],
+                                        const uint8_t shared_secret[CLOAK_AEAD_KEY_LEN]) {
+    if (out == NULL || session_key == NULL || shared_secret == NULL) {
+        return -1;
+    }
+
+    /* SEALED INTO A LOCAL, THEN COPIED, AND THE ORDER IS THE WHOLE
+     * POINT -- this is the shape cloak_server_auth_compose_reply already
+     * uses (its own encrypted_session_key[48]) and the reason it uses
+     * it.
+     *
+     * cloak_aead_seal TAKES NO OUTPUT CAPACITY (cloak/crypto.h): it
+     * writes whatever the cipher produces into whatever buffer it is
+     * handed, and reports the count afterwards. So a length check after
+     * the call can only ever DETECT a mismatch -- the write has already
+     * happened. An earlier revision of this function sealed straight
+     * into out + 12 and then compared, with a comment claiming it
+     * prevented an overflow of the caller's 60 bytes. It could not: it
+     * would have detected that overflow, from inside the wreckage.
+     *
+     * What this shape actually buys, stated exactly, because the
+     * previous comment's overclaim is the defect being fixed:
+     *   - The buffer any surprise lands in is OURS, one stack frame
+     *     wide, not the caller's cloak_dispatch_conn_t::reply -- the
+     *     same blast-radius argument that makes the sibling's local
+     *     correct.
+     *   - The only write into the caller's buffer is a memcpy of a
+     *     COMPILE-TIME length, reached only after sealed_len has been
+     *     checked, so the caller's 60 bytes cannot be overrun by a
+     *     runtime value at all.
+     *   - A refusal leaves `out` BYTE-FOR-BYTE UNTOUCHED, which is now
+     *     part of this function's contract (see the header) rather than
+     *     an accident. The old shape handed a caller that got -1 a
+     *     buffer already full of plausible-looking reply bytes.
+     *
+     * The nonce is a local for the same reason and is copied with the
+     * rest, so "the nonce in out is the nonce that sealed this" stays
+     * one assignment rather than two. */
+    uint8_t nonce[CLOAK_AEAD_NONCE_LEN];
+    cloak_random_bytes(nonce, sizeof(nonce));
+
+    uint8_t sealed[CLOAK_SERVER_AUTH_WS_REPLY_LEN - CLOAK_AEAD_NONCE_LEN];
+    size_t sealed_len = 0;
+    if (cloak_aead_seal(CLOAK_AEAD_AES_256_GCM, shared_secret, nonce, NULL, 0, session_key,
+                        CLOAK_AEAD_KEY_LEN, sealed, &sealed_len) != 0) {
+        return -1;
+    }
+    /* Not defensive decoration: this is what gates the memcpy below.
+     * AES-256-GCM sealing 32 bytes always yields 48, so no input reaches
+     * it -- libcloak-server/tests/test_server_auth.c reaches it by
+     * interposing on cloak_aead_seal through -Wl,--wrap, and asserts
+     * both halves of what it promises (refusal, and `out` untouched). */
+    if (sealed_len != sizeof(sealed)) {
+        return -1;
+    }
+
+    memcpy(out, nonce, sizeof(nonce));
+    memcpy(out + CLOAK_AEAD_NONCE_LEN, sealed, sizeof(sealed));
+    return 0;
 }

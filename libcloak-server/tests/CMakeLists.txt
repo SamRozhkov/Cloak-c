@@ -8,6 +8,28 @@ target_include_directories(test_server_auth PRIVATE ${CMAKE_SOURCE_DIR}/libcloak
 target_link_libraries(test_server_auth PRIVATE cloak-server)
 add_test(NAME test_server_auth COMMAND test_server_auth)
 
+# -Wl,--wrap lets this binary interpose on cloak_aead_seal -- a function
+# of its OWN static archive, which LD_PRELOAD cannot reach (calls between
+# objects inside one executable are direct, never through the PLT) and
+# which a competing definition in this file cannot override (that is a
+# duplicate symbol at link time, not a preemption).
+#
+# It exists for one test: cloak_aead_seal takes no output capacity, so
+# cloak_server_auth_compose_ws_reply's "the sealed length really was 48"
+# check can only be exercised by a cipher that reports a different one,
+# and no real AES-256-GCM ever does. Without this the check is an
+# unreachable line that merely looks like safety -- the thing this tree's
+# cloak/http.h argues against -- and the mutation that deletes it is
+# indistinguishable from the original.
+#
+# GNU ld / lld only, which matches this project's GCC-on-Linux build (the
+# same assumption the ASan block below already documents). --wrap on a
+# symbol nothing references is silently harmless, so a future refactor
+# that stops calling cloak_aead_seal here degrades to a no-op rather than
+# a build failure; test_compose_ws_reply_round_trips asserts the
+# interposition actually fired, which is what catches that.
+target_link_options(test_server_auth PRIVATE -Wl,--wrap=cloak_aead_seal)
+
 add_executable(test_replay_cache test_replay_cache.c)
 target_include_directories(test_replay_cache PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_replay_cache PRIVATE cloak-server)
@@ -333,3 +355,99 @@ target_link_libraries(test_server_stack PRIVATE cloak-client)
 # produce that failure. See test_write_shim.c's own top-of-file comment.
 set_tests_properties(test_server_stack PROPERTIES
     ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")
+
+# The CDN upgrade parser. No sqlite3 and no client_harness.h: this is a
+# pure function over a byte buffer with no session, no reactor and no
+# socket anywhere near it, which is the same shape (and the same reason)
+# as libcloak-mux's test_ws_frame.
+add_executable(test_ws_handshake test_ws_handshake.c)
+target_include_directories(test_ws_handshake PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_ws_handshake PRIVATE cloak-server)
+add_test(NAME test_ws_handshake COMMAND test_ws_handshake)
+set_tests_properties(test_ws_handshake PROPERTIES TIMEOUT 120)
+
+# The CDN transport's dispatcher branch: the first test in this tree that
+# drives a real socket through cloak_dispatcher_accept carrying an HTTP
+# GET and gets a cloak_session_t out the other end. Links sqlite3
+# directly, on top of the transitive link cloak-server already provides,
+# for the same reason test_dispatcher_users.c and test_adminapi.c do: it
+# seeds a user row through cloak_usermanager_write so that "the panel was
+# not touched" is a claim about a user the server WOULD have authorised,
+# and cloak-server's PRIVATE sqlite3 link deliberately does not propagate
+# the include path its implementation uses.
+#
+# No client_harness.h and therefore no cloak-client: every request here is
+# an HTTP GET this file builds itself, and the one client-side
+# cloak_session_t it raises is built directly on cloak-mux's
+# cloak_session_add_conn_framed -- there is no CDN client transport to
+# drive until module 8's client half exists.
+add_executable(test_dispatcher_ws test_dispatcher_ws.c)
+target_include_directories(test_dispatcher_ws PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_ws PRIVATE cloak-server sqlite3)
+add_test(NAME test_dispatcher_ws COMMAND test_dispatcher_ws)
+set_tests_properties(test_dispatcher_ws PROPERTIES TIMEOUT 120)
+
+# The interoperability suite: the first test in this tree whose PEER was
+# not written by this project. It drives a real ck-server binary, a real
+# gorilla/websocket client, a gorilla server, and a hand-written
+# fragmenting proxy between the Go client and the C server.
+#
+# Declared here with the rest of libcloak-server's tests, but the two
+# things it needs that this directory cannot give it -- the ck-server
+# binary's path, and the Go oracle built from
+# tests/ws_interop_oracle/ -- are APPENDED at the end of the top-level
+# CMakeLists.txt, after cmd/ck-server has been added. Same reason this
+# file appends cloak-client below rather than folding it in: the existing
+# content stays byte-identical, and CMake resolves both at generate time.
+
+# CLOAK_REQUIRE_GO IS DEFINED HERE, NOT AT THE TOP OF THE ROOT LIST FILE,
+# because this is the first place that needs it and because the root file
+# is only ever appended to in this tree. An option() call defines a cache
+# entry that every later directory can read -- and a `-DCLOAK_REQUIRE_GO=OFF`
+# on the command line sets that entry before any option() runs, so where
+# the call sits does not change what the user gets.
+#
+# WHEN IT IS OFF, THE TEST IS REMOVED, NOT SKIPPED. `ctest` prints a
+# skipped test and a passing test the same way, and this project has been
+# burned by exactly that: a skip branch is indistinguishable from
+# coverage. Turning this off drops the suite from 68 tests to 67, visibly,
+# which is a contract change a reader can see in one line of output. It
+# exists because a top-level FATAL_ERROR means a C library project cannot
+# be CONFIGURED at all without a Go toolchain, which blocks packagers and
+# minimal CI images; ON remains the default because the 67 -> 68 count is
+# part of module 8's contract and this is the only test in the tree whose
+# peer is not our own code.
+option(CLOAK_REQUIRE_GO
+       "Build test_ws_interop, which needs a Go toolchain and gorilla/websocket. \
+Turning this OFF removes that test: the suite becomes 67 tests, not 68." ON)
+
+if(CLOAK_REQUIRE_GO)
+    # Links sqlite3 directly, on top of the transitive link cloak-server
+    # already provides, for the same reason test_dispatcher_ws.c does: the
+    # two in-process cases raise a real cloak_userpanel_t over a real
+    # cloak_usermanager_t, and cloak-server's PRIVATE sqlite3 link
+    # deliberately does not propagate the include path.
+    add_executable(test_ws_interop test_ws_interop.c)
+    target_include_directories(test_ws_interop PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+    target_link_libraries(test_ws_interop PRIVATE cloak-server sqlite3)
+    add_test(NAME test_ws_interop COMMAND test_ws_interop)
+
+    # THE BOUND IS SET FROM THE WORST FAILING RUN, NOT THE PASSING ONE.
+    # A passing run is ~1 s in Debug and ~3 s under ASan+UBSan (one
+    # ASan-instrumented ck-server plus seven short-lived Go processes, and
+    # ~335 in-process handshakes for the split-point case). What the number
+    # has to accommodate is a run in which something never answers: every
+    # wait inside the file is bounded by CLOCK_MONOTONIC, the longest
+    # single one being CHILD_MS, which test_ws_interop.c sets to 10 s
+    # against seven children -- so even a wholly unresponsive run finishes
+    # inside this timeout and reports its own named assertions rather than
+    # being truncated as "***Timeout" with the diagnosis cut off. This is a
+    # backstop, not the mechanism.
+    set_tests_properties(test_ws_interop PROPERTIES TIMEOUT 120)
+else()
+    message(WARNING
+        "CLOAK_REQUIRE_GO=OFF: test_ws_interop is NOT built. The suite is 67 "
+        "tests, not 68, and NOTHING then measures this port against an "
+        "implementation it did not write -- which is how it once shipped a "
+        "frame format no Go peer could read. Turn this back on to restore it.")
+endif()
