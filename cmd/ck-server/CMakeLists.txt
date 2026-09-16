@@ -19,4 +19,20 @@ target_compile_definitions(test_ck_server_cli
     PRIVATE CK_SERVER_PATH="$<TARGET_FILE:ck-server>")
 add_dependencies(test_ck_server_cli ck-server)
 add_test(NAME test_ck_server_cli COMMAND test_ck_server_cli)
-set_tests_properties(test_ck_server_cli PROPERTIES TIMEOUT 60)
+
+# THE BOUND IS SET FROM THE WORST *FAILING* RUN, NOT THE PASSING ONE.
+# This case forks ~40 real processes, and under ASan each one pays about
+# 0.9 s for LeakSanitizer's exit scan (measured: 5 runs of `-u` take 4.6 s
+# with leak detection and 0.11 s without). A passing run is therefore ~0.2 s
+# in Debug and ~40 s under ASan.
+#
+# What this number has to accommodate is a run in which the shutdown path
+# is broken: thirteen cases signal a child and reap it, each bounded by the
+# test's own SHUTDOWN_MS of 2 s, so the worst failing run is ~40 + 26 s.
+# At TIMEOUT 60 that run was reported as "***Timeout", truncated, with its
+# named assertions cut off -- which is exactly how a removed
+# cloak_reactor_stop presented before SHUTDOWN_MS existed. 120 s leaves the
+# failing run room to finish and SAY WHAT BROKE. Every wait inside the test
+# is bounded by CLOCK_MONOTONIC, so this is a backstop and not the
+# mechanism.
+set_tests_properties(test_ck_server_cli PROPERTIES TIMEOUT 120)
