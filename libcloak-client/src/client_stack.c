@@ -381,6 +381,39 @@ static cloak_client_browser_t stack_browser(cloak_browser_t b) {
     }
 }
 
+/* ONE SNI FOR THIS SESSION, drawn uniformly from ServerName together
+ * with every MockDomainList entry -- Go's randomServerName selection
+ * over its own list.
+ *
+ * THE GRANULARITY IS PER SESSION, AND THAT IS GO'S. A
+ * cloak_client_connector_t copies server_name at init, this module calls
+ * init exactly once per round, and a round produces exactly one session
+ * -- so choosing here is choosing per session. (An earlier note in this
+ * tree claimed Go chooses per CONNECTION and that this could therefore
+ * not be matched; that had the granularity backwards.)
+ *
+ * WHY IT MATTERS RATHER THAN BEING A NICETY: a client presenting one
+ * fixed SNI across every session it ever opens is more distinguishable
+ * than one that varies, and alt_names is parsed everywhere in this tree
+ * and was consumed nowhere. The literal "random" ServerName is the only
+ * configuration that was already varying, and it is not the default.
+ *
+ * One byte of randomness, reduced modulo a list of at most
+ * CLOAK_MAX_ALT_NAMES + 1 == 17 entries. The modulo bias that leaves is
+ * at most one part in fifteen between the first and last candidates, and
+ * it is spent on exactly the quantity the connector's own backoff spends
+ * a byte on: something that must merely not be constant. */
+static const char *stack_pick_server_name(const cloak_client_config_t *c) {
+    size_t n = c->num_alt_names + 1;
+    if (n <= 1) {
+        return c->server_name;
+    }
+    uint8_t r = 0;
+    cloak_random_bytes(&r, 1);
+    size_t i = (size_t)r % n;
+    return i == 0 ? c->server_name : c->alt_names[i - 1];
+}
+
 /* Starts ONE round of one bring-up: a fresh session id, a fresh
  * connector over the resolved remote, and the piper installed into the
  * session template it is about to copy.
@@ -406,7 +439,7 @@ static int stack_start_round(cloak_client_stack_t *s, stack_slot_t *sl, int by_r
     cc.session = &sl->sesh;
     cc.browser = stack_browser(c->browser);
     cc.transport = c->transport;
-    cc.server_name = c->server_name;
+    cc.server_name = stack_pick_server_name(c);
     memcpy(cc.server_pub, c->server_pub_key, CLOAK_X25519_KEY_LEN);
     memcpy(cc.uid, c->uid, CLOAK_UID_LEN);
     cc.proxy_method = c->proxy_method;
@@ -568,6 +601,41 @@ static void stack_conn_done(cloak_client_connector_t *c, cloak_client_connector_
     }
 }
 
+/* SHARED MODE: bring a replacement up after the live session broke.
+ *
+ * THE LADDER RESTARTS AT ROUND 1 rather than continuing the previous
+ * one: this session worked, so the network was fine a moment ago and
+ * treating the break as the fifth failure in a row would punish a client
+ * for a server that merely restarted.
+ *
+ * IT STILL WAITS ONE BASE INTERVAL, and that delay is not politeness.
+ * Re-dialling inside a millisecond of a session dying produces a dial
+ * storm against exactly the far end least able to absorb one -- and a
+ * server that closes sessions for a PERSISTENT reason (a terminated
+ * user, exhausted credit, a revoked UID) would otherwise have this
+ * client in a full-handshake hot loop against it, forever.
+ *
+ * THE REPLACEMENT SLOT IS SEEDED WITH THE DEAD SESSION'S ID before its
+ * first round, so that stack_pick_session_id excludes it: the
+ * replacement's id differs from the id it replaces STRUCTURALLY, not
+ * with probability 1 - 2^-32. That is the whole reason this is its own
+ * function rather than three lines inside stack_on_broken -- the seeding
+ * is a property that can be asserted directly, and a property nothing
+ * asserts is a property nothing has. */
+static void stack_schedule_replacement(cloak_client_stack_t *s, uint32_t dead_id) {
+    stack_slot_t *ns = stack_slot_new(s, NULL, 1);
+    if (ns == NULL) {
+        s->sessions_failed++;
+        stack_emit(s, CLOAK_CLIENT_STACK_EVENT_GAVE_UP, dead_id, 0, 0);
+        return;
+    }
+    ns->session_id = dead_id;
+    uint64_t delay = 0;
+    if (!stack_arm_round(s, ns, 2, &delay)) {
+        stack_give_up(s, ns);
+    }
+}
+
 /* THE PIPER'S chain -- the owner's link of the broken-session chain,
  * invoked AFTER the piper has stopped every relay bound to the dying
  * session, which is the only window in which that was still possible.
@@ -593,33 +661,8 @@ static void stack_on_broken(cloak_session_t *sesh, void *userdata) {
         return;
     }
 
-    /* SHARED: bring a replacement up, with a FRESH id and a delay.
-     *
-     * THE LADDER RESTARTS AT ROUND 1 rather than continuing the previous
-     * one: this session worked, so the network was fine a moment ago and
-     * treating the break as the fifth failure in a row would punish a
-     * client for a server that merely restarted.
-     *
-     * IT STILL WAITS ONE BASE INTERVAL. Re-dialling inside a millisecond
-     * of a session dying produces a dial storm against exactly the far
-     * end least able to absorb one, and a server that closes sessions
-     * for a reason that persists would have this client in a hot loop.
-     *
-     * The replacement slot is SEEDED WITH THE DEAD SESSION'S ID before
-     * its first round, so that stack_pick_session_id excludes it: the
-     * replacement's id differs from the id it replaces structurally, not
-     * with probability 1 - 2^-32. */
-    stack_slot_t *ns = stack_slot_new(s, NULL, 1);
-    if (ns == NULL) {
-        s->sessions_failed++;
-        stack_emit(s, CLOAK_CLIENT_STACK_EVENT_GAVE_UP, dead_id, 0, 0);
-        return;
-    }
-    ns->session_id = dead_id;
-    uint64_t delay = 0;
-    if (!stack_arm_round(s, ns, 2, &delay)) {
-        stack_give_up(s, ns);
-    }
+    /* SHARED: bring a replacement up, with a FRESH id and a delay. */
+    stack_schedule_replacement(s, dead_id);
 }
 
 /* THE PIPER'S new_session -- singleplex only. One local connection has

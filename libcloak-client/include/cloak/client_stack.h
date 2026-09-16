@@ -329,24 +329,22 @@ typedef struct {
      *
      * WHICH FIELDS ARE CONSUMED, stated exhaustively because a field
      * that is silently ignored is worse than one that is rejected:
-     *   server_name, server_pub_key, uid, proxy_method,
-     *   encryption_method, browser, transport, num_conn, singleplex,
-     *   udp (-> the session's unordered flag), remote_host/remote_port
-     *   (resolved once, here), local_host/local_port (the listener),
-     *   stream_timeout_sec (-> the piper's first-byte deadline, which
-     *   is Go's own use of StreamTimeout in RouteTCP).
+     *   server_name TOGETHER WITH alt_names (Go's MockDomainList): one
+     *   SNI is drawn uniformly from the whole set PER SESSION, which is
+     *   Go's own granularity -- cloak_client_connector_t copies
+     *   server_name at init, this module calls init once per round, and
+     *   a round produces exactly one session. The literal "random" is
+     *   passed through unchanged and the transport regenerates it per
+     *   attempt, exactly as in Go.
+     *   server_pub_key, uid, proxy_method, encryption_method, browser,
+     *   transport, num_conn, singleplex, udp (-> the session's unordered
+     *   flag), remote_host/remote_port (resolved once, here),
+     *   local_host/local_port (the listener), stream_timeout_sec (-> the
+     *   piper's first-byte deadline, which is Go's own use of
+     *   StreamTimeout in RouteTCP).
      *
      * WHICH ARE NOT, and why -- this is a gap, recorded rather than
      * hidden:
-     *   alt_names (Go's MockDomainList). cloak_client_connector_t takes
-     *   ONE server_name and copies it at init, so honouring a list would
-     *   mean choosing per bring-up rather than per connection as Go
-     *   does. Neither matches the reference, and a wrong-in-a-new-way
-     *   fingerprint is worse than an honestly missing feature. Fixing it
-     *   belongs in the connector. server_name IS used; a config with
-     *   alt names still works, it just never draws from them. The
-     *   literal "random" is passed through and the transport regenerates
-     *   it per attempt, exactly as in Go.
      *   keep_alive_sec. Nothing in this port sets SO_KEEPALIVE yet.
      *   cdn_origin_host / cdn_ws_url_path. transport ==
      *   CLOAK_TRANSPORT_CDN is REJECTED at open (the connector rejects

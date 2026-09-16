@@ -68,7 +68,9 @@
 #include "cloak/reactor.h"
 #include "cloak/server_stack.h"
 #include "cloak/session.h"
+#include "cloak/stream.h"
 #include "cloak/switchboard.h"
+#include "cloak/valve.h"
 #include "cloak/userpanel.h"
 #include "test_framework.h"
 
@@ -853,12 +855,23 @@ static void round_trip(struct fixture *fx, client_t *cl, local_peer_t *lp, const
  * both sides of every comparison move with a mutation to the constant,
  * which is the shape this project has already paid for twice.
  *
- * THE JITTER IS PINNED ON BOTH SIDES. A one-sided (downward-only) jitter
- * -- which an earlier version of the connector's identical ladder
- * actually had -- satisfies "inside the window" perfectly; only the
- * requirement that the observed maximum EXCEEDS the nominal value catches
- * it. Likewise no jitter at all is caught by requiring the observed
- * minimum to fall BELOW it. */
+ * THE JITTER IS PINNED ON BOTH SIDES AND FOR ITS WIDTH, and the third of
+ * those is the one an earlier version of this file was missing. `d >= lo
+ * && d < hi` is a CONTAINMENT test, satisfied by any NARROWER jitter, and
+ * `seen_min < nominal` / `seen_max > nominal` pin only the sign of the
+ * spread. Measured: with the jitter cut from +/-25% to +/-5% this file
+ * stayed green three runs out of three -- which is the scenario the
+ * jitter exists for, a thousand clients behind one outage retrying in a
+ * 10% band instead of a 50% one, i.e. the dial storm back at five times
+ * the density. The two REACH assertions below therefore demand that the
+ * observed extremes get within a fifth of the nominal value of the
+ * documented window's edges: +/-5% cannot, +/-25% does with room, and a
+ * one-sided jitter still fails the upper one outright.
+ *
+ * The four-fifths and six-fifths are literals derived from "+/-25%" by
+ * hand, not from CLOAK_CLIENT_STACK_RECONNECT_JITTER_PCT: a bracket
+ * spelled in terms of the constant it is testing moves with the mutation
+ * instead of catching it. */
 #define LADDER_DRAWS 400
 
 static void ladder_bracket(uint64_t base, int round, uint64_t lo, uint64_t hi, uint64_t nominal) {
@@ -875,11 +888,13 @@ static void ladder_bracket(uint64_t base, int round, uint64_t lo, uint64_t hi, u
             seen_max = d;
         }
     }
-    /* Both sides of the jitter are actually reached. With 400 draws of a
-     * 256-bucket uniform, the chance of never seeing the bottom or the
-     * top decile is below 2^-60. */
-    ASSERT_TRUE(seen_min < nominal);
-    ASSERT_TRUE(seen_max > nominal);
+    /* THE SPREAD, not merely the direction. nominal * 4/5 is 0.8x and
+     * nominal * 6/5 is 1.2x: a +/-25% window reaches both (its edges are
+     * 0.75x and 1.25x, and 400 draws of a 256-bucket uniform miss the
+     * outer fifth of either tail with probability below 2^-100), while
+     * any window of +/-20% or less reaches neither. */
+    ASSERT_TRUE(seen_min < nominal * 4u / 5u);
+    ASSERT_TRUE(seen_max > nominal * 6u / 5u);
 }
 
 static void test_the_backoff_ladder_is_what_the_header_says(void) {
@@ -989,6 +1004,124 @@ static void test_the_session_id_predicate(void) {
     }
 }
 
+/* ---- the replacement's id is SEEDED, not merely likely to differ ------- */
+
+/* THE CLAIM THE HEADER AND THE COMMIT MESSAGE BOTH MAKE is that a
+ * reconnect's session id differs from the id it replaces STRUCTURALLY
+ * rather than with probability 1 - 2^-32, because the replacement slot
+ * carries the dead id while the new one is drawn. Nothing pinned that:
+ * deleting the seeding line leaves case 2's `id1 != id0` passing 4
+ * billion times out of 4 billion and one. Measured -- the deletion
+ * escaped three runs out of three before this case existed.
+ *
+ * So the seeding is asserted where it happens. stack_schedule_replacement
+ * is the whole of what stack_on_broken does for a shared session, and it
+ * needs nothing but a reactor, which is why it is its own function. */
+static void test_a_replacement_is_seeded_with_the_dead_id(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    cloak_client_stack_t s;
+    memset(&s, 0, sizeof(s));
+    s.self = &s;
+    s.reactor = r;
+    s.cfg.reconnect_base_ms = 1000;
+    s.cfg.max_rounds = CLOAK_CLIENT_STACK_ROUNDS_UNBOUNDED;
+
+    const uint32_t dead_id = 0xFACEB00Du;
+    stack_schedule_replacement(&s, dead_id);
+
+    /* A replacement really was created, it is the SHARED slot, it has not
+     * run a round yet, and its ladder is armed. */
+    ASSERT_TRUE(s.slots != NULL);
+    if (s.slots == NULL) {
+        cloak_reactor_destroy(r);
+        return;
+    }
+    ASSERT_EQ_INT(1, s.slots->shared);
+    ASSERT_EQ_INT(0, s.slots->round);
+    ASSERT_EQ_INT(1, (int)s.pending);
+    ASSERT_TRUE(s.slots->retry_timer != CLOAK_TIMER_INVALID);
+
+    /* THE SEED. Without this line the slot's id is 0 and the dead id is
+     * back in the pool. */
+    ASSERT_EQ_INT((int)dead_id, (int)s.slots->session_id);
+
+    /* AND THEREFORE the draw the next round makes cannot return it --
+     * over as many draws as the real thing will ever make in a lifetime
+     * of reconnects. This is the property; the line above is only how it
+     * is obtained. */
+    for (int i = 0; i < 20000; i++) {
+        ASSERT_TRUE(stack_pick_session_id(&s) != dead_id);
+    }
+
+    stack_slot_destroy(&s, s.slots);
+    ASSERT_TRUE(s.slots == NULL);
+    ASSERT_EQ_INT(0, (int)s.pending);
+    cloak_reactor_destroy(r);
+}
+
+/* ---- the SNI is drawn from ServerName together with MockDomainList ----- */
+
+/* alt_names is parsed everywhere in this tree and, until this round, was
+ * consumed nowhere: every session of every client presented one fixed
+ * SNI, which is more distinguishable than one that varies. The selection
+ * is per SESSION, which is Go's own granularity.
+ *
+ * Asserted here rather than end to end because no server in this project
+ * validates SNI, so an integration test could not tell a fixed name from
+ * a drawn one -- exactly the shape of test whose green comes from a path
+ * other than the one it names. */
+static void test_the_sni_is_drawn_from_the_whole_mock_domain_list(void) {
+    cloak_client_config_t c;
+    memset(&c, 0, sizeof(c));
+    snprintf(c.server_name, sizeof(c.server_name), "a.example.com");
+
+    /* NO alt names: always ServerName, and nothing is read past the end
+     * of an empty list. */
+    for (int i = 0; i < 256; i++) {
+        ASSERT_EQ_INT(0, strcmp("a.example.com", stack_pick_server_name(&c)));
+    }
+
+    snprintf(c.alt_names[0], sizeof(c.alt_names[0]), "b.example.com");
+    snprintf(c.alt_names[1], sizeof(c.alt_names[1]), "c.example.com");
+    c.num_alt_names = 2;
+
+    int seen[3] = {0, 0, 0};
+    for (int i = 0; i < 600; i++) {
+        const char *n = stack_pick_server_name(&c);
+        ASSERT_TRUE(n != NULL);
+        if (n == NULL) {
+            return;
+        }
+        if (strcmp(n, "a.example.com") == 0) {
+            seen[0]++;
+        } else if (strcmp(n, "b.example.com") == 0) {
+            seen[1]++;
+        } else if (strcmp(n, "c.example.com") == 0) {
+            seen[2]++;
+        } else {
+            ASSERT_TRUE(0); /* a name from outside the configured set */
+        }
+    }
+    /* All three reached. A selection that ignored the list, or that drew
+     * only from it, leaves one of these at zero; 600 draws over three
+     * candidates misses one with probability below (2/3)^600. */
+    ASSERT_TRUE(seen[0] > 0);
+    ASSERT_TRUE(seen[1] > 0);
+    ASSERT_TRUE(seen[2] > 0);
+    /* And roughly evenly: a byte reduced modulo 3 gives each candidate
+     * between 85 and 86 of 256 buckets, so ~200 +/- noise out of 600.
+     * The wide bound is the point -- this catches "always the first
+     * alt name", not a distribution claim. */
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(seen[i] > 100);
+    }
+}
+
 /* ---- case 1: the whole stack carries application bytes ------------------ */
 
 static const uint8_t CASE1_PAYLOAD[] = "case 1: an application's bytes, end to end";
@@ -1085,7 +1218,9 @@ static void test_a_dead_session_is_replaced_under_a_different_id(void) {
     cs_config(&cl, &fx, fx.front_port, 0, 1);
     cloak_client_stack_config_t sc;
     memset(&sc, 0, sizeof(sc));
-    sc.reconnect_base_ms = 100; /* the ladder is case 3's subject, not this one's */
+    /* 200 ms so the post-break delay below has a bracket wide enough to
+     * be read off event timestamps rather than off scheduling noise. */
+    sc.reconnect_base_ms = 200;
     char err[256] = {0};
     ASSERT_EQ_INT(0, cs_open(&cl, &fx, &sc, err, sizeof(err)));
     if (cl.st == NULL) {
@@ -1150,6 +1285,39 @@ static void test_a_dead_session_is_replaced_under_a_different_id(void) {
     ASSERT_EQ_INT(2, (int)cloak_client_stack_sessions_up(cl.st));
     ASSERT_EQ_INT(1, cl.counts[CLOAK_CLIENT_STACK_EVENT_SESSION_DOWN]);
     ASSERT_EQ_INT(2, cl.counts[CLOAK_CLIENT_STACK_EVENT_SESSION_UP]);
+
+    /* THE POST-BREAK DELAY, WITH A FLOOR. A replacement after a break
+     * restarts the ladder at round 1 but still waits one base interval,
+     * and that wait is not politeness: a server closing sessions for a
+     * PERSISTENT reason -- the terminated user this case just used --
+     * would otherwise put the client into a full-handshake hot loop
+     * against it. Measured: arming that round with zero delay escaped
+     * three runs out of three before this bracket existed, because
+     * everything else here only waits for the replacement to arrive.
+     *
+     * 200 ms base, jittered to [150, 250): the floor is what catches the
+     * hot loop, the ceiling catches a ladder that did not restart at
+     * round 1 (round 2's delay would be 400). Both literals. */
+    {
+        uint64_t down_at = 0;
+        uint64_t next_round_at = 0;
+        for (int i = 0; i < cl.event_count; i++) {
+            if (cl.events[i].ev == CLOAK_CLIENT_STACK_EVENT_SESSION_DOWN && down_at == 0) {
+                down_at = cl.events[i].at_ms;
+            } else if (down_at != 0 && next_round_at == 0 &&
+                       cl.events[i].ev == CLOAK_CLIENT_STACK_EVENT_ROUND_STARTED) {
+                next_round_at = cl.events[i].at_ms;
+                ASSERT_EQ_INT(1, cl.events[i].round); /* the ladder restarted */
+            }
+        }
+        ASSERT_TRUE(down_at != 0);
+        ASSERT_TRUE(next_round_at != 0);
+        uint64_t gap = next_round_at - down_at;
+        fprintf(stderr, "case 2 measured: replacement round started %llums after the break\n",
+                (unsigned long long)gap);
+        ASSERT_TRUE(gap >= 145);
+        ASSERT_TRUE(gap <= 330);
+    }
 
     /* AND EDGE E3: the replacement's template got the piper too. A
      * reconnect wired without it establishes and then carries nothing --
@@ -1778,6 +1946,121 @@ static void test_a_cancelled_bring_up_is_released_while_the_stack_runs(void) {
     ASSERT_EQ_INT(fds_before, count_open_fds());
 }
 
+/* ---- the template fields the stack promises to clear -------------------- */
+
+static int poison_calls;
+
+static void poison_broken(cloak_session_t *sesh, void *userdata) {
+    (void)sesh;
+    (void)userdata;
+    poison_calls++;
+}
+static void poison_new_stream(cloak_session_t *sesh, cloak_stream_t *st, void *userdata) {
+    (void)sesh;
+    (void)st;
+    (void)userdata;
+    poison_calls++;
+}
+static void poison_stream_data(cloak_session_t *sesh, cloak_stream_t *st, void *userdata) {
+    (void)sesh;
+    (void)st;
+    (void)userdata;
+    poison_calls++;
+}
+static void poison_writable(cloak_session_t *sesh, void *userdata) {
+    (void)sesh;
+    (void)userdata;
+    poison_calls++;
+}
+
+static const uint8_t POISON_PAYLOAD[] = "the template's ignored fields are cleared, not honoured";
+
+/* THE HEADER SAYS obfuscator, valve AND THE FOUR CALLBACKS ARE IGNORED,
+ * and fill_template_defaults clears them rather than merely documenting
+ * it. Nothing in this suite ever SET any of them, so every one of those
+ * clears was an equivalent mutant: the code was right and the test did
+ * not know it.
+ *
+ * WHAT THIS CASE CAN AND CANNOT KILL, said plainly rather than implied:
+ *
+ *   THE VALVE CLEAR IS THE ONE THAT IS OBSERVABLE, and it is the one that
+ *   matters. Nothing downstream overwrites it, so a valve left in the
+ *   template is installed into every session this client creates and
+ *   metered into -- through a pointer the caller may have popped off its
+ *   stack. Removing that clear makes the counter below non-zero.
+ *
+ *   THE OTHER FIVE ARE EQUIVALENT MUTANTS AND WILL STAY THAT WAY, for a
+ *   reason worth recording: cloak_client_piper_install overwrites all
+ *   four callbacks on the way to every connector, and the connector
+ *   overwrites the obfuscator with the agreed key. So the clears are
+ *   belt to install's braces. They are kept because "ignored" should be
+ *   TRUE at the point the header says it, not true only because
+ *   something later happens to rewrite it -- but a reader should not be
+ *   told these assertions pin something they do not. What the four
+ *   never-called assertions DO pin is install's own overwrite, which is
+ *   a different claim and a real one. */
+static void test_the_ignored_template_fields_are_cleared(void) {
+    int fds_before = count_open_fds();
+    struct fixture fx;
+    if (fixture_init(&fx) != 0) {
+        fixture_destroy(&fx);
+        return;
+    }
+
+    poison_calls = 0;
+    cloak_valve_t poison_valve;
+    memset(&poison_valve, 0, sizeof(poison_valve));
+
+    client_t cl;
+    cs_config(&cl, &fx, fx.front_port, 0, 1);
+    cloak_client_stack_config_t sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.session_template.on_broken = poison_broken;
+    sc.session_template.on_broken_userdata = &poison_calls;
+    sc.session_template.on_new_stream = poison_new_stream;
+    sc.session_template.on_new_stream_userdata = &poison_calls;
+    sc.session_template.on_stream_data = poison_stream_data;
+    sc.session_template.on_stream_data_userdata = &poison_calls;
+    sc.session_template.on_writable = poison_writable;
+    sc.session_template.on_writable_userdata = &poison_calls;
+    sc.session_template.valve = &poison_valve;
+    memset(&sc.session_template.obfuscator, 0xEE, sizeof(sc.session_template.obfuscator));
+    char err[256] = {0};
+    ASSERT_EQ_INT(0, cs_open(&cl, &fx, &sc, err, sizeof(err)));
+    if (cl.st == NULL) {
+        fixture_destroy(&fx);
+        return;
+    }
+
+    ASSERT_TRUE(pump_until(fx.reactor, cs_session_up, &cl, CS_MAX_TURNS, CS_TURN_MS));
+    local_peer_t lp;
+    ASSERT_EQ_INT(0, lp_open(&lp, fx.reactor, cloak_client_stack_local_port(cl.st)));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &lp, CS_MAX_TURNS, CS_TURN_MS));
+
+    /* THE TUNNEL STILL WORKS, which is what a poisoned obfuscator would
+     * have broken outright had the connector not replaced it. */
+    round_trip(&fx, &cl, &lp, POISON_PAYLOAD, sizeof(POISON_PAYLOAD));
+
+    /* NOTHING WAS METERED INTO THE CALLER'S VALVE: bytes crossed the
+     * session and this counter did not move. */
+    ASSERT_EQ_INT(0, (int)cloak_valve_rx(&poison_valve));
+    ASSERT_EQ_INT(0, (int)cloak_valve_tx(&poison_valve));
+
+    /* AND NONE OF THE FOUR CALLBACKS WAS EVER THE SESSION'S: the piper
+     * owns all four, which is edge E2 -- an owner's on_broken in this
+     * position is a use-after-free, not a customisation. */
+    ASSERT_EQ_INT(0, poison_calls);
+
+    lp_destroy(&lp);
+    cs_close(&cl);
+    /* The session breaking on close would have reached a poison
+     * on_broken had one survived. */
+    ASSERT_EQ_INT(0, poison_calls);
+    ASSERT_EQ_INT(0, (int)cloak_valve_rx(&poison_valve));
+    fixture_destroy(&fx);
+    ASSERT_EQ_INT(fds_before, count_open_fds());
+}
+
 /* ---- the configuration contracts ---------------------------------------- */
 
 /* Every rejection open can make, each asserted to produce ITS OWN code
@@ -1988,6 +2271,8 @@ TEST_MAIN_BEGIN()
 cloak_log_set_level(CLOAK_LOG_ERROR);
 test_the_backoff_ladder_is_what_the_header_says();
 test_the_session_id_predicate();
+test_a_replacement_is_seeded_with_the_dead_id();
+test_the_sni_is_drawn_from_the_whole_mock_domain_list();
 test_a_stack_carries_application_bytes_end_to_end();
 test_a_dead_session_is_replaced_under_a_different_id();
 test_the_backoff_is_observed_between_rounds();
@@ -1995,5 +2280,6 @@ test_singleplex_gives_each_connection_its_own_session();
 test_a_connection_whose_session_never_comes_up();
 test_teardown_at_every_stage();
 test_a_cancelled_bring_up_is_released_while_the_stack_runs();
+test_the_ignored_template_fields_are_cleared();
 test_the_configuration_contracts();
 TEST_MAIN_END()
