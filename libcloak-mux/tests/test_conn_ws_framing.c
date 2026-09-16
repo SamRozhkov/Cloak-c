@@ -668,24 +668,52 @@ static void test_client_mask_position_runs_across_chunk_boundaries(void) {
  *
  * The client envelope being LARGER than the TLS one is the specific
  * arithmetic an implementation that reused the TLS sizing would get
- * wrong, and it is checked explicitly below. */
+ * wrong, and it is checked explicitly below.
+ *
+ * AND THE RECEIVE ENVELOPE, WHICH IS NOT THE SAME NUMBER. We mask iff we
+ * are the client; our peer masks iff we are the server, so the four mask
+ * bytes land on the OPPOSITE side inbound and the two WS modes simply
+ * trade values:
+ *
+ *   max_frame_len 16640            send      receive
+ *     TLS_RECORD   5 + n           16645     16645   (symmetric)
+ *     WS_SERVER    2+2 [+4] + n    16644     16648   <- receive is LARGER
+ *     WS_CLIENT    2+2 [+4] + n    16648     16644   <- receive is SMALLER
+ *
+ * That asymmetry is stated here as a fact rather than left to be inferred
+ * from a stall. It is the whole reason max_recv_envelope_len exists: an
+ * earlier draft sized the receive buffer off max_envelope_len, which
+ * leaves a WS_SERVER conn four bytes short inbound -- not an overflow but
+ * a DEADLOCK, since a maximum-size frame never completes, so nothing is
+ * consumed, so room never appears.
+ *
+ * THE BRACKET ON max_recv_envelope_len IS TWO-SIDED, and only one side of
+ * it can be behavioural. Too SMALL is caught by the stall:
+ * test_recv_accumulator_holds_a_whole_inbound_frame at max_frame_len == 1
+ * is the case where recv_acc (two envelopes wide) stops hiding a -4, and
+ * it is the ONLY frame size that could find it -- the reachability
+ * condition is 2*(send envelope) < (receive envelope), i.e. n + e < 2.
+ * Too LARGE is pure over-allocation: it has no behavioural consequence at
+ * any frame size, so no test can bracket it from above and the literals
+ * below are the only thing that can. Hence the second assertion per case. */
 static void test_max_envelope_len_per_mode(void) {
     struct {
         cloak_conn_framing_t framing;
         size_t max_frame_len;
-        size_t expect;
+        size_t expect_send;
+        size_t expect_recv;
     } cases[] = {
-        {CLOAK_CONN_FRAMING_TLS_RECORD, 16640, 16645},
-        {CLOAK_CONN_FRAMING_WS_SERVER, 16640, 16644},
-        {CLOAK_CONN_FRAMING_WS_CLIENT, 16640, 16648},
-        {CLOAK_CONN_FRAMING_TLS_RECORD, 100, 105},
-        {CLOAK_CONN_FRAMING_WS_SERVER, 100, 102},
-        {CLOAK_CONN_FRAMING_WS_CLIENT, 100, 106},
+        {CLOAK_CONN_FRAMING_TLS_RECORD, 16640, 16645, 16645},
+        {CLOAK_CONN_FRAMING_WS_SERVER, 16640, 16644, 16648},
+        {CLOAK_CONN_FRAMING_WS_CLIENT, 16640, 16648, 16644},
+        {CLOAK_CONN_FRAMING_TLS_RECORD, 100, 105, 105},
+        {CLOAK_CONN_FRAMING_WS_SERVER, 100, 102, 106},
+        {CLOAK_CONN_FRAMING_WS_CLIENT, 100, 106, 102},
         /* 125/126 is the exact boundary of the inline length form. */
-        {CLOAK_CONN_FRAMING_WS_SERVER, 125, 127},
-        {CLOAK_CONN_FRAMING_WS_SERVER, 126, 130},
-        {CLOAK_CONN_FRAMING_WS_CLIENT, 125, 131},
-        {CLOAK_CONN_FRAMING_WS_CLIENT, 126, 134},
+        {CLOAK_CONN_FRAMING_WS_SERVER, 125, 127, 131},
+        {CLOAK_CONN_FRAMING_WS_SERVER, 126, 130, 134},
+        {CLOAK_CONN_FRAMING_WS_CLIENT, 125, 131, 127},
+        {CLOAK_CONN_FRAMING_WS_CLIENT, 126, 134, 130},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         int fds[2];
@@ -697,7 +725,8 @@ static void test_max_envelope_len_per_mode(void) {
         memset(&h, 0, sizeof(h));
         cloak_conn_t c;
         ASSERT_EQ_INT(init_conn(&c, fds[0], r, &h, cases[i].framing, cases[i].max_frame_len), 0);
-        ASSERT_EQ_INT((long long)c.max_envelope_len, (long long)cases[i].expect);
+        ASSERT_EQ_INT((long long)c.max_envelope_len, (long long)cases[i].expect_send);
+        ASSERT_EQ_INT((long long)c.max_recv_envelope_len, (long long)cases[i].expect_recv);
         cloak_conn_destroy(&c);
         cloak_reactor_destroy(r);
         close(fds[0]);
@@ -705,6 +734,10 @@ static void test_max_envelope_len_per_mode(void) {
     }
     /* Stated as its own assertion because it is the surprising one. */
     ASSERT_TRUE(16648 > 16645);
+    /* And the surprising one about the receive side: a WS_SERVER conn's
+     * inbound envelope is bigger than its outbound one, which is the
+     * direction the deadlock came from. */
+    ASSERT_TRUE(16648 > 16644);
 }
 
 /* THE MEASURED BRACKET, on the send side, at the real maximum: a frame of
@@ -1053,6 +1086,62 @@ static void test_orphan_continuation_is_rejected(void) {
     cloak_reactor_destroy(r);
     close(fds[0]);
     close(fds[1]);
+}
+
+/* The MIRROR IMAGE of the orphan CONTINUATION, and the more dangerous of
+ * the pair: a NEW DATA FRAME arriving while a fragmented message is still
+ * in progress (RFC 6455 s5.4 -- "the fragments of one message MUST NOT be
+ * interleaved between the fragments of another message"). gorilla refuses
+ * it too.
+ *
+ * What makes this worth its own test rather than a symmetry argument is
+ * the FAILURE MODE IF THE GUARD IS MISSING, which is not a rejected
+ * connection. Without it, the second frame's payload is appended to the
+ * first message's buffer and, because it carries FIN, the whole
+ * concatenation is handed to the deobfuscator AS ONE MUX FRAME: a corrupt
+ * frame delivered silently, reported downstream as a decryption failure
+ * or a corrupt peer, with nothing anywhere naming the real cause.
+ *
+ * And it is not a hostile-only shape. A CDN that re-fragments what it
+ * relays -- listed in the scouting report as EXPECTED behaviour on this
+ * path, not an attack -- is exactly the peer that rewrites frame
+ * boundaries, so this guard runs against ordinary traffic.
+ *
+ * Both non-CONTINUATION data opcodes are driven, since the guard is
+ * written as "anything that is not a CONTINUATION" and a version that
+ * only special-cased BINARY would pass a BINARY-only test. */
+static void test_new_data_frame_mid_fragmentation_is_rejected(void) {
+    const uint8_t interrupting_opcodes[] = {0x2 /* BINARY */, 0x1 /* TEXT */};
+    for (size_t i = 0; i < sizeof(interrupting_opcodes); i++) {
+        int fds[2];
+        ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
+        cloak_reactor_t *r = cloak_reactor_create();
+        ASSERT_TRUE(r != NULL);
+        if (r == NULL) return;
+        ws_harness_t h;
+        memset(&h, 0, sizeof(h));
+        cloak_conn_t c;
+        ASSERT_EQ_INT(init_conn(&c, fds[0], r, &h, CLOAK_CONN_FRAMING_WS_SERVER, MAX_FRAME_LEN), 0);
+
+        /* An unfinished message (FIN=0), then a brand-new data frame that
+         * does carry FIN. If the guard is gone the conn stays open and
+         * delivers 11 bytes -- "first" and "second" run together. */
+        const uint8_t first[] = "first";
+        const uint8_t second[] = "second";
+        uint8_t wire[128];
+        size_t n = build_ws_frame(wire, 0x2, 0, k_client_key, first, sizeof(first) - 1);
+        n += build_ws_frame(wire + n, interrupting_opcodes[i], 1, k_client_key,
+                            second, sizeof(second) - 1);
+        ASSERT_EQ_INT((long long)write(fds[1], wire, n), (long long)n);
+        PUMP_UNTIL(r, h.closed_count > 0 || h.received_count > 0);
+        ASSERT_EQ_INT(h.closed_count, 1);
+        ASSERT_EQ_INT(h.received_count, 0);
+
+        cloak_conn_destroy(&c);
+        cloak_reactor_destroy(r);
+        close(fds[0]);
+        close(fds[1]);
+    }
 }
 
 /* ================================================================== */
@@ -1639,6 +1728,7 @@ TEST_MAIN_BEGIN()
     test_continuation_frames_reassemble_into_one_message();
     test_continuation_reassembly_survives_byte_at_a_time_delivery();
     test_orphan_continuation_is_rejected();
+    test_new_data_frame_mid_fragmentation_is_rejected();
     test_ping_is_answered_with_a_pong_and_is_not_session_data();
     test_client_pong_is_masked();
     test_received_pong_is_ignored();

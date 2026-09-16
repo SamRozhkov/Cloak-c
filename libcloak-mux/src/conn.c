@@ -771,13 +771,28 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
          * its own records. Emitting 0x17 0x03 0x03 <len> inside a
          * WebSocket binary frame would be wire-incompatible with Go's
          * WSOverTLS and, to anyone who can see inside the CDN's TLS, a
-         * perfect Cloak signature. See cloak_conn_framing_t. */
-        size_t ws_total = conn_ws_envelope_len(frame_len,
-                                               c->framing == CLOAK_CONN_FRAMING_WS_CLIENT);
-        if (ws_total > c->max_envelope_len) {
-            conn_mark_broken(c);
-            return -1;
-        }
+         * perfect Cloak signature. See cloak_conn_framing_t.
+         *
+         * NO SECOND CEILING ON THE ENVELOPE HERE, and the omission is
+         * deliberate rather than forgotten -- a reader comparing this
+         * branch with the TLS one below will notice the asymmetry. A
+         * first draft did check conn_ws_envelope_len(frame_len, ...)
+         * against max_envelope_len, and that check could not fire:
+         * frame_len <= max_frame_len is established immediately above,
+         * conn_ws_envelope_len is monotonic in payload_len, and
+         * max_envelope_len IS conn_ws_envelope_len(max_frame_len, ...)
+         * for this same mode and the same we-mask expression. Deleting it
+         * left all 65 tests passing, which is the definition of a check
+         * nothing can pin -- and an unpinnable bound is exactly what
+         * cloak/conn.h warns rots into a false guarantee, the same
+         * reasoning that removed the redundant cancel in
+         * conn_mark_broken. The send queue's hard cap is still enforced,
+         * inside conn_ws_enqueue_frame, where the real header length is
+         * already known. (The TLS branch's equivalent ceiling is now
+         * equally unreachable, for the same reason: it predates the
+         * frame_len check above, which is what made it dead. It stays put
+         * because that path is byte-for-byte pinned by
+         * test_conn_record.c and is not this task's to disturb.) */
         if (conn_ws_enqueue_frame(c, CLOAK_WS_OP_BINARY, frame_bytes, frame_len) != 0) {
             return -1; /* already marked broken */
         }
