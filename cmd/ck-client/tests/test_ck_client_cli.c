@@ -49,6 +49,7 @@
  * immediately. */
 
 #include "cloak/base64.h"
+#include "cloak/config.h"
 #include "cloak/crypto.h"
 #include "test_framework.h"
 
@@ -63,6 +64,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -107,10 +109,49 @@ typedef struct {
     size_t out_len;
 } child_t;
 
+/* Closes everything above stderr in the freshly forked child, BEFORE exec.
+ * These are the TEST process's descriptors -- ctest's, the capture pipe's,
+ * the upstream listener's, whatever a future harness adds -- and every one
+ * of them that survived into ck-client would consume part of the
+ * descriptor budget the runtime-failure case measures, so the bracket
+ * would depend on who ran the test. Closing them makes the child's
+ * starting set exactly {0, 1, 2}, always. (The binary's own sanitizer
+ * runtime initialises after the exec, so nothing here touches it.)
+ *
+ * Borrowed from cmd/ck-server/tests/test_ck_server_cli.c, where the same
+ * budget argument was made first. */
+static void close_inherited_fds(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (d == NULL) {
+        return;
+    }
+    int keep = dirfd(d);
+    int doomed[256];
+    size_t n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && n < sizeof(doomed) / sizeof(doomed[0])) {
+        int fd = atoi(e->d_name);
+        if (fd > STDERR_FILENO && fd != keep) {
+            doomed[n++] = fd;
+        }
+    }
+    closedir(d);
+    for (size_t i = 0; i < n; i++) {
+        close(doomed[i]);
+    }
+}
+
 /* env is a NULL-terminated list of "NAME=VALUE" strings set in the child
- * only, so a case that does not ask for plugin mode cannot inherit it. */
-static int child_spawn(child_t *c, const char *path, char *const argv[],
-                       const char *const env[]) {
+ * only, so a case that does not ask for plugin mode cannot inherit it.
+ *
+ * nofile, when non-zero, is an RLIMIT_NOFILE applied to the child and to
+ * nothing else. It is how the runtime-failure exit code is reached from
+ * outside the program: ck-client's startup descriptor use is exact and
+ * ordered (epoll, then the local listener, then the signalfd), so a limit
+ * chosen one descriptor short of a given step makes exactly that step
+ * fail. See test_runtime_exit_code_and_the_descriptor_budget. */
+static int child_spawn_limited(child_t *c, const char *path, char *const argv[],
+                               const char *const env[], int nofile) {
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     int pipefd[2];
@@ -128,6 +169,15 @@ static int child_spawn(child_t *c, const char *path, char *const argv[],
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
+        if (nofile > 0) {
+            close_inherited_fds();
+            struct rlimit rl;
+            rl.rlim_cur = (rlim_t)nofile;
+            rl.rlim_max = (rlim_t)nofile;
+            if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+                _exit(126);
+            }
+        }
         if (env != NULL) {
             for (size_t i = 0; env[i] != NULL; i++) {
                 char buf[1024];
@@ -146,6 +196,11 @@ static int child_spawn(child_t *c, const char *path, char *const argv[],
     c->pid = pid;
     c->fd = pipefd[0];
     return 0;
+}
+
+static int child_spawn(child_t *c, const char *path, char *const argv[],
+                       const char *const env[]) {
+    return child_spawn_limited(c, path, argv, env, 0);
 }
 
 /* Pulls whatever is readable right now into c->out. Returns 1 on EOF. */
@@ -231,12 +286,17 @@ static int child_stop(child_t *c) {
     return child_reap(c, EXIT_MS);
 }
 
-static int run_to_exit(child_t *c, const char *path, char *const argv[],
-                       const char *const env[], int timeout_ms) {
-    if (child_spawn(c, path, argv, env) != 0) {
+static int run_to_exit_limited(child_t *c, const char *path, char *const argv[],
+                               const char *const env[], int timeout_ms, int nofile) {
+    if (child_spawn_limited(c, path, argv, env, nofile) != 0) {
         return -1;
     }
     return child_reap(c, timeout_ms);
+}
+
+static int run_to_exit(child_t *c, const char *path, char *const argv[],
+                       const char *const env[], int timeout_ms) {
+    return run_to_exit_limited(c, path, argv, env, timeout_ms, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -316,6 +376,29 @@ static int can_connect(int port) {
     }
     close(fd);
     return 0;
+}
+
+/* Same, at a NAMED loopback address rather than at 127.0.0.1. This is what
+ * makes -i's override visible from outside: 127.0.0.0/8 is all local on
+ * Linux, so a client told to listen on 127.0.0.2 and a client told to
+ * listen on 127.0.0.1 both succeed -- and differ in which address answers.
+ * A port number alone cannot tell the two apart. */
+static int can_connect_at(const char *ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+    int rc = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    close(fd);
+    return rc == 0 ? 0 : -1;
 }
 
 static void set_nonblock(int fd) {
@@ -750,6 +833,49 @@ static void test_flags_override_json(void) {
     pair_teardown(&p);
 }
 
+/* -i, pinned the same way -s is, and for the reason -s needed pinning:
+ * four of the five overrides were asserted and this one was not, so an
+ * implementation that filled -i in instead of overriding passed the whole
+ * suite. (An independent reviewer's mutation R8 proved exactly that.)
+ *
+ * WHAT MAKES IT VISIBLE FROM OUTSIDE: 127.0.0.0/8 is entirely local on
+ * Linux, so both candidate addresses bind successfully and the difference
+ * is WHICH ONE ANSWERS. The document says 127.0.0.2, the flag says
+ * 127.0.0.1, and the case asserts both directions -- 127.0.0.1 accepts and
+ * 127.0.0.2 refuses -- on the SAME port, so a port number cannot be
+ * standing in for the address. Reverse the precedence and both flip.
+ *
+ * NO SERVER, DELIBERATELY. What is under test is which local address the
+ * listener was opened on, and that is decided and logged before the first
+ * round can possibly finish -- so the remote points at a port nothing
+ * holds and the round simply fails in the background. One fewer process
+ * per run, which matters because this file's ASan runtime is dominated by
+ * process startup rather than by anything it measures. */
+static void test_local_host_flag_overrides_json(void) {
+    char pub[64];
+    derive_pub_b64(pub, sizeof(pub));
+    int local = free_port();
+    ASSERT_TRUE(local > 0);
+
+    char extra[512];
+    snprintf(extra, sizeof(extra),
+             "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"1\","
+             "\"LocalHost\":\"127.0.0.2\",\"LocalPort\":\"%d\",",
+             local);
+    char cfg[2048];
+    make_client_config(cfg, sizeof(cfg), pub, extra);
+
+    char *const argv[] = {(char *)"ck-client", (char *)"-c",        cfg,
+                          (char *)"-i",        (char *)"127.0.0.1", NULL};
+    child_t c;
+    ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, argv, NULL));
+    ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
+    ASSERT_TRUE(strstr(c.out, "listening on TCP 127.0.0.1:") != NULL);
+    ASSERT_EQ_INT(0, can_connect_at("127.0.0.1", local));
+    ASSERT_EQ_INT(-1, can_connect_at("127.0.0.2", local));
+    ASSERT_EQ_INT(0, child_stop(&c));
+}
+
 /* -proxy overrides the JSON too, and its effect is visible on the SERVER:
  * a proxy method the server's ProxyBook does not carry is refused at
  * dispatch, so no session ever comes up. The JSON names the good method
@@ -997,11 +1123,21 @@ static void test_sigterm_is_clean_and_leaks_no_descriptor(void) {
  * this case fails if -a forgets either the UID or the session id.
  *
  * WHAT MAKES A FAILURE VISIBLE RATHER THAN A HANG: the ProxyBook in this
- * case points at the same echo upstream every other case uses. A session
- * that was NOT recognised as admin is dispatched to the proxy instead, so
- * the HTTP request text is relayed to that upstream and comes back
- * verbatim -- a wrong answer that says exactly what went wrong, rather
- * than a timeout that says nothing. */
+ * case points at an upstream this test owns, and the loop below ACCEPTS
+ * AND ECHOES it. A session that was NOT recognised as admin is dispatched
+ * to the proxy instead, so the HTTP request text is relayed to that
+ * upstream and comes straight back verbatim -- and the loop stops the
+ * moment what came back is not an HTTP response, so the case fails in
+ * milliseconds with the echoed request printed, rather than after a 15 s
+ * read deadline with nothing to show.
+ *
+ * That last part is a repair. The first version of this case documented
+ * the echo but never accepted the upstream connection, so the two
+ * mutations that break admin routing both produced "[case 7] 0 response
+ * bytes" after the full deadline: the assertions still failed, but slower
+ * and less informatively than the comment promised. A comment that
+ * describes a diagnostic the code does not produce is worse than no
+ * comment. */
 static void test_admin_flag_reaches_the_admin_api(void) {
     pair_t p;
     pair_init(&p);
@@ -1040,16 +1176,66 @@ static void test_admin_flag_reaches_the_admin_api(void) {
 
     char resp[8192];
     size_t got = 0;
+    int up_fd = -1;
+    set_nonblock(p.upstream_fd);
     deadline = now_ms() + 15000;
     while (got + 1 < sizeof(resp) && now_ms() < deadline) {
-        struct pollfd rp = {app, POLLIN, 0};
-        if (poll(&rp, 1, 50) <= 0) {
+        struct pollfd pf[3];
+        int n = 0;
+        int app_i = n;
+        pf[n].fd = app;
+        pf[n].events = POLLIN;
+        pf[n].revents = 0;
+        n++;
+        int lst_i = -1, up_i = -1;
+        if (up_fd < 0) {
+            lst_i = n;
+            pf[n].fd = p.upstream_fd;
+            pf[n].events = POLLIN;
+            pf[n].revents = 0;
+            n++;
+        } else {
+            up_i = n;
+            pf[n].fd = up_fd;
+            pf[n].events = POLLIN;
+            pf[n].revents = 0;
+            n++;
+        }
+        if (poll(pf, (nfds_t)n, 50) <= 0) {
+            continue;
+        }
+        if (lst_i >= 0 && (pf[lst_i].revents & POLLIN) != 0) {
+            /* THE MISROUTE PATH: the request reached the proxy, not the
+             * admin API. Accept it and echo, so the wrong answer arrives
+             * instead of nothing at all. */
+            up_fd = accept(p.upstream_fd, NULL, NULL);
+            if (up_fd >= 0) {
+                set_nonblock(up_fd);
+            }
+        }
+        if (up_i >= 0 && (pf[up_i].revents & POLLIN) != 0) {
+            char buf[2048];
+            ssize_t r = read(up_fd, buf, sizeof(buf));
+            if (r > 0) {
+                ssize_t w = write(up_fd, buf, (size_t)r);
+                (void)w;
+            } else if (r == 0) {
+                close(up_fd);
+                up_fd = -1;
+            }
+        }
+        if ((pf[app_i].revents & (POLLIN | POLLHUP)) == 0) {
             continue;
         }
         ssize_t r = read(app, resp + got, sizeof(resp) - 1 - got);
         if (r > 0) {
             got += (size_t)r;
             resp[got] = '\0';
+            /* Not an HTTP response at all -- stop now and let the
+             * assertions report what DID come back. */
+            if (got >= 5 && memcmp(resp, "HTTP/", 5) != 0) {
+                break;
+            }
             /* A complete response: headers plus a body that closed. */
             if (strstr(resp, "\r\n\r\n") != NULL) {
                 const char *body = strstr(resp, "\r\n\r\n") + 4;
@@ -1062,6 +1248,9 @@ static void test_admin_flag_reaches_the_admin_api(void) {
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             break;
         }
+    }
+    if (up_fd >= 0) {
+        close(up_fd);
     }
     close(app);
     resp[got] = '\0';
@@ -1128,8 +1317,31 @@ static void test_plugin_mode_takes_an_ssv_string(void) {
      * to "shadowsocks", which is what the server's ProxyBook carries --
      * and the session coming up is what proves it. */
     ASSERT_EQ_INT(0, can_connect(local));
-
     p.local_port = local;
+    child_stop(&p.client);
+    p.client.pid = 0;
+
+    /* -V AND -fast-open ARE ACCEPTED, and every other flag is not. Go
+     * registers exactly those two in plugin mode, both documented as
+     * "ignored.", so their only observable property is that they do not
+     * turn into a usage error where -s would. Both halves are asserted,
+     * because "accepted" only means something against a refusal. */
+    {
+        char *const okargv[] = {(char *)"ck-client", (char *)"-V", (char *)"-fast-open",
+                                NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, okargv, env));
+        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
+        ASSERT_EQ_INT(0, child_stop(&c));
+    }
+    {
+        char *const badargv[] = {(char *)"ck-client", (char *)"-s", (char *)"127.0.0.1",
+                                 NULL};
+        child_t c;
+        ASSERT_EQ_INT(1, run_to_exit(&c, CK_CLIENT_PATH, badargv, env, EXIT_MS));
+        ASSERT_TRUE(strstr(c.out, "plugin mode") != NULL);
+    }
+
     pair_teardown(&p);
 }
 
@@ -1287,12 +1499,29 @@ static void test_config_from_a_file_and_from_ssv(void) {
  * LocalPort 1984, RemotePort 443 -- are filled in only where the document
  * left them empty. Every other case in this file names all three
  * explicitly, so without this one an implementation that dropped the
- * fill-ins entirely would pass the whole suite. The assertion is on the
- * two lines that report what was actually used, not on a flag being
- * echoed back.
+ * fill-ins entirely would pass the whole suite.
  *
- * No server is needed: the point is what the client BOUND and what it is
- * DIALLING, both of which it reports before the first round can finish. */
+ * NOTHING HERE BINDS 1984, AND THAT IS THE POINT OF THE REWRITE. The first
+ * version proved the defaults by BINDING them, so its coverage was
+ * conditional on a fixed, global, shared port happening to be free -- on a
+ * machine where something else holds 1984 the case contributed nothing and
+ * said so, which is a test that stops testing for an environmental reason.
+ *
+ * Instead the client is started one descriptor short of what the local
+ * listener needs (RLIMIT_NOFILE 4: {0,1,2} plus the reactor's epoll, and
+ * nothing left for a socket). It gets far enough to DECIDE the local
+ * address and to report it, and then fails to open it -- so the decision
+ * is observable in the error message without a bind ever succeeding:
+ *
+ *   unable to start the client (local address): local address:
+ *   "127.0.0.1:1984": listener: cannot bind ...: Too many open files
+ *
+ * which carries the LocalHost default and the LocalPort default in one
+ * string, and exits 3. RemotePort's default is on the earlier "remote is"
+ * line, which main.c logs before it creates the reactor at all.
+ *
+ * The descriptor limit is the bracket measured by case 12 below; this case
+ * borrows its lower rung. */
 static void test_defaults_fill_in_the_omitted_fields(void) {
     char pub[64];
     derive_pub_b64(pub, sizeof(pub));
@@ -1302,38 +1531,246 @@ static void test_defaults_fill_in_the_omitted_fields(void) {
 
     char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
     child_t c;
-    ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, argv, NULL));
-    if (child_wait_for(&c, "ck-client ready", BOOT_MS) != 0) {
-        /* THE ONLY ACCEPTABLE REASON not to be ready is that port 1984 is
-         * taken by something else on this machine, and that reason has to
-         * be PROVEN rather than assumed: the client must have exited with
-         * the bind code, naming the local address. Anything else -- a
-         * configuration error because a default was not applied, most of
-         * all -- is a failure of this case, not a skip.
-         *
-         * This is not a hypothetical. The first draft skipped on any
-         * failure to become ready, and a mutation that deleted the
-         * LocalHost fill-in walked straight through it: the client exited
-         * 2 with "LocalHost cannot be empty" and this case reported a
-         * skip. A skip branch that cannot tell why it is skipping is a
-         * test that has quietly stopped testing. */
-        int code = child_reap(&c, EXIT_MS);
-        if (code == CK_EXIT_BIND_CODE && strstr(c.out, "1984") != NULL) {
-            printf("  [case 11] port 1984 is busy on this machine; skipped\n");
-            return;
-        }
-        printf("  [case 11] client did not become ready, exit %d: %.300s\n", code, c.out);
-        ASSERT_TRUE(0);
-        return;
-    }
+    int code = run_to_exit_limited(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS, 4);
+    printf("  [case 11] exit %d: %.200s\n", code, c.out);
+
+    /* RemotePort defaulted to 443. */
     ASSERT_TRUE(strstr(c.out, "remote is 127.0.0.1:443") != NULL);
-    ASSERT_TRUE(strstr(c.out, "listening on TCP 127.0.0.1:1984") != NULL);
-    ASSERT_EQ_INT(0, child_stop(&c));
+    /* LocalHost defaulted to 127.0.0.1 and LocalPort to 1984 -- both in
+     * the address the listener was asked for and could not open. */
+    ASSERT_EQ_INT(CK_EXIT_BIND_CODE, code);
+    ASSERT_TRUE(strstr(c.out, "(local address)") != NULL);
+    ASSERT_TRUE(strstr(c.out, "\"127.0.0.1:1984\"") != NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/* Case 12: exit 4, on both of the paths that can produce it            */
+/* ------------------------------------------------------------------ */
+
+/* EXIT 4 IS THE ONE AN OPERATOR CANNOT AFFORD TO HAVE WRONG, and it was
+ * the one code this suite left open: an independent reviewer turned
+ * exit_code_for_stack_err's default arm from CK_EXIT_RUNTIME into
+ * CK_EXIT_OK and all 63 tests stayed green. A runtime failure reported as
+ * success loses a client silently, because a supervisor with
+ * restart-on-failure sees a clean exit and stops.
+ *
+ * There are exactly two ways ck-client can reach 4, and both are pinned
+ * here, because they run through different code:
+ *
+ *   (a) main's own `return CK_EXIT_RUNTIME` when cloak_signalfd_create
+ *       fails -- reached by RLIMIT_NOFILE below.
+ *   (b) exit_code_for_stack_err's DEFAULT ARM, reached by an open failure
+ *       whose code is none of CONFIG/TEMPLATE/RESOLVE/LISTEN.
+ *
+ * ---- (a) THE DESCRIPTOR BUDGET -------------------------------------
+ *
+ * ck-client's startup descriptor use is exact and ordered: the reactor's
+ * epoll, then the local listener, then the signalfd. A limit one short of
+ * a given step makes exactly that step fail. MEASURED, both builds:
+ *
+ *   3 descriptors -> execv itself cannot load the binary  -> 127
+ *   4 descriptors -> the LISTENER cannot be opened        -> exit 3
+ *   5 descriptors -> the SIGNALFD cannot be created       -> exit 4
+ *   6 descriptors -> everything fits, the client runs     -> ready
+ *
+ * BOTH NEIGHBOURS OF 5 ARE ASSERTED, so this is a bracket and not a
+ * claimed margin: a change that shifted the budget by one descriptor in
+ * either direction fails here rather than quietly moving which failure an
+ * operator sees. Six is also the whole startup inventory -- 0, 1, 2, the
+ * epoll, the listener, the signalfd -- which is the same number case 6's
+ * census arrives at from the other direction.
+ *
+ * ---- (b) THE DEFAULT ARM -------------------------------------------
+ *
+ * The default arm covers three codes. Two of them cannot be reached from
+ * this binary at all, and the proof is short enough to write down:
+ *
+ *   ERR_ARG      cloak_client_stack_open returns it only for a NULL out,
+ *                cfg, reactor or config, or for its own calloc failing.
+ *                main passes four non-NULL pointers, unconditionally.
+ *   ERR_PIPER    cloak_client_piper_init (src/client_piper.c:789) returns
+ *                -1 only for a NULL pp/cfg/reactor, or for singleplex
+ *                with a NULL new_session. The stack always supplies its
+ *                own reactor and its own stack_new_session.
+ *
+ * The third IS reachable, from the configuration, and that is what this
+ * sub-case uses. ERR_CONNECTOR means round 1 could not be STARTED, and
+ * cloak_client_connector_init refuses a ServerName longer than
+ * CLOAK_CLIENT_SERVER_NAME_MAX (253) -- while cloak_client_config_t holds
+ * up to CLOAK_MAX_HOST_LEN - 1 (255) and the parser accepts it. So a
+ * 254-character ServerName parses, opens, resolves, listens, and then
+ * fails to start its first round. MEASURED BRACKET, both sides:
+ *
+ *   253 characters -> the client starts             -> ready
+ *   254 characters -> ERR_CONNECTOR                 -> exit 4
+ *
+ * (That gap is itself worth recording: the stack could reject an
+ * over-long ServerName at open with a message naming the field, instead
+ * of reporting "the first round could not be started". It is a
+ * diagnosability gap, not a correctness one, and it is noted in the fix
+ * report rather than repaired here -- repairing it would move this path
+ * to ERR_CONFIG and leave the default arm unpinned again.) */
+static void test_runtime_exit_code_and_the_descriptor_budget(void) {
+    char pub[64];
+    derive_pub_b64(pub, sizeof(pub));
+    char cfg[2048];
+    make_client_config(cfg, sizeof(cfg), pub,
+                       "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\","
+                       "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\",");
+    char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
+
+    { /* one short of the signalfd: RUNTIME, and it says what broke */
+        child_t c;
+        ASSERT_EQ_INT(4, run_to_exit_limited(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS, 5));
+        ASSERT_TRUE(strstr(c.out, "unable to install the signal handler") != NULL);
+        ASSERT_TRUE(strstr(c.out, "ck-client ready") == NULL);
+    }
+    { /* one short of the listener: BIND, not RUNTIME */
+        child_t c;
+        ASSERT_EQ_INT(3, run_to_exit_limited(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS, 4));
+        ASSERT_TRUE(strstr(c.out, "(local address)") != NULL);
+    }
+    { /* exactly enough: the client runs */
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn_limited(&c, CK_CLIENT_PATH, argv, NULL, 6));
+        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
+        ASSERT_EQ_INT(0, child_stop(&c));
+    }
+
+    /* (b) the default arm, and its bracket. */
+    char name[CLOAK_MAX_HOST_LEN];
+    memset(name, 'a', sizeof(name));
+    {
+        name[253] = '\0'; /* 253 characters: the connector's own maximum */
+        char c253[2048];
+        snprintf(c253, sizeof(c253),
+                 "{\"ServerName\":\"%s\",\"ProxyMethod\":\"shadowsocks\","
+                 "\"EncryptionMethod\":\"aes-gcm\",\"UID\":\"%s\",\"PublicKey\":\"%s\","
+                 "\"NumConn\":2,\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\","
+                 "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\"}",
+                 name, UID_B64, pub);
+        char *const a[] = {(char *)"ck-client", (char *)"-c", c253, NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, a, NULL));
+        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
+        ASSERT_EQ_INT(0, child_stop(&c));
+    }
+    {
+        name[253] = 'a';
+        name[254] = '\0'; /* 254: one over, and the round cannot start */
+        char c254[2048];
+        snprintf(c254, sizeof(c254),
+                 "{\"ServerName\":\"%s\",\"ProxyMethod\":\"shadowsocks\","
+                 "\"EncryptionMethod\":\"aes-gcm\",\"UID\":\"%s\",\"PublicKey\":\"%s\","
+                 "\"NumConn\":2,\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\","
+                 "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\"}",
+                 name, UID_B64, pub);
+        char *const a[] = {(char *)"ck-client", (char *)"-c", c254, NULL};
+        child_t c;
+        ASSERT_EQ_INT(4, run_to_exit(&c, CK_CLIENT_PATH, a, NULL, EXIT_MS));
+        /* The TYPED edge, parenthesised, so the assertion cannot be
+         * satisfied by some other line that happens to say "bring-up". */
+        ASSERT_TRUE(strstr(c.out, "(first bring-up)") != NULL);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Case 13: -verbosity, and the one arm of it that was undocumented     */
+/* ------------------------------------------------------------------ */
+
+/* main.c documents a -verbosity that is not a level name as a USAGE
+ * error, exit 1. It was asserted nowhere, and a reviewer's mutation
+ * turning it into exit 0 passed the whole suite -- a client that silently
+ * treats a typo'd log level as success is a client whose logs an operator
+ * then cannot find.
+ *
+ * The EFFECT is asserted too, from both sides of the same invocation: at
+ * "error" the INFO lines are gone and the ERROR line remains; at "debug"
+ * the INFO line is back. A cloak_log_set_level that did nothing would
+ * pass an "is this level accepted" test and fail this one, because the
+ * default level is already info. */
+static void test_verbosity_is_validated_and_takes_effect(void) {
+    const char *missing = "/nonexistent/ck-client-verbosity.json";
+    {
+        char *const argv[] = {(char *)"ck-client", (char *)"-verbosity", (char *)"chatty",
+                              (char *)"-c", (char *)missing, NULL};
+        child_t c;
+        ASSERT_EQ_INT(1, run_to_exit(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS));
+        ASSERT_TRUE(strstr(c.out, "unknown verbosity level \"chatty\"") != NULL);
+        ASSERT_TRUE(strstr(c.out, "Usage of ck-client") != NULL);
+        /* It stopped at the flag: the config it was given does not exist,
+         * and a client that had gone on to load it would exit 2. */
+        ASSERT_TRUE(strstr(c.out, "configuration error") == NULL);
+    }
+    {
+        char *const argv[] = {(char *)"ck-client", (char *)"-verbosity", (char *)"error",
+                              (char *)"-c", (char *)missing, NULL};
+        child_t c;
+        ASSERT_EQ_INT(2, run_to_exit(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS));
+        ASSERT_TRUE(strstr(c.out, "configuration error") != NULL);
+        ASSERT_TRUE(strstr(c.out, "starting standalone mode") == NULL);
+    }
+    {
+        char *const argv[] = {(char *)"ck-client", (char *)"-verbosity", (char *)"debug",
+                              (char *)"-c", (char *)missing, NULL};
+        child_t c;
+        ASSERT_EQ_INT(2, run_to_exit(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS));
+        ASSERT_TRUE(strstr(c.out, "starting standalone mode") != NULL);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Case 14: KeepAlive is configured, carried, and consumed by nothing   */
+/* ------------------------------------------------------------------ */
+
+/* A GAP MADE AUDIBLE. cloak/client_stack.h records that keep_alive_sec is
+ * parsed and then used by no one -- nothing in this port sets SO_KEEPALIVE
+ * -- and a binary that silently ignores a setting an operator wrote down
+ * is the shape of bug that is only ever found by packet capture. It cannot
+ * be fixed here (the socket layer is a later module's), so it is WARNED
+ * about at startup, and the warning is asserted, which is what stops the
+ * gap from being quietly closed by forgetting about it.
+ *
+ * Run under the same descriptor limit case 11 uses, so this case binds
+ * nothing and needs no server: the warning is emitted before the reactor
+ * exists. */
+static void test_keepalive_is_warned_about(void) {
+    char pub[64];
+    derive_pub_b64(pub, sizeof(pub));
+    {
+        char cfg[2048];
+        make_client_config(cfg, sizeof(cfg), pub,
+                           "\"RemoteHost\":\"127.0.0.1\",\"KeepAlive\":30,");
+        char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
+        child_t c;
+        (void)run_to_exit_limited(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS, 4);
+        ASSERT_TRUE(strstr(c.out, "KeepAlive 30") != NULL);
+        ASSERT_TRUE(strstr(c.out, "ignored") != NULL);
+    }
+    { /* And NOT warned about when it was never configured -- otherwise the
+       * warning is noise every operator learns to skip. */
+        char cfg[2048];
+        make_client_config(cfg, sizeof(cfg), pub, "\"RemoteHost\":\"127.0.0.1\",");
+        char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
+        child_t c;
+        (void)run_to_exit_limited(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS, 4);
+        ASSERT_TRUE(strstr(c.out, "KeepAlive") == NULL);
+    }
 }
 
 TEST_MAIN_BEGIN()
+    /* LINE-BUFFERED, DELIBERATELY. stdout here is a pipe, so libc would
+     * block-buffer it and a ctest TIMEOUT would arrive with
+     * "<end of output>" and nothing else -- which is what the reviewer of
+     * this file measured under 2x CPU oversubscription. A flake with no
+     * diagnostic is a flake nobody can act on; line buffering costs
+     * nothing at this volume and makes a timeout say which case it
+     * reached. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
     test_version_and_help_exit_before_config();
     test_flags_override_json();
+    test_local_host_flag_overrides_json();
     test_proxy_flag_overrides_json();
     test_missing_remote_host_is_a_config_error();
     test_udp_is_refused();
@@ -1344,4 +1781,7 @@ TEST_MAIN_BEGIN()
     test_exit_codes_are_distinct();
     test_config_from_a_file_and_from_ssv();
     test_defaults_fill_in_the_omitted_fields();
+    test_runtime_exit_code_and_the_descriptor_budget();
+    test_verbosity_is_validated_and_takes_effect();
+    test_keepalive_is_warned_about();
 TEST_MAIN_END()

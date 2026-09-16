@@ -23,4 +23,18 @@ target_compile_definitions(test_ck_client_cli
             CK_SERVER_PATH="$<TARGET_FILE:ck-server>")
 add_dependencies(test_ck_client_cli ck-client ck-server)
 add_test(NAME test_ck_client_cli COMMAND test_ck_client_cli)
-set_tests_properties(test_ck_client_cli PROPERTIES TIMEOUT 60)
+# TIMEOUT 120, not 60, and the number is measured rather than guessed.
+# At TIMEOUT 60 an independent reviewer measured this file under
+# ASan+UBSan at 33.5 s idle, 43.9 s with the machine 50% oversubscribed,
+# and TIMING OUT at 60.04 s under 2x oversubscription -- and ctest reported
+# that timeout as "<end of output>", because the test's stdout was
+# block-buffered to a pipe. A flake with no diagnostic is a flake nobody
+# can act on, so the test now line-buffers stdout and this bound is 120.
+#
+# Almost all of the runtime is process startup and LeakSanitizer's exit
+# scan across the ck-server and ck-client processes this file spawns, not
+# the transfers it measures: with the cases added by the fix round it sits
+# at 45.0 s idle here, so the margin is 2.7x rather than the 1.8x that was
+# not enough. 120 also matches test_ck_server_cli, which was raised for
+# the same reason, so the two binaries' tests carry one bound and not two.
+set_tests_properties(test_ck_client_cli PROPERTIES TIMEOUT 120)

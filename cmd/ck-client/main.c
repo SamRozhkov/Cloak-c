@@ -827,6 +827,21 @@ int main(int argc, char **argv) {
         return CK_EXIT_CONFIG;
     }
 
+    /* A GAP, MADE AUDIBLE RATHER THAN LEFT SILENT. cloak/client_stack.h
+     * records that keep_alive_sec is consumed by nothing -- no socket in
+     * this port sets SO_KEEPALIVE -- and Go's client passes it to
+     * net.Dialer.KeepAlive, so a config carried over from Go Cloak asks
+     * for something this build does not do. A setting silently ignored is
+     * the shape of bug that is only ever found by packet capture; one
+     * WARN at startup costs nothing and is the only honest thing a binary
+     * can do about a gap it cannot close. (The parser stores -1 for
+     * "unset", so this fires only when an operator actually wrote one.) */
+    if (cfg.keep_alive_sec > 0) {
+        CLOAK_LOGW("KeepAlive %d is configured but no socket in this build sets "
+                   "SO_KEEPALIVE; the setting is ignored",
+                   cfg.keep_alive_sec);
+    }
+
     /* -a, exactly as Go: the admin UID replaces the config's, the session
      * id becomes 0 and NumConn becomes 1. The session id is the half a
      * caller cannot supply on its own -- see

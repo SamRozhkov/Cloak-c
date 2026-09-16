@@ -1002,6 +1002,19 @@ static void test_the_session_id_predicate(void) {
         ASSERT_TRUE(id != 0);
         ASSERT_EQ_INT(0, stack_id_in_use(&s, id));
     }
+
+    /* THE ONE EXCEPTION, and it is the opposite rule rather than a
+     * loosening of this one: in admin mode the draw returns 0 EVERY time,
+     * because 0 is exactly what the server's admin predicate wants. The
+     * same list is in place, so this also says that "distinct from every
+     * id in use" does not apply here -- there is only ever one such
+     * session, which is what cloak_client_stack_open's guard enforces. */
+    s.cfg.admin_session = 1;
+    for (int i = 0; i < 64; i++) {
+        ASSERT_EQ_INT(0, (int)stack_pick_session_id(&s));
+    }
+    s.cfg.admin_session = 0;
+    ASSERT_TRUE(stack_pick_session_id(&s) != 0);
 }
 
 /* ---- the replacement's id is SEEDED, not merely likely to differ ------- */
@@ -2178,6 +2191,69 @@ static void test_the_configuration_contracts(void) {
         sc.config = &bad;
         ASSERT_EQ_INT(CLOAK_CLIENT_STACK_ERR_CONFIG,
                       cloak_client_stack_open(&st, &sc, err, sizeof(err)));
+    }
+
+    /* ADMIN MODE'S GUARD, from all three sides.
+     *
+     * cloak_client_stack_config_t::admin_session makes every session this
+     * stack brings up carry id 0, which is the half of "this is an admin
+     * session" that a caller of this module cannot supply for itself (the
+     * server wants the admin uid AND session id 0, and stack_pick_session_
+     * id otherwise excludes 0 deliberately). Because every session in the
+     * mode shares that one id, two live ones would be ONE key on the
+     * server's registry and would be attached to each other -- so the mode
+     * is refused with anything that can produce a second session.
+     *
+     * UNTIL THIS BLOCK EXISTED, NOTHING EXERCISED THAT REFUSAL. An
+     * independent reviewer deleted the guard outright and all twelve
+     * client tests passed: its only coverage was indirect, through a
+     * ck-client mutant that set NumConn wrongly. A guard no test exercises
+     * is a comment.
+     *
+     * Both rejections, AND the acceptance -- a guard asserted only on its
+     * refusals is satisfied by one that refuses everything. */
+    {
+        cloak_client_stack_config_t sc = base;
+        cloak_client_config_t bad = cl.cfg;
+        sc.admin_session = 1;
+        bad.num_conn = 2;
+        bad.singleplex = 0;
+        sc.config = &bad;
+        err[0] = '\0';
+        ASSERT_EQ_INT(CLOAK_CLIENT_STACK_ERR_CONFIG,
+                      cloak_client_stack_open(&st, &sc, err, sizeof(err)));
+        ASSERT_TRUE(st == NULL);
+        ASSERT_TRUE(strstr(err, "admin mode") != NULL);
+    }
+    {
+        cloak_client_stack_config_t sc = base;
+        cloak_client_config_t bad = cl.cfg;
+        sc.admin_session = 1;
+        bad.num_conn = 1;
+        bad.singleplex = 1;
+        sc.config = &bad;
+        err[0] = '\0';
+        ASSERT_EQ_INT(CLOAK_CLIENT_STACK_ERR_CONFIG,
+                      cloak_client_stack_open(&st, &sc, err, sizeof(err)));
+        ASSERT_TRUE(st == NULL);
+        ASSERT_TRUE(strstr(err, "admin mode") != NULL);
+    }
+    {
+        /* The shape Go's `ck-client -a` actually produces: one connection,
+         * no singleplex. It is ACCEPTED, it comes up, and the session it
+         * brought up carries id 0 -- which is the whole effect of the
+         * field, asserted against a running server rather than inferred. */
+        client_t acl;
+        cs_config(&acl, &fx, fx.front_port, 0, 1);
+        cloak_client_stack_config_t sc;
+        memset(&sc, 0, sizeof(sc));
+        sc.admin_session = 1;
+        err[0] = '\0';
+        ASSERT_EQ_INT(0, cs_open(&acl, &fx, &sc, err, sizeof(err)));
+        ASSERT_TRUE(pump_until(fx.reactor, cs_session_up, &acl, CS_MAX_TURNS, CS_TURN_MS));
+        ASSERT_EQ_INT(0, (int)cloak_client_stack_session_id(acl.st));
+        ASSERT_EQ_INT(1, (int)cloak_client_stack_sessions_up(acl.st));
+        cs_close(&acl);
     }
 
     /* TEMPLATE, rejected by cloak_session_init itself. */
