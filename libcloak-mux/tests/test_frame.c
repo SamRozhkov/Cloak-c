@@ -282,7 +282,55 @@ static void test_wrong_key_rejected(void) {
     ASSERT_EQ_INT(rc, -1);
 }
 
-static void test_closing_byte_tamper_detected_with_aead(void) {
+/* THIS CASE WAS REVERSED, AND THE REVERSAL IS THE POINT.
+ *
+ * It used to be test_closing_byte_tamper_detected_with_aead, and it
+ * passed, because cloak_frame_obfuscate fed header bytes 12-13 (the
+ * closing flag and the extra-length byte) to AES-GCM as ASSOCIATED DATA.
+ * That made those two bytes authenticated -- genuinely better than what
+ * the frame format offers -- and it made this port unable to exchange a
+ * single data frame with the implementation it is a port of.
+ *
+ * AES-GCM's tag covers the AAD. Go seals with a nil AAD
+ * (internal/multiplex/obfs.go: `Seal(payload[:0], header[:NonceSize()],
+ * payload, nil)`), so the same plaintext under the same key and nonce
+ * produces a DIFFERENT tag on each side and every frame fails
+ * authentication at the other end. It was invisible for five modules
+ * because every test of it had this project's code on both ends, passing
+ * the same AAD and agreeing with itself -- the same shape as the
+ * two-byte-length-prefix defect cloak/conn.h's header describes.
+ *
+ * MEASURED, NOT ARGUED: a Go client built on cbeuw/Cloak's own obfs.go
+ * completed the CDN handshake against a real ck-server, sent one frame,
+ * and the server dropped it silently; the session established and then
+ * carried nothing. libcloak-server/tests/test_ws_interop.c case 1 is that
+ * measurement, and its
+ * test_a_go_produced_frame_deobfuscates_byte_for_byte pins a frame that
+ * the Go original actually emitted, so this cannot silently regress
+ * without a Go toolchain present.
+ *
+ * So the AAD is gone and the malleability is back, deliberately, and this
+ * case now asserts the behaviour Go has:
+ *
+ *   - Flipping the closing byte is NOT detected. An on-path attacker can
+ *     do it without the session key, because Salsa20-XOR is malleable.
+ *     Go can be attacked in exactly the same way, which is the reason
+ *     this port must be: a peer that is fussier than the reference
+ *     implementation is a behavioural distinguisher, which is the one
+ *     thing a circumvention tool cannot afford (the same argument
+ *     cloak/conn.h makes for not validating the TLS record's type byte,
+ *     and ws_handshake.c for reproducing gorilla's token-list quirks).
+ *     The capability it grants -- killing a session -- is one an on-path
+ *     attacker already has with a RST.
+ *   - The PAYLOAD is still authenticated, and bytes 0-11 of the header
+ *     still are: they are the AEAD nonce, which RFC 5116 section 2.1
+ *     authenticates internally. test_tamper_detected_after_obfuscate
+ *     above is what holds that half in place, and it is unchanged.
+ *
+ * If you are about to re-add the AAD: it will make this case and case 1
+ * of test_ws_interop fail together, and the second of those is the one
+ * that matters. */
+static void test_closing_byte_tamper_matches_go_and_is_not_detected(void) {
     cloak_obfuscator_t o;
     o.method = CLOAK_AEAD_AES_256_GCM;
     cloak_random_bytes(o.session_key, sizeof(o.session_key));
@@ -299,18 +347,23 @@ static void test_closing_byte_tamper_detected_with_aead(void) {
     long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
     ASSERT_TRUE(n > 0);
 
-    /* Flip the closing byte in the wire-format header (Salsa20-obfuscated,
-     * so this simulates an on-path attacker who does NOT know the session
-     * key -- Salsa20-XOR is malleable, no key needed to flip a bit). Before
-     * this fix, this byte was unauthenticated and deobfuscate would
-     * "successfully" report a corrupted closing value; after this fix, it
-     * must be caught as an authentication failure since closing/extra_len
-     * are now part of the AEAD-authenticated additional data. */
+    /* Flip the closing byte in the wire-format header. It is
+     * Salsa20-obfuscated, so this is an on-path attacker who does NOT know
+     * the session key: Salsa20-XOR is malleable and no key is needed to
+     * flip a bit. */
     buf[12] ^= 0x02;
 
     cloak_frame_t out;
     int rc = cloak_frame_deobfuscate(&o, &out, buf, (size_t)n);
-    ASSERT_EQ_INT(rc, -1);
+    /* Accepted, with the flipped value delivered -- exactly what Go does,
+     * and asserted rather than merely tolerated so that re-adding the AAD
+     * fails here as well as against a real Go peer. */
+    ASSERT_EQ_INT(rc, 0);
+    ASSERT_EQ_INT(CLOAK_FRAME_CLOSING_NOTHING ^ 0x02, out.closing);
+    /* The PAYLOAD is untouched by the flip: only the two bytes outside the
+     * AEAD's nonce are malleable, and this is what says so. */
+    ASSERT_EQ_INT((long long)sizeof(payload), (long long)out.payload_len);
+    ASSERT_MEM_EQ(out.payload, payload, sizeof(payload));
 }
 
 static void test_obfuscate_rejects_payload_larger_than_buf_cap(void) {
@@ -373,7 +426,7 @@ TEST_MAIN_BEGIN()
     test_chacha20poly1305_round_trip();
     test_tamper_detected_after_obfuscate();
     test_wrong_key_rejected();
-    test_closing_byte_tamper_detected_with_aead();
+    test_closing_byte_tamper_matches_go_and_is_not_detected();
     test_obfuscate_rejects_payload_larger_than_buf_cap();
     test_deobfuscate_rejects_extra_len_below_minimum();
 TEST_MAIN_END()

@@ -86,8 +86,34 @@ long cloak_frame_obfuscate(const cloak_obfuscator_t *o, const cloak_frame_t *fra
         uint8_t nonce[CLOAK_AEAD_NONCE_LEN];
         memcpy(nonce, buf, CLOAK_AEAD_NONCE_LEN); /* plaintext stream_id+seq, before header encryption */
         size_t sealed_len = 0;
+        /* NO ASSOCIATED DATA, AND THAT IS A WIRE-FORMAT REQUIREMENT, NOT A
+         * SECURITY PREFERENCE.
+         *
+         * Go seals with a nil AAD (internal/multiplex/obfs.go:
+         * `o.payloadCipher.Seal(payload[:0], header[:NonceSize()], payload,
+         * nil)`), and AES-GCM's tag covers the AAD, so a peer that passes
+         * ANY AAD produces a different tag for the same plaintext and its
+         * frames fail authentication at every implementation but its own.
+         *
+         * This port did pass one -- `buf + 12, 2`, the closing flag and
+         * the extra-length byte -- for five modules. It is invisible to
+         * every test that has our code on both ends, because both ends
+         * passed the same AAD and agreed; the round trip is perfect and
+         * the product does not work. MEASURED, not read: a real Go client
+         * built on cbeuw/Cloak's own obfs.go completes the CDN handshake
+         * against ck-server, sends one frame, and the server drops it
+         * silently -- the session establishes and then carries nothing
+         * (libcloak-server/tests/test_ws_interop.c, case 1, which is the
+         * test that found this).
+         *
+         * The frame header is not left unauthenticated by removing it.
+         * Bytes 0-11 are the AEAD NONCE, which RFC 5116 section 2.1
+         * authenticates internally -- that is exactly the guarantee Go's
+         * own comment above this call claims -- and bytes 12-13 are
+         * covered by the Salsa20 layer's key, whose nonce is the AEAD tag
+         * that a forger cannot produce. */
         int rc = cloak_aead_seal(o->method, o->session_key, nonce,
-                                  buf + 12, 2,
+                                  NULL, 0,
                                   payload_region, frame->payload_len + pad_len,
                                   payload_region, &sealed_len);
         if (rc != 0) {
@@ -131,8 +157,11 @@ int cloak_frame_deobfuscate(const cloak_obfuscator_t *o, cloak_frame_t *out_fram
         uint8_t nonce[CLOAK_AEAD_NONCE_LEN];
         memcpy(nonce, buf, CLOAK_AEAD_NONCE_LEN); /* now-decrypted plaintext stream_id+seq */
         size_t opened_len = 0;
+        /* No AAD, for the reason cloak_frame_obfuscate states at length:
+         * Go passes nil, the tag covers the AAD, and the two must match or
+         * nothing interoperates. */
         int rc = cloak_aead_open(o->method, o->session_key, nonce,
-                                  buf + 12, 2,
+                                  NULL, 0,
                                   pld_with_overhead, pld_with_overhead_len,
                                   pld_with_overhead, &opened_len);
         if (rc != 0) {

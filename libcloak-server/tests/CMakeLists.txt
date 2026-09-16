@@ -364,3 +364,37 @@ target_include_directories(test_dispatcher_ws PRIVATE ${CMAKE_SOURCE_DIR}/libclo
 target_link_libraries(test_dispatcher_ws PRIVATE cloak-server sqlite3)
 add_test(NAME test_dispatcher_ws COMMAND test_dispatcher_ws)
 set_tests_properties(test_dispatcher_ws PROPERTIES TIMEOUT 120)
+
+# The interoperability suite: the first test in this tree whose PEER was
+# not written by this project. It drives a real ck-server binary, a real
+# gorilla/websocket client, a gorilla server, and a hand-written
+# fragmenting proxy between the Go client and the C server.
+#
+# Declared here with the rest of libcloak-server's tests, but the two
+# things it needs that this directory cannot give it -- the ck-server
+# binary's path, and the Go oracle built from
+# tests/ws_interop_oracle/ -- are APPENDED at the end of the top-level
+# CMakeLists.txt, after cmd/ck-server has been added. Same reason this
+# file appends cloak-client below rather than folding it in: the existing
+# content stays byte-identical, and CMake resolves both at generate time.
+#
+# Links sqlite3 directly, on top of the transitive link cloak-server
+# already provides, for the same reason test_dispatcher_ws.c does: the
+# two in-process cases raise a real cloak_userpanel_t over a real
+# cloak_usermanager_t, and cloak-server's PRIVATE sqlite3 link
+# deliberately does not propagate the include path.
+add_executable(test_ws_interop test_ws_interop.c)
+target_include_directories(test_ws_interop PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_ws_interop PRIVATE cloak-server sqlite3)
+add_test(NAME test_ws_interop COMMAND test_ws_interop)
+
+# THE BOUND IS SET FROM THE WORST FAILING RUN, NOT THE PASSING ONE.
+# A passing run is ~4 s in Debug and ~20 s under ASan+UBSan (one
+# ASan-instrumented ck-server plus seven short-lived Go processes, and
+# ~335 in-process handshakes for the split-point case). What the number
+# has to accommodate is a run in which something never answers: every
+# wait inside the file is bounded by CLOCK_MONOTONIC, the longest single
+# one being CHILD_MS at 40 s, so a broken run reports its own named
+# assertion rather than being truncated as "***Timeout" with the
+# diagnosis cut off. This is a backstop, not the mechanism.
+set_tests_properties(test_ws_interop PROPERTIES TIMEOUT 120)
