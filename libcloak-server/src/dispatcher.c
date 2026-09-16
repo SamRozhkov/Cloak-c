@@ -459,6 +459,17 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     -- it is a send() loop over an opaque byte buffer -- so the CDN
  *     path needs no new write machinery, only different bytes.
  *
+ *     But coalescing is an OPTIMISATION, not a correctness requirement,
+ *     and that distinction was measured rather than assumed: a gorilla
+ *     client also accepts the same bytes split 129|62 with a 5 ms gap,
+ *     split every 40 bytes with 5 ms gaps, and split 129|62 with a
+ *     100 ms gap. Only REVERSING the order fails, which is the control
+ *     that gives those passes meaning. So a future change that splits
+ *     this write -- a partial send(), a different buffer strategy -- is
+ *     not a protocol break. Do not read the paragraph above as a reason
+ *     the two pieces must travel together; they must only travel in
+ *     order.
+ *
  * On success, fills c->reply/reply_len and c->auth_* (consumed by
  * conn_continue_reply_write and conn_handoff, steps 10-11) and returns 0.
  * On any failure this function returns -1 having left the connection
