@@ -45,11 +45,16 @@
  *   - gorilla's Upgrader.Upgrade (server.go:125-175) checks `Connection`,
  *     `Upgrade`, the method, `Sec-WebSocket-Version` and
  *     `Sec-WebSocket-Key`, then writes the 101.
- * Go runs them in that order -- auth first, upgrade validation second --
- * and the module-8 scouting report measured what that costs: an upgrade
- * that fails validation leaks a goroutine and an fd FOREVER, after the UID
- * has already been authorised (scouting report section 6.5, reproduced
- * three ways). This port validates the whole upgrade here, in one pass,
+ * Go runs them in that order -- auth first, upgrade validation second.
+ * CITED, NOT MEASURED HERE: the module-8 scouting report (section 6.5,
+ * where it was reproduced three ways with Cloak's own types) found what
+ * that ordering costs -- an upgrade that fails validation leaks a
+ * goroutine and an fd FOREVER, after the UID has already been
+ * authorised. Nothing in this file pair can re-derive that, since it
+ * needs a running Go server rather than a parser; treat it as a
+ * reference to that report, and go and read it there rather than
+ * believing it because it is repeated here.
+ * This port validates the whole upgrade here, in one pass,
  * BEFORE the dispatcher authorises anything -- so a bad upgrade is an
  * ordinary redirect to the cover site, exactly like an unrecognised
  * protocol. That is both the fix for Go's leak and the better mimicry: the

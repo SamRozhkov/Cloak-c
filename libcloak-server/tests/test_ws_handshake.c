@@ -95,6 +95,19 @@ int EVP_Digest(const void *data, size_t count, unsigned char *md,
     "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dzj6vH4/wYNFBsiKTA3PkVMU1phaG92" \
     "fYSLkpmgp661vMPK0djf5u30+wIJEBceJSwzOkFIT1ZdZGtyeYCHjpWc"
 
+/* HIDDEN_B64 split after 60 characters, for the obs-fold test: the two
+ * halves concatenate to exactly HIDDEN_B64, which is what lets that test
+ * tell a parser that refuses a fold from one that joins it. The split
+ * point is 60 rather than a round 64 so that the fold-inserted space
+ * lands where Go's own decoder reports it -- "illegal base64 data at
+ * input byte 60" -- and the partial decode before it is exactly 45
+ * bytes, both measured. test_the_fold_halves_are_the_whole_payload
+ * asserts the concatenation, so a future edit to either half that broke
+ * the property would fail loudly instead of quietly turning the fold test
+ * back into the weaker one it used to be. */
+#define HIDDEN_B64_HEAD60 "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dzj6vH4/wYNFBsiKTA3"
+#define HIDDEN_B64_TAIL68 "PkVMU1phaG92fYSLkpmgp661vMPK0djf5u30+wIJEBceJSwzOkFIT1ZdZGtyeYCHjpWc"
+
 /* The same 96 bytes with 95 and 97 in their place, and a 128-character
  * value that decodes to 94. All three exist to bracket "exactly 96" from
  * both sides -- and the last two prove the check is on the DECODED
@@ -177,6 +190,68 @@ static cloak_ws_hs_result_t parse_exact(const char *req, size_t len,
 
 static cloak_ws_hs_result_t parse_str(const char *req, cloak_ws_hs_t *out) {
     return parse_exact(req, strlen(req), out);
+}
+
+/* THE HOST TRAP, and the one mechanical defence against it.
+ *
+ * Every false "measured" claim this file has carried -- four of them,
+ * found across three review rounds -- was a claim about a request literal
+ * with NO Host header. Go answers `400 Bad Request: missing required Host
+ * header` to ANY HTTP/1.1 request that omits it (RFC 9112 3.2), before
+ * the handler runs and for a reason that has nothing to do with the
+ * property under test. So a Go measurement taken against such a literal
+ * measures the Host check and nothing else, and it will agree with
+ * whatever the comment above it claims, because 400 is also what a
+ * genuinely malformed request gets. That is this project's most
+ * expensive recurring shape -- a test green by a path other than the one
+ * it names -- appearing here four times in one file, which makes it a
+ * defect in how the literals are built rather than four typos.
+ *
+ * parse_measured is parse_exact plus one guard: the bytes must carry a
+ * Host header line. USE IT FOR EVERY HAND-WRITTEN LITERAL WHOSE COMMENT
+ * CLAIMS WHAT GO ANSWERS. A future literal that forgets Host then fails
+ * here, loudly, instead of quietly becoming the fifth instance.
+ *
+ * Two deliberate exemptions, both of which would be wrong to guard:
+ * requests that are TRUNCATED (the prefix sweep, and the "header block
+ * never ends" cases) cannot be required to contain a Host line, since
+ * the truncation is the point and Go answers nothing at all to them; and
+ * the Host tests themselves, which omit Host on purpose and document the
+ * divergence rather than claiming a measurement. Requests built through
+ * build() need no guard: it emits Host by default, and the only way to
+ * drop it is to write OMIT. */
+static int has_host_header(const char *req, size_t len) {
+    /* A Host line is a line whose name is "host", so look for a line
+     * break followed by it. Case-insensitive, because the whole point of
+     * this file is that a CDN rewrites the case of every name. */
+    for (size_t i = 0; i + 6 <= len; i++) {
+        if (req[i] != '\n') {
+            continue;
+        }
+        const char *p = req + i + 1;
+        size_t avail = len - i - 1;
+        if (avail < 5) {
+            return 0;
+        }
+        if ((p[0] == 'h' || p[0] == 'H') && (p[1] == 'o' || p[1] == 'O') &&
+            (p[2] == 's' || p[2] == 'S') && (p[3] == 't' || p[3] == 'T') &&
+            p[4] == ':') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static cloak_ws_hs_result_t parse_measured(const char *req, size_t len,
+                                           cloak_ws_hs_t *out) {
+    if (!has_host_header(req, len)) {
+        fprintf(stderr,
+                "FAIL %s:%d: a literal used under a \"measured\" claim has no "
+                "Host header; Go would 400 it for that reason alone\n",
+                __FILE__, __LINE__);
+        cloak_test_failures++;
+    }
+    return parse_exact(req, len, out);
 }
 
 /* The expected 96 bytes of Hidden plaintext. */
@@ -298,11 +373,57 @@ static void test_the_builder_reproduces_the_golden_request(void) {
     ASSERT_MEM_EQ(GOLDEN_REQUEST, buf, n);
 }
 
+static void test_the_host_guard_detects_a_missing_host(void) {
+    /* parse_measured's guard is a tripwire for a literal nobody has
+     * written yet, so nothing in today's suite makes it fire -- which is
+     * exactly how a "defence" ends up being a function that returns the
+     * wrong answer and is never noticed. Its LOGIC is therefore asserted
+     * directly, both ways, including the two mistakes it would be easy to
+     * make: matching "host:" anywhere in the bytes rather than at the
+     * start of a line, and matching case-sensitively. */
+    static const char with_host[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char lower_host[] = "GET / HTTP/1.1\r\nhost: x\r\n\r\n";
+    static const char upper_host[] = "GET / HTTP/1.1\r\nHOST: x\r\n\r\n";
+    static const char lf_host[] = "GET / HTTP/1.1\nHost: x\n\n";
+    static const char no_host[] = "GET / HTTP/1.1\r\nX-A: b\r\n\r\n";
+    static const char host_in_target[] = "GET /host:/x HTTP/1.1\r\nX-A: b\r\n\r\n";
+    static const char host_in_value[] = "GET / HTTP/1.1\r\nX-A: host: x\r\n\r\n";
+    static const char host_space_colon[] = "GET / HTTP/1.1\r\nHost : x\r\n\r\n";
+
+    ASSERT_EQ_INT(1, has_host_header(with_host, sizeof(with_host) - 1));
+    ASSERT_EQ_INT(1, has_host_header(lower_host, sizeof(lower_host) - 1));
+    ASSERT_EQ_INT(1, has_host_header(upper_host, sizeof(upper_host) - 1));
+    ASSERT_EQ_INT(1, has_host_header(lf_host, sizeof(lf_host) - 1));
+    ASSERT_EQ_INT(0, has_host_header(no_host, sizeof(no_host) - 1));
+    ASSERT_EQ_INT(0, has_host_header(host_in_target, sizeof(host_in_target) - 1));
+    ASSERT_EQ_INT(0, has_host_header(host_in_value, sizeof(host_in_value) - 1));
+    ASSERT_EQ_INT(0, has_host_header(host_space_colon, sizeof(host_space_colon) - 1));
+    /* And it never reads past the bytes it is given: a prefix that stops
+     * inside the word "Host" must answer 0 rather than run on. */
+    ASSERT_EQ_INT(0, has_host_header(with_host, 20));
+    ASSERT_EQ_INT(0, has_host_header(with_host, 0));
+}
+
+static void test_the_fold_halves_are_the_whole_payload(void) {
+    /* The obs-fold test below depends entirely on this: its two halves
+     * must concatenate to the WHOLE valid payload, or a parser that joins
+     * continuation lines without a space would produce a short value and
+     * be refused for the wrong reason -- which is exactly the weakness
+     * that version of the test had. Asserted here, next to the constants,
+     * so an edit to either half fails loudly instead of quietly
+     * re-weakening a test three directories away in a comment nobody
+     * re-reads. */
+    ASSERT_EQ_INT(60, (int)strlen(HIDDEN_B64_HEAD60));
+    ASSERT_EQ_INT(68, (int)strlen(HIDDEN_B64_TAIL68));
+    ASSERT_EQ_INT(CLOAK_WS_HS_HIDDEN_B64_LEN, (int)strlen(HIDDEN_B64));
+    ASSERT_TRUE(strcmp(HIDDEN_B64_HEAD60 HIDDEN_B64_TAIL68, HIDDEN_B64) == 0);
+}
+
 static void test_golden_request_parses_with_gorillas_own_accept(void) {
     cloak_ws_hs_t hs;
     memset(&hs, 0, sizeof(hs));
     ASSERT_EQ_INT(CLOAK_WS_HS_OK,
-                  parse_exact(GOLDEN_REQUEST, sizeof(GOLDEN_REQUEST) - 1, &hs));
+                  parse_measured(GOLDEN_REQUEST, sizeof(GOLDEN_REQUEST) - 1, &hs));
     assert_hidden_ok(&hs);
     ASSERT_EQ_INT(CLOAK_WS_HS_ACCEPT_LEN, (int)strlen(hs.accept));
     ASSERT_TRUE(strcmp(ACCEPT_GO, hs.accept) == 0);
@@ -453,7 +574,7 @@ static void test_every_header_name_lowercased(void) {
         "\r\n";
     cloak_ws_hs_t hs;
     memset(&hs, 0, sizeof(hs));
-    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_exact(lower, sizeof(lower) - 1, &hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_measured(lower, sizeof(lower) - 1, &hs));
     assert_hidden_ok(&hs);
     ASSERT_TRUE(strcmp(ACCEPT_GO, hs.accept) == 0);
 
@@ -469,7 +590,7 @@ static void test_every_header_name_lowercased(void) {
         "UPGRADE: WEBSOCKET\r\n"
         "\r\n";
     memset(&hs, 0, sizeof(hs));
-    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_exact(upper, sizeof(upper) - 1, &hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_measured(upper, sizeof(upper) - 1, &hs));
     assert_hidden_ok(&hs);
 }
 
@@ -615,7 +736,13 @@ static void test_cdn_injected_headers_are_skipped(void) {
      * between and after the ones that matter, the target rewritten, the
      * Host rewritten to the origin's internal name, every field name
      * lowercased and Connection rewritten. Measured as 101 against live
-     * gorilla, 630 bytes on the wire against the bare client's 335. */
+     * gorilla, 631 bytes on the wire against the bare client's 335 --
+     * the same 631 this function asserts below and ws_handshake.h
+     * quotes. (It said 630 until this round: the brief's number for a
+     * differently-spelled example, carried one line further than the
+     * first correction caught. A number that contradicts an assertion
+     * 28 lines below it is exactly the kind of claim a reader stops
+     * checking.) */
     static const char cf[] =
         "GET /ws/path?cf=1 HTTP/1.1\r\n"
         "host: origin.internal\r\n"
@@ -639,7 +766,7 @@ static void test_cdn_injected_headers_are_skipped(void) {
         "\r\n";
     cloak_ws_hs_t hs;
     memset(&hs, 0, sizeof(hs));
-    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_exact(cf, sizeof(cf) - 1, &hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_measured(cf, sizeof(cf) - 1, &hs));
     assert_hidden_ok(&hs);
     ASSERT_TRUE(strcmp(ACCEPT_GO, hs.accept) == 0);
 
@@ -652,15 +779,25 @@ static void test_cdn_injected_headers_are_skipped(void) {
 
 static void test_high_bytes_in_a_header_value_are_accepted(void) {
     /* Go allows any byte from 0x80 up in a header value and refuses
-     * everything below 0x20 except HTAB; measured, a 0xff inside
-     * User-Agent is answered 101 while a 0x7f or a bare CR in the same
-     * place is 400. Refusing high bytes would refuse requests Go serves,
-     * so the value check has an upper bound as well as a lower one and
-     * both sides of it are pinned (the refusals live in
-     * test_malformed_requests). */
+     * everything below 0x20 except HTAB. Refusing high bytes would refuse
+     * requests Go serves, so the value check has an upper bound as well
+     * as a lower one and both sides of it are pinned (the refusals live
+     * in test_malformed_requests).
+     *
+     * MEASURED ON THESE EXACT BYTES: 101, with the hidden payload
+     * decoding to the same 96 bytes. An earlier version of this literal
+     * had no Host header, and the 101 claimed here did not reproduce on
+     * it -- Go answered `400 Bad Request: missing required Host header`,
+     * for a reason with nothing to do with high bytes at all. The Host
+     * line below is therefore load-bearing for the CLAIM even though this
+     * parser never reads it, and parse_measured now refuses any literal
+     * that forgets one. The counter-cases (0x7f, bare CR, NUL, 0x01 in
+     * the same position) were re-measured WITH a Host present as well:
+     * all four 400, so the principle survives removing the confound. */
     static const unsigned char raw[] = {
         'G',  'E',  'T',  ' ',  '/',  ' ',  'H',  'T',  'T',  'P',  '/',
-        '1',  '.',  '1',  '\r', '\n', 'X',  '-',  'A',  ':',  ' ',  0x80,
+        '1',  '.',  '1',  '\r', '\n', 'H',  'o',  's',  't',  ':',  ' ',
+        'x',  '\r', '\n', 'X',  '-',  'A',  ':',  ' ',  0x80,
         0xfe, 0xff, '\r', '\n', 'H',  'i',  'd',  'd',  'e',  'n',  ':',
         ' '};
     char buf[4096];
@@ -674,7 +811,7 @@ static void test_high_bytes_in_a_header_value_are_accepted(void) {
 
     cloak_ws_hs_t hs;
     memset(&hs, 0, sizeof(hs));
-    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_exact(buf, n, &hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_measured(buf, n, &hs));
     assert_hidden_ok(&hs);
     ASSERT_TRUE(strcmp(ACCEPT_GO, hs.accept) == 0);
 }
@@ -1008,16 +1145,30 @@ static void test_malformed_requests(void) {
         "GET /ws/path HTTP/1.1 extra\r\nHost: x\r\n\r\n",
         "GET /ws/path FTP/1.1\r\nHost: x\r\n\r\n",
         " GET /ws/path HTTP/1.1\r\nHost: x\r\n\r\n",
-        /* Header lines Go's own textproto refuses: no colon, a space
-         * before the colon, a name that is not an RFC 7230 token (both
-         * the '{' and the '"' spellings), and an empty name. All four
-         * kinds were measured as 400, with the request never reaching
-         * the handler. */
-        "GET / HTTP/1.1\r\ngarbage-line\r\n\r\n",
-        "GET / HTTP/1.1\r\nHidden : x\r\n\r\n",
-        "GET / HTTP/1.1\r\nHid{den: x\r\n\r\n",
-        "GET / HTTP/1.1\r\nHid\"den: x\r\n\r\n",
-        "GET / HTTP/1.1\r\n: novalue\r\n\r\n",
+        /* Header lines Go refuses: no colon, a space before the colon, a
+         * name that is not an RFC 7230 token (both the '{' and the '"'
+         * spellings), and an empty name. All five were re-measured as
+         * 400 WITH the Host line they now carry, so the 400 is the
+         * header-line refusal and not the missing-Host refusal that
+         * masked it before.
+         *
+         * AND THEY ARE NOT ALL THE SAME 400, which the previous version
+         * of this comment got wrong by attributing all of them to
+         * textproto. Four are hard parse errors inside
+         * textproto.ReadMIMEHeader ("malformed MIME header line"), and
+         * Go reports them as a bare `400 Bad Request`. The space before
+         * the colon is NOT one: textproto accepts it and stores the key
+         * "Hidden " verbatim. It is refused later, by net/http's separate
+         * header-name-validity check, and Go says so in the status line
+         * -- `400 Bad Request: invalid header name`, which is how the
+         * two were told apart. This parser reaches the same verdict in
+         * one place, because it validates the name as a token and a
+         * space is not a token octet. */
+        "GET / HTTP/1.1\r\nHost: x\r\ngarbage-line\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nHidden : x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nHid{den: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nHid\"den: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\n: novalue\r\n\r\n",
     };
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         memset(&hs, 0, sizeof(hs));
@@ -1025,21 +1176,24 @@ static void test_malformed_requests(void) {
     }
 
     /* Control bytes in a header value. Go rejects any byte below 0x20
-     * that is not HTAB, and DEL; high bytes it allows. Measured: NUL and
-     * 0x01 both 400. Built by hand rather than through build() because a
-     * NUL cannot travel through a C string. */
+     * that is not HTAB, and DEL; high bytes it allows (the acceptance
+     * side is test_high_bytes_in_a_header_value_are_accepted). All four
+     * below were measured as 400 with the Host line these literals now
+     * carry -- NUL, 0x01, a bare CR and DEL -- so none of the four is
+     * the missing-Host 400 in disguise. Built by hand rather than
+     * through build() because a NUL cannot travel through a C string. */
     static const unsigned char ctl_bytes[] = {0x00, 0x01, 0x0d, 0x7f};
     for (size_t i = 0; i < sizeof(ctl_bytes); i++) {
         char raw[512];
         size_t n = 0;
-        const char *head = "GET / HTTP/1.1\r\nX-Cdn: ab";
+        const char *head = "GET / HTTP/1.1\r\nHost: x\r\nX-Cdn: ab";
         memcpy(raw, head, strlen(head));
         n = strlen(head);
         raw[n++] = (char)ctl_bytes[i];
         memcpy(raw + n, "cd\r\n\r\n", 6);
         n += 6;
         memset(&hs, 0, sizeof(hs));
-        ASSERT_EQ_INT(CLOAK_WS_HS_ERR_MALFORMED, parse_exact(raw, n, &hs));
+        ASSERT_EQ_INT(CLOAK_WS_HS_ERR_MALFORMED, parse_measured(raw, n, &hs));
     }
 }
 
@@ -1069,26 +1223,97 @@ static void test_bare_lf_line_endings_are_refused(void) {
         "\r\n";
     cloak_ws_hs_t hs;
     memset(&hs, 0, sizeof(hs));
-    ASSERT_EQ_INT(CLOAK_WS_HS_ERR_MALFORMED, parse_exact(lf, sizeof(lf) - 1, &hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_ERR_MALFORMED, parse_measured(lf, sizeof(lf) - 1, &hs));
 
-    /* An obs-fold continuation line is refused for the same reason. Go
-     * joins it with a space (measured: the folded Hidden arrived 129
-     * characters long and decoded to 45 bytes, so Go's own length check
-     * refuses it anyway); RFC 7230 3.2.4 deprecates the syntax and lets a
-     * server reject it outright. */
+    /* An obs-fold continuation line is refused for the same reason. RFC
+     * 7230 3.2.4 deprecates the syntax and lets a server reject it
+     * outright; Go instead JOINS the continuation onto the previous value
+     * with a single space.
+     *
+     * THE LITERAL BELOW IS BUILT SO THAT EVERY WAY OF HANDLING A FOLD
+     * GIVES A DIFFERENT ANSWER. It is HIDDEN_B64 -- the whole, valid,
+     * 128-character payload -- split after 60 characters, so:
+     *
+     *   - refusing the continuation line (what this parser does, because
+     *     the line has no colon) is MALFORMED, which is what is asserted;
+     *   - joining it WITHOUT a space reconstructs the valid payload
+     *     exactly, and returns OK. That is the dangerous implementation,
+     *     and it is the one the previous version of this test could not
+     *     see: its two halves summed to 72 characters rather than 128, so
+     *     a no-space join produced a short value that was refused anyway,
+     *     for a reason that had nothing to do with folding;
+     *   - joining it WITH a space, as Go does, gives 129 characters
+     *     containing an illegal base64 byte;
+     *   - skipping the continuation line silently leaves a 60-character
+     *     value.
+     *
+     * The last two are both refusals here, but with a different CODE than
+     * MALFORMED, so the assertion below discriminates all four. The two
+     * counter-cases after it pin the first and second bullets.
+     *
+     * WHAT GO ACTUALLY DOES WITH THESE EXACT BYTES, measured rather than
+     * transcribed from a neighbouring experiment (the previous version of
+     * this comment quoted numbers belonging to a different literal, which
+     * is the defect this round exists to fix): Header.Get("hidden")
+     * returns 129 characters, and base64.StdEncoding.DecodeString fails
+     * on it -- "illegal base64 data at input byte 60", the fold-inserted
+     * space. It therefore fails Go's ALPHABET check first, not its length
+     * check. The length check is still what refuses it in Cloak, because
+     * Cloak discards that decode error (scouting report 6.6) and proceeds
+     * with the 45 bytes DecodeString returned before the error, which its
+     * `len < 96` then refuses. Both checks are involved, in that order;
+     * this parser reaches neither, because it refuses the line itself. */
     static const char fold[] =
         "GET /ws/path HTTP/1.1\r\n"
         "Host: x\r\n"
         "Connection: Upgrade\r\n"
         "Upgrade: websocket\r\n"
-        "Hidden: AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2k\r\n"
-        " q7K5wMfO1dzj6vH4/wYNFBsiKTA3PkVMU1phaG92\r\n"
+        "Hidden: " HIDDEN_B64_HEAD60 "\r\n"
+        " " HIDDEN_B64_TAIL68 "\r\n"
         "Sec-WebSocket-Key: " KEY_GO "\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         "\r\n";
     memset(&hs, 0, sizeof(hs));
     ASSERT_EQ_INT(CLOAK_WS_HS_ERR_MALFORMED,
-                  parse_exact(fold, sizeof(fold) - 1, &hs));
+                  parse_measured(fold, sizeof(fold) - 1, &hs));
+
+    /* Counter-case 1: the two halves really are the whole payload. Joined
+     * with nothing between them, the same request parses and yields the
+     * 96 bytes -- so OK is genuinely reachable from these bytes, and the
+     * MALFORMED above is load-bearing rather than incidental. Measured:
+     * 101, hidden decodes to 96. */
+    static const char joined[] =
+        "GET /ws/path HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Hidden: " HIDDEN_B64_HEAD60 HIDDEN_B64_TAIL68 "\r\n"
+        "Sec-WebSocket-Key: " KEY_GO "\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n";
+    memset(&hs, 0, sizeof(hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_measured(joined, sizeof(joined) - 1, &hs));
+    assert_hidden_ok(&hs);
+
+    /* Counter-case 2: the same request with the continuation line simply
+     * deleted. This is the LENGTH path, and it gets the length path's own
+     * code -- BAD_HIDDEN, not MALFORMED -- which is what makes the
+     * assertion above a statement about the fold line and not about the
+     * short value it leaves behind. Measured: Go's Header.Get returns 60
+     * characters, which decode cleanly (no alphabet error at all) to 45
+     * bytes, and Cloak's `len < 96` refuses them. */
+    static const char dropped[] =
+        "GET /ws/path HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Hidden: " HIDDEN_B64_HEAD60 "\r\n"
+        "Sec-WebSocket-Key: " KEY_GO "\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n";
+    memset(&hs, 0, sizeof(hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_ERR_BAD_HIDDEN,
+                  parse_measured(dropped, sizeof(dropped) - 1, &hs));
 }
 
 static void test_refusal_order_matches_go(void) {
@@ -1189,7 +1414,7 @@ static void test_every_truncation_of_the_golden_request_is_refused(void) {
      * because everything fails. */
     memset(&hs, 0, sizeof(hs));
     ASSERT_EQ_INT(CLOAK_WS_HS_OK,
-                  parse_exact(GOLDEN_REQUEST, sizeof(GOLDEN_REQUEST) - 1, &hs));
+                  parse_measured(GOLDEN_REQUEST, sizeof(GOLDEN_REQUEST) - 1, &hs));
 }
 
 static void test_bytes_after_the_blank_line_are_ignored(void) {
@@ -1225,7 +1450,7 @@ static void test_bytes_after_the_blank_line_are_ignored(void) {
     memcpy(junk + jn, tail, strlen(tail));
     jn += strlen(tail);
     memset(&hs, 0, sizeof(hs));
-    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_exact(junk, jn, &hs));
+    ASSERT_EQ_INT(CLOAK_WS_HS_OK, parse_measured(junk, jn, &hs));
     assert_hidden_ok(&hs);
 
     /* ...and, the other way round, a parser that kept scanning would let
@@ -1322,7 +1547,7 @@ static void test_the_101_carries_the_accept_this_request_produced(void) {
     cloak_ws_hs_t hs;
     memset(&hs, 0, sizeof(hs));
     ASSERT_EQ_INT(CLOAK_WS_HS_OK,
-                  parse_exact(GOLDEN_REQUEST, sizeof(GOLDEN_REQUEST) - 1, &hs));
+                  parse_measured(GOLDEN_REQUEST, sizeof(GOLDEN_REQUEST) - 1, &hs));
     uint8_t buf[256];
     ssize_t n = cloak_ws_handshake_compose_101(buf, sizeof(buf), hs.accept);
     ASSERT_EQ_INT(CLOAK_WS_HS_101_LEN, (int)n);
@@ -1342,6 +1567,8 @@ static void test_the_101_carries_the_accept_this_request_produced(void) {
 
 TEST_MAIN_BEGIN()
 test_the_builder_reproduces_the_golden_request();
+test_the_host_guard_detects_a_missing_host();
+test_the_fold_halves_are_the_whole_payload();
 test_golden_request_parses_with_gorillas_own_accept();
 test_composed_101_is_gorillas_response_byte_for_byte();
 test_rfc6455_sample_accept_vector();
