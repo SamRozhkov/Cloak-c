@@ -826,6 +826,22 @@ int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_le
     return c->broken ? -1 : 0;
 }
 
+size_t cloak_conn_envelope_len(const cloak_conn_t *c, size_t frame_len) {
+    if (c == NULL) {
+        return 0;
+    }
+    if (c->framing == CLOAK_CONN_FRAMING_TLS_RECORD) {
+        return (size_t)CLOAK_CONN_RECORD_HEADER_LEN + frame_len;
+    }
+    /* The same conn_ws_envelope_len cloak_conn_send uses to decide
+     * whether the frame fits, asked in the same direction (we mask iff
+     * we are the client). Sharing the function is the point: a meter
+     * that recomputed the envelope would be free to drift from the
+     * bytes actually emitted, which is precisely the failure this
+     * function exists to end. */
+    return conn_ws_envelope_len(frame_len, c->framing == CLOAK_CONN_FRAMING_WS_CLIENT);
+}
+
 void cloak_conn_set_valve(cloak_conn_t *c, cloak_valve_t *v) {
     if (c == NULL) {
         return;

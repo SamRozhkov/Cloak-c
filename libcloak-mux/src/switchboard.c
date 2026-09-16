@@ -162,33 +162,51 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
          * divergence from Go, and one that loses the bytes of a frame
          * still queued when a connection dies.
          *
-         * CLOAK_CONN_RECORD_HEADER_LEN is included because cloak_conn_send
-         * adds that record header to every frame, so it genuinely crosses the
-         * socket: the count is the whole on-wire envelope, which is also
-         * exactly what the peer's RX side counts for the same frame.
+         * THE FRAMING BYTES ARE INCLUDED because cloak_conn_send really
+         * does put them on the socket: the count is the whole on-wire
+         * envelope, which is also exactly what the peer's RX side counts
+         * for the same frame.
          *
-         * THIS DELIBERATELY DIVERGES FROM GO, AND THE DIVERGENCE WIDENED
-         * WITH THE RECORD HEADER. Go writes the same five bytes, but does
-         * not bill them: common.TLSConn.Write ends `return n -
-         * recordLayerLength`, subtracting its own framing, and
-         * TLSConn.Read likewise returns dataLength, so Go bills exactly
-         * frame_len in each direction. This port bills frame_len + 5 here
-         * and raw wire bytes on the RX side (conn.c's own counting point
-         * explains why an envelope-level RX counter would meter a peer
-         * that streams megabytes which never assemble into a valid frame
-         * as zero -- unmetered traffic is not a cosmetic difference when
-         * the counter charges a user's credit, and cloak/valve.h states
-         * the WIRE-BYTES rule as this project's ruling). The counters are
-         * NOT to be aligned with Go's; what changed with this branch is
-         * only the size of the gap, from two bytes per frame to five,
-         * which on a ~30-byte interactive frame is roughly a 17%
-         * over-count against Go rather than 7%. An operator comparing a
-         * Cloak-C bill against a Cloak-Go one should expect that, and
-         * cloak/valve.h is where it is promised.
+         * AND THE ENVELOPE IS ASKED OF THE CONNECTION, NOT ASSUMED. This
+         * line used to read CLOAK_CONN_RECORD_HEADER_LEN + frame_len --
+         * a flat +5, the TLS record header's size, billed for every frame
+         * on every connection. That was correct while the TLS path was
+         * the only path; it stopped being correct the moment a CDN
+         * connection could exist, because a WebSocket envelope is two
+         * bytes below a 126-byte payload and four at or above it (six and
+         * eight from the client, whose mask key is another four). The
+         * error was not academic: on the ~30-byte interactive frames this
+         * comment's own example uses, +5 against a true +2 OVER-CHARGED a
+         * metered user by about 8.6% -- 88 MiB per GiB -- and on a
+         * 16401-byte bulk frame it under-charged by about 0.018%.
+         * Over-charging is the half that matters, because this counter is
+         * what spends a user's credit. cloak_conn_envelope_len is the
+         * same arithmetic cloak_conn_send performs before it enqueues, so
+         * the billed figure and the emitted bytes cannot drift.
+         *
+         * THIS DELIBERATELY DIVERGES FROM GO, AND BY A DIFFERENT AMOUNT
+         * PER TRANSPORT NOW. Go bills neither transport's framing:
+         * common.TLSConn.Write ends `return n - recordLayerLength` and
+         * common.WebSocketConn.Write returns len(data), so Go bills
+         * exactly frame_len in each direction on both. This port bills
+         * the true envelope here and raw wire bytes on the RX side
+         * (conn.c's own counting point explains why an envelope-level RX
+         * counter would meter a peer that streams megabytes which never
+         * assemble into a valid frame as zero -- unmetered traffic is not
+         * a cosmetic difference when the counter charges a user's credit,
+         * and cloak/valve.h states the WIRE-BYTES rule as this project's
+         * ruling). The counters are NOT to be aligned with Go's. What an
+         * operator comparing a Cloak-C bill against a Cloak-Go one should
+         * expect is now a gap of five bytes per frame on the direct path
+         * and two or four on the CDN path, rather than five everywhere;
+         * cloak/valve.h is where that is promised, and
+         * libcloak-server/tests/test_dispatcher_ws.c is where both are
+         * bracketed against literals.
          *
          * rx/tx here are the SERVER's directions, NOT the user manager's
          * up/down -- see cloak/valve.h before touching this line. */
-        cloak_valve_add_tx(sb->valve, (int64_t)(CLOAK_CONN_RECORD_HEADER_LEN + frame_len));
+        cloak_valve_add_tx(sb->valve,
+                           (int64_t)cloak_conn_envelope_len(sb->conns[idx], frame_len));
     }
     return rc;
 }

@@ -343,3 +343,24 @@ target_include_directories(test_ws_handshake PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_ws_handshake PRIVATE cloak-server)
 add_test(NAME test_ws_handshake COMMAND test_ws_handshake)
 set_tests_properties(test_ws_handshake PROPERTIES TIMEOUT 120)
+
+# The CDN transport's dispatcher branch: the first test in this tree that
+# drives a real socket through cloak_dispatcher_accept carrying an HTTP
+# GET and gets a cloak_session_t out the other end. Links sqlite3
+# directly, on top of the transitive link cloak-server already provides,
+# for the same reason test_dispatcher_users.c and test_adminapi.c do: it
+# seeds a user row through cloak_usermanager_write so that "the panel was
+# not touched" is a claim about a user the server WOULD have authorised,
+# and cloak-server's PRIVATE sqlite3 link deliberately does not propagate
+# the include path its implementation uses.
+#
+# No client_harness.h and therefore no cloak-client: every request here is
+# an HTTP GET this file builds itself, and the one client-side
+# cloak_session_t it raises is built directly on cloak-mux's
+# cloak_session_add_conn_framed -- there is no CDN client transport to
+# drive until module 8's client half exists.
+add_executable(test_dispatcher_ws test_dispatcher_ws.c)
+target_include_directories(test_dispatcher_ws PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dispatcher_ws PRIVATE cloak-server sqlite3)
+add_test(NAME test_dispatcher_ws COMMAND test_dispatcher_ws)
+set_tests_properties(test_dispatcher_ws PROPERTIES TIMEOUT 120)

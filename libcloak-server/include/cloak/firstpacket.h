@@ -53,14 +53,36 @@ typedef enum {
 typedef enum {
     CLOAK_FIRSTPACKET_TRANSPORT_UNKNOWN = 0,
     CLOAK_FIRSTPACKET_TRANSPORT_TLS = 1,      /* first byte 0x16: a TLS record */
-    /* first byte 'G': an HTTP GET. This is produced (framed correctly,
-     * all the way to the blank line ending the headers) but has NO
-     * consumer anywhere in this codebase yet -- correct for now, since
-     * the CDN/WebSocket transport module this is for does not exist yet.
-     * Until it does, the dispatcher MUST treat this transport the same as
-     * any other case it has no handler for: a redirect case (see
-     * cloak_firstpacket_redirect_on_error and RedirAddr), never wired to
-     * a half-built CDN code path. */
+    /* first byte 'G': an HTTP GET, framed all the way to the blank line
+     * that ends the headers.
+     *
+     * THIS NOW HAS A CONSUMER. Until module 8 it had none, and this
+     * comment said so and told the dispatcher to redirect every such
+     * connection. dispatcher.c's step 1 is that consumer: it hands these
+     * bytes to cloak_ws_handshake_parse, which validates the whole
+     * upgrade and extracts the auth payload from the `Hidden` header, and
+     * a connection that passes becomes an ordinary Cloak session whose
+     * socket is framed CLOAK_CONN_FRAMING_WS_SERVER.
+     *
+     * WHAT STILL HOLDS, and it is the half that was always the point: a
+     * GET this parser frames successfully is NOT thereby a Cloak client.
+     * Every failure past this layer -- an unparseable request, a bad
+     * `Hidden`, a `Connection` header a CDN rewrote, an unauthorised UID
+     * -- is a redirect to RedirAddr and must be indistinguishable from
+     * every other, because a prober that can tell "no such user" from
+     * "not a Cloak server" has found one. See cloak_firstpacket_
+     * redirect_on_error, and dispatcher.c's own step-1 and step-6
+     * comments.
+     *
+     * THE 3000-BYTE BOUND BELOW NOW BINDS IN PRODUCTION, which it could
+     * not while nothing consumed this transport. A bare Go client's
+     * upgrade request measures 335 bytes; the same request behind a
+     * Cloudflare-shaped edge measured 631, because a CDN injects
+     * X-Forwarded-For, CF-Connecting-IP, CF-RAY, CDN-Loop, Via and more.
+     * 3000 still holds comfortably, but a request that exceeds it is
+     * silently redirected to the cover site with no diagnostic anywhere,
+     * so the margin is a real operational quantity rather than a
+     * theoretical one. */
     CLOAK_FIRSTPACKET_TRANSPORT_WEBSOCKET = 2,
 } cloak_firstpacket_transport_t;
 

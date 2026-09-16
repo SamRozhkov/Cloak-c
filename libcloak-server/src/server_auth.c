@@ -1,4 +1,9 @@
 #include "cloak/server_auth.h"
+/* cloak_random_bytes, for cloak_server_auth_compose_ws_reply's nonce --
+ * the one thing in this file that is not a pure function of its
+ * arguments. See that function's own header comment for why the nonce is
+ * drawn here rather than by the caller. */
+#include "cloak/common.h"
 #include "cloak/crypto.h"
 
 #include <string.h>
@@ -199,4 +204,34 @@ long cloak_server_auth_compose_reply(const uint8_t shared_secret[CLOAK_AEAD_KEY_
     p += 5 + fake_cert_len;
 
     return (long)(p - out);
+}
+
+int cloak_server_auth_compose_ws_reply(uint8_t out[CLOAK_SERVER_AUTH_WS_REPLY_LEN],
+                                        const uint8_t session_key[CLOAK_AEAD_KEY_LEN],
+                                        const uint8_t shared_secret[CLOAK_AEAD_KEY_LEN]) {
+    if (out == NULL || session_key == NULL || shared_secret == NULL) {
+        return -1;
+    }
+
+    /* The nonce goes straight into its final position: it is the first
+     * twelve bytes of the reply AND the nonce the seal below uses, and
+     * writing it once is what makes those two facts impossible to get
+     * out of step. See this function's header comment for why it is
+     * drawn here rather than by the caller. */
+    cloak_random_bytes(out, CLOAK_AEAD_NONCE_LEN);
+
+    size_t sealed_len = 0;
+    if (cloak_aead_seal(CLOAK_AEAD_AES_256_GCM, shared_secret, out, NULL, 0, session_key,
+                        CLOAK_AEAD_KEY_LEN, out + CLOAK_AEAD_NONCE_LEN, &sealed_len) != 0) {
+        return -1;
+    }
+    /* Checked rather than assumed, for the same reason
+     * cloak_server_auth_compose_reply checks its own 48: this length is
+     * what the 60 in CLOAK_SERVER_AUTH_WS_REPLY_LEN is made of, and a
+     * cipher whose tag length ever differed would otherwise overflow the
+     * caller's buffer silently. */
+    if (sealed_len != CLOAK_SERVER_AUTH_WS_REPLY_LEN - CLOAK_AEAD_NONCE_LEN) {
+        return -1;
+    }
+    return 0;
 }

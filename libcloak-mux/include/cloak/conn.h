@@ -403,6 +403,36 @@ void cloak_conn_destroy(cloak_conn_t *c);
  * this call returns). Must not block. */
 int cloak_conn_send(cloak_conn_t *c, const uint8_t *frame_bytes, size_t frame_len);
 
+/* How many bytes one frame of frame_len will actually occupy on THIS
+ * connection's socket, framing included -- five for a TLS record, two or
+ * four for a WebSocket server frame, six or eight for a WebSocket client
+ * frame (the extra four being the mask key). NULL reports 0.
+ *
+ * IT EXISTS BECAUSE THE TX METER WAS WRONG, and the defect was a
+ * constant standing in for a question only this object can answer.
+ * cloak_switchboard_send billed CLOAK_CONN_RECORD_HEADER_LEN + frame_len
+ * for every frame regardless of what the connection put on the wire,
+ * which on a CDN connection over-charged an interactive ~30-byte frame
+ * by about 8.6% -- 88 MiB per GiB of a metered user's credit -- and
+ * under-charged a 16401-byte bulk frame by about 0.018%. The
+ * over-charging half is the one that matters: it bills a user for bytes
+ * nobody sent.
+ *
+ * It is exactly the same arithmetic cloak_conn_send itself performs
+ * before it enqueues, deliberately so: one function decides what an
+ * envelope costs, and the meter asks it rather than reproducing it.
+ * cloak_switchboard_send is the only caller today.
+ *
+ * NOTE THE ASYMMETRY WITH max_envelope_len, which is this function
+ * evaluated at max_frame_len and is therefore an upper bound, not the
+ * cost of a particular frame -- and note that the RECEIVE side needs
+ * neither: conn.c counts raw wire bytes as they come off the socket,
+ * which is already the true figure (and is why an RX equivalent of this
+ * function would be the wrong shape entirely -- see that counting
+ * point's own comment on why an envelope-level RX counter meters a peer
+ * streaming garbage as zero). */
+size_t cloak_conn_envelope_len(const cloak_conn_t *c, size_t frame_len);
+
 /* Installs (or, with cb == NULL, removes) the drained notification.
  * Separate from cloak_conn_init so existing callers keep compiling. */
 void cloak_conn_set_drained_cb(cloak_conn_t *c, cloak_conn_drained_cb cb, void *userdata);
