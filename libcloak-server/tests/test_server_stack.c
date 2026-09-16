@@ -1,16 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cloak/server_stack.h"
 
-#include "cloak/adminapi.h"
 #include "cloak/base64.h"
 #include "cloak/clienthello.h"
 #include "cloak/crypto.h"
 #include "cloak/net.h"
-#include "cloak/proxy.h"
 #include "cloak/reactor.h"
-#include "cloak/registry.h"
 #include "cloak/session.h"
 #include "cloak/stream.h"
+#include "cloak/usermanager.h"
 #include "cloak/userpanel.h"
 #include "test_framework.h"
 #include "client_harness.h"
@@ -30,33 +28,38 @@
  * binary uses instead of the 129 lines of wiring test_server_e2e.c and
  * test_admin_e2e.c spell out by hand. Those two files remain the
  * hand-wired prototype and are deliberately unchanged: what is new here
- * is that the wiring itself is now under test rather than merely
- * duplicated.
+ * is that the wiring itself is under test rather than merely duplicated.
+ *
+ * NOTHING HERE TOUCHES A MEMBER OF THE STACK, because there are none to
+ * touch: the handle is opaque and every assertion below goes through a
+ * counter accessor or an opaque sub-object. That is the module's main
+ * enforcement and this file is written to be evidence that a binary can
+ * do its job without the struct.
  *
  * WHAT EACH CASE IS FOR:
  *
  *   1. A stack built from a parsed config serves a real handshake and
- *      moves bytes both ways -- the property test_server_e2e.c asserts,
- *      now through the helper.
- *   2. THE FOUR-LINK CHAIN, pinned link by link. Two proxy relays (on two
- *      sessions of one user) and an admin stream are live at once; three
- *      breaks follow, and the OWNER'S link -- which runs last -- records
- *      what the three module links ahead of it had already done at the
- *      moment it ran. That recording is the order assertion: link 4
- *      cannot see link 1's, 2's and 3's work unless they ran first.
- *      Mutation-verified per link; see the task report.
- *   3. Teardown in the stack's own order with traffic outstanding at
- *      every layer, under ASan.
- *   4. Nine enforced edges, one case each, every one asserting the typed
- *      code AND that the message names the edge.
- *   5. Every configured BindAddr accepts.
- *   6. Built and destroyed twice in one process, with descriptors
- *      counted through /proc/self/fd -- LeakSanitizer does not track
- *      those.
+ *      moves bytes both ways.
+ *   2. THE FOUR-LINK CHAIN, pinned link by link, over three breaks.
+ *   3. A TERMINATION stops BOTH modules -- the on_session_closing
+ *      trampoline, both halves, reached twice: once through a real
+ *      credit exhaustion and once through a user holding an admin
+ *      session and a proxy session at the same time.
+ *   4. AN ABANDONED HANDSHAKE reclaims BOTH modules -- the dispatcher's
+ *      session_aborted trampoline, both halves, through a forced
+ *      reply-write failure.
+ *   5. Teardown in the stack's own order with traffic outstanding.
+ *   6. Ten enforced edges, one case each, asserting the typed code, the
+ *      code's exact name, and that the message names the edge.
+ *   7. Every configured BindAddr accepts.
+ *   8. Built and destroyed twice, descriptors counted via /proc/self/fd.
+ *   9. The caller's cloak_server_config_t may die the moment open
+ *      returns.
+ *  10. cloak_server_stack_strerror, compared exactly.
+ *  11. The replay cache the stack actually allocated.
  *
  * EVERY WAIT IS A BOUNDED pump_until (client_harness.h), which is a real
- * time bound, and every peer socket is non-blocking or bounded by a
- * receive timeout. */
+ * time bound. */
 
 /* ------------------------------------------------------------------ */
 /* Descriptor accounting                                                */
@@ -69,8 +72,8 @@
  * count includes opendir's own descriptor in every sample, so successive
  * samples are directly comparable.
  *
- * Returns -1 if /proc/self/fd is unavailable, which case 6 treats as a
- * FAILURE rather than as a skip -- a detector that silently stops
+ * Returns -1 if /proc/self/fd is unavailable, which the callers treat as
+ * a FAILURE rather than as a skip -- a detector that silently stops
  * detecting is the defect this project has paid for most often. */
 static int fd_count(void) {
     DIR *d = opendir("/proc/self/fd");
@@ -93,6 +96,17 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* A FIXED CLOCK for the user manager and the panel, so credit and expiry
+ * behave the same in every run. It does not affect the handshake's own
+ * timestamp check, which reads the wall clock inside server_auth. */
+#define T_NOW    ((int64_t)1600000000)
+#define T_EXPIRY (T_NOW + 100000)
+
+static int64_t fixed_now(void *userdata) {
+    (void)userdata;
+    return T_NOW;
 }
 
 /* ------------------------------------------------------------------ */
@@ -180,7 +194,7 @@ static ssize_t up_send(upstream_t *up, int idx, const void *data, size_t len) {
     return send(up->conns[idx].fd, data, len, MSG_NOSIGNAL);
 }
 
-/* One accepted upstream connection, released. Case 6 needs this: each
+/* One accepted upstream connection, released. Case 8 needs this: each
  * cycle's relay leaves an accepted socket behind that belongs to the
  * TEST, not to the stack, so without closing it the descriptor count
  * grows by one per cycle for a reason that has nothing to do with the
@@ -235,11 +249,11 @@ static int up_has_len(void *ctx) {
 /* The environment the stack is built INTO                              */
 /* ------------------------------------------------------------------ */
 
-/* Everything that is genuinely outside the server process: the reactor,
- * the cover site a redirect goes to, the upstream a relay is spliced
- * with, and the parsed config. The stack itself is deliberately NOT part
- * of this struct -- every case constructs its own, which is what makes
- * case 6's "twice in one process" a plain loop. */
+/* Everything genuinely outside the server process: the reactor, the cover
+ * site a redirect goes to, the upstream a relay is spliced with, and the
+ * parsed config. The stack is deliberately NOT part of this struct --
+ * every case opens its own handle, which is what makes case 8's "twice in
+ * one process" a plain loop. */
 struct env {
     cloak_reactor_t *reactor;
 
@@ -256,8 +270,9 @@ struct env {
 
     cloak_server_config_t cfg;
     uint8_t server_pub[CLOAK_X25519_KEY_LEN];
-    uint8_t uid_user[CLOAK_UID_LEN];
-    uint8_t uid_admin[CLOAK_UID_LEN];
+    uint8_t uid_user[CLOAK_UID_LEN];  /* BypassUID */
+    uint8_t uid_admin[CLOAK_UID_LEN]; /* AdminUID (always bypass too) */
+    uint8_t uid_db[CLOAK_UID_LEN];    /* neither: a metered database user */
 };
 
 static void env_tmp_path(char *buf, size_t cap, const char *tag) {
@@ -269,7 +284,8 @@ static void env_tmp_path(char *buf, size_t cap, const char *tag) {
 }
 
 /* WAL leaves sidecars; a survivor would carry a previous run's rows into
- * this one. */
+ * this one and make a credit assertion pass or fail for reasons unrelated
+ * to the code under test. */
 static void env_unlink(const char *path) {
     char aux[600];
     unlink(path);
@@ -320,6 +336,7 @@ static int env_init(struct env *e, const char *tag, size_t num_bind) {
     ASSERT_EQ_INT(0, cloak_x25519_generate_keypair(server_priv, e->server_pub));
     mk_uid(e->uid_user, 0x11);
     mk_uid(e->uid_admin, 0x22);
+    mk_uid(e->uid_db, 0x33);
 
     char priv_b64[64];
     char user_b64[32];
@@ -332,14 +349,6 @@ static int env_init(struct env *e, const char *tag, size_t num_bind) {
     env_tmp_path(e->db_path, sizeof(e->db_path), tag);
     env_unlink(e->db_path);
 
-    /* The config a real deployment writes, parsed from JSON exactly as a
-     * binary parses its config file. The proxy user is a BypassUID rather
-     * than a database row: every case here is about the WIRING, and a
-     * bypass user reaches the panel through cloak_userpanel_get_bypass_
-     * user and is deactivated by the same notify_session_closed a
-     * database user is -- so the chain is exercised identically with no
-     * rows to seed. The DatabasePath is still real, so the manager, the
-     * admin API and the panel are all the production objects. */
     char bind_list[256];
     size_t off = 0;
     ASSERT_TRUE(num_bind >= 1 && num_bind <= 4);
@@ -348,6 +357,11 @@ static int env_init(struct env *e, const char *tag, size_t num_bind) {
                                 i == 0 ? "" : ",");
     }
 
+    /* The config a real deployment writes, parsed from JSON exactly as a
+     * binary parses its config file. Three UIDs with three different
+     * standings: a BypassUID, the AdminUID (which cloak_server_t always
+     * folds into the bypass set), and a UID that is in neither and is
+     * therefore a metered database user. */
     char json[2048];
     snprintf(json, sizeof(json),
              "{\"ProxyBook\":{\"ss\":[\"tcp\",\"127.0.0.1:%d\"]},"
@@ -385,18 +399,42 @@ static void env_destroy(struct env *e) {
     }
 }
 
+/* Writes one user row through a manager of its OWN, opened and closed
+ * BEFORE the stack exists. Deliberately not through the stack's manager:
+ * a second live writer on a WAL database is how test_admin_e2e.c
+ * provokes SQLITE_BUSY on purpose, and that is not what this file is
+ * about. */
+static void seed_user(const char *db_path, const uint8_t uid[CLOAK_UID_LEN], int32_t sessions_cap,
+                      int64_t up_credit, int64_t down_credit) {
+    cloak_usermanager_t *m = NULL;
+    char err[256] = {0};
+    ASSERT_EQ_INT(0, cloak_usermanager_open(&m, db_path, fixed_now, NULL, err, sizeof(err)));
+    ASSERT_TRUE(m != NULL);
+    if (m == NULL) {
+        return;
+    }
+    cloak_user_info_t row;
+    memset(&row, 0, sizeof(row));
+    memcpy(row.uid, uid, CLOAK_UID_LEN);
+    row.sessions_cap = sessions_cap;
+    row.up_rate = 0;
+    row.down_rate = 0;
+    row.up_credit = up_credit;
+    row.down_credit = down_credit;
+    row.expiry_time = T_EXPIRY;
+    ASSERT_EQ_INT(0, cloak_usermanager_write(m, &row, CLOAK_USER_FIELD_ALL));
+    cloak_usermanager_close(m);
+}
+
 /* ------------------------------------------------------------------ */
 /* The owner's link of the chain -- the probe                           */
 /* ------------------------------------------------------------------ */
 
 /* THE ORDER ASSERTION LIVES HERE. This is link 4, the last one, so
- * everything it can see has already happened: whatever the proxy, the
- * admin API and the panel were going to do for this session, they did
- * before this ran. Recording their state AT THIS INSTANT is therefore a
- * statement about ORDER, not merely about outcome -- an outcome recorded
- * after the pump would be equally green whichever order the links ran
- * in, and would not notice a link that never ran at all if something
- * else happened to clean up after it. */
+ * everything it can see has already happened. Recording the other three
+ * modules' state AT THIS INSTANT is therefore a statement about ORDER,
+ * not merely about outcome -- an outcome recorded after the pump would be
+ * equally green whichever order the links ran in. */
 struct chain_probe {
     cloak_server_stack_t *st;
     int calls;
@@ -404,7 +442,6 @@ struct chain_probe {
     uint32_t last_session_id;
     int last_sesh_null;
 
-    /* Snapshots taken inside the callback. */
     size_t proxy_sessions;
     size_t proxy_streams;
     size_t api_sessions;
@@ -423,12 +460,12 @@ static void probe_chain(cloak_server_registry_t *reg, cloak_session_t *sesh,
     if (uid != NULL) {
         memcpy(p->last_uid, uid, CLOAK_UID_LEN);
     }
-    p->proxy_sessions = cloak_proxy_session_count(&p->st->proxy);
-    p->proxy_streams = cloak_proxy_stream_count(&p->st->proxy);
-    p->api_sessions = cloak_adminapi_session_count(&p->st->api);
-    p->api_streams = cloak_adminapi_stream_count(&p->st->api);
+    p->proxy_sessions = cloak_server_stack_proxy_session_count(p->st);
+    p->proxy_streams = cloak_server_stack_proxy_stream_count(p->st);
+    p->api_sessions = cloak_server_stack_admin_session_count(p->st);
+    p->api_streams = cloak_server_stack_admin_stream_count(p->st);
     p->panel_still_has_uid =
-        (uid != NULL && cloak_userpanel_find(p->st->panel, uid) != NULL) ? 1 : 0;
+        (uid != NULL && cloak_userpanel_find(cloak_server_stack_panel(p->st), uid) != NULL) ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -439,9 +476,13 @@ static void stack_config(struct env *e, cloak_server_stack_config_t *sc) {
     memset(sc, 0, sizeof(*sc));
     sc->reactor = e->reactor;
     sc->config = &e->cfg;
+    sc->now_fn = fixed_now;
+    /* Long enough that no periodic tick lands inside a case: every cycle
+     * in this file is driven by an explicit cloak_server_stack_upload_now,
+     * which runs the identical panel cycle the tick runs. */
+    sc->upload_interval_ms = 3600000;
     /* Everything else left at 0, which is what a binary with no operator
-     * overrides passes: the whole point of the defaults is that this is
-     * a complete, correct configuration. */
+     * overrides passes. */
 }
 
 static int front_port(const cloak_server_stack_t *st) {
@@ -509,7 +550,7 @@ struct count_wait {
 
 static int registry_uid_count_is(void *ctx) {
     struct count_wait *w = ctx;
-    return cloak_server_registry_count_for_uid(&w->st->registry, w->uid) == w->want;
+    return cloak_server_stack_session_count_for_uid(w->st, w->uid) == w->want;
 }
 
 struct api_wait {
@@ -519,8 +560,12 @@ struct api_wait {
 
 static int api_stream_count_is(void *ctx) {
     struct api_wait *w = ctx;
-    return cloak_adminapi_stream_count(&w->st->api) >= w->want;
+    return cloak_server_stack_admin_stream_count(w->st) >= w->want;
 }
+
+/* An admin request that STOPS MID-HEADERS: parser, stream context and
+ * deadline all stay live for as long as the session does. */
+static const char ADMIN_PARTIAL[] = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n";
 
 /* ------------------------------------------------------------------ */
 /* 1. A stack from a parsed config carries traffic                      */
@@ -528,7 +573,7 @@ static int api_stream_count_is(void *ctx) {
 
 /* THE PROPERTY test_server_e2e.c ASSERTS, NOW THROUGH THE HELPER. Nothing
  * here knows the names of the nine objects: a config, a reactor, one
- * cloak_server_stack_init, and the server works. Both directions are
+ * cloak_server_stack_open, and the server works. Both directions are
  * asserted, because a relay spliced one way only is a thing this project
  * has shipped. */
 static void test_stack_carries_traffic_end_to_end(void) {
@@ -537,25 +582,30 @@ static void test_stack_carries_traffic_end_to_end(void) {
 
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
-    cloak_server_stack_t st;
+    cloak_server_stack_t *st = NULL;
     char err[256] = {0};
-    ASSERT_EQ_INT(0, cloak_server_stack_init(&st, &sc, err, sizeof(err)));
-    ASSERT_EQ_INT(1, (int)cloak_server_stack_listener_count(&st));
-    ASSERT_TRUE(front_port(&st) > 0);
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        env_destroy(&e);
+        return;
+    }
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_listener_count(st));
+    ASSERT_TRUE(front_port(st) > 0);
 
     client_session_t cs;
-    ASSERT_EQ_INT(0, open_proxy_client(&e, &st, &cs, 101));
-    ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&st.registry));
-    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&st.proxy));
+    ASSERT_EQ_INT(0, open_proxy_client(&e, st, &cs, 101));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_session_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_session_count(st));
     /* The panel really is wired into the dispatcher (E8): an authorised
      * session made this UID active. */
-    ASSERT_TRUE(cloak_userpanel_find(st.panel, e.uid_user) != NULL);
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_user) != NULL);
 
     cloak_stream_t *sstream = cloak_session_open_stream(&cs.sesh, NULL);
     ASSERT_TRUE(sstream != NULL);
     if (sstream == NULL) {
         client_session_close(&cs);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         env_destroy(&e);
         return;
     }
@@ -566,7 +616,7 @@ static void test_stack_carries_traffic_end_to_end(void) {
     ASSERT_EQ_INT(1, e.up.accept_count);
     ASSERT_EQ_INT(8, (int)e.up.conns[0].in_len);
     ASSERT_UP_BYTES(e.up, 0, "upstream", 8);
-    ASSERT_EQ_INT(1, (int)cloak_proxy_stream_count(&st.proxy));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_stream_count(st));
 
     uint8_t back[10];
     reader_t rd = {sstream, back, 10, 0};
@@ -578,7 +628,7 @@ static void test_stack_carries_traffic_end_to_end(void) {
 
     cloak_session_release_stream(&cs.sesh, sstream);
     client_session_close(&cs);
-    cloak_server_stack_destroy(&st);
+    cloak_server_stack_close(st);
     env_destroy(&e);
 }
 
@@ -594,9 +644,8 @@ static void test_stack_carries_traffic_end_to_end(void) {
  *
  * THE SHAPE. THREE sessions are live at once: TWO proxy sessions for the
  * SAME user, each with a running relay, and an ADMIN session with a
- * half-sent request (a live parser, a live stream context and an armed
- * deadline). Each is then broken with the others still live, and each
- * break is checked against the link that has visible work for it:
+ * half-sent request. Each is then broken with the others still live, and
+ * each break is checked against the link that has visible work for it:
  *
  *   L1 proxy    -- pinned by BREAK A, which breaks ONE OF TWO sessions
  *                  the same proxy user holds. That detail is the whole
@@ -619,15 +668,11 @@ static void test_stack_carries_traffic_end_to_end(void) {
  *                  easy to forget and impossible to notice".
  *   L4 owner    -- its own call count, and the snapshots above.
  *
- * WHY THE SNAPSHOTS ARE THE ORDER ASSERTION: see struct chain_probe.
- *
- * WHAT THIS CANNOT ASSERT, stated rather than implied: the relative
- * order of L1, L2 and L3 among themselves is a use-after-free question
- * (a relay stopped after its session is destroyed, a deadline left armed
- * against a freed stream), and the only detector for those is ASan --
- * which is why this file is in the mandatory sanitizer run. What is
- * asserted here without a sanitizer is that all four links ran and that
- * the owner's ran last. */
+ * WHAT THIS DOES NOT ASSERT, stated rather than implied: the relative
+ * order of L1 and L2 is NOT load-bearing -- verified by mutation, since
+ * neither module reads the other's contexts and the session is live
+ * through both. What is load-bearing, and is asserted, is that the
+ * panel's link runs after both and the owner's runs last of all. */
 static void test_broken_session_runs_the_whole_chain(void) {
     struct env e;
     ASSERT_EQ_INT(0, env_init(&e, "chain", 1));
@@ -644,22 +689,27 @@ static void test_broken_session_runs_the_whole_chain(void) {
      * whatever link 2 did. */
     sc.adminapi_request_timeout_ms = 600000;
 
-    cloak_server_stack_t st;
+    cloak_server_stack_t *st = NULL;
     char err[256] = {0};
-    ASSERT_EQ_INT(0, cloak_server_stack_init(&st, &sc, err, sizeof(err)));
-    probe.st = &st;
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        env_destroy(&e);
+        return;
+    }
+    probe.st = st;
 
     /* ---- TWO live proxy relays, on TWO sessions of the SAME user ----
      * One at a time up to its own upstream connection, so the (session ->
      * upstream connection) mapping is deterministic rather than lucky. */
     client_session_t user_a;
     client_session_t user_b;
-    ASSERT_EQ_INT(0, open_proxy_client(&e, &st, &user_a, 201));
+    ASSERT_EQ_INT(0, open_proxy_client(&e, st, &user_a, 201));
     cloak_stream_t *psa = cloak_session_open_stream(&user_a.sesh, NULL);
     ASSERT_TRUE(psa != NULL);
     if (psa == NULL) {
         client_session_close(&user_a);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         env_destroy(&e);
         return;
     }
@@ -667,13 +717,13 @@ static void test_broken_session_runs_the_whole_chain(void) {
     struct up_wait uwa = {&e.up, 0, 6};
     ASSERT_TRUE(pump_until(e.reactor, up_has_len, &uwa, 400, 5));
 
-    ASSERT_EQ_INT(0, open_proxy_client(&e, &st, &user_b, 202));
+    ASSERT_EQ_INT(0, open_proxy_client(&e, st, &user_b, 202));
     cloak_stream_t *psb = cloak_session_open_stream(&user_b.sesh, NULL);
     ASSERT_TRUE(psb != NULL);
     if (psb == NULL) {
         client_session_close(&user_b);
         client_session_close(&user_a);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         env_destroy(&e);
         return;
     }
@@ -682,34 +732,33 @@ static void test_broken_session_runs_the_whole_chain(void) {
     ASSERT_TRUE(pump_until(e.reactor, up_has_len, &uwb, 400, 5));
 
     ASSERT_EQ_INT(2, e.up.accept_count);
-    ASSERT_EQ_INT(2, (int)cloak_proxy_session_count(&st.proxy));
-    ASSERT_EQ_INT(2, (int)cloak_proxy_stream_count(&st.proxy));
-    ASSERT_EQ_INT(2, (int)cloak_server_registry_count_for_uid(&st.registry, e.uid_user));
+    ASSERT_EQ_INT(2, (int)cloak_server_stack_proxy_session_count(st));
+    ASSERT_EQ_INT(2, (int)cloak_server_stack_proxy_stream_count(st));
+    ASSERT_EQ_INT(2, (int)cloak_server_stack_session_count_for_uid(st, e.uid_user));
 
     /* ---- a live admin stream, stopped mid-headers ---- */
     client_session_t admin;
-    ASSERT_EQ_INT(0, open_admin_client(&e, &st, &admin));
-    ASSERT_EQ_INT(1, (int)cloak_adminapi_session_count(&st.api));
+    ASSERT_EQ_INT(0, open_admin_client(&e, st, &admin));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_session_count(st));
     cloak_stream_t *ast = cloak_session_open_stream(&admin.sesh, NULL);
     ASSERT_TRUE(ast != NULL);
     if (ast == NULL) {
         client_session_close(&admin);
         client_session_close(&user_b);
         client_session_close(&user_a);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         env_destroy(&e);
         return;
     }
-    static const char partial[] = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n";
-    ASSERT_EQ_INT((int)(sizeof(partial) - 1),
-                  (int)cloak_stream_write(ast, (const uint8_t *)partial, sizeof(partial) - 1));
-    struct api_wait aw = {&st, 1};
+    ASSERT_EQ_INT((int)(sizeof(ADMIN_PARTIAL) - 1),
+                  (int)cloak_stream_write(ast, (const uint8_t *)ADMIN_PARTIAL,
+                                          sizeof(ADMIN_PARTIAL) - 1));
+    struct api_wait aw = {st, 1};
     ASSERT_TRUE(pump_until(e.reactor, api_stream_count_is, &aw, 400, 5));
-    ASSERT_EQ_INT(1, (int)cloak_adminapi_stream_count(&st.api));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_stream_count(st));
 
-    /* Both users active, nothing broken yet. */
-    ASSERT_TRUE(cloak_userpanel_find(st.panel, e.uid_user) != NULL);
-    ASSERT_TRUE(cloak_userpanel_find(st.panel, e.uid_admin) != NULL);
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_user) != NULL);
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_admin) != NULL);
     ASSERT_EQ_INT(0, probe.calls);
 
     /* ========== BREAK A: one of the proxy user's TWO sessions ==========
@@ -726,60 +775,58 @@ static void test_broken_session_runs_the_whole_chain(void) {
      * therefore the only thing that can have reclaimed the proxy's
      * context for session 201. */
     client_session_close(&user_a);
-    struct count_wait cw_a = {&st, e.uid_user, 1};
+    struct count_wait cw_a = {st, e.uid_user, 1};
     ASSERT_TRUE(pump_until(e.reactor, registry_uid_count_is, &cw_a, 600, 5));
 
-    ASSERT_EQ_INT(1, probe.calls);                                 /* L4 ran */
+    ASSERT_EQ_INT(1, probe.calls);                              /* L4 ran */
     ASSERT_EQ_INT(201, (int)probe.last_session_id);
     ASSERT_MEM_EQ(probe.last_uid, e.uid_user, CLOAK_UID_LEN);
-    ASSERT_EQ_INT(1, (int)probe.proxy_sessions);                   /* L1 ran, and only for 201 */
+    ASSERT_EQ_INT(1, (int)probe.proxy_sessions);                /* L1 ran, for 201 only */
     ASSERT_EQ_INT(1, (int)probe.proxy_streams);
-    ASSERT_EQ_INT(1, probe.panel_still_has_uid);                   /* session 202 keeps it active */
-    /* The admin session is untouched: the chain keys on the session that
-     * broke and not on "everything". */
-    ASSERT_EQ_INT(1, (int)probe.api_sessions);
+    ASSERT_EQ_INT(1, probe.panel_still_has_uid);                /* 202 keeps it active */
+    ASSERT_EQ_INT(1, (int)probe.api_sessions);                  /* untouched */
     ASSERT_EQ_INT(1, (int)probe.api_streams);
 
-    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&st.proxy));
-    ASSERT_EQ_INT(1, (int)cloak_proxy_stream_count(&st.proxy));
-    ASSERT_TRUE(cloak_userpanel_find(st.panel, e.uid_user) != NULL);
-    ASSERT_EQ_INT(0, user_b.broken); /* the sibling session is unharmed */
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_session_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_stream_count(st));
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_user) != NULL);
+    ASSERT_EQ_INT(0, user_b.broken);
 
     /* ========== BREAK B: the proxy user's LAST session ========== */
     client_session_close(&user_b);
-    struct count_wait cw_b = {&st, e.uid_user, 0};
+    struct count_wait cw_b = {st, e.uid_user, 0};
     ASSERT_TRUE(pump_until(e.reactor, registry_uid_count_is, &cw_b, 600, 5));
 
     ASSERT_EQ_INT(2, probe.calls);
     ASSERT_EQ_INT(202, (int)probe.last_session_id);
     ASSERT_MEM_EQ(probe.last_uid, e.uid_user, CLOAK_UID_LEN);
-    ASSERT_EQ_INT(0, (int)probe.proxy_sessions);                   /* L1 again */
+    ASSERT_EQ_INT(0, (int)probe.proxy_sessions);                /* L1 again */
     ASSERT_EQ_INT(0, (int)probe.proxy_streams);
-    ASSERT_EQ_INT(0, probe.panel_still_has_uid);                   /* L3 ran first */
+    ASSERT_EQ_INT(0, probe.panel_still_has_uid);                /* L3 ran first */
     ASSERT_EQ_INT(1, (int)probe.api_sessions);
     ASSERT_EQ_INT(1, (int)probe.api_streams);
 
-    ASSERT_TRUE(cloak_userpanel_find(st.panel, e.uid_user) == NULL);
-    ASSERT_TRUE(cloak_userpanel_find(st.panel, e.uid_admin) != NULL);
-    ASSERT_EQ_INT(1, (int)cloak_adminapi_session_count(&st.api));
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_user) == NULL);
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_admin) != NULL);
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_session_count(st));
 
     /* ========== BREAK C: the admin session ========== */
     client_session_close(&admin);
-    struct count_wait cw_c = {&st, e.uid_admin, 0};
+    struct count_wait cw_c = {st, e.uid_admin, 0};
     ASSERT_TRUE(pump_until(e.reactor, registry_uid_count_is, &cw_c, 600, 5));
 
-    ASSERT_EQ_INT(3, probe.calls);                                 /* L4 ran again */
+    ASSERT_EQ_INT(3, probe.calls);                              /* L4 ran again */
     ASSERT_EQ_INT(0, (int)probe.last_session_id);
     ASSERT_MEM_EQ(probe.last_uid, e.uid_admin, CLOAK_UID_LEN);
-    ASSERT_EQ_INT(0, (int)probe.api_sessions);                     /* L2 ran first */
-    ASSERT_EQ_INT(0, (int)probe.api_streams);                      /* L2 ran first */
-    ASSERT_EQ_INT(0, probe.panel_still_has_uid);                   /* L3 ran first */
+    ASSERT_EQ_INT(0, (int)probe.api_sessions);                  /* L2 ran first */
+    ASSERT_EQ_INT(0, (int)probe.api_streams);                   /* L2 ran first */
+    ASSERT_EQ_INT(0, probe.panel_still_has_uid);                /* L3 ran first */
     ASSERT_EQ_INT(0, (int)probe.proxy_sessions);
 
-    ASSERT_TRUE(cloak_userpanel_find(st.panel, e.uid_admin) == NULL);
-    ASSERT_EQ_INT(0, (int)cloak_server_registry_count(&st.registry));
-    ASSERT_EQ_INT(0, (int)cloak_adminapi_session_count(&st.api));
-    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&st.proxy));
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_admin) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_session_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_admin_session_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_session_count(st));
 
     /* Nothing may fire into the wreckage: both upstream sockets are still
      * open and still registered, so a relay that outlived its session
@@ -791,12 +838,335 @@ static void test_broken_session_runs_the_whole_chain(void) {
     }
     ASSERT_EQ_INT(3, probe.calls);
 
-    cloak_server_stack_destroy(&st);
+    cloak_server_stack_close(st);
     env_destroy(&e);
 }
 
 /* ------------------------------------------------------------------ */
-/* 3. Teardown in the stack's own order, with traffic in flight         */
+/* 3. A termination stops BOTH modules                                  */
+/* ------------------------------------------------------------------ */
+
+/* EDGE E5, WHICH HAD NO TEST AT ALL UNTIL REVIEW SAID SO. Emptying
+ * stack_session_closing survived the whole suite, and so did each half
+ * of it, because nothing anywhere terminated a user: on_session_closing
+ * fires ONLY from cloak_server_registry_close_all_for_uid, which only
+ * cloak_userpanel_terminate reaches.
+ *
+ * WHY IT MATTERS MORE THAN THE CHAIN DOES. A termination closes sessions
+ * WITHOUT firing the registry's on_broken, so the whole four-link chain
+ * is silent for it. This hook is the only notification either module
+ * gets, and cloak/userpanel.h names the consequence exactly: "a
+ * use-after-free on the first upstream byte after the first
+ * out-of-credit user is terminated".
+ *
+ * TWO PHASES, because one covers the real trigger and the other covers
+ * the "both" property:
+ *
+ *   PHASE 1 -- a metered database user runs out of credit and is
+ *   terminated by an ordinary upload cycle, which is the production
+ *   trigger, driven here through cloak_server_stack_upload_now (the same
+ *   panel cycle the periodic timer runs). Only the proxy half is visible:
+ *   a database user cannot hold an admin session.
+ *
+ *   PHASE 2 -- ONE UID holding an admin session AND a proxy session at
+ *   the same time, terminated in one walk. That shape is reachable and is
+ *   not a contrivance: the dispatcher calls a session admin only when the
+ *   UID is the admin UID AND session_id == 0, so every OTHER session id
+ *   the admin UID opens is an ordinary proxy session. Both halves of the
+ *   trampoline have visible work in the same termination, so dropping
+ *   either one fails here. */
+static void test_termination_stops_both_modules(void) {
+    struct env e;
+    ASSERT_EQ_INT(0, env_init(&e, "terminate", 1));
+
+    /* Credit far below what the transfer below moves, so the very first
+     * upload cycle after it finds the user out of credit. */
+    seed_user(e.db_path, e.uid_db, 4, 1000, 1000);
+
+    cloak_server_stack_config_t sc;
+    stack_config(&e, &sc);
+    sc.adminapi_request_timeout_ms = 600000;
+
+    cloak_server_stack_t *st = NULL;
+    char err[256] = {0};
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        env_destroy(&e);
+        return;
+    }
+
+    /* =================== PHASE 1: credit exhaustion =================== */
+    client_session_t dbuser;
+    ASSERT_EQ_INT(0, open_client_at(&e, &dbuser, e.uid_db, "ss", 301, front_port(st)));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_session_count(st));
+    cloak_userpanel_user_t *pu = cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_db);
+    ASSERT_TRUE(pu != NULL);
+    /* A DATABASE user is metered; the contrast with the bypass admin user
+     * in phase 2 is what makes "metered" mean something here. */
+    ASSERT_TRUE(pu != NULL && cloak_userpanel_user_valve(pu) != NULL);
+
+    cloak_stream_t *dbs = cloak_session_open_stream(&dbuser.sesh, NULL);
+    ASSERT_TRUE(dbs != NULL);
+    if (dbs == NULL) {
+        client_session_close(&dbuser);
+        cloak_server_stack_close(st);
+        env_destroy(&e);
+        return;
+    }
+    uint8_t burn[4096];
+    memset(burn, 'x', sizeof(burn));
+    ASSERT_EQ_INT((int)sizeof(burn), (int)cloak_stream_write(dbs, burn, sizeof(burn)));
+    struct up_wait uw = {&e.up, 0, sizeof(burn)};
+    ASSERT_TRUE(pump_until(e.reactor, up_has_len, &uw, 800, 5));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_stream_count(st));
+
+    /* The cycle the periodic timer runs, taken at a deterministic moment.
+     * It drains the valve, settles it into the database, finds the credit
+     * exhausted and terminates the user -- which is what reaches
+     * on_session_closing. */
+    ASSERT_EQ_INT(0, cloak_server_stack_upload_now(st));
+
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_db) == NULL);
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_session_count_for_uid(st, e.uid_db));
+    /* THE ASSERTION THE TRAMPOLINE'S PROXY HALF OWNS. close_all_for_uid
+     * fires no on_broken, so these counters can only have been cleared
+     * through the hook. */
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_session_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_stream_count(st));
+
+    /* THE CLIENT IS TORN DOWN BEFORE THE PUMP BELOW, and the order is
+     * not incidental: the server has just closed this session, so a
+     * reactor turn would deliver the closing-stream frames to the client,
+     * which RETIRES its streams -- after which cloak_session_destroy no
+     * longer reclaims them and releasing them by hand is not safe either
+     * (test_server_e2e.c documents the same hazard for the same reason).
+     * Found by LeakSanitizer during mutation work, not by reading: a
+     * teardown-order mutation shifted that timing and 12 client-side
+     * streams leaked, which would have been read as a finding about the
+     * server. */
+    client_session_close(&dbuser);
+
+    /* The byte that would land on a relay that had NOT been stopped.
+     * Expected to fail at the socket level, so the result is not
+     * asserted; what is asserted is that pumping afterwards touches
+     * nothing freed, and ASan is the detector. */
+    (void)up_send(&e.up, 0, "after-the-free", 14);
+    for (int i = 0; i < 60; i++) {
+        cloak_reactor_run_once(e.reactor, 2);
+    }
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_stream_count(st));
+
+    /* ============ PHASE 2: one UID, an admin session AND a proxy ======= */
+    client_session_t admin;
+    ASSERT_EQ_INT(0, open_admin_client(&e, st, &admin));
+    cloak_stream_t *ast = cloak_session_open_stream(&admin.sesh, NULL);
+    ASSERT_TRUE(ast != NULL);
+    if (ast == NULL) {
+        client_session_close(&admin);
+        cloak_server_stack_close(st);
+        env_destroy(&e);
+        return;
+    }
+    ASSERT_EQ_INT((int)(sizeof(ADMIN_PARTIAL) - 1),
+                  (int)cloak_stream_write(ast, (const uint8_t *)ADMIN_PARTIAL,
+                                          sizeof(ADMIN_PARTIAL) - 1));
+    struct api_wait aw = {st, 1};
+    ASSERT_TRUE(pump_until(e.reactor, api_stream_count_is, &aw, 400, 5));
+
+    /* The SAME UID, a different session id: an ordinary proxy session. */
+    client_session_t adminproxy;
+    ASSERT_EQ_INT(0, open_client_at(&e, &adminproxy, e.uid_admin, "ss", 302, front_port(st)));
+    cloak_stream_t *aps = cloak_session_open_stream(&adminproxy.sesh, NULL);
+    ASSERT_TRUE(aps != NULL);
+    if (aps == NULL) {
+        client_session_close(&adminproxy);
+        client_session_close(&admin);
+        cloak_server_stack_close(st);
+        env_destroy(&e);
+        return;
+    }
+    ASSERT_EQ_INT(6, (int)cloak_stream_write(aps, (const uint8_t *)"both!!", 6));
+    struct up_wait uw2 = {&e.up, 1, 6};
+    ASSERT_TRUE(pump_until(e.reactor, up_has_len, &uw2, 400, 5));
+
+    /* BOTH modules hold a context for this ONE uid, at the same time. */
+    ASSERT_EQ_INT(2, (int)cloak_server_stack_session_count_for_uid(st, e.uid_admin));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_session_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_stream_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_session_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_stream_count(st));
+
+    /* The termination itself -- the same function an out-of-credit cycle
+     * calls, applied to a bypass user that no cycle would ever pick. */
+    cloak_userpanel_user_t *au = cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_admin);
+    ASSERT_TRUE(au != NULL);
+    /* A bypass user is NOT metered, which is the other half of phase 1's
+     * contrast and is what makes credit exhaustion inapplicable here. */
+    ASSERT_TRUE(au == NULL || cloak_userpanel_user_valve(au) == NULL);
+    cloak_userpanel_terminate(cloak_server_stack_panel(st), au, "test");
+
+    /* BOTH HALVES, ASSERTED SEPARATELY. Dropping the proxy call leaves
+     * the first pair non-zero; dropping the adminapi call leaves the
+     * second pair non-zero; emptying the trampoline leaves all four. */
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_session_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_stream_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_admin_session_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_admin_stream_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_session_count_for_uid(st, e.uid_admin));
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_admin) == NULL);
+
+    /* Both clients down before the pump, for the reason phase 1 gives. */
+    client_session_close(&adminproxy);
+    client_session_close(&admin);
+
+    (void)up_send(&e.up, 1, "after-the-free", 14);
+    for (int i = 0; i < 60; i++) {
+        cloak_reactor_run_once(e.reactor, 2);
+    }
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_stream_count(st));
+
+    cloak_server_stack_close(st);
+    env_destroy(&e);
+}
+
+/* ------------------------------------------------------------------ */
+/* 4. An abandoned handshake reclaims BOTH modules                      */
+/* ------------------------------------------------------------------ */
+
+/* EDGE E6, WHICH ALSO HAD NO TEST. Emptying stack_session_aborted
+ * survived the whole suite: nothing anywhere reached the dispatcher's
+ * abandoned-session hook, because every handshake in every other case
+ * succeeds.
+ *
+ * WHAT IT GUARDS: prepare_session allocates a per-session context BEFORE
+ * the cloak_session_t exists. If the session never comes to exist, or is
+ * unwound after being created, the registry's broken callback never fires
+ * for it and nothing else would ever free that context -- one leak per
+ * abandoned handshake, remotely reachable and unbounded. Both
+ * cloak/proxy.h and cloak/adminapi.h say so and neither can enforce it,
+ * because the dispatcher has ONE hook and two modules need it.
+ *
+ * HOW THE WINDOW IS FORCED: test_write_shim.c (LD_PRELOAD) makes the
+ * dispatcher's step-10 reply write fail for one specific connection,
+ * which is the only deterministic way to reach the post-creation unwind
+ * -- the reply is far smaller than any socket buffer floor, so genuine
+ * backpressure cannot produce it. The shim consumes its environment
+ * variable the instant it fires, so its disappearance is EXTERNAL PROOF
+ * that the intended path ran; without that proof this case would pass
+ * vacuously on a build with no LD_PRELOAD, having covered nothing. */
+static int shim_fired(void *ctx) {
+    (void)ctx;
+    return getenv("CLOAK_TEST_FORCE_PEER_PORT") == NULL;
+}
+
+/* Drives one connection whose reply write is forced to fail, for the
+ * (uid, session_id, proxy_method) given. Returns 0 on success. */
+static int abandon_one_handshake(struct env *e, const cloak_server_stack_t *st, const uint8_t *uid,
+                                 const char *method, uint32_t session_id) {
+    int fd = client_connect(front_port(st));
+    ASSERT_TRUE(fd >= 0);
+    if (fd < 0) {
+        return -1;
+    }
+    int cport = client_local_port(fd);
+    ASSERT_TRUE(cport > 0);
+    if (cport <= 0) {
+        close(fd);
+        return -1;
+    }
+
+    char portbuf[16];
+    snprintf(portbuf, sizeof(portbuf), "%d", cport);
+    ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_PEER_PORT", portbuf, 1));
+    ASSERT_EQ_INT(0, setenv("CLOAK_TEST_FORCE_MODE", "error", 1));
+    unsetenv("CLOAK_TEST_FORCE_STICKY");
+
+    uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    size_t record_len =
+        build_client_record(e->server_pub, uid, method, (uint8_t)CLOAK_AEAD_AES_256_GCM,
+                            (int64_t)time(NULL), session_id, 0, record, sizeof(record), shared);
+    ASSERT_TRUE(record_len > 0);
+    if (record_len == 0) {
+        close(fd);
+        unsetenv("CLOAK_TEST_FORCE_PEER_PORT");
+        unsetenv("CLOAK_TEST_FORCE_MODE");
+        return -1;
+    }
+    ASSERT_TRUE(write(fd, record, record_len) == (ssize_t)record_len);
+
+    /* THE PROOF THAT THE FORCED PATH RAN, not that some earlier refusal
+     * did: the shim consumed the variable. */
+    ASSERT_TRUE(pump_until(e->reactor, shim_fired, NULL, 600, 5));
+    for (int i = 0; i < 40; i++) {
+        cloak_reactor_run_once(e->reactor, 2);
+    }
+
+    unsetenv("CLOAK_TEST_FORCE_PEER_PORT");
+    unsetenv("CLOAK_TEST_FORCE_MODE");
+    close(fd);
+    for (int i = 0; i < 20; i++) {
+        cloak_reactor_run_once(e->reactor, 2);
+    }
+    return 0;
+}
+
+static void test_aborted_handshake_reclaims_both_modules(void) {
+    struct env e;
+    ASSERT_EQ_INT(0, env_init(&e, "abort", 1));
+
+    cloak_server_stack_config_t sc;
+    stack_config(&e, &sc);
+    cloak_server_stack_t *st = NULL;
+    char err[256] = {0};
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        env_destroy(&e);
+        return;
+    }
+
+    /* ---- the PROXY half: an ordinary bypass user's handshake ---- */
+    ASSERT_EQ_INT(0, abandon_one_handshake(&e, st, e.uid_user, "ss", 401));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_session_count(st));
+    /* The context cloak_proxy_prepare_session allocated before the
+     * session existed. Only the trampoline's proxy half frees it. */
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_proxy_session_count(st));
+    /* And the panel was told too, so the user is not left active
+     * forever -- the other silent leak on this path. */
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_user) == NULL);
+
+    /* ---- the ADMIN half: the admin UID on session id 0 ---- */
+    ASSERT_EQ_INT(0, abandon_one_handshake(&e, st, e.uid_admin, "nosuch", 0));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_session_count(st));
+    /* The context cloak_adminapi_prepare_session allocated. Only the
+     * trampoline's adminapi half frees it. */
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_admin_session_count(st));
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_admin_stream_count(st));
+    ASSERT_TRUE(cloak_userpanel_find(cloak_server_stack_panel(st), e.uid_admin) == NULL);
+
+    /* The server is still healthy afterwards: an abandoned handshake is
+     * not allowed to poison the next good one. */
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_proxy_client(&e, st, &cs, 402));
+    cloak_stream_t *s = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s != NULL) {
+        ASSERT_EQ_INT(6, (int)cloak_stream_write(s, (const uint8_t *)"after!", 6));
+        struct up_wait uw = {&e.up, 0, 6};
+        ASSERT_TRUE(pump_until(e.reactor, up_has_len, &uw, 400, 5));
+        ASSERT_UP_BYTES(e.up, 0, "after!", 6);
+        cloak_session_release_stream(&cs.sesh, s);
+    }
+    client_session_close(&cs);
+
+    cloak_server_stack_close(st);
+    env_destroy(&e);
+}
+
+/* ------------------------------------------------------------------ */
+/* 5. Teardown in the stack's own order, with traffic in flight         */
 /* ------------------------------------------------------------------ */
 
 #define INFLIGHT_CHUNK ((size_t)4096)
@@ -819,8 +1189,8 @@ struct inflight {
 /* Keeps writing, one chunk per reactor turn, and stops once enough bytes
  * are stuck between the client and the stalled upstream. Paced
  * deliberately: an unpaced writer pushes everything into the kernel
- * before a single reactor turn runs, and there is then no moment at
- * which the transfer is partly done. */
+ * before a single reactor turn runs, and there is then no moment at which
+ * the transfer is partly done. */
 static int inflight_ready(void *ctx) {
     struct inflight *w = ctx;
     if (w->sent < INFLIGHT_CHUNKS * INFLIGHT_CHUNK &&
@@ -838,11 +1208,9 @@ static int inflight_ready(void *ctx) {
  * every layer: a running relay with bytes stuck inside the server, an
  * admin session context, and a half-sent admin request whose deadline is
  * ARMED. Most of what this can catch is visible only under ASan -- a
- * relay stopped too late holds a freed cloak_stream_t, a panel closed too
- * early leaves a live session metering into a freed valve, a deadline
- * never cancelled fires against freed memory. The plain Debug build sees
- * the counter assertions and nothing else, which is why this file is in
- * the mandatory sanitizer run.
+ * relay stopped too late holds a freed cloak_stream_t, a deadline never
+ * cancelled fires against freed memory. Mutation-verified: destroying the
+ * registry BEFORE the proxy is a heap-use-after-free here.
  *
  * THE DEADLINE IS GIVEN A REAL CHANCE: the request timeout is 300 ms and
  * the reactor is pumped PAST it after the whole stack is gone, with the
@@ -855,17 +1223,22 @@ static void test_teardown_with_traffic_in_flight(void) {
     stack_config(&e, &sc);
     sc.adminapi_request_timeout_ms = 300;
 
-    cloak_server_stack_t st;
+    cloak_server_stack_t *st = NULL;
     char err[256] = {0};
-    ASSERT_EQ_INT(0, cloak_server_stack_init(&st, &sc, err, sizeof(err)));
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        env_destroy(&e);
+        return;
+    }
 
     client_session_t user;
-    ASSERT_EQ_INT(0, open_proxy_client(&e, &st, &user, 301));
+    ASSERT_EQ_INT(0, open_proxy_client(&e, st, &user, 501));
     cloak_stream_t *pst = cloak_session_open_stream(&user.sesh, NULL);
     ASSERT_TRUE(pst != NULL);
     if (pst == NULL) {
         client_session_close(&user);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         env_destroy(&e);
         return;
     }
@@ -875,7 +1248,7 @@ static void test_teardown_with_traffic_in_flight(void) {
     if (src == NULL) {
         cloak_session_release_stream(&user.sesh, pst);
         client_session_close(&user);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         env_destroy(&e);
         return;
     }
@@ -890,7 +1263,7 @@ static void test_teardown_with_traffic_in_flight(void) {
     struct up_wait uw = {&e.up, 0, 6};
     ASSERT_TRUE(pump_until(e.reactor, up_has_len, &uw, 400, 5));
     ASSERT_EQ_INT(6, (int)e.up.conns[0].in_len);
-    ASSERT_EQ_INT(1, (int)cloak_proxy_stream_count(&st.proxy));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_stream_count(st));
 
     /* Now the upstream stops reading and the client keeps writing: the
      * difference is bytes sitting inside the server. */
@@ -898,45 +1271,39 @@ static void test_teardown_with_traffic_in_flight(void) {
     struct inflight fl = {&user.sesh, pst, src, 0, &e.up, INFLIGHT_MIN_OUTSTANDING};
     ASSERT_TRUE(pump_until(e.reactor, inflight_ready, &fl, 4000, 2));
 
-    /* An admin session with a request stopped mid-headers. */
     client_session_t admin;
-    ASSERT_EQ_INT(0, open_admin_client(&e, &st, &admin));
+    ASSERT_EQ_INT(0, open_admin_client(&e, st, &admin));
     cloak_stream_t *ast = cloak_session_open_stream(&admin.sesh, NULL);
     ASSERT_TRUE(ast != NULL);
     if (ast == NULL) {
         free(src);
         client_session_close(&admin);
         client_session_close(&user);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         env_destroy(&e);
         return;
     }
-    static const char partial[] = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n";
-    ASSERT_EQ_INT((int)(sizeof(partial) - 1),
-                  (int)cloak_stream_write(ast, (const uint8_t *)partial, sizeof(partial) - 1));
-    struct api_wait aw = {&st, 1};
+    ASSERT_EQ_INT((int)(sizeof(ADMIN_PARTIAL) - 1),
+                  (int)cloak_stream_write(ast, (const uint8_t *)ADMIN_PARTIAL,
+                                          sizeof(ADMIN_PARTIAL) - 1));
+    struct api_wait aw = {st, 1};
     ASSERT_TRUE(pump_until(e.reactor, api_stream_count_is, &aw, 400, 5));
 
     /* MID-FLIGHT, ASSERTED AT THE MOMENT OF THE TEARDOWN rather than
-     * hoped for: bytes crossed the stack, a substantial quantity is still
-     * in transit inside it, and the transfer is nowhere near done. */
+     * hoped for. */
     ASSERT_TRUE(e.up.conns[0].in_len >= 6);
     ASSERT_TRUE(fl.sent > e.up.conns[0].in_len);
     ASSERT_TRUE(fl.sent - e.up.conns[0].in_len >= INFLIGHT_MIN_OUTSTANDING);
-    ASSERT_EQ_INT(1, (int)cloak_proxy_stream_count(&st.proxy));
-    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&st.proxy));
-    ASSERT_EQ_INT(1, (int)cloak_adminapi_session_count(&st.api));
-    ASSERT_EQ_INT(1, (int)cloak_adminapi_stream_count(&st.api));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_stream_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_proxy_session_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_session_count(st));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_stream_count(st));
     ASSERT_EQ_INT(0, user.broken);
 
     /* ---- the shutdown, in the stack's order ---- */
     uint64_t t0 = now_ms();
-    cloak_server_stack_destroy(&st);
-    ASSERT_EQ_INT(0, (int)cloak_proxy_stream_count(&st.proxy));
-    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&st.proxy));
-    ASSERT_EQ_INT(0, (int)cloak_adminapi_stream_count(&st.api));
-    ASSERT_EQ_INT(0, (int)cloak_adminapi_session_count(&st.api));
-    ASSERT_EQ_INT(0, (int)cloak_server_stack_listener_count(&st));
+    cloak_server_stack_close(st);
+    st = NULL;
 
     /* The client sessions are still live on the reactor, exactly as a
      * remote client would be when a server exits. They are destroyed
@@ -961,36 +1328,45 @@ static void test_teardown_with_traffic_in_flight(void) {
         cloak_reactor_run_once(e.reactor, 2);
     }
 
-    /* A second destroy must be a no-op, not a double free. */
-    cloak_server_stack_destroy(&st);
+    /* Closing a NULL handle is a no-op, which is what makes a caller's
+     * unconditional cleanup path correct. */
+    cloak_server_stack_close(NULL);
 
     free(src);
     env_destroy(&e);
 }
 
 /* ------------------------------------------------------------------ */
-/* 4. The enforced edges -- one case each                               */
+/* 6. The enforced edges -- one case each                               */
 /* ------------------------------------------------------------------ */
 
-/* Every case here asserts THREE things: the typed code, that the message
- * names the edge (not merely that it is non-empty -- a generic "failed"
- * would satisfy that and tell an operator nothing), and that the
- * half-built stack is still safe to destroy. The last one matters: the
- * failure path is exactly where a caller's own cleanup runs, and five
- * earlier constructors on this project crashed there. */
-static void assert_rejected(cloak_server_stack_t *st, const cloak_server_stack_config_t *sc,
-                            int expect_code, const char *expect_in_message) {
+/* Every case here asserts FOUR things: the typed code, the code's EXACT
+ * name (a strlen > 0 check would be satisfied by the strerror default
+ * arm's "unknown" for every code, which is a test written against the
+ * symbol it tests rather than against the behaviour), that the message
+ * names the edge, and that nothing was left open. */
+static void assert_rejected(const cloak_server_stack_config_t *sc, int expect_code,
+                            const char *expect_name, const char *expect_in_message) {
     char err[256];
     memset(err, 0xAA, sizeof(err));
-    int rc = cloak_server_stack_init(st, sc, err, sizeof(err));
+    cloak_server_stack_t *st = (cloak_server_stack_t *)(void *)&err; /* deliberately non-NULL */
+    int before = fd_count();
+    ASSERT_TRUE(before > 0);
+
+    int rc = cloak_server_stack_open(&st, sc, err, sizeof(err));
     ASSERT_EQ_INT(expect_code, rc);
+    /* *out is NULL on EVERY failure path, including the ones that reject
+     * before allocating: a caller's cleanup closes NULL, not a stale
+     * pointer it never wrote. */
+    ASSERT_TRUE(st == NULL);
+    ASSERT_EQ_INT(0, strcmp(cloak_server_stack_strerror(rc), expect_name));
     ASSERT_TRUE(strlen(err) > 0 && strlen(err) < sizeof(err));
     ASSERT_TRUE(strstr(err, expect_in_message) != NULL);
-    /* The code's own name is stable and is what a log line carries. */
-    ASSERT_TRUE(strlen(cloak_server_stack_strerror(rc)) > 0);
-    /* Safe on the rejected struct, always. */
-    cloak_server_stack_destroy(st);
-    cloak_server_stack_destroy(st);
+    /* THE UNWIND, measured with no destroy of our own in between: a
+     * rejected open must release everything it had already built. */
+    ASSERT_EQ_INT(before, fd_count());
+
+    cloak_server_stack_close(st); /* NULL: a no-op */
 }
 
 /* EDGE 1: no reactor. */
@@ -1000,8 +1376,7 @@ static void test_edge_null_reactor(void) {
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
     sc.reactor = NULL;
-    cloak_server_stack_t st;
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_ARG, "reactor");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_ARG, "argument", "reactor");
     env_destroy(&e);
 }
 
@@ -1012,8 +1387,7 @@ static void test_edge_null_config(void) {
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
     sc.config = NULL;
-    cloak_server_stack_t st;
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_ARG, "config");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_ARG, "argument", "server config");
     env_destroy(&e);
 }
 
@@ -1025,8 +1399,7 @@ static void test_edge_no_bind_address(void) {
     e.cfg.num_bind_addr = 0;
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
-    cloak_server_stack_t st;
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_CONFIG, "BindAddr");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_CONFIG, "server config", "BindAddr");
     env_destroy(&e);
 }
 
@@ -1039,8 +1412,7 @@ static void test_edge_too_many_bind_addresses(void) {
     e.cfg.num_bind_addr = CLOAK_MAX_BIND_ADDR + 1;
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
-    cloak_server_stack_t st;
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_CONFIG, "BindAddr");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_CONFIG, "server config", "BindAddr");
     env_destroy(&e);
 }
 
@@ -1055,42 +1427,64 @@ static void test_edge_session_template_rejected(void) {
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
     sc.session_config_template.max_on_wire_size = 70000;
-    cloak_server_stack_t st;
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_TEMPLATE, "session template");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_TEMPLATE, "session template", "session template");
     env_destroy(&e);
 }
 
-/* EDGE 6: the retry ladder outlasting the session it belongs to.
- * cloak/proxy.h states this invariant and then says nothing there can
- * check it, "because the session config belongs to the dispatcher, not
- * to this module" -- the stack owns both, so this is the first place in
- * the project where it CAN be checked.
+/* EDGE 6a: the retry ladder outlasting the session it belongs to, with
+ * the ladder CONFIGURED EXPLICITLY.
  *
- * A MEASURED BRACKET, NOT A CLAIMED MARGIN: the accepted side below sits
- * one millisecond above the ladder and the rejected side one millisecond
- * below it, so the boundary itself is pinned rather than a comfortable
- * distance from it. A check with the comparison the wrong way round, or
- * off by one, fails one of the two halves. */
-static void test_edge_retry_ladder_outlasts_the_session(void) {
+ * A MEASURED BRACKET, NOT A CLAIMED MARGIN: the rejected side sits one
+ * millisecond below the ladder and the accepted side one millisecond
+ * above it, so the boundary itself is pinned. A comparison the wrong way
+ * round, or off by one, fails one of the two halves. */
+static void test_edge_retry_ladder_explicit(void) {
     struct env e;
-    ASSERT_EQ_INT(0, env_init(&e, "edge6", 1));
+    ASSERT_EQ_INT(0, env_init(&e, "edge6a", 1));
 
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
     sc.proxy_retry_delay_ms = 10;
     sc.proxy_max_retries = 100; /* ladder = 1000 ms */
 
-    /* The rejected side: one millisecond short of the ladder. */
     sc.session_config_template.inactivity_timeout_ms = 1000;
-    cloak_server_stack_t st;
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_RETRY_LADDER, "retry");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_RETRY_LADDER, "proxy retry ladder", "retry ladder");
 
-    /* The accepted side: one millisecond past it, everything else
-     * identical. */
     sc.session_config_template.inactivity_timeout_ms = 1001;
+    cloak_server_stack_t *st = NULL;
     char err[256] = {0};
-    ASSERT_EQ_INT(0, cloak_server_stack_init(&st, &sc, err, sizeof(err)));
-    cloak_server_stack_destroy(&st);
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    cloak_server_stack_close(st);
+
+    env_destroy(&e);
+}
+
+/* EDGE 6b: THE SAME EDGE ON THE PATH EVERY BINARY ACTUALLY TAKES, and the
+ * reason 6a alone is not enough. A binary that accepts the proxy's
+ * defaults writes ZERO in both retry fields, so a check that used the raw
+ * config would compute a ladder of zero and accept everything -- which is
+ * the only case most deployments are in. Here both fields are left at 0
+ * and the bracket is drawn around the proxy's REAL ladder
+ * (CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS x _MAX_RETRIES = 20000 ms), spelled
+ * as a literal so that a change to either constant fails here rather than
+ * being absorbed by an expression that moves with it. */
+static void test_edge_retry_ladder_defaults(void) {
+    struct env e;
+    ASSERT_EQ_INT(0, env_init(&e, "edge6b", 1));
+
+    cloak_server_stack_config_t sc;
+    stack_config(&e, &sc);
+    ASSERT_EQ_INT(0, (int)sc.proxy_retry_delay_ms);
+    ASSERT_EQ_INT(0, (int)sc.proxy_max_retries);
+
+    sc.session_config_template.inactivity_timeout_ms = 20000;
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_RETRY_LADDER, "proxy retry ladder", "20000 ms");
+
+    sc.session_config_template.inactivity_timeout_ms = 20001;
+    cloak_server_stack_t *st = NULL;
+    char err[256] = {0};
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    cloak_server_stack_close(st);
 
     env_destroy(&e);
 }
@@ -1104,8 +1498,7 @@ static void test_edge_config_rejected_by_server_state(void) {
     e.cfg.num_proxy_entries = CLOAK_MAX_PROXY_BOOK + 1;
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
-    cloak_server_stack_t st;
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_SERVER, "server state");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_SERVER, "server state", "server state");
     env_destroy(&e);
 }
 
@@ -1119,77 +1512,50 @@ static void test_edge_database_cannot_be_opened(void) {
 
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
-    cloak_server_stack_t st;
 
     snprintf(e.cfg.database_path, sizeof(e.cfg.database_path),
              "/nonexistent-cloak-stack-dir/users.db");
-    assert_rejected(&st, &sc, CLOAK_SERVER_STACK_ERR_DATABASE, "database");
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_DATABASE, "user database", "user database");
 
-    /* No DatabasePath at all: the void manager, which succeeds. */
     e.cfg.database_path[0] = '\0';
+    cloak_server_stack_t *st = NULL;
     char err[256] = {0};
-    ASSERT_EQ_INT(0, cloak_server_stack_init(&st, &sc, err, sizeof(err)));
-    ASSERT_TRUE(st.mgr != NULL);
-    cloak_server_stack_destroy(&st);
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(cloak_server_stack_manager(st) != NULL);
+    cloak_server_stack_close(st);
 
     env_destroy(&e);
 }
 
 /* EDGE 9: a bind address that cannot be opened -- and, because it is the
  * SECOND of two, the unwind path as well: the listener already opened
- * must be closed again. Descriptors are counted around the whole
- * rejection, which is the only way to see that. */
+ * must be released by the failing open itself. assert_rejected measures
+ * descriptors with no destroy of its own in between, which is the only
+ * way to see that (an earlier version measured after its own destroy and
+ * the missing-unwind mutation survived). */
 static void test_edge_bind_address_cannot_be_opened(void) {
     struct env e;
     ASSERT_EQ_INT(0, env_init(&e, "edge9", 1));
 
     ASSERT_EQ_INT(1, (int)e.cfg.num_bind_addr);
     e.cfg.num_bind_addr = 2;
-    /* TEST-NET-1 (RFC 5737): a syntactically valid address that is
-     * guaranteed not to be assigned to any interface here, so bind(2)
-     * fails with EADDRNOTAVAIL. Deterministic and local -- no DNS, and no
-     * dependence on whether this process happens to be root (a privileged
-     * port would bind fine inside a container that runs as root, which is
-     * what made the first attempt at this case pass for the wrong
-     * reason). */
+    /* TEST-NET-1 (RFC 5737): a syntactically valid address guaranteed not
+     * to be assigned to any interface here, so bind(2) fails with
+     * EADDRNOTAVAIL. Deterministic and local -- no DNS, and no dependence
+     * on whether this process happens to be root (a privileged port would
+     * bind fine inside a container that runs as root, which is what made
+     * the first attempt at this case pass for the wrong reason). */
     snprintf(e.cfg.bind_addr[1], sizeof(e.cfg.bind_addr[1]), "192.0.2.1:1234");
 
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
-    cloak_server_stack_t st;
-
-    int before = fd_count();
-    ASSERT_TRUE(before > 0);
-
-    char err[256];
-    memset(err, 0xAA, sizeof(err));
-    int rc = cloak_server_stack_init(&st, &sc, err, sizeof(err));
-    ASSERT_EQ_INT(CLOAK_SERVER_STACK_ERR_LISTEN, rc);
-
-    /* THE UNWIND, MEASURED BEFORE ANY DESTROY OF OURS. This assertion is
-     * deliberately not routed through assert_rejected: that helper
-     * destroys the stack first, and a count taken afterwards is green
-     * whether cloak_server_stack_init unwound or not. Measured -- with
-     * the unwind deleted, the count-after-destroy version of this case
-     * still passed. What is asserted here is that the FIRST listener,
-     * the database and the server state were all released by the failing
-     * init itself, before it returned. */
-    ASSERT_EQ_INT(before, fd_count());
-
-    ASSERT_TRUE(strlen(err) > 0 && strlen(err) < sizeof(err));
-    ASSERT_TRUE(strstr(err, "192.0.2.1:1234") != NULL);
-    ASSERT_EQ_INT(0, (int)cloak_server_stack_listener_count(&st));
-
-    /* And destroy is still a no-op on it, twice. */
-    cloak_server_stack_destroy(&st);
-    cloak_server_stack_destroy(&st);
-    ASSERT_EQ_INT(before, fd_count());
+    assert_rejected(&sc, CLOAK_SERVER_STACK_ERR_LISTEN, "bind address", "192.0.2.1:1234");
 
     env_destroy(&e);
 }
 
 /* ------------------------------------------------------------------ */
-/* 5. Every configured BindAddr accepts                                 */
+/* 7. Every configured BindAddr accepts                                 */
 /* ------------------------------------------------------------------ */
 
 /* Three listeners, three DIFFERENT ports, and a real handshake plus real
@@ -1203,25 +1569,30 @@ static void test_every_bind_address_accepts(void) {
 
     cloak_server_stack_config_t sc;
     stack_config(&e, &sc);
-    cloak_server_stack_t st;
+    cloak_server_stack_t *st = NULL;
     char err[256] = {0};
-    ASSERT_EQ_INT(0, cloak_server_stack_init(&st, &sc, err, sizeof(err)));
-    ASSERT_EQ_INT(3, (int)cloak_server_stack_listener_count(&st));
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        env_destroy(&e);
+        return;
+    }
+    ASSERT_EQ_INT(3, (int)cloak_server_stack_listener_count(st));
 
     int ports[3];
     for (size_t i = 0; i < 3; i++) {
-        ports[i] = cloak_server_stack_listener_port(&st, i);
+        ports[i] = cloak_server_stack_listener_port(st, i);
         ASSERT_TRUE(ports[i] > 0);
     }
     ASSERT_TRUE(ports[0] != ports[1] && ports[1] != ports[2] && ports[0] != ports[2]);
-    ASSERT_EQ_INT(-1, cloak_server_stack_listener_port(&st, 3));
+    ASSERT_EQ_INT(-1, cloak_server_stack_listener_port(st, 3));
 
     client_session_t cs[3];
     cloak_stream_t *sts[3];
     for (size_t i = 0; i < 3; i++) {
         sts[i] = NULL;
         ASSERT_EQ_INT(0,
-                      open_client_at(&e, &cs[i], e.uid_user, "ss", (uint32_t)(400 + i), ports[i]));
+                      open_client_at(&e, &cs[i], e.uid_user, "ss", (uint32_t)(600 + i), ports[i]));
         sts[i] = cloak_session_open_stream(&cs[i].sesh, NULL);
         ASSERT_TRUE(sts[i] != NULL);
         if (sts[i] == NULL) {
@@ -1235,8 +1606,8 @@ static void test_every_bind_address_accepts(void) {
         ASSERT_UP_BYTES(e.up, (int)i, payload, 6);
     }
     ASSERT_EQ_INT(3, e.up.accept_count);
-    ASSERT_EQ_INT(3, (int)cloak_server_registry_count(&st.registry));
-    ASSERT_EQ_INT(3, (int)cloak_proxy_stream_count(&st.proxy));
+    ASSERT_EQ_INT(3, (int)cloak_server_stack_session_count(st));
+    ASSERT_EQ_INT(3, (int)cloak_server_stack_proxy_stream_count(st));
 
     for (size_t i = 0; i < 3; i++) {
         if (sts[i] != NULL) {
@@ -1244,20 +1615,18 @@ static void test_every_bind_address_accepts(void) {
         }
         client_session_close(&cs[i]);
     }
-    cloak_server_stack_destroy(&st);
+    cloak_server_stack_close(st);
     env_destroy(&e);
 }
 
 /* ------------------------------------------------------------------ */
-/* 6. Built and destroyed twice, with descriptors counted               */
+/* 8. Built and destroyed twice, with descriptors counted               */
 /* ------------------------------------------------------------------ */
 
 /* TWO FULL CYCLES IN ONE PROCESS, each carrying real traffic, with the
- * descriptor count measured after the first and compared after the
- * second. The first cycle is what warms everything a process allocates
- * once (SQLite's page cache, the resolver); the comparison is therefore
- * between cycle 1 and cycle 2, never against a cold baseline, which is
- * what makes it exact rather than approximately right.
+ * descriptor count measured after each and compared. The comparison is
+ * cycle to cycle, never against a cold baseline, so whatever a process
+ * allocates once (SQLite's page cache, the resolver) is warm in both.
  *
  * LeakSanitizer does not track descriptors: a stack that leaked a
  * listener, an accepted socket or a SQLite file handle per cycle would
@@ -1272,13 +1641,18 @@ static void test_build_and_destroy_twice_leaves_nothing(void) {
     for (int cycle = 0; cycle < 2; cycle++) {
         cloak_server_stack_config_t sc;
         stack_config(&e, &sc);
-        cloak_server_stack_t st;
+        cloak_server_stack_t *st = NULL;
         char err[256] = {0};
-        ASSERT_EQ_INT(0, cloak_server_stack_init(&st, &sc, err, sizeof(err)));
-        ASSERT_EQ_INT(2, (int)cloak_server_stack_listener_count(&st));
+        ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+        ASSERT_TRUE(st != NULL);
+        if (st == NULL) {
+            env_destroy(&e);
+            return;
+        }
+        ASSERT_EQ_INT(2, (int)cloak_server_stack_listener_count(st));
 
         client_session_t cs;
-        ASSERT_EQ_INT(0, open_proxy_client(&e, &st, &cs, (uint32_t)(500 + cycle)));
+        ASSERT_EQ_INT(0, open_proxy_client(&e, st, &cs, (uint32_t)(700 + cycle)));
         cloak_stream_t *s = cloak_session_open_stream(&cs.sesh, NULL);
         ASSERT_TRUE(s != NULL);
         if (s != NULL) {
@@ -1289,7 +1663,7 @@ static void test_build_and_destroy_twice_leaves_nothing(void) {
             cloak_session_release_stream(&cs.sesh, s);
         }
         client_session_close(&cs);
-        cloak_server_stack_destroy(&st);
+        cloak_server_stack_close(st);
         /* The upstream connection this cycle's relay produced belongs to
          * the TEST, not to the stack; released here so that what is
          * compared below is the stack's own footprint and nothing else.
@@ -1304,10 +1678,164 @@ static void test_build_and_destroy_twice_leaves_nothing(void) {
         ASSERT_TRUE(after_cycle[cycle] > 0);
     }
 
-    /* Each cycle opened two listeners and one SQLite database and left
-     * exactly the same number of descriptors behind as the one before
-     * it: whatever the stack opened, it closed. */
     ASSERT_EQ_INT(after_cycle[0], after_cycle[1]);
+
+    env_destroy(&e);
+}
+
+/* ------------------------------------------------------------------ */
+/* 9. The caller's config may die the moment open returns               */
+/* ------------------------------------------------------------------ */
+
+/* THE STACK TAKES A COPY, and this is what that buys. cloak_server_t
+ * borrows its cloak_server_config_t for its whole life and AUTHENTICATION
+ * READS IT ON EVERY HANDSHAKE -- cloak_server_lookup_proxy walks the
+ * ProxyBook names, cloak_server_is_admin compares admin_uid -- so a
+ * binary that parsed its config into a local and returned, or reused the
+ * struct for a reload, would have a dangling read on the hot path. An
+ * earlier revision of the header listed this as unenforceable; it was one
+ * memcpy.
+ *
+ * The config here is HEAP allocated, scribbled and then FREED, so ASan
+ * reports a heap-use-after-free rather than the test depending on what a
+ * dead stack frame happens to still contain. Both readers are exercised
+ * afterwards: a proxy client (the ProxyBook lookup) and an admin client
+ * (the admin_uid comparison). */
+static void test_config_may_die_after_open(void) {
+    struct env e;
+    ASSERT_EQ_INT(0, env_init(&e, "cfglife", 1));
+
+    cloak_server_config_t *heap_cfg = malloc(sizeof(*heap_cfg));
+    ASSERT_TRUE(heap_cfg != NULL);
+    if (heap_cfg == NULL) {
+        env_destroy(&e);
+        return;
+    }
+    *heap_cfg = e.cfg;
+
+    cloak_server_stack_config_t sc;
+    stack_config(&e, &sc);
+    sc.config = heap_cfg;
+
+    cloak_server_stack_t *st = NULL;
+    char err[256] = {0};
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        free(heap_cfg);
+        env_destroy(&e);
+        return;
+    }
+
+    /* The caller's config is gone from this line onward. */
+    memset(heap_cfg, 0xEE, sizeof(*heap_cfg));
+    free(heap_cfg);
+    heap_cfg = NULL;
+
+    /* A PROXY client: dispatcher step 7 calls cloak_server_lookup_proxy,
+     * which reads the ProxyBook entry NAMES out of the config. */
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_proxy_client(&e, st, &cs, 801));
+    cloak_stream_t *s = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s != NULL) {
+        ASSERT_EQ_INT(7, (int)cloak_stream_write(s, (const uint8_t *)"cfgfree", 7));
+        struct up_wait uw = {&e.up, 0, 7};
+        ASSERT_TRUE(pump_until(e.reactor, up_has_len, &uw, 400, 5));
+        ASSERT_UP_BYTES(e.up, 0, "cfgfree", 7);
+        cloak_session_release_stream(&cs.sesh, s);
+    }
+
+    /* AN ADMIN client: step 6a calls cloak_server_is_admin, which
+     * compares against admin_uid in the config. A wrong answer here is
+     * not a crash but a category error -- the session would be prepared
+     * by the proxy instead -- so the admin-side counter is what is
+     * asserted. */
+    client_session_t admin;
+    ASSERT_EQ_INT(0, open_admin_client(&e, st, &admin));
+    ASSERT_EQ_INT(1, (int)cloak_server_stack_admin_session_count(st));
+
+    client_session_close(&admin);
+    client_session_close(&cs);
+    cloak_server_stack_close(st);
+    env_destroy(&e);
+}
+
+/* ------------------------------------------------------------------ */
+/* 10. strerror, compared exactly                                       */
+/* ------------------------------------------------------------------ */
+
+/* ONE EXACT COMPARISON PER CODE. The obvious version of this -- assert
+ * the string is non-empty -- is satisfied by the default arm's "unknown"
+ * for every code in the table, so it would pass on an implementation with
+ * no table at all. These strings reach an operator's log next to the
+ * message, so they are contract. */
+static void test_strerror_names_every_code(void) {
+    ASSERT_EQ_INT(0, strcmp(cloak_server_stack_strerror(0), "ok"));
+    ASSERT_EQ_INT(0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_ARG), "argument"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_CONFIG), "server config"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_TEMPLATE), "session template"));
+    ASSERT_EQ_INT(0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_RETRY_LADDER),
+                            "proxy retry ladder"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_SERVER), "server state"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_DATABASE), "user database"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_REGISTRY), "session registry"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_PANEL), "user panel"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_ADMINAPI), "admin API"));
+    ASSERT_EQ_INT(0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_PROXY), "proxy"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_DISPATCHER), "dispatcher"));
+    ASSERT_EQ_INT(
+        0, strcmp(cloak_server_stack_strerror(CLOAK_SERVER_STACK_ERR_LISTEN), "bind address"));
+    /* And the default arm, which is the thing every other assertion here
+     * exists to distinguish itself from. */
+    ASSERT_EQ_INT(0, strcmp(cloak_server_stack_strerror(-9999), "unknown"));
+    ASSERT_EQ_INT(0, strcmp(cloak_server_stack_strerror(1), "unknown"));
+}
+
+/* ------------------------------------------------------------------ */
+/* 11. The replay cache the stack actually allocated                    */
+/* ------------------------------------------------------------------ */
+
+/* THE DEFAULT IS SPELLED AS A LITERAL, deliberately. Asserting against
+ * CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY would derive both
+ * sides of the comparison from the same symbol, so the constant could be
+ * changed by a factor of 256 without this failing -- a defect this
+ * project has shipped before. The accessor reports what
+ * cloak_server_init really allocated, not this module's copy of the
+ * request, so a substitution that never reached the allocation is
+ * visible. */
+static void test_replay_cache_capacity(void) {
+    struct env e;
+    ASSERT_EQ_INT(0, env_init(&e, "replay", 1));
+    char err[256] = {0};
+
+    cloak_server_stack_config_t sc;
+    stack_config(&e, &sc);
+    cloak_server_stack_t *st = NULL;
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_EQ_INT(1024, (int)cloak_server_stack_replay_cache_capacity(st));
+    cloak_server_stack_close(st);
+
+    /* An explicit value is honoured verbatim, which is what makes the
+     * assertion above a statement about the DEFAULT rather than about a
+     * hard-coded allocation. */
+    st = NULL;
+    sc.replay_cache_capacity = 64;
+    ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
+    ASSERT_EQ_INT(64, (int)cloak_server_stack_replay_cache_capacity(st));
+    cloak_server_stack_close(st);
+
+    /* A closed or absent stack reports 0 rather than reading freed
+     * memory. */
+    ASSERT_EQ_INT(0, (int)cloak_server_stack_replay_cache_capacity(NULL));
 
     env_destroy(&e);
 }
@@ -1315,16 +1843,22 @@ static void test_build_and_destroy_twice_leaves_nothing(void) {
 TEST_MAIN_BEGIN()
 test_stack_carries_traffic_end_to_end();
 test_broken_session_runs_the_whole_chain();
+test_termination_stops_both_modules();
+test_aborted_handshake_reclaims_both_modules();
 test_teardown_with_traffic_in_flight();
 test_edge_null_reactor();
 test_edge_null_config();
 test_edge_no_bind_address();
 test_edge_too_many_bind_addresses();
 test_edge_session_template_rejected();
-test_edge_retry_ladder_outlasts_the_session();
+test_edge_retry_ladder_explicit();
+test_edge_retry_ladder_defaults();
 test_edge_config_rejected_by_server_state();
 test_edge_database_cannot_be_opened();
 test_edge_bind_address_cannot_be_opened();
 test_every_bind_address_accepts();
 test_build_and_destroy_twice_leaves_nothing();
+test_config_may_die_after_open();
+test_strerror_names_every_code();
+test_replay_cache_capacity();
 TEST_MAIN_END()

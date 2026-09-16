@@ -2,15 +2,83 @@
 
 #include "cloak/server_stack.h"
 
+#include "cloak/adminapi.h"
+#include "cloak/net.h"
+#include "cloak/proxy.h"
+#include "cloak/server.h"
+
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* THE ENTIRE POINT OF THIS FILE is that the nine objects, the four-link
  * chain, the three trampolines and the teardown order live in ONE place
  * and a caller cannot reach any of them. Read cloak/server_stack.h first;
  * the argument for every ordering decision below is there, next to the
- * field it governs, rather than here. */
+ * field it governs, rather than here.
+ *
+ * THE STRUCT IS DEFINED HERE, NOT IN THE HEADER, and that is load-bearing
+ * rather than tidiness: cloak_server_registry_t, cloak_proxy_t,
+ * cloak_adminapi_t and cloak_dispatcher_t are all PUBLIC structs with
+ * writable wiring fields, so a stack held by value would let a caller
+ * write the very assignments this module exists to own. See the header's
+ * "THE STACK IS AN OPAQUE HANDLE" paragraph for the review that found
+ * that, and for what it cost. */
+
+struct cloak_server_stack {
+    /* Set to the struct's own address at open. A handle is heap-allocated
+     * and its definition is private, so a caller cannot copy one -- `*b =
+     * *a` needs the complete type. This field therefore guards only the
+     * cases that remain: a handle built by something other than
+     * cloak_server_stack_open, and a byte-wise copy made by code that
+     * declared its own layout. Cheap, and it turns a wild pointer into a
+     * refusal rather than a wild write. */
+    void *self;
+
+    cloak_server_stack_config_t cfg; /* copied by value, defaults filled in */
+
+    /* THE STACK'S OWN COPY OF THE SERVER CONFIG, and the reason the
+     * caller's may die the moment open returns. cloak_server_t borrows
+     * its config for its whole life and authentication reads it on every
+     * handshake (cloak_server_lookup_proxy walks the ProxyBook names,
+     * cloak_server_is_admin reads admin_uid), so a binary that parsed
+     * into a local and returned would have a dangling read on the hot
+     * path. cloak_server_config_t is a pure POD -- fixed arrays, no
+     * pointers -- so one memcpy removes the whole class. */
+    cloak_server_config_t config;
+
+    cloak_reactor_t *reactor; /* borrowed */
+
+    cloak_server_t srv;
+    int srv_ready;
+
+    cloak_usermanager_t *mgr;
+
+    cloak_server_registry_t registry;
+    int registry_ready;
+
+    cloak_userpanel_t *panel;
+
+    cloak_adminapi_t api;
+    int api_ready;
+
+    cloak_proxy_t proxy;
+    int proxy_ready;
+
+    cloak_dispatcher_t dispatcher;
+    int dispatcher_ready;
+
+    cloak_listener_t listeners[CLOAK_MAX_BIND_ADDR];
+    size_t listener_count;
+};
+
+/* Every accessor goes through this, so a handle that did not come from
+ * cloak_server_stack_open answers like a NULL one instead of being
+ * dereferenced. */
+static int stack_valid(const cloak_server_stack_t *s) {
+    return s != NULL && s->self == (const void *)s;
+}
 
 /* ------------------------------------------------------------------ */
 /* Error reporting                                                      */
@@ -82,7 +150,8 @@ static int stack_prepare_session(cloak_dispatcher_t *d, const cloak_server_clien
 /* EDGE E6. One abandoned-session hook, two modules that allocated a
  * context before the session existed. Omitting either is an unbounded,
  * remotely reachable leak -- one context per abandoned handshake -- which
- * cloak/adminapi.h and cloak/proxy.h both say and neither can enforce. */
+ * cloak/adminapi.h and cloak/proxy.h both say and neither can enforce.
+ * Both halves are pinned by mutation; see the task report. */
 static void stack_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[CLOAK_UID_LEN],
                                   uint32_t session_id, void *userdata) {
     cloak_server_stack_t *s = userdata;
@@ -97,7 +166,14 @@ static void stack_session_aborted(cloak_dispatcher_t *d, const uint8_t uid[CLOAK
  * not stopped here is a use-after-free on the next upstream byte after
  * the first out-of-credit user is terminated. cloak_userpanel_open
  * already refuses to start without SOME callback here; what it cannot
- * check is that the callback tells BOTH modules. Here it always does.
+ * check is that the callback tells BOTH modules. Here it always does,
+ * and both halves are pinned by mutation.
+ *
+ * ONE UID REALLY CAN HOLD BOTH, which is why "both" is not a theoretical
+ * requirement: the dispatcher calls a session admin only when the UID is
+ * the admin UID AND session_id == 0, so the same admin UID's other
+ * session ids are ordinary proxy sessions. Terminating that UID closes
+ * an admin session and a proxy session in the same walk.
  *
  * d is NULL: there is no connection being dispatched, and
  * cloak_proxy_session_aborted documents that it only forwards d. */
@@ -156,22 +232,21 @@ static void fill_template_defaults(cloak_session_config_t *t) {
 /* Construction                                                        */
 /* ------------------------------------------------------------------ */
 
-int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_config_t *cfg,
+int cloak_server_stack_open(cloak_server_stack_t **out, const cloak_server_stack_config_t *cfg,
                             char *err, size_t err_cap) {
     if (err != NULL && err_cap > 0) {
         err[0] = '\0';
     }
-    if (s == NULL) {
-        stack_err(err, err_cap, "argument: the cloak_server_stack_t is NULL");
+    if (out == NULL) {
+        stack_err(err, err_cap, "argument: the out pointer is NULL");
         return CLOAK_SERVER_STACK_ERR_ARG;
     }
 
-    /* INITIALIZE BEFORE VALIDATING, so that EVERY return below -- the
-     * rejected-argument ones included -- leaves a struct
-     * cloak_server_stack_destroy is safe on. Five earlier constructors on
-     * this project had this backwards and it was a crash every time a
-     * caller's own cleanup ran. */
-    memset(s, 0, sizeof(*s));
+    /* INITIALIZE BEFORE VALIDATING: *out is NULL from here on unless this
+     * function succeeds, so a caller whose cleanup runs
+     * cloak_server_stack_close(*out) on every path closes NULL rather
+     * than an uninitialized pointer. */
+    *out = NULL;
 
     if (cfg == NULL) {
         stack_err(err, err_cap, "argument: the cloak_server_stack_config_t is NULL");
@@ -186,9 +261,20 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
         return CLOAK_SERVER_STACK_ERR_ARG;
     }
 
+    cloak_server_stack_t *s = calloc(1, sizeof(*s));
+    if (s == NULL) {
+        stack_err(err, err_cap, "argument: out of memory allocating the stack");
+        return CLOAK_SERVER_STACK_ERR_ARG;
+    }
+    s->self = s;
     s->cfg = *cfg;
     s->reactor = cfg->reactor;
-    const cloak_server_config_t *c = cfg->config;
+
+    /* THE COPY. From here on the caller's cloak_server_config_t is never
+     * read again -- see the field's own comment. */
+    s->config = *cfg->config;
+    s->cfg.config = &s->config;
+    const cloak_server_config_t *c = &s->config;
 
     if (s->cfg.replay_cache_capacity == 0) {
         s->cfg.replay_cache_capacity = CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY;
@@ -200,12 +286,14 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
      * listener loop simply runs zero times and the process sits there. */
     if (c->num_bind_addr == 0) {
         stack_err(err, err_cap, "server config: BindAddr names no address to listen on");
+        cloak_server_stack_close(s);
         return CLOAK_SERVER_STACK_ERR_CONFIG;
     }
     if (c->num_bind_addr > CLOAK_MAX_BIND_ADDR) {
         stack_err(err, err_cap,
                   "server config: BindAddr count %zu exceeds CLOAK_MAX_BIND_ADDR (%d)",
                   c->num_bind_addr, (int)CLOAK_MAX_BIND_ADDR);
+        cloak_server_stack_close(s);
         return CLOAK_SERVER_STACK_ERR_CONFIG;
     }
 
@@ -232,6 +320,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
                       s->cfg.session_config_template.stream_recv_capacity,
                       s->cfg.session_config_template.stream_max_pending_frames,
                       s->cfg.session_config_template.conn_send_queue_cap);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_TEMPLATE;
         }
         cloak_session_destroy(&probe);
@@ -242,11 +331,14 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
      * words, that nothing there can check it "because the session config
      * belongs to the dispatcher, not to this module". This struct owns
      * both halves, so this is the first place in the project where it CAN
-     * be checked. Above the session's inactivity timeout, a stream that
-     * can NEVER start (a conn_send_queue_cap smaller than one worst-case
-     * frame -- a misconfiguration, not congestion) is reclaimed by the
-     * session's timeout instead of by the stream path, holding a
-     * connected upstream descriptor the whole way. */
+     * be checked.
+     *
+     * THE EFFECTIVE VALUES, NOT THE CONFIGURED ONES. A binary that
+     * accepts the proxy's defaults writes 0 in both fields, so a check
+     * against the raw config would compute a ladder of zero and pass
+     * everything -- which is the ONLY case most deployments are in. The
+     * substitution below is therefore part of the check, not a
+     * convenience, and it is pinned by its own mutation. */
     {
         uint64_t delay = s->cfg.proxy_retry_delay_ms != 0 ? s->cfg.proxy_retry_delay_ms
                                                           : CLOAK_PROXY_DEFAULT_RETRY_DELAY_MS;
@@ -260,6 +352,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
                       "proxy retry ladder: retry_delay_ms * max_retries (%llu ms) must be "
                       "below the session inactivity timeout (%llu ms)",
                       (unsigned long long)ladder, (unsigned long long)inactivity);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_RETRY_LADDER;
         }
     }
@@ -267,12 +360,14 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
     /* ================= 1. the server's runtime state =================
      * Resolves RedirAddr and every ProxyBook entry, which BLOCKS. That is
      * permitted here and only here (cloak/server.h): this runs once, at
-     * startup, and it is why the data path can dial without a lookup. */
+     * startup, and it is why the data path can dial without a lookup.
+     * Pointed at the stack's OWN copy of the config. */
     {
         char sub[200] = {0};
-        if (cloak_server_init(&s->srv, c, s->cfg.replay_cache_capacity, sub, sizeof(sub)) != 0) {
+        if (cloak_server_init(&s->srv, &s->config, s->cfg.replay_cache_capacity, sub,
+                              sizeof(sub)) != 0) {
             stack_err(err, err_cap, "server state: %s", sub);
-            cloak_server_stack_destroy(s);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_SERVER;
         }
         s->srv_ready = 1;
@@ -290,7 +385,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
                                    sizeof(sub)) != 0 ||
             s->mgr == NULL) {
             stack_err(err, err_cap, "user database: %s", sub[0] != '\0' ? sub : "open failed");
-            cloak_server_stack_destroy(s);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_DATABASE;
         }
     }
@@ -307,7 +402,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
     if (cloak_server_registry_init(&s->registry, s->reactor, cloak_proxy_registry_broken,
                                    &s->proxy) != 0) {
         stack_err(err, err_cap, "session registry: cloak_server_registry_init failed");
-        cloak_server_stack_destroy(s);
+        cloak_server_stack_close(s);
         return CLOAK_SERVER_STACK_ERR_REGISTRY;
     }
     s->registry_ready = 1;
@@ -330,7 +425,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
         pc.chain_userdata = s->cfg.on_session_broken_userdata;
         if (cloak_userpanel_open(&s->panel, &pc) != 0 || s->panel == NULL) {
             stack_err(err, err_cap, "user panel: cloak_userpanel_open failed");
-            cloak_server_stack_destroy(s);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_PANEL;
         }
     }
@@ -348,7 +443,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
         ac.chain_userdata = s->panel;
         if (cloak_adminapi_init(&s->api, &ac) != 0) {
             stack_err(err, err_cap, "admin API: cloak_adminapi_init failed");
-            cloak_server_stack_destroy(s);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_ADMINAPI;
         }
         s->api_ready = 1;
@@ -371,7 +466,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
         pxc.chain_userdata = &s->api;
         if (cloak_proxy_init(&s->proxy, &pxc) != 0) {
             stack_err(err, err_cap, "proxy: cloak_proxy_init failed");
-            cloak_server_stack_destroy(s);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_PROXY;
         }
         s->proxy_ready = 1;
@@ -399,7 +494,7 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
         dc.max_pending_conns = s->cfg.max_pending_conns;
         if (cloak_dispatcher_init(&s->dispatcher, &dc) != 0) {
             stack_err(err, err_cap, "dispatcher: cloak_dispatcher_init failed");
-            cloak_server_stack_destroy(s);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_DISPATCHER;
         }
         s->dispatcher_ready = 1;
@@ -417,12 +512,13 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
                                 cloak_dispatcher_accept, &s->dispatcher, sub, sizeof(sub)) != 0) {
             stack_err(err, err_cap, "bind address: BindAddr[%zu] \"%s\": %s", i, c->bind_addr[i],
                       sub[0] != '\0' ? sub : "listen failed");
-            cloak_server_stack_destroy(s);
+            cloak_server_stack_close(s);
             return CLOAK_SERVER_STACK_ERR_LISTEN;
         }
         s->listener_count++;
     }
 
+    *out = s;
     return 0;
 }
 
@@ -430,17 +526,17 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
 /* Teardown                                                            */
 /* ------------------------------------------------------------------ */
 
-void cloak_server_stack_destroy(cloak_server_stack_t *s) {
-    if (s == NULL) {
+void cloak_server_stack_close(cloak_server_stack_t *s) {
+    if (!stack_valid(s)) {
         return;
     }
 
     /* THE ORDER IS THE WHOLE FUNCTION, and it is NOT the reverse of
      * construction -- see cloak/server_stack.h for the argument behind
-     * each step. Every step is flag-guarded, so this is idempotent and
-     * safe on a zeroed struct, which is what makes it usable as the
-     * failure path of cloak_server_stack_init as well as a binary's
-     * shutdown. */
+     * each step, including which of the two inversions is observable
+     * today and which is not. Every step is flag-guarded, so this runs
+     * correctly on a partially built stack, which is what every failure
+     * path of cloak_server_stack_open hands it. */
 
     /* 1. listeners: nothing new arrives mid-teardown. */
     while (s->listener_count > 0) {
@@ -454,10 +550,11 @@ void cloak_server_stack_destroy(cloak_server_stack_t *s) {
         s->dispatcher_ready = 0;
     }
 
-    /* 3. THE PROXY, BEFORE THE REGISTRY -- inversion one. Stops every
-     * live relay, which cloak/stream_relay.h requires to happen before
-     * the session a relay is bound to is destroyed. Reversed, the next
-     * upstream byte lands on a freed cloak_stream_t. */
+    /* 3. THE PROXY, BEFORE THE REGISTRY. Stops every live relay, which
+     * cloak/stream_relay.h requires to happen before the session a relay
+     * is bound to is destroyed. Reversed, this is a heap-use-after-free
+     * under ASan with traffic in flight -- pinned by mutation, not
+     * assumed. */
     if (s->proxy_ready) {
         cloak_proxy_destroy(&s->proxy);
         s->proxy_ready = 0;
@@ -478,11 +575,14 @@ void cloak_server_stack_destroy(cloak_server_stack_t *s) {
         s->registry_ready = 0;
     }
 
-    /* 6. THE PANEL, AFTER THE REGISTRY -- inversion two, and the one the
-     * construction order actively invites getting wrong (the panel was
-     * built BEFORE the registry). It frees every active user's
-     * cloak_valve_t without closing anybody's sessions, and every live
-     * session holds a borrowed pointer to one. */
+    /* 6. the panel, after the registry. cloak/userpanel.h requires this
+     * -- the panel frees every active user's valve without closing
+     * anybody's sessions -- but see the header: swapping 5 and 6 is not
+     * observable today, because a valve is read only on the switchboard's
+     * data path and no reactor turn runs between these two statements.
+     * Kept because the rule is real at the level of the objects and
+     * because any future step here that yields to the reactor makes it
+     * observable at once. */
     if (s->panel != NULL) {
         cloak_userpanel_close(s->panel);
         s->panel = NULL;
@@ -494,24 +594,76 @@ void cloak_server_stack_destroy(cloak_server_stack_t *s) {
         s->mgr = NULL;
     }
 
-    /* 8. the server state the proxy and the dispatcher borrowed. */
+    /* 8. the server state the proxy and the dispatcher borrowed, and then
+     * the handle. */
     if (s->srv_ready) {
         cloak_server_destroy(&s->srv);
         s->srv_ready = 0;
     }
+
+    s->self = NULL;
+    free(s);
+}
+
+int cloak_server_stack_upload_now(cloak_server_stack_t *s) {
+    if (!stack_valid(s) || s->panel == NULL) {
+        return -1;
+    }
+    return cloak_userpanel_upload_now(s->panel);
 }
 
 /* ------------------------------------------------------------------ */
 /* Accessors                                                           */
 /* ------------------------------------------------------------------ */
 
+size_t cloak_server_stack_listener_count(const cloak_server_stack_t *s) {
+    return stack_valid(s) ? s->listener_count : 0;
+}
+
 int cloak_server_stack_listener_port(const cloak_server_stack_t *s, size_t i) {
-    if (s == NULL || i >= s->listener_count) {
+    if (!stack_valid(s) || i >= s->listener_count) {
         return -1;
     }
     return cloak_listener_port(&s->listeners[i]);
 }
 
-size_t cloak_server_stack_listener_count(const cloak_server_stack_t *s) {
-    return s == NULL ? 0 : s->listener_count;
+size_t cloak_server_stack_session_count(const cloak_server_stack_t *s) {
+    return stack_valid(s) ? cloak_server_registry_count(&s->registry) : 0;
+}
+
+size_t cloak_server_stack_session_count_for_uid(const cloak_server_stack_t *s,
+                                                const uint8_t uid[CLOAK_UID_LEN]) {
+    return stack_valid(s) ? cloak_server_registry_count_for_uid(&s->registry, uid) : 0;
+}
+
+size_t cloak_server_stack_proxy_session_count(const cloak_server_stack_t *s) {
+    return stack_valid(s) ? cloak_proxy_session_count(&s->proxy) : 0;
+}
+
+size_t cloak_server_stack_proxy_stream_count(const cloak_server_stack_t *s) {
+    return stack_valid(s) ? cloak_proxy_stream_count(&s->proxy) : 0;
+}
+
+size_t cloak_server_stack_admin_session_count(const cloak_server_stack_t *s) {
+    return stack_valid(s) ? cloak_adminapi_session_count(&s->api) : 0;
+}
+
+size_t cloak_server_stack_admin_stream_count(const cloak_server_stack_t *s) {
+    return stack_valid(s) ? cloak_adminapi_stream_count(&s->api) : 0;
+}
+
+/* Reported out of the cache cloak_server_init ACTUALLY allocated, not out
+ * of this module's copy of the request. The two can only differ if the
+ * request never reached the allocation, which is exactly the mistake
+ * worth catching. */
+size_t cloak_server_stack_replay_cache_capacity(const cloak_server_stack_t *s) {
+    return (stack_valid(s) && s->srv_ready) ? s->srv.replay.capacity : 0;
+}
+
+cloak_userpanel_t *cloak_server_stack_panel(cloak_server_stack_t *s) {
+    return stack_valid(s) ? s->panel : NULL;
+}
+
+cloak_usermanager_t *cloak_server_stack_manager(cloak_server_stack_t *s) {
+    return stack_valid(s) ? s->mgr : NULL;
 }

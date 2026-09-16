@@ -322,3 +322,14 @@ set_tests_properties(test_server_stack PROPERTIES TIMEOUT 60)
 # client_harness.h, for the same reason the nine tests in the foreach
 # above need it: this file drives the real cloak_client_handshake_t.
 target_link_libraries(test_server_stack PRIVATE cloak-client)
+
+# Reuses cloak_test_write_shim and _cloak_ld_preload (computed above for
+# test_dispatcher_auth), for the same reason test_dispatcher_limits,
+# test_proxy_teardown, test_server_e2e and test_dispatcher_users do: this
+# file's abandoned-handshake case needs the dispatcher's step-10 reply
+# write to fail deterministically, which is the only way to reach the
+# post-creation unwind that fires session_aborted -- and the reply is far
+# smaller than any socket buffer floor, so genuine backpressure cannot
+# produce that failure. See test_write_shim.c's own top-of-file comment.
+set_tests_properties(test_server_stack PROPERTIES
+    ENVIRONMENT "LD_PRELOAD=${_cloak_ld_preload}")

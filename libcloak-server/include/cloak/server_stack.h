@@ -4,14 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "cloak/adminapi.h"
 #include "cloak/config.h"
 #include "cloak/dispatcher.h"
-#include "cloak/net.h"
-#include "cloak/proxy.h"
 #include "cloak/reactor.h"
 #include "cloak/registry.h"
-#include "cloak/server.h"
 #include "cloak/session.h"
 #include "cloak/usermanager.h"
 #include "cloak/userpanel.h"
@@ -39,13 +35,25 @@
  * A startup error is the only feedback anyone can act on; the alternative
  * arrives in production, under load, long after the mistake.
  *
- * WHAT THIS CHANGES FOR A BINARY: the nine ordering edges below are no
- * longer edges a caller can reach at all. There is no field in
- * cloak_server_stack_config_t for the registry's on_broken, for any of
- * the three `chain` slots, for on_session_closing, for prepare_session or
- * for session_aborted -- those are this module's, always, and a binary
- * that wanted to get one wrong would have to edit this file. A ck-server
- * now needs a config, a reactor and two calls.
+ * THE STACK IS AN OPAQUE HANDLE, AND THAT IS THE ENFORCEMENT. An earlier
+ * revision of this file made cloak_server_stack_t a public struct holding
+ * the nine objects by value, and claimed the nine edges were structural
+ * because the CONFIG has no field for any of them. That claim was half
+ * true and was caught in review: cloak_server_registry_t, cloak_proxy_t,
+ * cloak_adminapi_t and cloak_dispatcher_t are all public structs with
+ * writable wiring fields, so `st.registry.on_broken =
+ * cloak_userpanel_registry_broken` -- the exact mis-wire this file exists
+ * to prevent -- compiled cleanly, as did cloak_proxy_destroy(&st.proxy)
+ * out of order. "Unreachable through the config, reachable by writing a
+ * member the header invites you to read" is a documentation rule wearing
+ * a structural claim's clothes, and documentation is precisely what has
+ * already failed three times here. The definition now lives in
+ * server_stack.c and a caller holds a pointer it cannot dereference. Six
+ * of the nine edges became genuinely unreachable at that moment; the
+ * accessors below hand back only opaque types and counters.
+ *
+ * WHAT THIS CHANGES FOR A BINARY: a ck-server needs a config, a reactor
+ * and two calls.
  *
  * THE NINE EDGES, and where each one now lives:
  *
@@ -66,11 +74,22 @@
  *      cloak_proxy_prepare_session, and on nothing else.
  *   E8 the dispatcher's panel IS the panel that owns the valves every
  *      session it authorises meters into.
- *   E9 the teardown order, which inverts construction TWICE: the proxy
- *      and the admin API are destroyed BEFORE the registry (they hold
- *      stream pointers into live sessions), and the panel is closed
- *      AFTER it (it owns the valves those sessions meter into). See
- *      cloak_server_stack_destroy.
+ *   E9 the teardown order. See cloak_server_stack_close.
+ *
+ * WHAT ORDER THE CHAIN ACTUALLY REQUIRES, stated precisely because the
+ * three module headers imply a total order and only part of it is real.
+ * The registry's adapter invokes the head BEFORE any bookkeeping of its
+ * own and defers the session's free to a zero-delay timer, so the session
+ * is fully live through all four links. The proxy's link and the admin
+ * API's link touch only their own module's per-session contexts and
+ * neither reads the other's, so SWAPPING THOSE TWO IS UNOBSERVABLE --
+ * verified by mutation under ASan, not assumed. What IS load-bearing is
+ * that the PANEL'S LINK RUNS LAST of the three, because it alone can
+ * reach cloak_userpanel_terminate, which destroys sessions through
+ * cloak_server_registry_close_all_for_uid: anything still holding a
+ * pointer into one of those sessions must have let go first. The order
+ * below keeps proxy-then-adminapi because that is the order the three
+ * module headers describe, not because it is forced.
  *
  * WHAT IT STILL CANNOT ENFORCE is stated at each such edge below rather
  * than in a preamble, because a preamble is the part a reader skips:
@@ -80,8 +99,8 @@
  * cloak/userpanel.h still document the chain as an owner's
  * responsibility, and every test in this module that builds a partial
  * graph still does it by hand -- that is those tests' value. This is the
- * supported path for BINARIES, not a replacement for the modules'
- * own contracts.
+ * supported path for BINARIES, not a replacement for the modules' own
+ * contracts.
  *
  * ONE STACK PER PROCESS. The graph is static: it is built once at
  * startup and torn down once at shutdown, and nothing about it changes
@@ -91,6 +110,8 @@
  *
  * THREADING: none, like everything else in this project. One stack, one
  * reactor, one thread. */
+
+typedef struct cloak_server_stack cloak_server_stack_t;
 
 /* ------------------------------------------------------------------ */
 /* Errors                                                              */
@@ -116,7 +137,11 @@
 /* A short, stable, English name for a code above ("bind address",
  * "session template", ...). Never NULL: an unrecognised code returns
  * "unknown". Intended for a log line that already carries the err
- * buffer's sentence. */
+ * buffer's sentence. THESE STRINGS ARE PART OF THE CONTRACT and are
+ * compared exactly by this module's tests -- an assertion that merely
+ * checked for a non-empty string would be satisfied by "unknown" for
+ * every code, which is a test written against the symbol it tests
+ * rather than against the behaviour. */
 const char *cloak_server_stack_strerror(int code);
 
 /* ------------------------------------------------------------------ */
@@ -158,28 +183,34 @@ typedef struct {
     /* Required. BORROWED, and NOT ENFORCEABLE: the reactor must outlive
      * the stack. Every one of the nine objects below registers
      * descriptors and timers with it, and C offers no way to check a
-     * pointer's liveness. Destroy the stack, then the reactor. */
+     * pointer's liveness. Close the stack, then the reactor. */
     cloak_reactor_t *reactor;
 
-    /* Required. BORROWED, and NOT ENFORCEABLE for the same reason: the
-     * cloak_server_t holds this pointer for its whole life
-     * (cloak/server.h), so the config must outlive the stack. A binary
-     * that parses its config into a local and returns is the realistic
-     * way to get this wrong; keep it alongside the stack. */
+    /* Required, and READ ONLY FOR THE DURATION OF cloak_server_stack_open
+     * -- the stack takes its own COPY. cloak_server_config_t is a pure
+     * POD (fixed arrays, no pointers), so one memcpy removes an entire
+     * class of caller error: a binary that parses its config into a local
+     * and returns, or reuses the struct for a reload, would otherwise
+     * leave cloak_server_t holding a dangling pointer that
+     * authentication reads on every handshake
+     * (cloak_server_lookup_proxy and cloak_server_is_admin both read it).
+     * An earlier revision of this header listed that as unenforceable; it
+     * was one memcpy. */
     const cloak_server_config_t *config;
 
-    /* 0 -> CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY. */
+    /* 0 -> CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY. Reported
+     * back by cloak_server_stack_replay_cache_capacity. */
     size_t replay_cache_capacity;
 
     /* The mux parameters every session this server creates is built
      * with. A zeroed field gets the matching CLOAK_SERVER_STACK_DEFAULT_*
      * above; a NON-zero field is used verbatim and is VALIDATED at
-     * cloak_server_stack_init (see that function's TEMPLATE paragraph).
+     * cloak_server_stack_open (see that function's TEMPLATE paragraph).
      *
-     * valve, on_broken and the three stream callbacks are ignored here:
-     * the panel supplies the valve per user, the registry overwrites
-     * on_broken (cloak/registry.h), and prepare_session installs the
-     * other three. */
+     * valve, on_broken and the three stream callbacks are ignored here,
+     * and are CLEARED rather than merely documented as ignored: the panel
+     * supplies the valve per user, the registry overwrites on_broken
+     * (cloak/registry.h), and prepare_session installs the other three. */
     cloak_session_config_t session_config_template;
 
     /* The clock, shared by the user manager and the panel. NULL ->
@@ -199,7 +230,11 @@ typedef struct {
      * than left at the proxy's defaults unconditionally, because ONE
      * cross-module invariant can only be checked where both halves are
      * visible -- and this struct is the first place in the project where
-     * they are. See cloak_server_stack_init's RETRY LADDER paragraph. */
+     * they are. See cloak_server_stack_open's RETRY LADDER paragraph.
+     * Note that the check runs on the EFFECTIVE values, so a caller that
+     * leaves these at 0 (which is what a binary accepting the proxy's
+     * defaults writes) is checked against the proxy's real 50 ms x 400
+     * ladder, not against zero. */
     uint64_t proxy_retry_delay_ms;
     unsigned proxy_max_retries;
     uint64_t proxy_dial_timeout_ms;
@@ -227,10 +262,10 @@ typedef struct {
      *
      * NOT ENFORCEABLE: cloak/registry.h forbids this callback from
      * freeing the registry's own storage -- and therefore from freeing
-     * the stack that contains it. Calling cloak_server_stack_destroy from
-     * here is safe; free()ing the cloak_server_stack_t is not, because
-     * the registry adapter reads its own struct again after this returns.
-     * Nothing here can check that. */
+     * the stack that contains it. Calling cloak_server_stack_close from
+     * here is safe; nothing here can check that a caller did not instead
+     * free the handle out from under the registry adapter, which reads
+     * its own struct again after this returns. */
     cloak_registry_broken_cb on_session_broken;
     void *on_session_broken_userdata;
 
@@ -242,61 +277,25 @@ typedef struct {
 } cloak_server_stack_config_t;
 
 /* ------------------------------------------------------------------ */
-/* The stack                                                           */
+/* Lifetime                                                            */
 /* ------------------------------------------------------------------ */
 
-/* PUBLIC so that a binary can hold one by value and so that a test can
- * assert against the pieces, exactly as cloak_proxy_t and
- * cloak_adminapi_t are public. Read the fields freely; do not construct
- * or destroy any of them yourself, which is the whole point of the file.
+/* Builds the whole graph, in the one order that works, and writes the
+ * handle to *out.
  *
- * Every *_ready flag exists so cloak_server_stack_destroy can run on a
- * partially built stack -- which is what a failure halfway through
- * cloak_server_stack_init leaves behind, and what the caller's own
- * cleanup path will hand it. */
-typedef struct {
-    cloak_server_stack_config_t cfg; /* copied by value, defaults filled in */
-
-    cloak_reactor_t *reactor; /* borrowed; cfg.reactor, hoisted */
-
-    cloak_server_t srv;
-    int srv_ready;
-
-    /* NULL until built. A VOID manager (no rows, every route 500) when
-     * the config named no DatabasePath -- which cloak/usermanager.h and
-     * cloak/adminapi.h both call a legitimate deployment rather than a
-     * degraded one: the server then serves its bypass and admin UIDs and
-     * nobody else. */
-    cloak_usermanager_t *mgr;
-
-    cloak_server_registry_t registry;
-    int registry_ready;
-
-    cloak_userpanel_t *panel;
-
-    cloak_adminapi_t api;
-    int api_ready;
-
-    cloak_proxy_t proxy;
-    int proxy_ready;
-
-    cloak_dispatcher_t dispatcher;
-    int dispatcher_ready;
-
-    /* One per configured BindAddr, in config order. */
-    cloak_listener_t listeners[CLOAK_MAX_BIND_ADDR];
-    size_t listener_count;
-} cloak_server_stack_t;
-
-/* Builds the whole graph, in the one order that works, and returns 0.
+ * *out is set to NULL FIRST and is written only on success, so a caller
+ * whose cleanup path runs cloak_server_stack_close(*out) closes NULL
+ * rather than an uninitialized pointer -- the same
+ * initialize-before-validate ordering every other constructor in this
+ * project uses, for the same reason.
  *
  * CONSTRUCTION ORDER, and why each step is where it is:
  *
  *   1. cloak_server_t       -- resolved ProxyBook and RedirAddr, bypass
- *                              set, replay cache. Borrowed by the proxy
- *                              and the dispatcher, so it is first. This
- *                              step BLOCKS on DNS, which is permitted
- *                              here and only here (cloak/server.h).
+ *                              set, replay cache, pointed at the stack's
+ *                              OWN COPY of the config. This step BLOCKS
+ *                              on DNS, which is permitted here and only
+ *                              here (cloak/server.h).
  *   2. cloak_usermanager_t  -- borrowed by the panel and the admin API.
  *                              Also blocks; also startup-only.
  *   3. cloak_server_registry_t with cloak_proxy_registry_broken and the
@@ -317,7 +316,7 @@ typedef struct {
  *
  * WHAT IS VALIDATED, one typed error per edge, each naming itself in err:
  *
- *   ARG        s, cfg, cfg->reactor or cfg->config is NULL.
+ *   ARG        out, cfg, cfg->reactor or cfg->config is NULL.
  *   CONFIG     the config names no BindAddr at all (a server that binds
  *              nothing is not a degraded server, it is a silent one), or
  *              more than CLOAK_MAX_BIND_ADDR of them.
@@ -338,7 +337,10 @@ typedef struct {
  *              retry_delay_ms * max_retries must be strictly less than
  *              the template's inactivity_timeout_ms, so a stream that can
  *              never start is reclaimed on the stream path rather than
- *              left to the session's.
+ *              left to the session's. THE EFFECTIVE VALUES ARE USED, so
+ *              the common case -- a binary that writes neither field and
+ *              gets the proxy's 50 ms x 400 -- is the case that is
+ *              checked.
  *   SERVER     cloak_server_init said no (an unresolvable RedirAddr or
  *              ProxyBook entry, a hand-built config over
  *              CLOAK_MAX_PROXY_BOOK / CLOAK_MAX_BYPASS_UID); its own
@@ -351,28 +353,21 @@ typedef struct {
  *              argument has been checked, so these are allocation-class
  *              failures.
  *   LISTEN     a BindAddr could not be opened; err carries the address
- *              and the listener's own message. Every listener already
- *              opened is closed again before this returns.
+ *              and the listener's own message.
  *
  * ON ANY FAILURE everything built so far is torn down before this
- * returns, in the same order cloak_server_stack_destroy uses -- so a
- * rejected init leaks nothing and holds no descriptor, and the partially
- * built graph is never handed back to a caller who would then have to
- * know which half of it exists. s is zeroed BEFORE anything is
- * validated, so even the ARG returns leave a struct
- * cloak_server_stack_destroy is safe on, and calling it afterwards is
- * then a documented no-op -- a caller's unconditional cleanup path is
- * correct either way.
+ * returns, in the same order cloak_server_stack_close uses -- a rejected
+ * open leaks nothing and holds no descriptor -- and *out is left NULL.
  *
  * err, when non-NULL, always receives a NUL-terminated sentence naming
  * the edge, truncated to err_cap. */
-int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_config_t *cfg,
+int cloak_server_stack_open(cloak_server_stack_t **out, const cloak_server_stack_config_t *cfg,
                             char *err, size_t err_cap);
 
-/* Tears the whole graph down, in the one order that works.
+/* Tears the whole graph down, in the one order that works, and frees the
+ * handle. Safe on NULL. After this, s is freed.
  *
- * TEARDOWN ORDER, which INVERTS CONSTRUCTION TWICE -- and those two
- * inversions are the thing a hand-wired binary gets silently wrong:
+ * TEARDOWN ORDER:
  *
  *   1. the listeners, so nothing new arrives mid-teardown;
  *   2. the dispatcher, which unwinds connections still mid-handshake --
@@ -380,50 +375,102 @@ int cloak_server_stack_init(cloak_server_stack_t *s, const cloak_server_stack_co
  *   3. THE PROXY, BEFORE THE REGISTRY. cloak_proxy_destroy stops every
  *      live cloak_stream_relay_t, and cloak/stream_relay.h requires that
  *      to happen before the session a relay is bound to is destroyed.
- *      Reversed, the relay holds a freed cloak_stream_t and the next
- *      upstream byte is a use-after-free.
+ *      THIS ONE IS REAL AND IS PINNED: reversed, it is a
+ *      heap-use-after-free under ASan with traffic in flight.
  *   4. THE ADMIN API, BEFORE THE REGISTRY, for the same shape of reason:
  *      releasing a stream requires a live session, and its per-stream
  *      deadline timers are armed against streams the registry is about
  *      to free.
  *   5. the registry, which destroys every session left.
- *   6. THE PANEL, AFTER THE REGISTRY. It frees every active user's
+ *   6. the panel, AFTER the registry. It frees every active user's
  *      cloak_valve_t without closing anybody's sessions, and every live
- *      session holds a borrowed pointer to one (cloak/valve.h). A
- *      session outliving the panel meters into freed memory on its next
- *      byte. This is the second inversion: the panel was built before
- *      the registry and must be closed after it.
+ *      session holds a borrowed pointer to one (cloak/valve.h).
+ *      HONESTLY: THIS ONE IS NOT OBSERVABLE TODAY, and saying so is
+ *      better than billing it as load-bearing. Swapping 5 and 6 survives
+ *      ASan with traffic in flight, because a valve is read only on the
+ *      switchboard's data path and no reactor turn intervenes between
+ *      two consecutive statements of this function. The order is kept
+ *      because the rule is real at the level of the objects -- any
+ *      future teardown step between them that yields to the reactor, or
+ *      any panel close that grew a flush, makes it observable at once --
+ *      and because cloak/userpanel.h states it as a requirement.
  *   7. the user manager, after the panel that reads it;
- *   8. the server state the proxy and the dispatcher borrowed.
+ *   8. the server state the proxy and the dispatcher borrowed, and then
+ *      the handle itself.
  *
- * DOES NOT touch the reactor or the cloak_server_config_t -- both are
- * borrowed, and both must still be alive when this is called.
+ * DOES NOT touch the reactor -- borrowed, and it must still be alive
+ * when this is called. It no longer has any opinion about the caller's
+ * cloak_server_config_t, which it copied at open.
  *
  * DOES NOT upload whatever metering the panel still has queued: that is
  * cloak_userpanel_close's documented trade (an operator loses at most one
  * upload interval). A binary that wants the last interval billed calls
- * cloak_userpanel_upload_now(s->panel) BEFORE this.
- *
- * Idempotent, and safe on a zeroed struct, so a caller's cleanup path can
- * call it unconditionally.
+ * cloak_server_stack_upload_now BEFORE this.
  *
  * NOT ENFORCEABLE: the calling context. This reaches cloak_session_destroy
  * (through the registry) and therefore inherits its restriction -- NOT
  * from within on_new_stream, and NOT from within any cloak_conn_t /
  * cloak_switchboard_t callback. From ordinary code, from a reactor timer,
- * from a signalfd handler or from a cloak_registry_broken_cb it is safe.
- * s == NULL is a no-op. */
-void cloak_server_stack_destroy(cloak_server_stack_t *s);
+ * from a signalfd handler or from a cloak_registry_broken_cb it is
+ * safe. */
+void cloak_server_stack_close(cloak_server_stack_t *s);
+
+/* One upload cycle, run by hand: drains every active user's valve,
+ * settles the queue into the database in one transaction, and terminates
+ * whoever the database says has run out. Exactly what the periodic timer
+ * runs. A graceful shutdown calls this before cloak_server_stack_close so
+ * the last interval is billed. Returns cloak_userpanel_upload_now's own
+ * result; s == NULL returns -1. */
+int cloak_server_stack_upload_now(cloak_server_stack_t *s);
+
+/* ------------------------------------------------------------------ */
+/* Accessors                                                           */
+/* ------------------------------------------------------------------ */
+
+/* THESE ARE DELIBERATELY NARROW. Handing back a cloak_proxy_t * or a
+ * cloak_server_registry_t * would put every wiring field this module
+ * exists to own back within a caller's reach, which is the mistake the
+ * public-struct revision of this header made. What is returned here is
+ * either a COUNTER or an OPAQUE type whose own wiring lives behind its
+ * own module's typedef. */
+
+/* How many listeners are open: the config's num_bind_addr after a
+ * successful open. s == NULL returns 0. */
+size_t cloak_server_stack_listener_count(const cloak_server_stack_t *s);
 
 /* The port listener i is actually bound to, which is what a BindAddr of
- * ":0" makes worth asking. Returns -1 for a NULL stack or an i at or past
- * cloak_server_stack_listener_count. */
+ * ":0" makes worth asking. -1 for a NULL stack or an out-of-range i. */
 int cloak_server_stack_listener_port(const cloak_server_stack_t *s, size_t i);
 
-/* How many listeners are open -- the config's num_bind_addr after a
- * successful init, and however many had been opened before the failing
- * one after a failed one (which is zero, since the failure path closes
- * them). s == NULL returns 0. */
-size_t cloak_server_stack_listener_count(const cloak_server_stack_t *s);
+/* Live sessions in the registry, in total and for one UID. */
+size_t cloak_server_stack_session_count(const cloak_server_stack_t *s);
+size_t cloak_server_stack_session_count_for_uid(const cloak_server_stack_t *s,
+                                                const uint8_t uid[CLOAK_UID_LEN]);
+
+/* Per-session and per-stream contexts the proxy and the admin API
+ * currently hold. Diagnostics, and what a test asserts the chain and the
+ * trampolines against. */
+size_t cloak_server_stack_proxy_session_count(const cloak_server_stack_t *s);
+size_t cloak_server_stack_proxy_stream_count(const cloak_server_stack_t *s);
+size_t cloak_server_stack_admin_session_count(const cloak_server_stack_t *s);
+size_t cloak_server_stack_admin_stream_count(const cloak_server_stack_t *s);
+
+/* The replay cache this stack actually allocated -- the configured value
+ * when one was given, and the default otherwise. */
+size_t cloak_server_stack_replay_cache_capacity(const cloak_server_stack_t *s);
+
+/* The panel and the user manager. BORROWED, still owned by the stack,
+ * and returned rather than wrapped because BOTH ARE OPAQUE TYPES: there
+ * is no wiring field behind either typedef for a caller to reach, so
+ * handing them out costs nothing structurally, while wrapping every one
+ * of cloak/userpanel.h's and cloak/usermanager.h's operations would be a
+ * second API that could drift from the first.
+ *
+ * A binary wants the panel for its own reporting and the manager for a
+ * user-administration subcommand. NOT ENFORCEABLE, and the one residual
+ * of handing these out: do not close either yourself -- the stack does,
+ * in the order above. */
+cloak_userpanel_t *cloak_server_stack_panel(cloak_server_stack_t *s);
+cloak_usermanager_t *cloak_server_stack_manager(cloak_server_stack_t *s);
 
 #endif
