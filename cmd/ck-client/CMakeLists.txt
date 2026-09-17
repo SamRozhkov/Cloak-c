@@ -44,7 +44,21 @@ add_test(NAME test_ck_client_cli COMMAND test_ck_client_cli)
 # raised for the same reason, so the two binaries' tests carry one bound
 # and not two.
 #
-# RE-MEASURED AFTER THE FINAL FIX WAVE: 53.1 s idle under ASan+UBSan
+# RE-MEASURED AGAIN AFTER MODULE 9 TASK 7 (the -u/"UDP" wiring): 60.2 s
+# idle under ASan+UBSan, against 53.1 s before it. That task replaced case
+# 4's two subprocesses with eleven -- the -h run, the three listener runs
+# (with -u, without it, and by config key), -u=false, -u=perhaps, the two
+# NumConn runs and case 4b's two ClientHello captures -- and the margin
+# against TIMEOUT 120 is therefore 2.0x, not 2.3x.
+#
+# THE BOUND WAS STILL NOT RAISED, for the reason below, and the win named
+# at the end of this comment was still not taken: ASAN_OPTIONS=detect_leaks=0
+# on the children would remove most of this number AND the only leak check
+# that ever runs against the two BINARIES, which is coverage this project
+# has no other source for. Whoever adds the next case here should take
+# that trade deliberately rather than by arriving at it.
+#
+# THE MEASUREMENT BEFORE THAT: 53.1 s idle under ASan+UBSan
 # (39.8 s for test_ck_server_cli), against 45.0 s before it -- the wave
 # added seven subprocesses across the SIGPIPE, ServerName, admin-singleplex,
 # plugin-detection and billing cases. The margin is therefore 2.3x, not

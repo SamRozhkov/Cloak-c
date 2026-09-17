@@ -24,10 +24,22 @@
  *      comment: both values are ones the case can see the difference
  *      between, in both directions.
  *   3. No RemoteHost anywhere: exit 2, and the message names the field.
- *   4. -u is REFUSED, naming unordered mode, rather than silently
- *      carrying TCP under a caller that asked for datagrams. The config
- *      key "UDP": true is refused too, and with a different exit code,
- *      because one is a wrong command line and the other a wrong config.
+ *   4. -u and "UDP": true are HONOURED, and what they select is asserted
+ *      by the SHAPE OF THE LOCAL SOCKET -- a TCP connect to it is refused
+ *      and the TCP port is still free -- in both states, so a flag that
+ *      is parsed and then dropped fails this and not merely a flag that
+ *      is refused. The usage line is Go's own wording, verbatim.
+ *   4a. The MINIMAL udp configuration -- "UDP": true with no NumConn --
+ *      is refused in a message that names NumConn, because omitting
+ *      NumConn is what selects the singleplex this build cannot combine
+ *      with udp, and a first attempt at a feature must not fail naming a
+ *      mode the user never wrote. See the case for why the alternative
+ *      (defaulting NumConn) was rejected as a wire-visible divergence.
+ *   4b. THE BIT ON THE WIRE: the client's own ClientHello is captured and
+ *      decrypted with the SERVER'S decrypter, and its unordered flag is
+ *      asserted 1 with -u and 0 without. Everything in case 4 is about a
+ *      socket this client opened for itself; only this says what it told
+ *      the server, which is the half a Go server would act on.
  *   5. END TO END THROUGH BOTH BINARIES: an application socket into
  *      ck-client's local port, a real ck-client, a real ck-server, a fake
  *      upstream behind it, 256 KiB compared byte for byte in both
@@ -49,8 +61,10 @@
  * immediately. */
 
 #include "cloak/base64.h"
+#include "cloak/clienthello_parse.h"
 #include "cloak/config.h"
 #include "cloak/crypto.h"
+#include "cloak/server_auth.h"
 #include "cloak/usermanager.h"
 #include "test_framework.h"
 
@@ -1004,36 +1018,366 @@ static void test_missing_remote_host_is_a_config_error(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Case 4: -u is refused, naming unordered mode                          */
+/* Case 4: -u and "UDP": true are HONOURED                               */
 /* ------------------------------------------------------------------ */
 
-static void test_udp_is_refused(void) {
+/* Binds a TCP socket to `port` on loopback WITHOUT SO_REUSEADDR and
+ * reports whether it succeeded. That is the deterministic way to ask
+ * "is there a TCP listener on this port": a port already in LISTEN
+ * refuses a second bind with EADDRINUSE, and a port held only by a UDP
+ * socket does not, because the two protocols carry separate port spaces.
+ *
+ * Deliberately NOT a UDP bind, which would be the more direct question
+ * and is not deterministic here: cloak_udp_piper_t's socket sets
+ * SO_REUSEADDR, and Linux lets a second UDP socket share a unicast
+ * addr:port when every socket bound to it has that option -- so a UDP
+ * probe would answer differently depending on whether the probe itself
+ * set it. The TCP pair below has no such dependency. Returns 1 if the
+ * bind succeeded (nothing is listening for TCP there), 0 if it did not. */
+static int tcp_port_is_free(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons((uint16_t)port);
+    int rc = bind(fd, (struct sockaddr *)&a, sizeof(a));
+    close(fd);
+    return rc == 0 ? 1 : 0;
+}
+
+/* The two inputs that select unordered mode, and the thing they select.
+ *
+ * WHAT WOULD HAVE TO BREAK FOR THIS TO FAIL, which is the only reason it
+ * is shaped this way rather than as "it started":
+ *
+ *  - A `-u` that is parsed and then DROPPED -- the state this file's
+ *    previous case could not have distinguished from a refusal, because
+ *    a refused flag and an ignored one both fail to produce a UDP
+ *    listener. Both halves of the local-port pair below flip: with -u the
+ *    TCP port is FREE and a TCP connect is REFUSED, without it the port
+ *    is TAKEN and a connect succeeds. An ignored -u gives the second
+ *    answer to the first question.
+ *  - A `"UDP": true` handled only in the library and not in main.c, or
+ *    only in main.c and not in the library: the config-key half and the
+ *    flag half are asserted separately and identically.
+ *  - The usage line drifting away from Go's. The wording is Go's own,
+ *    verbatim, because a pluggable transport's -h output is read by
+ *    people migrating a working deployment.
+ *
+ * The bit this mode actually puts on the wire is case 4b's, not this
+ * one's: a client can bind a UDP socket and still advertise an ordered
+ * session, and only the wire says which. */
+static void test_udp_is_honoured(void) {
     char pub[64];
     derive_pub_b64(pub, sizeof(pub));
-    char cfg[2048];
-    make_client_config(cfg, sizeof(cfg), pub,
-                       "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\",");
 
-    /* The FLAG: a wrong command line, so exit 1. */
-    char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, (char *)"-u", NULL};
+    /* THE USAGE TEXT, in Go's words. -h returns before the configuration
+     * is touched (case 1), so no -c is needed. */
+    {
+        char *const argv[] = {(char *)"ck-client", (char *)"-h", NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, run_to_exit(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS));
+        ASSERT_TRUE(strstr(c.out,
+                           "udp: set this flag if the underlying proxy is using UDP "
+                           "protocol") != NULL);
+    }
+
+    /* THE FLAG. RemotePort 1 is a port nothing answers on: the session
+     * never comes up, which costs this case nothing -- the listener is
+     * open before the first connection is dialled and stays open across
+     * every retry (cloak/client_stack.h), and this case is about the
+     * listener. */
+    int local = free_port();
+    ASSERT_TRUE(local > 0);
+    char extra[512];
+    snprintf(extra, sizeof(extra),
+             "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"1\","
+             "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"%d\",",
+             local);
+    char cfg[2048];
+    make_client_config(cfg, sizeof(cfg), pub, extra);
+
+    {
+        char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, (char *)"-u", NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, argv, NULL));
+        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
+        char line[128];
+        snprintf(line, sizeof(line), "listening on UDP 127.0.0.1:%d", local);
+        ASSERT_TRUE(strstr(c.out, line) != NULL);
+        /* The local endpoint is a DATAGRAM socket, asserted twice over:
+         * nothing accepts TCP there, and the TCP port is still free. */
+        ASSERT_EQ_INT(-1, can_connect(local));
+        ASSERT_EQ_INT(1, tcp_port_is_free(local));
+        ASSERT_EQ_INT(0, child_stop(&c));
+    }
+
+    /* THE SAME CONFIGURATION WITHOUT THE FLAG, so both answers above are
+     * ones this case can see the difference between. */
+    {
+        char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, argv, NULL));
+        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
+        char line[128];
+        snprintf(line, sizeof(line), "listening on TCP 127.0.0.1:%d", local);
+        ASSERT_TRUE(strstr(c.out, line) != NULL);
+        ASSERT_EQ_INT(0, can_connect(local));
+        ASSERT_EQ_INT(0, tcp_port_is_free(local));
+        ASSERT_EQ_INT(0, child_stop(&c));
+    }
+
+    /* THE CONFIG KEY, which reaches the same place by a different road. */
+    {
+        char udpextra[512];
+        snprintf(udpextra, sizeof(udpextra),
+                 "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"1\","
+                 "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"%d\",\"UDP\":true,",
+                 local);
+        char udpcfg[2048];
+        make_client_config(udpcfg, sizeof(udpcfg), pub, udpextra);
+        char *const argv[] = {(char *)"ck-client", (char *)"-c", udpcfg, NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, argv, NULL));
+        ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
+        ASSERT_EQ_INT(-1, can_connect(local));
+        ASSERT_EQ_INT(1, tcp_port_is_free(local));
+        ASSERT_EQ_INT(0, child_stop(&c));
+
+        /* AND -u=false TURNS IT OFF AGAIN, which is Go's flag.Visit and
+         * was NOT this file's behaviour: every bool flag here took its
+         * inline value, threw it away and set true. That was harmless
+         * while -u was refused outright and is a flag that does the
+         * opposite of what it says now that it selects a tunnel. The
+         * assertion is the TCP pair again, so it fails for a -u=false
+         * that is ignored just as loudly as for one that is inverted. */
+        char *const argv_off[] = {(char *)"ck-client", (char *)"-c", udpcfg,
+                                  (char *)"-u=false", NULL};
+        child_t off;
+        ASSERT_EQ_INT(0, child_spawn(&off, CK_CLIENT_PATH, argv_off, NULL));
+        ASSERT_EQ_INT(0, child_wait_for(&off, "ck-client ready", BOOT_MS));
+        ASSERT_EQ_INT(0, can_connect(local));
+        ASSERT_EQ_INT(0, tcp_port_is_free(local));
+        ASSERT_EQ_INT(0, child_stop(&off));
+
+        /* An unparseable one is a usage error, not a silent true. */
+        char *const argv_bad[] = {(char *)"ck-client", (char *)"-c", udpcfg,
+                                  (char *)"-u=perhaps", NULL};
+        child_t bad;
+        ASSERT_EQ_INT(1, run_to_exit(&bad, CK_CLIENT_PATH, argv_bad, NULL, EXIT_MS));
+        ASSERT_TRUE(strstr(bad.out, "perhaps") != NULL);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Case 4a: the minimal UDP configuration explains ITS OWN failure       */
+/* ------------------------------------------------------------------ */
+
+/* THE TRAP THIS TASK OPENED, and the reason it is a case of its own.
+ *
+ * NumConn <= 0 -- INCLUDING AN OMITTED NumConn -- means singleplex, in
+ * this port and in Go (cloak/config.h, and Go's ProcessRawConfig). This
+ * build does not implement singleplex WITH udp and refuses the pair. So
+ * the very first configuration a reader of Go's documentation writes,
+ *
+ *     {"UDP": true, ... }
+ *
+ * is refused, naming a mode the user never typed. That is a message
+ * about something they did not configure, which is the shape of error
+ * report that sends somebody to the source.
+ *
+ * WHAT WAS NOT DONE, and why: defaulting NumConn to something above zero
+ * when udp is set. It would start, and it would be WIRE-VISIBLE
+ * divergence from Go -- a Go client reading this same configuration opens
+ * ONE connection and this one would open several -- for a configuration
+ * the user did not write. A refusal that explains itself costs the user
+ * one line of configuration; a silent divergence costs them a
+ * distinguishable client.
+ *
+ * So the message names the real cause instead. This case fails if it
+ * stops doing so. */
+static void test_udp_without_numconn_names_numconn(void) {
+    char pub[64];
+    derive_pub_b64(pub, sizeof(pub));
+    /* NOT make_client_config, which always writes a NumConn: the whole
+     * point here is the key's ABSENCE. */
+    char cfg[2048];
+    snprintf(cfg, sizeof(cfg),
+             "{"
+             "\"ServerName\":\"www.bing.com\","
+             "\"ProxyMethod\":\"shadowsocks\","
+             "\"EncryptionMethod\":\"aes-gcm\","
+             "\"UID\":\"%s\","
+             "\"PublicKey\":\"%s\","
+             "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\","
+             "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\","
+             "\"UDP\":true,"
+             "\"BrowserSig\":\"chrome\""
+             "}",
+             UID_B64, pub);
+    char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
     child_t c;
-    ASSERT_EQ_INT(1, run_to_exit(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS));
-    ASSERT_TRUE(strstr(c.out, "unordered") != NULL);
-    /* And it is refused rather than accepted-then-ignored: nothing was
-     * started, so there is no readiness line. */
+    ASSERT_EQ_INT(2, run_to_exit(&c, CK_CLIENT_PATH, argv, NULL, EXIT_MS));
+    /* The cause the user can act on, not merely the mode they never
+     * named. Both words, because "singleplex" alone is the message this
+     * case exists to reject. */
+    ASSERT_TRUE(strstr(c.out, "singleplex") != NULL);
+    ASSERT_TRUE(strstr(c.out, "NumConn") != NULL);
     ASSERT_TRUE(strstr(c.out, "ck-client ready") == NULL);
 
-    /* The CONFIG KEY: a wrong configuration, so exit 2. Two inputs, two
-     * classes, two codes -- which is the distinction exit codes exist
-     * for, and it is asserted rather than described. */
-    char udpcfg[2048];
-    make_client_config(udpcfg, sizeof(udpcfg), pub,
-                       "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"443\","
-                       "\"LocalPort\":\"1984\",\"UDP\":true,");
-    char *const uargv[] = {(char *)"ck-client", (char *)"-c", udpcfg, NULL};
-    child_t u;
-    ASSERT_EQ_INT(2, run_to_exit(&u, CK_CLIENT_PATH, uargv, NULL, EXIT_MS));
-    ASSERT_TRUE(strstr(u.out, "unordered") != NULL);
+    /* And the same configuration with a NumConn starts, so the message
+     * above is a fixable one rather than a description of a mode that
+     * cannot be entered at all. */
+    char cfg2[2048];
+    snprintf(cfg2, sizeof(cfg2),
+             "{"
+             "\"ServerName\":\"www.bing.com\","
+             "\"ProxyMethod\":\"shadowsocks\","
+             "\"EncryptionMethod\":\"aes-gcm\","
+             "\"UID\":\"%s\","
+             "\"PublicKey\":\"%s\","
+             "\"NumConn\":1,"
+             "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"1\","
+             "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\","
+             "\"UDP\":true,"
+             "\"BrowserSig\":\"chrome\""
+             "}",
+             UID_B64, pub);
+    char *const argv2[] = {(char *)"ck-client", (char *)"-c", cfg2, NULL};
+    child_t c2;
+    ASSERT_EQ_INT(0, child_spawn(&c2, CK_CLIENT_PATH, argv2, NULL));
+    ASSERT_EQ_INT(0, child_wait_for(&c2, "ck-client ready", BOOT_MS));
+    ASSERT_EQ_INT(0, child_stop(&c2));
+}
+
+/* ------------------------------------------------------------------ */
+/* Case 4b: the unordered bit, read OFF THE WIRE                         */
+/* ------------------------------------------------------------------ */
+
+/* THE ONLY EVIDENCE OUTSIDE THIS PROCESS THAT THE MODE EXISTS. Every
+ * other assertion in case 4 is about a socket this client opened for
+ * itself; a client that bound a UDP port and then advertised an ORDERED
+ * session would pass all of them, and would be exactly the divergence
+ * this task was dispatched to close -- our own server refuses that
+ * combination, but a GO server does not, and Task 1 measured what it does
+ * instead: it reorders. All three byte counts came back identical and
+ * only a content comparison failed. So the flag is asserted where it is
+ * actually decided, on the wire, in both states.
+ *
+ * The bytes are decrypted with the SERVER'S OWN decrypter
+ * (cloak_server_auth_decrypt) rather than by indexing byte 41 by hand: a
+ * hand-cut offset is a second copy of the layout, free to agree with a
+ * mutated builder. This one cannot -- it is the code a real server runs.
+ *
+ * Nothing replies to the ClientHello: the handshake is abandoned after
+ * the first record, the client retries in the background, and the case is
+ * over. */
+
+/* Reads exactly one TLS record -- 5-byte header, then the length that
+ * header declares -- bounded by the clock. Returns the total number of
+ * bytes in the record, or -1. */
+static int read_one_tls_record(int fd, uint8_t *buf, size_t cap, int timeout_ms) {
+    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
+    size_t have = 0;
+    size_t want = 5;
+    for (;;) {
+        if (have >= want) {
+            if (want == 5) {
+                size_t body = ((size_t)buf[3] << 8) | (size_t)buf[4];
+                want = 5 + body;
+                if (want > cap) {
+                    return -1;
+                }
+                continue;
+            }
+            return (int)want;
+        }
+        uint64_t now = now_ms();
+        if (now >= deadline) {
+            return -1;
+        }
+        struct pollfd p = {fd, POLLIN, 0};
+        if (poll(&p, 1, (int)(deadline - now)) <= 0) {
+            return -1;
+        }
+        ssize_t n = read(fd, buf + have, want - have);
+        if (n <= 0) {
+            return -1;
+        }
+        have += (size_t)n;
+    }
+}
+
+/* Accepts one connection on `listen_fd`, reads its ClientHello, and
+ * returns the unordered flag the server would have read out of it: 0, 1,
+ * or -1 if anything went wrong. */
+static int wire_unordered_flag(int listen_fd) {
+    struct pollfd p = {listen_fd, POLLIN, 0};
+    if (poll(&p, 1, BOOT_MS) <= 0) {
+        return -1;
+    }
+    int fd = accept(listen_fd, NULL, NULL);
+    if (fd < 0) {
+        return -1;
+    }
+    uint8_t rec[8192];
+    int n = read_one_tls_record(fd, rec, sizeof(rec), BOOT_MS);
+    close(fd);
+    if (n <= 0) {
+        return -1;
+    }
+    cloak_clienthello_parsed_t parsed;
+    if (cloak_clienthello_parse(rec, (size_t)n, &parsed) != 0) {
+        return -1;
+    }
+    uint8_t priv[CLOAK_X25519_KEY_LEN];
+    size_t priv_len = 0;
+    if (cloak_base64_decode(PRIV_B64, priv, sizeof(priv), &priv_len) != 0 ||
+        priv_len != CLOAK_X25519_KEY_LEN) {
+        return -1;
+    }
+    cloak_server_clientinfo_t info;
+    uint8_t secret[CLOAK_AEAD_KEY_LEN];
+    if (cloak_server_auth_decrypt(parsed.random, parsed.session_id, parsed.session_id_len,
+                                  parsed.x25519_key_share, priv, (int64_t)time(NULL), &info,
+                                  secret) != 0) {
+        return -1;
+    }
+    return info.unordered ? 1 : 0;
+}
+
+static void test_the_unordered_bit_is_on_the_wire(void) {
+    char pub[64];
+    derive_pub_b64(pub, sizeof(pub));
+
+    for (int udp = 0; udp <= 1; udp++) {
+        int front = 0;
+        int listen_fd = listen_on(&front);
+        ASSERT_TRUE(listen_fd >= 0);
+
+        char extra[512];
+        snprintf(extra, sizeof(extra),
+                 "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"%d\","
+                 "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\",",
+                 front);
+        char cfg[2048];
+        make_client_config(cfg, sizeof(cfg), pub, extra);
+
+        char *const argv_u[] = {(char *)"ck-client", (char *)"-c", cfg, (char *)"-u", NULL};
+        char *const argv_o[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, udp ? argv_u : argv_o, NULL));
+
+        int seen = wire_unordered_flag(listen_fd);
+        ASSERT_EQ_INT(udp, seen);
+
+        ASSERT_EQ_INT(0, child_stop(&c));
+        close(listen_fd);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2161,7 +2505,9 @@ TEST_MAIN_BEGIN()
     test_local_host_flag_overrides_json();
     test_proxy_flag_overrides_json();
     test_missing_remote_host_is_a_config_error();
-    test_udp_is_refused();
+    test_udp_is_honoured();
+    test_udp_without_numconn_names_numconn();
+    test_the_unordered_bit_is_on_the_wire();
     test_end_to_end_through_both_binaries();
     test_sigterm_is_clean_and_leaks_no_descriptor();
     test_admin_flag_reaches_the_admin_api();

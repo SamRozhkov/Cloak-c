@@ -929,9 +929,34 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
          * cancel_session pair plus somewhere to hold a peer's first
          * DATAGRAM while its session handshakes, and a shared datagram
          * socket has no kernel buffer to leave it in the way a TCP
-         * connection does (cloak/udp_piper.h states the gap). */
+         * connection does (cloak/udp_piper.h states the gap).
+         *
+         * THE MESSAGE NAMES NumConn, and that is not decoration. Nothing
+         * called "singleplex" appears in the configuration: it is what
+         * NumConn <= 0 selects, INCLUDING AN OMITTED NumConn
+         * (config_client.c, and Go's ProcessRawConfig does the same). So
+         * the shortest configuration anybody writes for this feature --
+         * "UDP": true and nothing else -- lands here, and a message that
+         * said only "singleplex" would be naming a mode the user never
+         * typed. This layer cannot tell an omitted NumConn from an
+         * explicit 0, because the parser collapses both; naming the key
+         * covers both, which is why the sentence is shaped this way
+         * rather than branching on something it does not know.
+         *
+         * WHAT WAS NOT DONE: quietly defaulting NumConn when udp is set.
+         * It would start, and it would make this client WIRE-VISIBLY
+         * different from a Go client reading the same file -- Go opens
+         * one connection for that configuration and this would open
+         * several -- for a value the operator never wrote. A refusal that
+         * explains itself costs one line of configuration; a silent
+         * divergence costs a distinguishable client. Pinned by
+         * test_ck_client_cli.c's test_udp_without_numconn_names_numconn,
+         * which asserts both words and then that the same configuration
+         * with a NumConn starts. */
         stack_err(err, err_cap,
-                  "client config: UDP mode with singleplex is not supported by this build");
+                  "client config: UDP mode with singleplex is not supported by this build "
+                  "-- singleplex is what NumConn <= 0 selects, and an omitted NumConn means "
+                  "NumConn <= 0, so set NumConn to 1 or more");
         cloak_client_stack_close(s);
         return CLOAK_CLIENT_STACK_ERR_CONFIG;
     }

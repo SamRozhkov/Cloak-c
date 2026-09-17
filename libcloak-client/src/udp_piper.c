@@ -534,13 +534,26 @@ static void piper_pump_read(cloak_udp_piper_t *pp) {
     uint8_t buf[UDP_PIPER_RX_BUF];
 
     pp->in_read_loop = 1;
+    unsigned taken = 0;
     for (;;) {
         if (pp->fd < 0) {
             break;
         }
+        /* THE PER-TURN BUDGET. cloak/udp_piper.h states the argument;
+         * what matters here is that this break leaves read_paused CLEAR,
+         * so the sync_interest at the bottom of this function re-issues a
+         * non-zero mask and the edge-triggered socket re-reports whatever
+         * is still sitting in it on the next turn. The pool pause below
+         * is the opposite case and must stay the opposite case: it drops
+         * interest, and only on_writable can bring it back. */
+        if (taken >= CLOAK_UDP_PIPER_READ_BUDGET) {
+            pp->read_yields++;
+            break;
+        }
         size_t cap = 1;
         if (pp->sesh != NULL) {
-            /* THE BUDGET, re-derived before every single read, exactly as
+            /* THE POOL BUDGET (distinct from the per-turn one above),
+             * re-derived before every single read, exactly as
              * cloak_stream_relay_t re-derives its own. One datagram is
              * one frame in this mode, so the question is simply whether
              * the LEAST free connection in the pool could hold one more
@@ -592,6 +605,15 @@ static void piper_pump_read(cloak_udp_piper_t *pp) {
             }
             break;
         }
+
+        /* COUNTED HERE, ahead of every `continue` below, and that
+         * placement is the whole of the budget's usefulness: an oversized
+         * or empty datagram, or one from a source no peer can be made
+         * for, costs the outbound pool nothing, so a flood of them would
+         * be bounded by nothing at all if the budget were spent at the
+         * write instead. */
+        pp->datagrams_read++;
+        taken++;
 
         if (!peer_addr_usable(&from, from_len)) {
             pp->refused_peers++;
@@ -1010,6 +1032,14 @@ uint64_t cloak_udp_piper_send_stalls(const cloak_udp_piper_t *pp) {
 
 uint64_t cloak_udp_piper_pool_pauses(const cloak_udp_piper_t *pp) {
     return pp == NULL ? 0 : pp->pool_pauses;
+}
+
+uint64_t cloak_udp_piper_datagrams_read(const cloak_udp_piper_t *pp) {
+    return pp == NULL ? 0 : pp->datagrams_read;
+}
+
+uint64_t cloak_udp_piper_read_yields(const cloak_udp_piper_t *pp) {
+    return pp == NULL ? 0 : pp->read_yields;
 }
 
 size_t cloak_udp_piper_refused_peers(const cloak_udp_piper_t *pp) {

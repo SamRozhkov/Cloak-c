@@ -261,6 +261,28 @@ typedef struct cloak_udp_piper cloak_udp_piper_t;
  * sending is one this client would be wrong to forget. */
 #define CLOAK_UDP_PIPER_DEFAULT_SEND_RETRY_MS ((uint64_t)10)
 
+/* Datagrams the local socket's read loop will take in ONE entry before
+ * re-arming and returning to the reactor. See
+ * cloak_udp_piper_datagrams_read for why a bound is needed at all -- in
+ * short, neither of the loop's two previous exits (EAGAIN and the
+ * outbound pool) bounds a turn on a healthy link, and the datagrams this
+ * module drops rather than forwards bound nothing at all.
+ *
+ * 32 IS CHOSEN, NOT MEASURED, and saying so is cheaper than implying an
+ * oracle that does not exist: there is no Go number to match (Go reads
+ * each peer in a goroutine of its own, with no budget), and no throughput
+ * target was measured against it. What the value has to be is FINITE and
+ * large enough that the re-arm is not paid per datagram; 32 datagrams is
+ * up to half a megabyte of application payload per turn at the shipping
+ * max_on_wire_size, which is far above any real local proxy's burst, and
+ * one extra epoll_ctl per 32 datagrams is not a cost worth tuning.
+ *
+ * It is pinned EXACTLY -- not as a bound -- by test_udp_piper.c's
+ * test_the_read_loop_yields_after_its_budget, which spells 32 as a
+ * literal so that a change here is a failing test and therefore a
+ * deliberate act. */
+#define CLOAK_UDP_PIPER_READ_BUDGET ((unsigned)32)
+
 /* Streams THE SERVER may open toward this client, and have refused,
  * before the session is closed outright. Identical in value and in
  * argument to CLOAK_CLIENT_PIPER_MAX_REJECTED_STREAMS -- see
@@ -401,6 +423,8 @@ struct cloak_udp_piper {
     uint64_t empty_datagrams;
     uint64_t send_stalls;   /* sendto refusals, not peers */
     uint64_t pool_pauses;   /* times the local socket's read interest was dropped */
+    uint64_t datagrams_read;/* datagrams taken off the local socket, whatever became of them */
+    uint64_t read_yields;   /* times the read loop stopped on its per-turn budget */
 
     /* recv_dropped_datagrams harvested from streams that have already
      * been released, so that cloak_udp_piper_dropped_datagrams can be a
@@ -561,6 +585,46 @@ uint64_t cloak_udp_piper_send_stalls(const cloak_udp_piper_t *pp);
  * bytes eventually crossed would pass just as well against a piper that
  * never applied backpressure at all and overran the pool. */
 uint64_t cloak_udp_piper_pool_pauses(const cloak_udp_piper_t *pp);
+
+/* Datagrams taken off the local socket over this piper's life, counted at
+ * the recvfrom and therefore INCLUDING the ones that were dropped
+ * afterwards -- oversized, empty, or from a source no peer could be made
+ * for. Exposed because it is the only quantity from which the per-turn
+ * read budget below can be observed at all.
+ *
+ * ---------------------------------------------------------------------
+ * THE PER-TURN READ BUDGET, which this counter and the next exist to make
+ * checkable. The read loop stops after CLOAK_UDP_PIPER_READ_BUDGET
+ * datagrams in one entry, re-arms the socket and returns to the reactor.
+ *
+ * It is not an optimisation. Before it, the loop's only exits were EAGAIN
+ * and the outbound pool -- and on a healthy link the pool never fills,
+ * because every frame is accepted by a connection immediately, so one
+ * peer with a full socket buffer held the whole reactor turn. The
+ * datagrams this module DROPS rather than sends make that strictly worse:
+ * they cost the pool nothing at all, so a flood of oversized or empty
+ * ones is unbounded no matter how congested the session is. Everything
+ * else this process owns -- the other peers' retry timers, the peer
+ * deadlines, the pool's own readiness -- waits behind that loop.
+ *
+ * The budget is a COUNT OF DATAGRAMS and not of bytes, because the
+ * pathological case is many tiny ones; and it is counted at the recvfrom
+ * rather than at the write, so a dropped datagram spends budget exactly
+ * as a forwarded one does. Pinned by test_udp_piper.c's
+ * test_the_read_loop_yields_after_its_budget, which asserts the exact
+ * count read in one reactor turn and that the remainder still arrives. */
+uint64_t cloak_udp_piper_datagrams_read(const cloak_udp_piper_t *pp);
+
+/* Times the read loop stopped because it had spent its per-turn budget,
+ * as opposed to draining the socket (EAGAIN) or pausing on the pool.
+ *
+ * DISTINCT FROM cloak_udp_piper_pool_pauses, and the two must not be
+ * folded together: a pool pause drops read interest and is resumed ONLY
+ * by the session's on_writable, while a budget yield keeps interest and
+ * is resumed by the re-arm the loop's own exit performs. A test that
+ * could not tell them apart could not tell a working budget from one that
+ * wedges the socket until the pool happens to drain. */
+uint64_t cloak_udp_piper_read_yields(const cloak_udp_piper_t *pp);
 
 /* Datagrams dropped because they came from an unknown peer and no peer
  * could be created for them -- the piper was at max_peers, had no

@@ -2142,6 +2142,137 @@ static void test_stack_udp_mode_binds_a_datagram_socket(void) {
     cloak_reactor_destroy(r);
 }
 
+struct dgram_wait {
+    const cloak_udp_piper_t *pp;
+    int want;
+};
+
+static int piper_read_at_least(void *ctx) {
+    struct dgram_wait *w = ctx;
+    return (int)cloak_udp_piper_datagrams_read(w->pp) >= w->want;
+}
+
+/* ============ 13. THE PER-TURN READ BUDGET ============================== */
+
+/* THE HAZARD THIS CLOSES, and why it only becomes one now. Until the
+ * refusal in cmd/ck-client/main.c was lifted, nothing in a shipped binary
+ * could reach piper_pump_read at all. It is now the client's whole local
+ * endpoint, shared by every peer, and its read loop had exactly two
+ * exits: EAGAIN, and the pool check.
+ *
+ * NEITHER BOUNDS A TURN.
+ *
+ *  - The pool check only fires when the session's outbound queue is
+ *    backing up. On loopback, and on any healthy link, every frame this
+ *    loop produces is handed to a connection that accepts it immediately,
+ *    so min_conn_free never falls and the loop runs until the socket is
+ *    dry -- however much a peer put there.
+ *  - Worse, the datagrams that are DROPPED rather than sent -- oversized,
+ *    empty, or from a source the peer map refuses -- cost the pool
+ *    nothing at all, so a flood of them is unbounded no matter how
+ *    congested the session is.
+ *
+ * One busy peer can therefore hold the reactor turn, and everything else
+ * this process owns -- the other peers' send timers, the peer deadlines,
+ * the connection pool's own readiness -- waits behind it. Task 5's
+ * implementer asked for this budget before task 7 put the module in front
+ * of real traffic, which is this commit.
+ *
+ * THE NUMBER IS A LITERAL HERE, derived by hand from the 32 in
+ * udp_piper.c rather than spelled as that symbol: a bound written in
+ * terms of the constant it is testing moves with a mutation to it instead
+ * of catching it (this file's ladder cases make the same argument). 40 is
+ * sent, so the remainder is 8 -- enough that "all of them arrived" cannot
+ * be confused with "the budget happens to be 40".
+ *
+ * WHAT EACH ASSERTION KILLS:
+ *   - no budget at all: the first turn reads all 40, so `32` fails.
+ *   - a budget that does not re-arm the socket (a `read_paused = 1` on
+ *     the way out, say): the remaining 8 never arrive, because a paused
+ *     read has no readiness edge left of its own and only on_writable
+ *     resumes it -- and the pool never backed up, so on_writable never
+ *     fires. The second wait fails.
+ *   - a budget applied only to datagrams that were actually SENT: this
+ *     case's datagrams all are, so it would survive here -- which is why
+ *     the counter is incremented at the recvfrom and not at the write,
+ *     and why that placement is stated in udp_piper.c rather than left to
+ *     be inferred. */
+static void test_the_read_loop_yields_after_its_budget(void) {
+    static struct fixture fx;
+    cloak_udp_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.peer_timeout_ms = 60000;
+    /* The default conn_send_queue_cap (262144) against a 16401 wire: the
+     * pool can hold fifteen worst-case frames and these datagrams are
+     * eight bytes each, so the pool check cannot be what stops the loop.
+     * Asserted below rather than assumed. */
+    ASSERT_EQ_INT(0, fixture_init_ex(&fx, &pcfg, 16401, 65536, 0, 1, 0));
+    if (!fx.ready) {
+        fixture_destroy(&fx);
+        return;
+    }
+    char err[200] = {0};
+    ASSERT_EQ_INT(0, cloak_udp_piper_open(&fx.pp, "127.0.0.1:0", err, sizeof(err)));
+    int port = cloak_udp_piper_port(&fx.pp);
+    ASSERT_TRUE(port > 0);
+
+    struct peer p;
+    memset(&p, 0, sizeof(p));
+    p.fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    ASSERT_TRUE(p.fd >= 0);
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port = htons((uint16_t)port);
+    memcpy(&p.piper, &to, sizeof(to));
+    p.piper_len = sizeof(to);
+
+    /* Forty small datagrams, queued in the piper's socket BEFORE the
+     * reactor is touched: eight bytes each is around 30 KiB of kernel
+     * accounting against a default 208 KiB receive buffer, so none is
+     * dropped -- which the final count asserts rather than assumes. */
+    uint8_t d[8];
+    for (int i = 0; i < 40; i++) {
+        fill_pattern(d, sizeof(d), (uint8_t)(0x50 + i));
+        ASSERT_EQ_INT(0, peer_send(&p, d, sizeof(d)));
+    }
+
+    /* ONE TURN. cloak_reactor_run_once dispatches each ready descriptor
+     * once, so this is exactly one entry into piper_pump_read. */
+    ASSERT_TRUE(cloak_reactor_run_once(fx.r, 100) > 0);
+    ASSERT_EQ_INT(32, (int)cloak_udp_piper_datagrams_read(&fx.pp));
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_read_yields(&fx.pp));
+    /* The loop stopped on the BUDGET and not on the pool, which is the
+     * difference between this case and case 9. */
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_pool_pauses(&fx.pp));
+
+    /* AND THE REST ARRIVE, with nothing further sent by the peer: the
+     * yield re-arms the socket, so the readiness this turn did not
+     * consume is redelivered. */
+    struct dgram_wait dw = {&fx.pp, 40};
+    ASSERT_EQ_INT(1, pump_until(fx.r, piper_read_at_least, &dw, PUMP_MAX_TURNS, PUMP_TURN_MS));
+    ASSERT_EQ_INT(40, (int)cloak_udp_piper_datagrams_read(&fx.pp));
+    /* Exactly one yield: 40 = 32 + 8, and the second pass had eight left. */
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_read_yields(&fx.pp));
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_peer_count(&fx.pp));
+
+    /* All forty reached the far end, in order and whole -- so the budget
+     * costs datagrams nothing, which is the other half of the claim. */
+    struct pair_ctx pc = {&fx.far, 1};
+    ASSERT_EQ_INT(1, pump_until(fx.r, far_streams_at_least, &pc, PUMP_MAX_TURNS, PUMP_TURN_MS));
+    struct count_ctx cc = {&fx.far.st[0], 40};
+    ASSERT_EQ_INT(1, pump_until(fx.r, far_count_at_least, &cc, PUMP_MAX_TURNS, PUMP_TURN_MS));
+    ASSERT_EQ_INT(40, fx.far.st[0].count);
+    for (int i = 0; i < 40; i++) {
+        ASSERT_EQ_INT(0x50 + i, fx.far.st[0].seqs[i]);
+        ASSERT_EQ_INT(8, fx.far.st[0].lens[i]);
+    }
+
+    close(p.fd);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
 test_two_peers_two_streams_no_crossing();
 test_datagram_backpressure_mechanism();
@@ -2158,4 +2289,5 @@ test_ipv6_peers_are_distinct_peers();
 test_hard_send_error_discards_the_datagram_and_keeps_the_peer();
 test_relay_read_budget_respects_the_unordered_write_limit();
 test_stack_udp_mode_binds_a_datagram_socket();
+test_the_read_loop_yields_after_its_budget();
 TEST_MAIN_END()

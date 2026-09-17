@@ -94,13 +94,27 @@
  * silently ignoring a flag a launcher thought it was passing.
  *
  * ---------------------------------------------------------------------
- * -u IS REFUSED. Unordered (datagram) mode is a later module: the session
- * layer's unordered flag exists but nothing in this build carries UDP
- * end to end. A client that accepted -u and then carried TCP would be
- * strictly worse than one that refuses, because the caller would believe
- * it had a datagram path. The config key "UDP": true is refused too, for
- * the same reason and with the configuration exit code rather than the
- * usage one -- two different wrong inputs, two different classes.
+ * -u IS A DOCUMENT EDIT, not a branch. Earlier versions of this file
+ * REFUSED -u and "UDP": true outright, because nothing in the build
+ * carried UDP end to end; both refusals are gone and neither left a
+ * special case behind. The flag's whole implementation is one
+ * conf_set_bool into the configuration document, in the same place and
+ * for the same reason as -i, -l, -s and -p: the library decides what
+ * `udp` means, this file only decides that the command line beat the
+ * file. A branch here would be a second definition of the mode.
+ *
+ * The precedence is Go's flag.Visit, which runs only for flags actually
+ * PRESENT on the command line: -u sets UDP true, -u=false sets it false
+ * and therefore overrides a "UDP": true in the document, and an absent -u
+ * changes nothing. That is why ck_args_t carries udp_given as well as
+ * udp -- one field cannot say "absent" and "false" at the same time.
+ * (-u=false was silently TRUE in this file until this module; see
+ * parse_args.)
+ *
+ * "UDP": true and -u therefore reach the SAME place by two roads, and
+ * test_ck_client_cli.c's case 4 asserts both roads separately for that
+ * reason -- a flag handled here and a key handled in the library would
+ * look identical from one of them.
  *
  * ---------------------------------------------------------------------
  * THREE SMALLER THINGS, recorded here because a reader comparing the two
@@ -203,7 +217,11 @@ static void usage(FILE *out) {
                  "corresponding entry in server's ProxyBook\n");
     fprintf(out, "  -s string\n");
     fprintf(out, "        remoteHost: IP of your proxy server\n");
-    fprintf(out, "  -u    udp: NOT IMPLEMENTED -- unordered mode is not in this build\n");
+    /* Go's own wording, verbatim (cmd/ck-client/main.go): a pluggable
+     * transport's -h output is read by people migrating a deployment that
+     * already works, and a line that says something different from the
+     * one they know is a line they have to go and check. */
+    fprintf(out, "  -u    udp: set this flag if the underlying proxy is using UDP protocol\n");
     fprintf(out, "  -v    Print the version number\n");
     fprintf(out, "  -verbosity string\n");
     fprintf(out, "        verbosity level: error, warn, info, debug or trace "
@@ -533,6 +551,26 @@ static int conf_load(const char *conf, ck_conf_t *c, const char **source, char *
     return 0;
 }
 
+/* conf_set for a value that must NOT arrive at the parser as a string.
+ *
+ * cloak_config_get_bool refuses anything that is not a JSON boolean, so
+ * "UDP": "true" is a configuration error rather than a true flag -- which
+ * is exactly what conf_set would have produced, silently, because every
+ * other flag this file forwards is a string. The ssv form needs no such
+ * care: config_ssv.c already types NumConn, StreamTimeout, KeepAlive and
+ * UDP itself, turning the literal text "true" into a JSON bool, so that
+ * half is conf_set with the word. */
+static int conf_set_bool(ck_conf_t *c, const char *key, int value, char *err, size_t err_cap) {
+    if (c->ssv) {
+        return conf_set(c, key, value ? "true" : "false", err, err_cap);
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(c->doc, key);
+    if (cJSON_AddBoolToObject(c->doc, key, value) == NULL) {
+        return ck_err(err, err_cap, "out of memory setting %s", key);
+    }
+    return 0;
+}
+
 static int conf_finish(const ck_conf_t *c, cloak_client_config_t *cfg, char *err,
                        size_t err_cap) {
     char parse_err[CLOAK_CONFIG_ERR_LEN] = {0};
@@ -624,13 +662,40 @@ typedef struct {
     const char *proxy_method;
     const char *admin_uid;
     int udp;
+    /* WHETHER -u WAS GIVEN AT ALL, which is a different question from
+     * whether it was true, and Go asks exactly this one: its flag.Visit
+     * callback runs only for flags actually present on the command line,
+     * so an absent -u leaves the document's "UDP" alone while an explicit
+     * -u=false clears it. A single `udp` field cannot express that. */
+    int udp_given;
     int ask_version;
     int print_usage;
 } ck_args_t;
 
+/* strconv.ParseBool's accepted spellings, which is what Go's flag package
+ * uses for a bool flag's inline value. Returns 0 and writes *out, or -1
+ * if the text is not one of them. */
+static int parse_bool_value(const char *v, int *out) {
+    static const char *const yes[] = {"1", "t", "T", "TRUE", "true", "True"};
+    static const char *const no[] = {"0", "f", "F", "FALSE", "false", "False"};
+    for (size_t i = 0; i < sizeof(yes) / sizeof(yes[0]); i++) {
+        if (strcmp(v, yes[i]) == 0) {
+            *out = 1;
+            return 0;
+        }
+        if (strcmp(v, no[i]) == 0) {
+            *out = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* Go's flag package accepts -x, --x, -x=v and (for non-bool flags) -x v.
- * Boolean flags never consume the following argument, which is why -u,
- * -v and -h take no value here either.
+ * Boolean flags never consume the FOLLOWING argument -- so -u, -v and -h
+ * never eat the next word -- but they do take an INLINE one, -u=false,
+ * which this file parses because Go's flag.Bool does (strconv.ParseBool).
+ * See the bool branch below for what used to happen to it.
  *
  * WHICH FLAGS ARE LEGAL DEPENDS ON THE MODE, exactly as in Go, where
  * plugin mode registers a different (and much smaller) flag set. An
@@ -689,12 +754,32 @@ static int parse_args(int argc, char **argv, int plugin_mode, ck_args_t *a, char
             target = &a->proxy_method;
         } else if (strcmp(base, "a") == 0) {
             target = &a->admin_uid;
-        } else if (strcmp(base, "u") == 0) {
-            a->udp = 1;
-        } else if (strcmp(base, "v") == 0) {
-            a->ask_version = 1;
-        } else if (strcmp(base, "h") == 0) {
-            a->print_usage = 1;
+        } else if (strcmp(base, "u") == 0 || strcmp(base, "v") == 0 ||
+                   strcmp(base, "h") == 0) {
+            /* THE THREE BOOL FLAGS, and the one form of them this file
+             * used to get wrong. `-u` is true, as it is in Go; but
+             * `-u=false` is FALSE in Go (flag.Bool goes through
+             * strconv.ParseBool) and was silently true here, because the
+             * inline value was parsed off the name and then discarded for
+             * every flag that took no argument. That was invisible while
+             * -u was refused outright; the moment -u started selecting a
+             * datagram tunnel it became a flag that does the opposite of
+             * what it says, so it is parsed now. The accepted spellings
+             * are strconv.ParseBool's, and an unparseable one is a usage
+             * error exactly as it is in Go rather than a silent true. */
+            int on = 1;
+            if (inline_value != NULL && parse_bool_value(inline_value, &on) != 0) {
+                return ck_err(err, err_cap, "invalid boolean value \"%s\" for flag -%s",
+                              inline_value, base);
+            }
+            if (base[0] == 'u') {
+                a->udp = on;
+                a->udp_given = 1;
+            } else if (base[0] == 'v') {
+                a->ask_version = on;
+            } else {
+                a->print_usage = on;
+            }
         } else {
             return ck_err(err, err_cap, "unknown flag \"%s\"", arg);
         }
@@ -754,13 +839,6 @@ int main(int argc, char **argv) {
     if (args.print_usage) {
         usage(stdout);
         return CK_EXIT_OK;
-    }
-    if (args.udp) {
-        fprintf(stderr,
-                "ck-client: -u selects unordered (datagram) mode, which this build does "
-                "not implement; it is refused rather than silently carrying TCP under a "
-                "caller that asked for UDP\n");
-        return CK_EXIT_USAGE;
     }
 
     cloak_log_level_t level;
@@ -836,6 +914,12 @@ int main(int argc, char **argv) {
         if (rc == 0 && args.proxy_method != NULL) {
             rc = conf_set(&conf, "ProxyMethod", args.proxy_method, err, sizeof(err));
         }
+        /* -u, and the whole of what -u does. Gated on GIVEN and not on
+         * TRUE, which is Go's flag.Visit exactly: -u=false clears a
+         * "UDP": true in the document, and an absent -u leaves it. */
+        if (rc == 0 && args.udp_given) {
+            rc = conf_set_bool(&conf, "UDP", args.udp, err, sizeof(err));
+        }
         if (rc == 0) {
             rc = conf_default(&conf, "LocalHost", local_host, err, sizeof(err));
         }
@@ -857,13 +941,6 @@ int main(int argc, char **argv) {
     conf_free(&conf);
     if (rc != 0) {
         CLOAK_LOGE("configuration error in %s: %s", source, err);
-        return CK_EXIT_CONFIG;
-    }
-
-    if (cfg.udp) {
-        CLOAK_LOGE("configuration error in %s: \"UDP\": true selects unordered (datagram) "
-                   "mode, which this build does not implement",
-                   source);
         return CK_EXIT_CONFIG;
     }
 
@@ -970,8 +1047,11 @@ int main(int argc, char **argv) {
     }
 
     /* The BOUND port, not the configured one: a LocalPort of "0" is what
-     * makes the difference worth printing. */
-    CLOAK_LOGI("listening on TCP %s:%d for %s client", cfg.local_host,
+     * makes the difference worth printing -- and the PROTOCOL, because in
+     * unordered mode this endpoint is a datagram socket and an operator
+     * pointing a TCP client at it gets connection refused with nothing
+     * anywhere saying why. Go prints the protocol here too. */
+    CLOAK_LOGI("listening on %s %s:%d for %s client", cfg.udp ? "UDP" : "TCP", cfg.local_host,
                cloak_client_stack_local_port(stack), cfg.proxy_method);
     CLOAK_LOGI("ck-client ready");
 
