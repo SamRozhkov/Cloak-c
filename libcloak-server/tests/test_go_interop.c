@@ -42,6 +42,13 @@
  *      unmasked client and a masked server, both of which drew a "bad
  *      MASK" from gorilla) are what made its passes mean anything.
  *
+ *   5. THE MIRROR OF THE CONTROL, ADDED AFTER REVIEW. Case 3 proves GO's
+ *      client refuses; nothing proved OURS did. A C client that ignored
+ *      the ServerHello's AES-GCM tag entirely passed all four of the
+ *      original cases, because an honest Go server always produces a
+ *      valid tag. So case 5 is case 2 with one bit flipped in a GO
+ *      server's ServerHello, and our client must refuse it.
+ *
  *   4. BYTE 41 IS 0 IN BOTH DIRECTIONS. The auth payload's flag byte
  *      (bit 0 = unordered) is read off the wire by this test itself -- it
  *      decrypts the ClientHello it relayed, using the server private key
@@ -123,17 +130,25 @@
  * the two positive cases alone spent 60 s of a 120 s budget on one
  * mutation; 15000 is still a ~300x margin over the healthy figure and
  * leaves the whole file's worst failing path at roughly
- *   (XFER_MS + 2*EXIT_MS) * 2  +  HANDSHAKE_FAIL_MS + QUIET_MS + 2*EXIT_MS
- *   = 50 + 27 = 77 s,
- * which is what TIMEOUT 120 has to cover. The case prints what it
- * actually took, so this is a backstop and not the mechanism. */
+ *   (XFER_MS + 2*EXIT_MS) * 2  +  (HANDSHAKE_FAIL_MS + QUIET_MS + 2*EXIT_MS) * 2
+ *   = 50 + 2 * 20 = 90 s,
+ * counting BOTH negative controls, which is what TIMEOUT 120 has to
+ * cover. That sum assumes every one of the six children also ignores
+ * SIGTERM; the realistic worst failing run measured here is about half of
+ * it. The case prints what it actually took, so this is a backstop and
+ * not the mechanism. */
 #define XFER_MS 15000
-/* The negative control's two windows. HANDSHAKE_FAIL_MS is how long the Go
+/* The negative controls' two windows. HANDSHAKE_FAIL_MS is how long a
  * client gets to say it refused; QUIET_MS is how long the application end
- * is then watched for a byte that must never come. Go's MakeSession sleeps
- * 3 s between handshake attempts, so 15 s is five attempts' worth of room
- * for the FIRST failure to be logged. */
-#define HANDSHAKE_FAIL_MS 15000
+ * is then watched for a byte that must never come.
+ *
+ * CUT FROM 15000 WHEN THE SECOND NEGATIVE CONTROL WAS ADDED, because two
+ * of these windows now sit in the same TIMEOUT 120 as two XFER_MS ones.
+ * Both clients log their refusal on the FIRST failed handshake -- Go's
+ * MakeSession logs before its 3 s sleep, not after, and ours narrates the
+ * stack event immediately -- so this window only ever has to cover one
+ * round trip on loopback. Measured below in each case's printed line. */
+#define HANDSHAKE_FAIL_MS 8000
 #define QUIET_MS 2000
 
 /* 128 KiB. Go's client caps one on-wire message at appDataMaxLength =
@@ -422,6 +437,12 @@ typedef struct {
     relay_pair_t pairs[MAX_PAIRS];
     size_t npairs;
     size_t accepted; /* total connections ever accepted, for diagnostics */
+    /* Every byte ever forwarded server -> client, across all pairs
+     * including ones already closed. The negative controls use it to
+     * prove the refusal happened AFTER a reply was delivered rather than
+     * because nothing ever arrived -- without it, "the client refused"
+     * and "the client never got anything" are the same assertion. */
+    uint64_t s2c_total_all;
 } relay_t;
 
 typedef struct {
@@ -692,6 +713,7 @@ static void harness_pump(harness_t *h, int timeout_ms) {
                     p->s2c.len = (size_t)got;
                     p->s2c.off = 0;
                     p->s2c_total += (uint64_t)got;
+                    r->s2c_total_all += (uint64_t)got;
                     if (q_flush(&p->s2c, p->cfd) != 0) {
                         pair_drop(r, (size_t)idx[k]);
                     }
@@ -832,13 +854,55 @@ static void derive_keys(uint8_t priv[CLOAK_X25519_KEY_LEN], char *pub_b64, size_
     ASSERT_EQ_INT(0, cloak_base64_encode(pub, sizeof(pub), pub_b64, cap));
 }
 
-static int write_temp(const char *path, const char *content) {
-    FILE *f = fopen(path, "wb");
-    if (f == NULL) {
+/* Writes `content` to a FRESHLY CREATED, UNIQUELY NAMED file and returns
+ * its path in path_out.
+ *
+ * THE UNIQUENESS IS LOAD-BEARING AND mkstemp IS THE ONLY THING THAT
+ * DELIVERS IT HERE. Measured, and the measurement is the whole reason
+ * this function exists: two concurrent `ctest -R test_go_interop` runs
+ * against one build directory failed 5 times out of 5 when the config
+ * files had fixed names -- one run overwrote the other's configuration,
+ * so a ck-client dutifully listened on the OTHER run's local port and the
+ * first run's 15-second dial never connected. `ctest` never schedules one
+ * test twice in parallel, but two shells against one build directory is a
+ * plausible edit-loop accident (task 0 just created an edit loop), and a
+ * sibling task reported exactly this symptom in the wild.
+ *
+ * PUTTING getpid() IN THE NAME DOES NOT FIX IT, and that was measured
+ * too: 5 failures out of 6 with the pid in the name, because inside a
+ * container PIDs are namespaced -- two identical `docker run`s hand the
+ * test the same small pid, so the "unique" names collided exactly as
+ * before. mkstemp asks the filesystem, which is the only namespace both
+ * runs actually share.
+ *
+ * No ".json" suffix: mkstemp requires its XXXXXX to be the last six
+ * characters, mkstemps is not POSIX, and neither binary cares about the
+ * extension (ck-client decides file-versus-ssv on the content, not the
+ * name). */
+static int write_temp_unique(char *path_out, size_t cap, const char *name,
+                             const char *content) {
+    if (snprintf(path_out, cap, "go_interop_%s_XXXXXX", name) >= (int)cap) {
         return -1;
     }
-    fputs(content, f);
-    fclose(f);
+    int fd = mkstemp(path_out);
+    if (fd < 0) {
+        return -1;
+    }
+    size_t len = strlen(content);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, content + off, len - off);
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) {
+            continue;
+        }
+        close(fd);
+        return -1;
+    }
+    close(fd);
     return 0;
 }
 
@@ -853,7 +917,8 @@ static int write_temp(const char *path, const char *content) {
  * empty buffer it just failed to fill -- so its own flag help's "path to
  * the configuration file or its content" is false for the server. (Our
  * ck-server accepts both; see the binaries plan's D3.) */
-static void write_server_config(const char *path, int bind_port, int upstream_port) {
+static void write_server_config(char *path_out, size_t cap, const char *name, int bind_port,
+                                int upstream_port) {
     char cfg[1024];
     snprintf(cfg, sizeof(cfg),
              "{"
@@ -865,11 +930,12 @@ static void write_server_config(const char *path, int bind_port, int upstream_po
              "\"KeepAlive\":0"
              "}",
              upstream_port, bind_port, UID_B64, PRIV_B64);
-    ASSERT_EQ_INT(0, write_temp(path, cfg));
+    ASSERT_EQ_INT(0, write_temp_unique(path_out, cap, name, cfg));
 }
 
-static void write_client_config(const char *path, const char *pub_b64, int remote_port,
-                                int local_port) {
+static void write_client_config(char *path_out, size_t cap, const char *name,
+                                const char *pub_b64, int remote_port, int local_port,
+                                int num_conn) {
     char cfg[1024];
     snprintf(cfg, sizeof(cfg),
              "{"
@@ -879,13 +945,13 @@ static void write_client_config(const char *path, const char *pub_b64, int remot
              "\"EncryptionMethod\":\"aes-gcm\","
              "\"UID\":\"%s\","
              "\"PublicKey\":\"%s\","
-             "\"NumConn\":2,"
+             "\"NumConn\":%d,"
              "\"BrowserSig\":\"chrome\","
              "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"%d\","
              "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"%d\""
              "}",
-             UID_B64, pub_b64, remote_port, local_port);
-    ASSERT_EQ_INT(0, write_temp(path, cfg));
+             UID_B64, pub_b64, num_conn, remote_port, local_port);
+    ASSERT_EQ_INT(0, write_temp_unique(path_out, cap, name, cfg));
 }
 
 /* ------------------------------------------------------------------ */
@@ -967,6 +1033,34 @@ typedef struct {
     const char *client_ready;
     int client_is_go;
     long corrupt_at; /* -1, or an offset into the server -> client stream */
+    /* Negative runs only, and the two clients need DIFFERENT evidence
+     * because they narrate differently.
+     *
+     * `client_refusal`, when non-NULL, is a line the client must print
+     * once it has rejected the corrupted ServerHello. Go's ck-client logs
+     * one per failed handshake, so it is immediate and reliable.
+     *
+     * `require_reconnect` asks instead that the relay see MORE
+     * connections than one healthy session needs. That is the right
+     * evidence for OUR client, which narrates only whole rounds: its
+     * connector retries a failed handshake several times inside one round
+     * before reporting "round failed", so the round-level line arrives
+     * after a delay that depends on machine load. MEASURED: with a
+     * "round failed" wait and an 8 s window, four concurrent-run trials
+     * out of twelve missed it; the reconnect is visible in milliseconds
+     * and cannot be produced by a client that accepted the reply, since
+     * with NumConn 1 an accepting client opens exactly one connection and
+     * stops.
+     *
+     * `client_forbidden`, when non-NULL, is a line the client must NOT
+     * print -- for ours that is "session up", which is precisely what a
+     * client with no ServerHello tag check does print. */
+    const char *client_refusal;
+    int require_reconnect;
+    const char *client_forbidden;
+    /* NumConn for the client's configuration. 2 everywhere but case 5 --
+     * see that case's comment for why 1 is load-bearing there. */
+    int num_conn;
 } scenario_t;
 
 /* WHICH IMPLEMENTATION IS ACTUALLY AT THAT END. The readiness markers
@@ -1031,12 +1125,16 @@ static void run_scenario(const scenario_t *sc, uint8_t *hello_out, size_t *hello
     int local_port = free_port();
     ASSERT_TRUE(local_port > 0);
 
-    char scfg[128];
-    char ccfg[128];
-    snprintf(scfg, sizeof(scfg), "go_interop_%s_server.json", sc->name);
-    snprintf(ccfg, sizeof(ccfg), "go_interop_%s_client.json", sc->name);
-    write_server_config(scfg, server_port, h.up_port);
-    write_client_config(ccfg, pub_b64, h.relay.port, local_port);
+    char scfg[160];
+    char ccfg[160];
+    /* Unique names, created atomically -- see write_temp_unique. */
+    char sname[96];
+    char cname[96];
+    snprintf(sname, sizeof(sname), "%s_server", sc->name);
+    snprintf(cname, sizeof(cname), "%s_client", sc->name);
+    write_server_config(scfg, sizeof(scfg), sname, server_port, h.up_port);
+    write_client_config(ccfg, sizeof(ccfg), cname, pub_b64, h.relay.port, local_port,
+                        sc->num_conn);
 
     child_t server;
     child_t client;
@@ -1075,6 +1173,29 @@ static void run_scenario(const scenario_t *sc, uint8_t *hello_out, size_t *hello
     assert_implementation("the server", &server, sc->server_is_go);
     assert_implementation("the client", &client, sc->client_is_go);
 
+    /* THE CLIENT MUST BE LISTENING ON THE PORT WE CONFIGURED, and this
+     * assertion exists because its absence cost a diagnosis. When two
+     * concurrent runs shared a config file name, the client read the
+     * OTHER run's configuration and listened on the other run's port --
+     * and the only symptom was "the client's local port never accepted"
+     * after a fifteen-second dial, which names the wrong thing entirely.
+     * Both clients log the address they bind, so one strstr turns a
+     * mysterious timeout into "it is listening somewhere else".
+     *
+     * Checked against the CHILD'S OWN OUTPUT rather than against our
+     * config text, so it catches a configuration that never reached the
+     * child as well as one that reached the wrong child. */
+    char want_port[32];
+    snprintf(want_port, sizeof(want_port), ":%d", local_port);
+    if (strstr(client.out, want_port) == NULL) {
+        fprintf(stderr,
+                "FAIL %s:%d: %s: the client was configured with local port %d but never said "
+                "so -- it is listening somewhere else, which almost always means it read a "
+                "configuration that is not the one this run wrote (%s). It said:\n%s\n",
+                __FILE__, __LINE__, sc->name, local_port, ccfg, client.out);
+        cloak_test_failures++;
+    }
+
     static uint8_t send_buf[PAYLOAD_LEN];
     static uint8_t reply_buf[PAYLOAD_LEN];
     static uint8_t want_buf[PAYLOAD_LEN];
@@ -1086,8 +1207,9 @@ static void run_scenario(const scenario_t *sc, uint8_t *hello_out, size_t *hello
 
     h.app_fd = dial_local_retrying(&h, local_port, BOOT_MS);
     if (h.app_fd < 0) {
-        fprintf(stderr, "FAIL %s:%d: %s: the client's local port %d never accepted\n", __FILE__,
-                __LINE__, sc->name, local_port);
+        fprintf(stderr,
+                "FAIL %s:%d: %s: the client's local port %d never accepted. It said:\n%s\n",
+                __FILE__, __LINE__, sc->name, local_port, client.out);
         cloak_test_failures++;
         child_stop(&client);
         child_stop(&server);
@@ -1142,16 +1264,24 @@ static void run_scenario(const scenario_t *sc, uint8_t *hello_out, size_t *hello
         while (now_ms() < deadline) {
             harness_pump(&h, 10);
             child_drain(&client, 0);
-            if (strstr(client.out, "Failed to prepare connection to remote") != NULL) {
+            int said_so = sc->client_refusal == NULL ||
+                          strstr(client.out, sc->client_refusal) != NULL;
+            int tried_again =
+                !sc->require_reconnect || h.relay.accepted > (size_t)sc->num_conn;
+            if (said_so && tried_again) {
                 refused = 1;
                 break;
             }
         }
         if (!refused) {
             fprintf(stderr,
-                    "FAIL %s:%d: %s: the Go client ACCEPTED a ServerHello with one flipped "
-                    "bit at server->client offset %ld. It said:\n%s\n",
-                    __FILE__, __LINE__, sc->name, sc->corrupt_at, client.out);
+                    "FAIL %s:%d: %s: the client ACCEPTED a ServerHello with one flipped "
+                    "bit at server->client offset %ld -- no refusal evidence in %d ms "
+                    "(wanted %s%s%zu of %d connection(s) reopened). It said:\n%s\n",
+                    __FILE__, __LINE__, sc->name, sc->corrupt_at, HANDSHAKE_FAIL_MS,
+                    sc->client_refusal != NULL ? sc->client_refusal : "(no marker)",
+                    sc->require_reconnect ? ", and a reconnect; saw " : "; saw ",
+                    h.relay.accepted, sc->num_conn, client.out);
             cloak_test_failures++;
         }
         uint64_t quiet = now_ms() + QUIET_MS;
@@ -1160,8 +1290,28 @@ static void run_scenario(const scenario_t *sc, uint8_t *hello_out, size_t *hello
         }
         ASSERT_EQ_INT(0, (long long)h.got);
         ASSERT_EQ_INT(0, (long long)h.up_seen);
-        printf("   refused=%d, %zu application bytes crossed, %zu relayed connection(s)\n",
-               refused, h.got, h.relay.accepted);
+        if (sc->client_forbidden != NULL && strstr(client.out, sc->client_forbidden) != NULL) {
+            fprintf(stderr,
+                    "FAIL %s:%d: %s: the client printed \"%s\" even though the ServerHello "
+                    "it was given does not authenticate. It said:\n%s\n",
+                    __FILE__, __LINE__, sc->name, sc->client_forbidden, client.out);
+            cloak_test_failures++;
+        }
+        /* A REFUSAL IS ONLY MEANINGFUL IF A REPLY WAS DELIVERED. The
+         * ServerHello record alone is 127 bytes; requiring more than the
+         * corruption offset rules out a "refusal" that is really a
+         * connection that never got an answer. */
+        if (h.relay.s2c_total_all <= (uint64_t)sc->corrupt_at) {
+            fprintf(stderr,
+                    "FAIL %s:%d: %s: only %llu byte(s) ever reached the client from the "
+                    "server, so its refusal proves nothing about the ServerHello\n",
+                    __FILE__, __LINE__, sc->name,
+                    (unsigned long long)h.relay.s2c_total_all);
+            cloak_test_failures++;
+        }
+        printf("   refused=%d, %zu application bytes crossed, %llu server bytes delivered, "
+               "%zu relayed connection(s)\n",
+               refused, h.got, (unsigned long long)h.relay.s2c_total_all, h.relay.accepted);
     }
 
     child_stop(&client);
@@ -1191,6 +1341,7 @@ static void test_go_client_to_c_server(void) {
         .client_ready = "Listening on",
         .client_is_go = 1,
         .corrupt_at = -1,
+        .num_conn = 2,
     };
     run_scenario(&sc, go_hello, &go_hello_len);
     ASSERT_TRUE(go_hello_len > 0);
@@ -1206,6 +1357,7 @@ static void test_c_client_to_go_server(void) {
         .client_ready = "session up",
         .client_is_go = 0,
         .corrupt_at = -1,
+        .num_conn = 2,
     };
     run_scenario(&sc, c_hello, &c_hello_len);
     ASSERT_TRUE(c_hello_len > 0);
@@ -1236,6 +1388,76 @@ static void test_go_client_refuses_a_corrupted_serverhello(void) {
         .client_ready = "Listening on",
         .client_is_go = 1,
         .corrupt_at = SERVERHELLO_NONCE_OFFSET,
+        .client_refusal = "Failed to prepare connection to remote",
+        .require_reconnect = 0,
+        .client_forbidden = NULL,
+        .num_conn = 2,
+    };
+    run_scenario(&sc, NULL, NULL);
+}
+
+/* CASE 5: THE MIRROR OF CASE 3, AND THE REASON IT EXISTS.
+ *
+ * Case 3 proves GO's client refuses a ServerHello this port corrupted.
+ * Nothing proved OURS does. That asymmetry was not theoretical: this
+ * task's review made a C client that does not enforce the ServerHello's
+ * AES-GCM tag at all -- it fell back to using the ciphertext as the
+ * session key -- and it passed all four of this file's cases, because an
+ * honest Go server always produces a valid tag. The only test in the tree
+ * that caught it was test_client_transport.c's
+ * test_wrong_key_reply_is_rejected, which corrupts a ServerHello produced
+ * by OUR OWN fake server: exactly the "both ends are ours" condition this
+ * whole file exists to end.
+ *
+ * So: case 2 again, with one bit flipped at the same offset 11 of a GO
+ * server's reply, and nothing else changed. Our client must refuse.
+ *
+ * WHAT IS ASSERTED, and its one honest limit: ck-client narrates stack
+ * events, so "round failed" is visible from outside the process, but the
+ * specific CLOAK_CLIENT_HANDSHAKE_ERR_AUTH code is not -- it never
+ * reaches stdout. That code is pinned in-process by
+ * test_wrong_key_reply_is_rejected; this case pins that a REAL Go
+ * server's corrupted reply reaches the same refusal, that "session up" is
+ * never printed, that no application byte crosses, and that the reply
+ * really was delivered first. Together the two cover both the code and
+ * the interoperation; neither does it alone. */
+static void test_c_client_refuses_a_corrupted_serverhello(void) {
+    scenario_t sc = {
+        .name = "negative_control_c_client",
+        .server_path = GO_CK_SERVER_PATH,
+        .server_ready = "Listening on",
+        .server_is_go = 1,
+        .client_path = CK_CLIENT_PATH,
+        /* "ck-client ready", not "session up": the whole point is that the
+         * session never comes up. The local listener is open before the
+         * first handshake either way. */
+        .client_ready = "ck-client ready",
+        .client_is_go = 0,
+        .corrupt_at = SERVERHELLO_NONCE_OFFSET,
+        /* No marker: see require_reconnect's comment on scenario_t. */
+        .client_refusal = NULL,
+        .require_reconnect = 1,
+        .client_forbidden = "session up",
+        /* ONE CONNECTION, AND THE NUMBER IS LOAD-BEARING.
+         *
+         * With NumConn 2 this case PASSED against a client that had the
+         * AEAD check removed entirely -- measured, by re-applying the
+         * review's own mutation. Our connector has a defence Go does not:
+         * cloak_client_connector's keys_agree() refuses a round whose N
+         * connections did not derive the SAME session key
+         * (CLOAK_CLIENT_CONNECTOR_ERR_KEY_MISMATCH). Each connection's
+         * garbage key is different garbage, so the round failed on the
+         * mismatch and never reached the tag check -- the case asserted a
+         * refusal and got one, for the wrong reason.
+         *
+         * With ONE connection there is nothing to disagree with, so the
+         * only thing that can reject this ServerHello is the AES-GCM tag
+         * -- which is exactly the property this case exists to pin. The
+         * masking is a real (and welcome) divergence from Go, recorded
+         * here rather than in a comment nobody reads, and it is why a
+         * mirror control written the obvious way would have proved
+         * nothing. */
+        .num_conn = 1,
     };
     run_scenario(&sc, NULL, NULL);
 }
@@ -1327,6 +1549,7 @@ int main(void) {
     test_go_client_to_c_server();
     test_c_client_to_go_server();
     test_go_client_refuses_a_corrupted_serverhello();
+    test_c_client_refuses_a_corrupted_serverhello();
     test_byte_41_is_zero_in_both_directions();
 
     if (cloak_test_failures > 0) {

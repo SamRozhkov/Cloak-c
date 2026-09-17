@@ -899,6 +899,367 @@ static void test_exact_size_output_buffer_stress(void) {
     }
 }
 
+/* ===================================================================== */
+/* THE FINGERPRINT PIN: a disguise property with NO ORACLE, so the        */
+/* literals below ARE the oracle.                                        */
+/* ===================================================================== */
+
+/* WHY THIS EXISTS, AND WHY NOTHING ELSE IN THIS TREE CAN DO ITS JOB.
+ *
+ * Module 9 task 1 put Go Cloak's own ck-client and ck-server in front of
+ * this port and proved the direct path interoperates. Its review then
+ * measured what that oracle CANNOT see, and this was the headline:
+ * replacing the Chrome template's three TLS 1.3 cipher suites
+ * (0x1301/0x1302/0x1303) with TLS_RSA_WITH_3DES_EDE_CBC_SHA (0x000a) left
+ * the ENTIRE 69-test suite green. Go's server reads the record header,
+ * the `random`, the session id and the key share, and looks at nothing
+ * else in the ClientHello -- so no interoperability test, against any Go
+ * peer, present or future, can ever notice that these templates stopped
+ * looking like a browser.
+ *
+ * But the one reader that is not in this repository -- a censor's
+ * fingerprinter -- reads all of it. Offering 3DES where Chrome offers
+ * TLS 1.3 is a JA3-visible, single-packet giveaway, and mimicking Chrome
+ * is the ENTIRE POINT of these templates. A defect of that shape is
+ * invisible to every other assertion in this tree and fatal to the
+ * program's purpose.
+ *
+ * THERE IS THEREFORE NO ORACLE FOR THIS PROPERTY AND THE LITERALS BELOW
+ * ARE THE ORACLE. That is stated plainly rather than dressed up: these
+ * arrays are not derived from the templates (that would be a tautology --
+ * a test that reads its expectation out of the thing it is testing, which
+ * is the defect the review flagged in test_frame). They are the published
+ * cipher-suite lists and extension orders of the three browsers the
+ * templates were captured from, and each was cross-checked against the
+ * captured template when written. Their job is to make ANY edit to a
+ * template's shape -- deliberate or accidental, by a human or by a
+ * regeneration script -- show up as a named failing assertion rather than
+ * as a changed fingerprint nobody looks at.
+ *
+ * WHEN A BROWSER'S REAL FINGERPRINT CHANGES, these literals are updated
+ * IN THE SAME COMMIT as the regenerated template, from the same uTLS
+ * capture, and never by copying whatever the new template happens to say.
+ * See cloak/clienthello.h's maintenance note.
+ *
+ * WHAT IS PINNED, and why exactly this much:
+ *   - the handshake's legacy_version, the session-id length, the cipher
+ *     suite list IN ORDER, the compression-method list, and the extension
+ *     type list IN ORDER. Every one of those is part of a JA3 digest and
+ *     none of them varies between handshakes of a real browser.
+ *   - NOT extension CONTENTS or LENGTHS: the SNI is caller-chosen, the
+ *     ECH payload length is deliberately re-drawn per build (see
+ *     test_chrome_ech_payload_length_varies_and_stays_consistent), and
+ *     the key shares are fresh every time. Pinning those would pin the
+ *     randomness this file elsewhere asserts must exist.
+ *   - The GREASE values (0xfafa, 0x2a2a, 0x1a1a, 0x44cd) ARE pinned,
+ *     because these templates freeze them rather than re-draw them. That
+ *     is a known property of the capture, not an oversight of this test;
+ *     if a future module makes GREASE per-connection (real browsers do),
+ *     this test is where that change must be reflected, deliberately.
+ *
+ * The assertion runs on a BUILT hello, not on the raw template, so it
+ * also covers a build step that reorders or rewrites any of this. */
+
+#define MAX_PINNED_SUITES 32
+#define MAX_PINNED_EXTS 32
+
+typedef struct {
+    int ok;
+    uint16_t legacy_version;
+    size_t session_id_len;
+    uint16_t suites[MAX_PINNED_SUITES];
+    size_t suite_count;
+    uint8_t compression[8];
+    size_t compression_count;
+    uint16_t ext_types[MAX_PINNED_EXTS];
+    size_t ext_count;
+} fingerprint_t;
+
+/* A second, deliberately separate structural walk from walk_and_verify
+ * above: that one checks internal consistency, this one extracts the
+ * fingerprint-bearing fields. Kept apart so neither grows a dependency on
+ * the other's bookkeeping. */
+static fingerprint_t read_fingerprint(const uint8_t *buf, size_t len) {
+    fingerprint_t f;
+    memset(&f, 0, sizeof(f));
+    if (len < 4 + 2 + 32 + 1) {
+        return f;
+    }
+    size_t off = 4;
+    f.legacy_version = read_be16(buf + off);
+    off += 2;
+    off += 32; /* random */
+    f.session_id_len = buf[off];
+    off += 1 + f.session_id_len;
+    if (off + 2 > len) {
+        return f;
+    }
+    size_t cs_len = read_be16(buf + off);
+    off += 2;
+    if (off + cs_len > len || (cs_len % 2) != 0 || cs_len / 2 > MAX_PINNED_SUITES) {
+        return f;
+    }
+    for (size_t i = 0; i < cs_len / 2; i++) {
+        f.suites[i] = read_be16(buf + off + 2 * i);
+    }
+    f.suite_count = cs_len / 2;
+    off += cs_len;
+    if (off >= len) {
+        return f;
+    }
+    size_t cm_len = buf[off];
+    off += 1;
+    if (off + cm_len > len || cm_len > sizeof(f.compression)) {
+        return f;
+    }
+    memcpy(f.compression, buf + off, cm_len);
+    f.compression_count = cm_len;
+    off += cm_len;
+    if (off + 2 > len) {
+        return f;
+    }
+    size_t ext_len = read_be16(buf + off);
+    off += 2;
+    size_t ext_end = off + ext_len;
+    if (ext_end != len) {
+        return f;
+    }
+    while (off < ext_end) {
+        if (off + 4 > ext_end || f.ext_count >= MAX_PINNED_EXTS) {
+            return f;
+        }
+        f.ext_types[f.ext_count++] = read_be16(buf + off);
+        uint16_t dlen = read_be16(buf + off + 2);
+        if (off + 4 + dlen > ext_end) {
+            return f;
+        }
+        off += 4 + (size_t)dlen;
+    }
+    f.ok = 1;
+    return f;
+}
+
+/* `report` is 0 only for test_the_fingerprint_pin_can_fail below, which
+ * drives this function with deliberately wrong literals: it must still
+ * COUNT the mismatches (that is what it is asserting) but must not print
+ * FAIL lines, because a file that prints expected FAILs teaches a reader
+ * to skim past real ones. It returns the number of mismatches so that
+ * case can assert on it. */
+static int assert_fingerprint_reported(const char *who,
+                                       const cloak_clienthello_template_t *tmpl,
+                                       const uint16_t *want_suites, size_t want_suite_count,
+                                       const uint16_t *want_exts, size_t want_ext_count,
+                                       int report) {
+    int mismatches = 0;
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t keyshare[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x40);
+    fill_marker(keyshare, 0x70);
+
+    uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
+    long n = cloak_clienthello_build(tmpl, random, session_id, keyshare, "www.bing.com", out,
+                                     sizeof(out));
+    ASSERT_TRUE(n > 0);
+    if (n <= 0) {
+        return mismatches;
+    }
+
+    fingerprint_t f = read_fingerprint(out, (size_t)n);
+    ASSERT_TRUE(f.ok);
+    if (!f.ok) {
+        return mismatches;
+    }
+
+    /* TLS 1.2 in the handshake's legacy_version field for all three
+     * browsers; the real version lives in supported_versions. */
+    if (report) {
+        ASSERT_EQ_INT(0x0303, f.legacy_version);
+    }
+    /* A 32-byte session id, which is also where Cloak hides half its auth
+     * payload -- a template that stopped carrying one would break both the
+     * disguise and the protocol. */
+    if (report) {
+        ASSERT_EQ_INT(32, (long long)f.session_id_len);
+        /* null compression only. Anything else is a 1990s fingerprint. */
+        ASSERT_EQ_INT(1, (long long)f.compression_count);
+        ASSERT_EQ_INT(0, f.compression[0]);
+        ASSERT_EQ_INT((long long)want_suite_count, (long long)f.suite_count);
+    }
+    for (size_t i = 0; i < want_suite_count && i < f.suite_count; i++) {
+        if (f.suites[i] != want_suites[i]) {
+            mismatches++;
+            if (!report) {
+                continue;
+            }
+            fprintf(stderr,
+                    "FAIL %s:%d: %s cipher suite %zu is 0x%04x, pinned 0x%04x -- the "
+                    "ClientHello fingerprint changed, and NO interoperability test can see "
+                    "that. If this was deliberate, update the template and these literals "
+                    "together, from the same uTLS capture.\n",
+                    __FILE__, __LINE__, who, i, f.suites[i], want_suites[i]);
+            cloak_test_failures++;
+        }
+    }
+
+    if (report) {
+        ASSERT_EQ_INT((long long)want_ext_count, (long long)f.ext_count);
+    }
+    for (size_t i = 0; i < want_ext_count && i < f.ext_count; i++) {
+        if (f.ext_types[i] != want_exts[i]) {
+            mismatches++;
+            if (!report) {
+                continue;
+            }
+            fprintf(stderr,
+                    "FAIL %s:%d: %s extension %zu is 0x%04x, pinned 0x%04x -- the extension "
+                    "ORDER is part of the fingerprint and no interoperability test can see "
+                    "it change.\n",
+                    __FILE__, __LINE__, who, i, f.ext_types[i], want_exts[i]);
+            cloak_test_failures++;
+        }
+    }
+    return mismatches;
+}
+
+static void assert_fingerprint(const char *who, const cloak_clienthello_template_t *tmpl,
+                               const uint16_t *want_suites, size_t want_suite_count,
+                               const uint16_t *want_exts, size_t want_ext_count) {
+    (void)assert_fingerprint_reported(who, tmpl, want_suites, want_suite_count, want_exts,
+                                      want_ext_count, 1);
+}
+
+/* Chrome, as uTLS's HelloChrome_Auto offers them: one GREASE value, the
+ * three TLS 1.3 suites, then the TLS 1.2 ECDHE set. THE THREE 0x13xx
+ * ENTRIES ARE THE ONES THE REVIEW'S ESCAPING MUTATION REPLACED. */
+static const uint16_t chrome_suites[] = {
+    0xfafa, /* GREASE, frozen by this capture */
+    0x1301, 0x1302, 0x1303,
+    0xc02b, 0xc02f, 0xc02c, 0xc030,
+    0xcca9, 0xcca8,
+    0xc013, 0xc014,
+    0x009c, 0x009d,
+    0x002f, 0x0035,
+};
+static const uint16_t chrome_exts[] = {
+    0xfafa, /* GREASE */
+    0x0000, /* server_name */
+    0x0005, /* status_request */
+    0xff01, /* renegotiation_info */
+    0x001b, /* compress_certificate */
+    0x0010, /* application_layer_protocol_negotiation */
+    0x44cd, /* application_settings (Chrome's private codepoint) */
+    0x0017, /* extended_master_secret */
+    0x0033, /* key_share */
+    0x000b, /* ec_point_formats */
+    0x0023, /* session_ticket */
+    0x002d, /* psk_key_exchange_modes */
+    0x000a, /* supported_groups */
+    0x002b, /* supported_versions */
+    0x000d, /* signature_algorithms */
+    0xfe0d, /* encrypted_client_hello */
+    0x0012, /* signed_certificate_timestamp */
+    0x2a2a, /* GREASE */
+};
+
+static const uint16_t firefox_suites[] = {
+    0x1301, 0x1303, 0x1302, /* note the 1303/1302 swap -- Firefox, not Chrome */
+    0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030,
+    0xc00a, 0xc009, 0xc013, 0xc014,
+    0x009c, 0x009d,
+    0x002f, 0x0035,
+};
+static const uint16_t firefox_exts[] = {
+    0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0023, 0x0010, 0x0005,
+    0x0022, /* delegated_credentials -- Firefox only */
+    0x0033, 0x002b, 0x000d, 0x002d,
+    0x001c, /* record_size_limit -- Firefox only */
+    0xfe0d,
+};
+
+static const uint16_t safari_suites[] = {
+    0x2a2a, /* GREASE */
+    0x1301, 0x1302, 0x1303,
+    0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8,
+    0xc00a, 0xc009, 0xc014, 0xc013,
+    0x009d, 0x009c, 0x0035, 0x002f,
+    0xc008, 0xc012, 0x000a, /* the 3DES tail Safari really does still offer */
+};
+static const uint16_t safari_exts[] = {
+    0x2a2a, 0x0000, 0x0017, 0xff01, 0x000a, 0x000b, 0x0010, 0x0005,
+    0x000d, 0x0012, 0x0033, 0x002d, 0x002b, 0x001b,
+    0x1a1a, /* GREASE */
+    0x0015, /* padding -- always last */
+};
+
+static void test_chrome_fingerprint_is_pinned(void) {
+    assert_fingerprint("chrome", &cloak_clienthello_chrome, chrome_suites,
+                       sizeof(chrome_suites) / sizeof(chrome_suites[0]), chrome_exts,
+                       sizeof(chrome_exts) / sizeof(chrome_exts[0]));
+}
+
+static void test_firefox_fingerprint_is_pinned(void) {
+    assert_fingerprint("firefox", &cloak_clienthello_firefox, firefox_suites,
+                       sizeof(firefox_suites) / sizeof(firefox_suites[0]), firefox_exts,
+                       sizeof(firefox_exts) / sizeof(firefox_exts[0]));
+}
+
+static void test_safari_fingerprint_is_pinned(void) {
+    assert_fingerprint("safari", &cloak_clienthello_safari, safari_suites,
+                       sizeof(safari_suites) / sizeof(safari_suites[0]), safari_exts,
+                       sizeof(safari_exts) / sizeof(safari_exts[0]));
+}
+
+/* The pin must be able to FAIL, and a pin that only ever compares a list
+ * to itself cannot. This drives the same comparison with two entries
+ * deliberately wrong and asserts exactly two mismatches come back --
+ * which is the only way to show, from inside the suite, that
+ * assert_fingerprint_reported's loops are reachable and discriminating.
+ *
+ * THE WRONG VALUES ARE DERIVED FROM WHAT THE TEMPLATE ACTUALLY PRODUCED,
+ * NOT FROM THE PINNED LITERALS. An earlier draft flipped chrome_suites[1]
+ * to 0x000a, and then the review's own 3DES mutation -- which sets the
+ * template to exactly that -- turned a deliberate mismatch into a match
+ * and this case failed with a confusing off-by-one instead of the
+ * fingerprint case failing cleanly. A self-check must not have an opinion
+ * about the template's contents; it only checks the comparison machinery.
+ * Flipping the low bit of an observed value is wrong by construction
+ * whatever the template says. */
+static void test_the_fingerprint_pin_can_fail(void) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t keyshare[32];
+    fill_marker(random, 0x11);
+    fill_marker(session_id, 0x41);
+    fill_marker(keyshare, 0x71);
+
+    uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
+    long n = cloak_clienthello_build(&cloak_clienthello_chrome, random, session_id, keyshare,
+                                     "www.bing.com", out, sizeof(out));
+    ASSERT_TRUE(n > 0);
+    if (n <= 0) {
+        return;
+    }
+    fingerprint_t f = read_fingerprint(out, (size_t)n);
+    ASSERT_TRUE(f.ok);
+    if (!f.ok || f.suite_count < 2 || f.ext_count < 2) {
+        return;
+    }
+
+    uint16_t bad_suites[MAX_PINNED_SUITES];
+    uint16_t bad_exts[MAX_PINNED_EXTS];
+    memcpy(bad_suites, f.suites, sizeof(bad_suites));
+    memcpy(bad_exts, f.ext_types, sizeof(bad_exts));
+    bad_suites[1] = (uint16_t)(f.suites[1] ^ 0x0001u);
+    bad_exts[1] = (uint16_t)(f.ext_types[1] ^ 0x0001u);
+
+    int mismatches = assert_fingerprint_reported("chrome(deliberately wrong)",
+                                                 &cloak_clienthello_chrome, bad_suites,
+                                                 f.suite_count, bad_exts, f.ext_count, 0);
+    ASSERT_EQ_INT(2, mismatches);
+}
+
 TEST_MAIN_BEGIN()
     test_build_chrome_round_trip_and_structural_integrity();
     test_build_shorter_sni_shrinks_and_shifts_keyshare();
@@ -922,4 +1283,8 @@ TEST_MAIN_BEGIN()
     test_chrome_ech_payload_length_varies_and_stays_consistent();
     test_firefox_ech_payload_length_is_fixed();
     test_exact_size_output_buffer_stress();
+    test_chrome_fingerprint_is_pinned();
+    test_firefox_fingerprint_is_pinned();
+    test_safari_fingerprint_is_pinned();
+    test_the_fingerprint_pin_can_fail();
 TEST_MAIN_END()
