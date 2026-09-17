@@ -28,7 +28,10 @@
  *      by the SHAPE OF THE LOCAL SOCKET -- a TCP connect to it is refused
  *      and the TCP port is still free -- in both states, so a flag that
  *      is parsed and then dropped fails this and not merely a flag that
- *      is refused. The usage line is Go's own wording, verbatim.
+ *      is refused. BOTH KINDS OF -c ARE COVERED: -u reaches the document
+ *      through a different branch for JSON and for an ssv option string,
+ *      and the ssv branch was measured to drop the flag silently with all
+ *      73 tests green. The usage line is Go's own wording, verbatim.
  *   4a. The MINIMAL udp configuration -- "UDP": true with no NumConn --
  *      is refused in a message that names NumConn, because omitting
  *      NumConn is what selects the singleplex this build cannot combine
@@ -1116,18 +1119,40 @@ static void test_udp_is_honoured(void) {
         ASSERT_EQ_INT(0, child_stop(&c));
     }
 
-    /* THE SAME CONFIGURATION WITHOUT THE FLAG, so both answers above are
-     * ones this case can see the difference between. */
+    /* THE SAME FLAG ON THE OTHER KIND OF CONFIGURATION SOURCE: -c can be
+     * an ssv OPTION STRING as well as JSON (case 10), and -u reaches the
+     * document through a DIFFERENT branch of conf_set_bool for each.
+     *
+     * THAT SECOND BRANCH WAS UNPINNED AND THE GAP WAS MEASURED, which is
+     * why this leg exists rather than being assumed covered by the JSON
+     * one: making the ssv branch write "false" unconditionally passed all
+     * 73 tests, and a direct probe of the mutated binary logged
+     * `listening on TCP 127.0.0.1:46211` for `-c "<option string>" -u`.
+     * That is precisely the accepted-and-ignored flag the two refusals
+     * this module removed existed to prevent, surviving on the path next
+     * door. The assertions are the same TCP pair as the JSON leg, so this
+     * fails for an ssv branch that drops -u exactly as loudly.
+     *
+     * The string carries no UDP= of its own: the flag must be the only
+     * thing that can put this endpoint on UDP, or the leg would pass
+     * against a conf_set_bool that never ran. */
     {
-        char *const argv[] = {(char *)"ck-client", (char *)"-c", cfg, NULL};
+        char ssv[1024];
+        snprintf(ssv, sizeof(ssv),
+                 "UID=%s;PublicKey=%s;ServerName=www.bing.com;"
+                 "ProxyMethod=shadowsocks;EncryptionMethod=aes-gcm;NumConn=2;"
+                 "RemoteHost=127.0.0.1;RemotePort=1;"
+                 "LocalHost=127.0.0.1;LocalPort=%d",
+                 UID_B64, pub, local);
+        char *const argv[] = {(char *)"ck-client", (char *)"-c", ssv, (char *)"-u", NULL};
         child_t c;
         ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, argv, NULL));
         ASSERT_EQ_INT(0, child_wait_for(&c, "ck-client ready", BOOT_MS));
         char line[128];
-        snprintf(line, sizeof(line), "listening on TCP 127.0.0.1:%d", local);
+        snprintf(line, sizeof(line), "listening on UDP 127.0.0.1:%d", local);
         ASSERT_TRUE(strstr(c.out, line) != NULL);
-        ASSERT_EQ_INT(0, can_connect(local));
-        ASSERT_EQ_INT(0, tcp_port_is_free(local));
+        ASSERT_EQ_INT(-1, can_connect(local));
+        ASSERT_EQ_INT(1, tcp_port_is_free(local));
         ASSERT_EQ_INT(0, child_stop(&c));
     }
 
@@ -1160,6 +1185,18 @@ static void test_udp_is_honoured(void) {
         child_t off;
         ASSERT_EQ_INT(0, child_spawn(&off, CK_CLIENT_PATH, argv_off, NULL));
         ASSERT_EQ_INT(0, child_wait_for(&off, "ck-client ready", BOOT_MS));
+        /* The TCP half of the log line lives here rather than in a
+         * control run of its own, and that is this case's RUNTIME PLAN
+         * rather than an accident: cmd/ck-client/CMakeLists.txt records
+         * that this file's ASan margin is the last acceptable one, so the
+         * ssv leg above was paid for by deleting the "same configuration
+         * without the flag" run, whose every assertion -- the TCP log
+         * line, can_connect, tcp_port_is_free, on this same port -- is
+         * made here against a client that reached TCP by a sharper road.
+         * Net subprocess count unchanged. */
+        char offline[128];
+        snprintf(offline, sizeof(offline), "listening on TCP 127.0.0.1:%d", local);
+        ASSERT_TRUE(strstr(off.out, offline) != NULL);
         ASSERT_EQ_INT(0, can_connect(local));
         ASSERT_EQ_INT(0, tcp_port_is_free(local));
         ASSERT_EQ_INT(0, child_stop(&off));
@@ -1227,6 +1264,11 @@ static void test_udp_without_numconn_names_numconn(void) {
      * case exists to reject. */
     ASSERT_TRUE(strstr(c.out, "singleplex") != NULL);
     ASSERT_TRUE(strstr(c.out, "NumConn") != NULL);
+    /* AND WHETHER TO EXPECT IT LATER. The remedy alone does not tell an
+     * operator migrating a working Go deployment whether this is a gap in
+     * this port or a thing nobody implements; Go's RouteUDP does take
+     * Singleplex, so the message says so and this asserts it says so. */
+    ASSERT_TRUE(strstr(c.out, "Go's client does support it") != NULL);
     ASSERT_TRUE(strstr(c.out, "ck-client ready") == NULL);
 
     /* And the same configuration with a NumConn starts, so the message

@@ -952,11 +952,24 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
          * divergence costs a distinguishable client. Pinned by
          * test_ck_client_cli.c's test_udp_without_numconn_names_numconn,
          * which asserts both words and then that the same configuration
-         * with a NumConn starts. */
+         * with a NumConn starts.
+         *
+         * AND IT SAYS GO SUPPORTS THE COMBINATION, in four words, because
+         * that is the one fact the remedy does not carry: an operator
+         * migrating a working Go deployment needs to know whether the
+         * difference is a gap in this port (wait for it, or set NumConn)
+         * or a thing nobody implements (change the design). Go's
+         * RouteUDP takes remoteConfig.Singleplex and honours it
+         * (ck-client.go:198), so it is the first. The message stays
+         * inside CLOAK_CONFIG_ERR_LEN (256) with room to spare -- it is
+         * 215 bytes -- which matters because cloak_client_stack_open's
+         * callers size their buffer with that constant and a longer
+         * sentence would be silently truncated. */
         stack_err(err, err_cap,
                   "client config: UDP mode with singleplex is not supported by this build "
-                  "-- singleplex is what NumConn <= 0 selects, and an omitted NumConn means "
-                  "NumConn <= 0, so set NumConn to 1 or more");
+                  "(Go's client does support it) -- singleplex is what NumConn <= 0 "
+                  "selects, and an omitted NumConn means NumConn <= 0, so set NumConn to "
+                  "1 or more");
         cloak_client_stack_close(s);
         return CLOAK_CLIENT_STACK_ERR_CONFIG;
     }

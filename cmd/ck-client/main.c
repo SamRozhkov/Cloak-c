@@ -985,7 +985,28 @@ int main(int argc, char **argv) {
      * with exit 2 and a message naming the remedy ("NumConn": 1), which
      * is the same thing that makes Go's admin mode work. Refusing is the
      * faithful choice AND the better one; that is not usually true, so it
-     * is written down. */
+     * is written down.
+     *
+     * -a WITH -u SERVES THE ADMIN API OVER DATAGRAMS, and this paragraph
+     * exists because the combination is reachable, untested, and easy to
+     * reach by accident -- an operator who put "UDP": true in the file
+     * their proxy uses and then ran the same file with -a gets it.
+     *
+     * IT IS NOT REFUSED, and that is Go's shape: RouteUDP sits OUTSIDE
+     * the adminUID branch (ck-client.go:188-196), so Go serves admin over
+     * a datagram endpoint too. It starts here and it works, in the sense
+     * that cloak_adminapi_t's read and write paths both carry their own
+     * unordered arms (its own header's WIRE section, and the write budget
+     * clamped to one frame in unordered mode) -- but the local endpoint
+     * is then a UDP socket with no reassembly at either end, so a
+     * response over one frame's payload arrives as SEVERAL DATAGRAMS that
+     * nothing joins up, and no admin client in this tree speaks that.
+     *
+     * NOT TESTED, said plainly rather than implied: no case in this tree
+     * drives -a and -u together, and module 9 task 8 owns the
+     * binary-to-binary datagram path. What is written down here is the
+     * intent -- accept it, because Go does, and do not pretend the
+     * response framing is a byte stream -- not a measurement. */
     int admin_session = 0;
     if (args.admin_uid != NULL && args.admin_uid[0] != '\0') {
         uint8_t uid[CLOAK_UID_LEN];

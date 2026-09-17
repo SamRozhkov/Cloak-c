@@ -51,6 +51,15 @@ add_test(NAME test_ck_client_cli COMMAND test_ck_client_cli)
 # NumConn runs and case 4b's two ClientHello captures -- and the margin
 # against TIMEOUT 120 is therefore 2.0x, not 2.3x.
 #
+# HELD ACROSS TASK 7'S FIX ROUND, and the mechanism is worth copying: case
+# 4 gained a leg (the ssv option-string path, whose conf_set_bool branch was
+# measured to drop -u silently with all 73 green) and PAID FOR IT by
+# deleting the "same configuration without the flag" run, every assertion of
+# which -- the TCP log line, can_connect, tcp_port_is_free, on the same port
+# -- moved into the -u=false run that was already there. Net subprocess
+# count unchanged; measured 60.5 s at -j2, against 60.2 s before. A new leg
+# here has to arrive with a trade like that one.
+#
 # THE BOUND WAS STILL NOT RAISED, for the reason below, and the win named
 # at the end of this comment was still not taken: ASAN_OPTIONS=detect_leaks=0
 # on the children would remove most of this number AND the only leak check

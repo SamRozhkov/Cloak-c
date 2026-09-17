@@ -2269,6 +2269,56 @@ static void test_the_read_loop_yields_after_its_budget(void) {
         ASSERT_EQ_INT(8, fx.far.st[0].lens[i]);
     }
 
+    /* ---- AND THE PLACEMENT, which is the half the first phase cannot
+     * see. Every datagram above was FORWARDED, so a budget spent just
+     * before cloak_stream_write instead of at the recvfrom would have
+     * behaved identically -- and that is not a hypothetical: an
+     * independent reviewer made exactly that edit and all 73 tests
+     * passed. udp_piper.c and cloak/udp_piper.h both argue that counting
+     * at the recvfrom, ahead of every `continue`, "is the whole of the
+     * budget's usefulness"; until this phase existed, nothing tested the
+     * claim.
+     *
+     * FORTY ZERO-LENGTH DATAGRAMS, which the module swallows (Go does
+     * too) without ever reaching a write and without costing the outbound
+     * pool a single byte. That is the flood the argument is about: with
+     * the budget spent at the write it is bounded by NOTHING, and one
+     * peer drains the whole socket in one reactor turn however much it
+     * put there.
+     *
+     * Zero-length rather than oversized because it needs no buffer: forty
+     * empty datagrams cannot be lost to a full receive queue, so the
+     * exact counts below are counts and not a lower bound. */
+    for (int i = 0; i < 40; i++) {
+        ASSERT_EQ_INT(0, peer_send(&p, d, 0));
+    }
+    uint64_t read_before = cloak_udp_piper_datagrams_read(&fx.pp);
+    uint64_t yields_before = cloak_udp_piper_read_yields(&fx.pp);
+    ASSERT_EQ_INT(40, (int)read_before);
+    ASSERT_TRUE(cloak_reactor_run_once(fx.r, 100) > 0);
+    /* EXACTLY 32 MORE in that one turn, and one more yield. With the
+     * increments moved to the write site both numbers stand still --
+     * read_before + 0 and yields_before + 0 -- because not one of these
+     * datagrams reaches a write, and all forty are consumed in the single
+     * turn instead of thirty-two. */
+    ASSERT_EQ_INT((int)read_before + 32, (int)cloak_udp_piper_datagrams_read(&fx.pp));
+    ASSERT_EQ_INT((int)yields_before + 1, (int)cloak_udp_piper_read_yields(&fx.pp));
+    ASSERT_EQ_INT(32, (int)cloak_udp_piper_empty_datagrams(&fx.pp));
+    /* Still the budget and still not the pool: an empty datagram queues
+     * nothing, so this number cannot have moved. */
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_pool_pauses(&fx.pp));
+
+    /* The remaining eight arrive on later turns, so a yield on a stream
+     * of dropped datagrams re-arms exactly as one on a stream of
+     * forwarded datagrams does. */
+    struct dgram_wait dw2 = {&fx.pp, (int)read_before + 40};
+    ASSERT_EQ_INT(1, pump_until(fx.r, piper_read_at_least, &dw2, PUMP_MAX_TURNS, PUMP_TURN_MS));
+    ASSERT_EQ_INT(40, (int)cloak_udp_piper_empty_datagrams(&fx.pp));
+    /* And the peer is untouched by any of it: an empty datagram from a
+     * KNOWN sender refreshes its deadline and nothing more. */
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_peer_count(&fx.pp));
+    ASSERT_EQ_INT(40, fx.far.st[0].count);
+
     close(p.fd);
     fixture_destroy(&fx);
 }
