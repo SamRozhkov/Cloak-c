@@ -221,3 +221,22 @@ target_compile_definitions(test_ws_interop PRIVATE
     ORACLE_PATH="${_cloak_oracle_bin}")
 
 endif()
+
+# ---------------------------------------------------------------------------
+# test_go_interop's two in-tree dependencies (module 9 task 1).
+#
+# APPENDED here, after both cmd/ add_subdirectory calls above, for exactly
+# the reason the CLOAK_REQUIRE_GO block above is: the test is declared in
+# libcloak-server/tests, which is added BEFORE cmd/ck-server and
+# cmd/ck-client, so the two executables it drives as subprocesses do not
+# exist as targets yet at the point it is declared. $<TARGET_FILE:...>
+# resolves at generate time; the add_dependencies edges are what make a
+# plain `cmake --build` produce the binaries before the test runs.
+#
+# NOT inside the CLOAK_REQUIRE_GO guard: test_go_interop needs no Go
+# toolchain, only two prebuilt binaries at run time, and it reports their
+# absence itself. See its own comment in libcloak-server/tests/CMakeLists.txt.
+add_dependencies(test_go_interop ck-server ck-client)
+target_compile_definitions(test_go_interop PRIVATE
+    CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
+    CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")

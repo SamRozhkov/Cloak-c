@@ -472,6 +472,85 @@ else()
         "frame format no Go peer could read. Turn this back on to restore it.")
 endif()
 
+# ---------------------------------------------------------------------------
+# The DIRECT path's interoperability suite (module 9 task 1).
+#
+# test_ws_interop, above, put a foreign implementation in front of the
+# server's WEBSOCKET leg. The direct (TLS-shaped) leg and the whole C
+# CLIENT had never met foreign code at all -- eight modules in, both ends
+# of every one of their tests were our own -- which is exactly the
+# condition under which this port once shipped a frame format no Go peer
+# could read. test_go_interop closes that: it drives Go Cloak's own
+# ck-client and ck-server BINARIES as subprocesses, in both roles.
+#
+# NOT GUARDED BY CLOAK_REQUIRE_GO, deliberately. That option is about a Go
+# TOOLCHAIN, because ws_interop_oracle is Go source this build compiles.
+# This test compiles nothing: it execs two prebuilt binaries that
+# Dockerfile.dev's `gobuild` stage puts in the image, so a machine with no
+# Go toolchain at all can still run it, and tying it to CLOAK_REQUIRE_GO
+# would remove coverage for a dependency it does not have. The suite is
+# therefore 69 tests with a Go toolchain and 68 with -DCLOAK_REQUIRE_GO=OFF.
+#
+# A MISSING BINARY IS A NAMED FAILURE, NOT A CONFIGURE ERROR AND NOT A
+# TIMEOUT. The paths below are resolved here if they exist and defaulted
+# to where Dockerfile.dev puts them if they do not, so the TEST reports
+# the absence in milliseconds, naming the file and the image that builds
+# it. Making this a configure-time FATAL_ERROR would mean a C library
+# cannot be configured without Go binaries present; making it a skip would
+# be invisible in ctest output, which this tree has been burned by.
+find_program(CLOAK_GO_CK_CLIENT NAMES go-ck-client HINTS /usr/local/bin)
+find_program(CLOAK_GO_CK_SERVER NAMES go-ck-server HINTS /usr/local/bin)
+if(NOT CLOAK_GO_CK_CLIENT)
+    set(CLOAK_GO_CK_CLIENT "/usr/local/bin/go-ck-client")
+endif()
+if(NOT CLOAK_GO_CK_SERVER)
+    set(CLOAK_GO_CK_SERVER "/usr/local/bin/go-ck-server")
+endif()
+
+add_executable(test_go_interop test_go_interop.c)
+target_include_directories(test_go_interop PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+# cloak-server for cloak_clienthello_parse (case 4 reads the relayed
+# ClientHello itself); cloak-common for base64, X25519 and the AEAD it
+# then decrypts the authentication payload with.
+target_link_libraries(test_go_interop PRIVATE cloak-server cloak-common)
+target_compile_definitions(test_go_interop PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_go_interop COMMAND test_go_interop)
+
+# The two things this directory cannot give it -- the paths of OUR
+# ck-client and ck-server binaries -- are APPENDED at the end of the
+# top-level CMakeLists.txt, after cmd/ck-client and cmd/ck-server have
+# been added, exactly as test_ws_interop's ck-server path already is.
+
+# TIMEOUT 120, the bound this project uses for anything that forks real
+# binaries, and set from the worst FAILING run rather than the passing
+# one. MEASURED: a passing run is 2.2 s in Debug (four cases, six child
+# processes, 128 KiB each way through two of them).
+#
+# What the number has to accommodate is a run where the two ends cannot
+# read each other's frames -- the exact shape of the defect this file
+# exists to catch, and one this file was actually run against by
+# mutation. Every wait inside the test is bounded by CLOCK_MONOTONIC, and
+# the file's own budget comment works the arithmetic out to ~77 s for the
+# worst failing path (XFER_MS 15 s per stalled transfer, EXIT_MS 5 s per
+# child that ignores SIGTERM, HANDSHAKE_FAIL_MS 15 s for the negative
+# control). That leaves ~40 s of headroom, so even a wholly unresponsive
+# run finishes inside this timeout and prints its own named assertion
+# instead of being truncated as "***Timeout" with the diagnosis cut off.
+#
+# The first draft of those budgets did NOT fit: at XFER_MS 30 s the two
+# positive cases alone burned 60 s of the 120 under the frame-AEAD
+# mutation. They were cut after measuring that, not before.
+set_tests_properties(test_go_interop PROPERTIES TIMEOUT 120)
+
+# LABELS "slow" (module 9 task 0's fast/slow split): this file forks and
+# execs six real Cloak binaries -- two of them Go's -- which is precisely
+# the cost that split exists to keep out of the edit loop, and which turns
+# brutal under ASan's per-child LeakSanitizer exit scan. `ctest -L fast`
+# excludes it; the default `ctest` still runs it.
+set_tests_properties(test_go_interop PROPERTIES LABELS "slow")
+
 # Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's own
 # comment on cloak_label_fast_tests() for what this call does and why it
 # has to be made from here rather than from that file). Placed after the

@@ -1,4 +1,9 @@
-FROM debian:bookworm-slim
+# Named so the `gobuild` stage below can be built ON TOP of the finished
+# development image rather than beside it: it needs this stage's Go
+# toolchain and its curl, and nothing else. The name is the only change to
+# this stage -- every layer below it is byte-identical to what module 8
+# left, and the final stage inherits its ENV and its WORKDIR.
+FROM debian:bookworm-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -33,3 +38,49 @@ RUN mkdir -p /go/src/oracle && cd /go/src/oracle \
     && go mod download all
 
 WORKDIR /src
+
+# ---------------------------------------------------------------------------
+# Go Cloak's OWN ck-client and ck-server binaries, for module 9 task 1's
+# test_go_interop.
+#
+# WHY BINARIES AND NOT MORE GO SOURCE. The oracle above (gorilla/websocket)
+# is a library this build compiles a small Go program against, and it only
+# ever tested the server's WEBSOCKET leg. The DIRECT (TLS-shaped) leg and
+# the whole C CLIENT had never been run against foreign code at all -- both
+# ends of every one of their tests were ours, which is the exact condition
+# under which this port once shipped a frame format no Go peer could read.
+# The cheapest way to fix that is not to reimplement Cloak's client in Go,
+# it is to run Cloak's client.
+#
+# WHY A TARBALL AND NOT `go install`. `go install github.com/cbeuw/Cloak/
+# cmd/ck-client@v2.12.0` DOES NOT WORK, and this comment exists so nobody
+# tries it again: Cloak's go.mod declares `module github.com/cbeuw/Cloak`
+# with no /v2 suffix, so its v2.x tags are +incompatible and are not served
+# by proxy.golang.org (https://proxy.golang.org/github.com/cbeuw/!cloak/@v/
+# list returns only v0.x and v1.x). Go then falls back to direct VCS and
+# dies with `exec: "git": executable file not found in $PATH`. Installing
+# git and cloning instead works but costs +450 MB in a single stage;
+# fetching the release tarball with the curl already installed above costs
+# +30 MB, because only the two binaries are copied out.
+#
+# v2.12.0 is pinned, not a branch: it is commit c3d5470ef76bba68d7812f5d06e
+# 4181dc1b1a5d6, the revision this port was read against.
+#
+# The binaries are built WITHOUT upstream's `-ldflags -X main.version=`, so
+# `go-ck-client -v` prints an empty version. Harmless, and nothing asserts
+# on it.
+FROM base AS gobuild
+ARG CLOAK_UPSTREAM=v2.12.0
+RUN mkdir -p /tmp/up \
+    && curl -fsSL "https://github.com/cbeuw/Cloak/archive/refs/tags/${CLOAK_UPSTREAM}.tar.gz" \
+       | tar -xz -C /tmp/up --strip-components=1 \
+    && cd /tmp/up \
+    && go build -o /out/go-ck-client ./cmd/ck-client \
+    && go build -o /out/go-ck-server ./cmd/ck-server
+
+# The image the project is actually built and tested in: `base`, plus two
+# binaries. Everything the gobuild stage downloaded to produce them -- the
+# source tree, Cloak's own ~10 modules, Go's build cache -- stays in that
+# stage and never reaches here.
+FROM base
+COPY --from=gobuild /out/go-ck-client /out/go-ck-server /usr/local/bin/
