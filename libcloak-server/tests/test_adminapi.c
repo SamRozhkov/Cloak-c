@@ -2130,10 +2130,13 @@ static void test_argument_and_lifetime_edges(void) {
  * got no answer at all, and the client saw the stream close mid-exchange
  * with nothing to distinguish it from a peer that hung up.
  *
- * Reachable exactly as dispatcher.c's own comment says: the proxy path
- * refuses unordered clients above that point, but an admin session that
- * set the flag reaches the session construction below it and is built
- * UNORDERED.
+ * Reachable because an admin session that sets the flag is built
+ * UNORDERED, which it always has been. (Until module 9 task 6 this
+ * comment added that the PROXY path refused unordered clients outright,
+ * making an admin session the only way in. That is no longer true --
+ * cloak_proxy_prepare_session carries them now -- which widens the
+ * reachability rather than narrowing it, and changes nothing about this
+ * case.)
  *
  * The body is padded with whitespace INSIDE the JSON object rather than
  * with junk, so the assertion is 201 plus the database row rather than a

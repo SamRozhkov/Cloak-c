@@ -662,6 +662,45 @@ struct cloak_dispatcher {
      * Always <= conn_count. This is what cloak_dispatcher_accept checks
      * against the cap, NOT conn_count. */
     size_t pending_count;
+
+    /* THE ONE REFUSAL THIS SERVER MAKES THAT GO DOES NOT MAKE, counted
+     * because it is otherwise invisible: connections refused at step 8
+     * because the ordering flag in their own auth record disagreed with
+     * the mode of the live session they asked to join.
+     *
+     * WHY IT IS A COUNTER AND NOT AN ERROR THE PEER CAN SEE. The refusal
+     * IS the cover-site redirect, byte for byte identical to the one an
+     * unauthorised UID, a replayed record or a stale timestamp produces
+     * -- deliberately, because a refusal distinguishable from those would
+     * be an oracle a prober could use to confirm this is a Cloak server
+     * at all (see this file's step-6 comment for the same argument about
+     * the four authorisation failures). So the diagnosis belongs on the
+     * operator's side only: this counter, and the CLOAK_LOGW line beside
+     * the check in dispatcher.c that names the session and both modes.
+     *
+     * WHAT A NON-ZERO VALUE MEANS. Not congestion, not an attack this
+     * server was under, and never something a legitimate client does: all
+     * NumConn connections of one Cloak session carry the same flag,
+     * because it comes from one client's one config. A non-zero count is
+     * therefore either a peer whose two ends disagree (a bug in a client,
+     * or a fork of one) or somebody deliberately probing what happens
+     * when they do. It is monotonic for the life of the dispatcher and is
+     * never reset.
+     *
+     * THE DIVERGENCE ITSELF. Go's ActiveUser.GetSession returns the
+     * existing session and discards the joining connection's own
+     * SessionConfig, so the connection is spliced on and its frames are
+     * interpreted under the SESSION's mode rather than its own -- which,
+     * once the two modes frame differently, is silent corruption with no
+     * error at either end. Refusing costs nothing against an honest peer
+     * and converts that into an immediate, visible failure. Asserted by
+     * test_dispatcher_auth.c's
+     * test_second_connection_with_the_opposite_ordering_is_refused (both
+     * directions) and bounded on the other side by
+     * test_second_connection_with_the_same_ordering_joins, which is what
+     * stops the check degenerating into "refuse every additional
+     * connection". */
+    uint64_t ordering_mismatch_refusals;
 };
 
 /* Zeroes d and validates the rest -- in that order, so that ANY failure

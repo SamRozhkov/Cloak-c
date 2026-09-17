@@ -11,6 +11,7 @@
 #include "cloak/clienthello_parse.h"
 #include "cloak/common.h"
 #include "cloak/crypto.h"
+#include "cloak/log.h"
 #include "cloak/ws_frame.h"
 #include "cloak/ws_handshake.h"
 
@@ -414,28 +415,24 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     composing with fresh material here silently breaks every frame on
  *     this connection with no error at the handshake).
  *
- *     AND THE SAME THING HAPPENS TO THE ORDERING MODE, WHICH IS A KNOWN
- *     GAP RATHER THAN A RULE. This path skips the whole of 8b, so
- *     info.unordered -- decrypted and parsed like every other field of
- *     this connection's own auth record -- is DISCARDED here: the mode
- *     the session was created with, by whichever connection got here
- *     first, is the mode this connection joins. A peer that opens
- *     (uid, session_id) ordered and then attaches a second connection
- *     with the flag set is spliced onto the ordered session, and the
- *     mirror image likewise, with no error anywhere. For the KEY, first
- *     wins is correct and deliberate. For the ORDERING MODE it is not:
- *     the two connections of that session would be framing different
- *     things down the same pipe as soon as the modes differ at all.
- *     Inert today only because nothing reads sesh->ordering yet (module
- *     9's tasks 3-7 are what change that), and pinned as it stands by
+ *     BUT NOT THE ORDERING MODE, WHICH IS CHECKED RATHER THAN INHERITED.
+ *     info.unordered is decrypted and parsed like every other field of
+ *     this connection's own auth record, and here it is COMPARED against
+ *     the live session's mode: a disagreement is REFUSED (the ordinary
+ *     redirect, plus cloak_dispatcher_t::ordering_mismatch_refusals and a
+ *     log line), not spliced. Until module 9 this branch discarded the
+ *     flag -- first connection wins, exactly as for the key -- which was
+ *     harmless only while nothing read sesh->ordering. Once the two modes
+ *     frame differently, a spliced connection's frames are interpreted
+ *     under the SESSION's mode rather than its own, with no error at
+ *     either end. A deliberate divergence from Go, which splices
+ *     silently; no legitimate client can produce the disagreement, since
+ *     all NumConn connections of one session carry the same flag. The
+ *     check itself carries the full reasoning, and
  *     test_dispatcher_auth.c's
- *     test_second_connection_cannot_change_the_ordering_mode, whose own
- *     comment carries the reasoning and the decision already taken: such
- *     a connection is to be REFUSED AT JOIN with a named error -- a
- *     deliberate divergence from Go, which splices silently -- by the
- *     task that makes the modes differ. That test fails the moment
- *     anything here starts re-deriving the mode, which is how the
- *     decision reaches whoever makes it rather than being remembered.
+ *     test_second_connection_with_the_opposite_ordering_is_refused and
+ *     test_second_connection_with_the_same_ordering_joins are the two
+ *     halves that pin it.
  *     If not found:
  *
  *     8a. THE PER-USER SESSIONS CAP, asked only on this path and only of
@@ -658,16 +655,55 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
          * ITS key back out rather than generating a fresh one. See
          * cloak/registry.h's own get_or_create doc comment.
          *
-         * NOTE WHAT ELSE IS FIXED HERE, because it is a gap and not a
-         * rule: this branch never looks at info.unordered, so a
-         * connection whose auth record disagrees with this session's
-         * ordering mode joins it anyway, silently. Read this function's
-         * own step-8 narrative above for why that is inert today, why it
-         * stops being inert in this module, and where the refusal it will
-         * become is already specified; test_dispatcher_auth.c's
-         * test_second_connection_cannot_change_the_ordering_mode pins the
-         * current behaviour and fails the moment anything here changes
-         * it. */
+         * AND THE ORDERING MODE IS NOT FIXED THE SAME WAY: it is CHECKED,
+         * and a disagreement is REFUSED. Until this module that was the
+         * live-key rule's exact analogue -- info.unordered was decrypted,
+         * parsed, and discarded, so the first connection's mode won for
+         * every later one. For the KEY that is right: a session has one
+         * obfuscator and a joining connection must use it. For the MODE
+         * it is not, and the difference is that the key is something the
+         * connection can be made to agree with, while the mode is
+         * something it has already committed to. A connection that framed
+         * datagrams joining a session that reassembles byte streams (or
+         * the mirror) has every one of its frames interpreted under the
+         * SESSION's mode, with no error at either end and corruption as
+         * the first symptom.
+         *
+         * A LEGITIMATE PEER CANNOT REACH THIS. All NumConn connections of
+         * one Cloak session carry the same flag, because it comes from
+         * one client's one config -- so refusing costs nothing against an
+         * honest peer and turns a silent misinterpretation into an
+         * immediate failure against a broken or hostile one. This is a
+         * DELIBERATE DIVERGENCE from Go, whose ActiveUser.GetSession
+         * returns the existing session and drops the joining connection's
+         * own SessionConfig on the floor.
+         *
+         * THE REFUSAL IS THE ORDINARY REDIRECT, indistinguishable from
+         * the one a bad UID gets -- see step 6's comment for why every
+         * refusal this function makes must look alike from outside. The
+         * diagnosis is therefore operator-side only: the counter below
+         * and this log line. Asserted by test_dispatcher_auth.c's
+         * test_second_connection_with_the_opposite_ordering_is_refused,
+         * with test_second_connection_with_the_same_ordering_joins
+         * bounding it on the other side so it cannot decay into "refuse
+         * every additional connection". */
+        cloak_session_ordering_t asked = info.unordered ? CLOAK_SESSION_ORDERING_UNORDERED
+                                                        : CLOAK_SESSION_ORDERING_ORDERED;
+        if (sesh->ordering != asked) {
+            d->ordering_mismatch_refusals++;
+            CLOAK_LOGW("dispatcher: refusing a connection to session %u -- it asked for %s while "
+                       "the live session is %s; no legitimate client varies this flag between the "
+                       "connections of one session",
+                       info.session_id, asked == CLOAK_SESSION_ORDERING_UNORDERED ? "unordered"
+                                                                                  : "ordered",
+                       sesh->ordering == CLOAK_SESSION_ORDERING_UNORDERED ? "unordered"
+                                                                          : "ordered");
+            /* Step 6 may have made this user active for a session this
+             * connection is not going to get; the panel is still owed the
+             * news, exactly as on step 7's refusal. */
+            dispatcher_release_user(d, info.uid);
+            return -1;
+        }
         memcpy(session_key, sesh->obfuscator.session_key, CLOAK_AEAD_KEY_LEN);
     } else {
         /* 8a. The per-user sessions cap. `user` is NULL for a dispatcher
@@ -702,15 +738,20 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
          * makes a session's mode structurally equal to the mode its peer
          * asked for rather than equal by coincidence.
          *
-         * Nothing reads this field yet (module 9's tasks 3-7 are what
-         * give the two modes different behaviour), and the only path that
-         * currently refuses an unordered client does so ABOVE this point
-         * and for its own reasons -- cloak_proxy_prepare_session's
-         * obligation 5, which runs at step 8c below and redirects rather
-         * than building a stream that would mangle datagrams. An admin
-         * session that set the flag reaches here and is built UNORDERED;
-         * that is the honest record of what the client asked for, and it
-         * is inert until those tasks land. See cloak/ordering.h. */
+         * THIS FIELD IS NOW READ ALL THE WAY DOWN, which it was not when
+         * this comment was first written: cloak_stream_t frames one
+         * datagram per write and reassembles nothing, the proxy splices
+         * an unordered stream to a datagram upstream with
+         * cloak_dgram_relay_t, and nothing anywhere refuses an unordered
+         * client for being one -- cloak_proxy_prepare_session's old
+         * obligation 5, which used to redirect them at step 8c below, is
+         * gone (see cloak/proxy.h for what replaced it). An admin session
+         * that set the flag is still built UNORDERED here, which is the
+         * honest record of what the client asked for and is now carried
+         * through by cloak_adminapi_t rather than being inert. The one
+         * refusal that exists is at step 8's OTHER branch, for a
+         * connection joining a session in the opposite mode. See
+         * cloak/ordering.h. */
         session_cfg.ordering = info.unordered ? CLOAK_SESSION_ORDERING_UNORDERED
                                               : CLOAK_SESSION_ORDERING_ORDERED;
         /* THE METER. Per-USER (it is the panel's, shared by every session

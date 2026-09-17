@@ -29,14 +29,21 @@ static void stream_relay_teardown(cloak_stream_relay_t *sr, int fire_done);
  * whose conn_send_queue_cap sits between 16403 and 16405 flips from
  * accepting streams to refusing every one of them at start -- correct
  * behaviour, since such a pool genuinely cannot hold a worst-case frame,
- * but silent and baffling from the outside. Raise conn_send_queue_cap. */
-static size_t stream_relay_frame_cost_for(const cloak_stream_t *stream) {
+ * but silent and baffling from the outside. Raise conn_send_queue_cap.
+ *
+ * EXPORTED (module 9 task 6) FOR ONE REASON: cloak_dgram_relay_t makes
+ * the identical start-time rejection and the identical per-read room
+ * check, and two copies of a wire-format cost formula that MUST agree is
+ * the kind of drift this tree pays for later. It stays declared in this
+ * header, with this comment, because this is where the reasoning lives;
+ * nothing about it is specific to a stream relay. */
+size_t cloak_stream_relay_frame_cost(const cloak_stream_t *stream) {
     return (size_t)CLOAK_CONN_RECORD_HEADER_LEN + stream->max_payload_per_frame +
            (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
 }
 
 static size_t stream_relay_frame_cost(const cloak_stream_relay_t *sr) {
-    return stream_relay_frame_cost_for(sr->stream);
+    return cloak_stream_relay_frame_cost(sr->stream);
 }
 
 /* The number of raw bytes it is currently safe to pull from the fd and
@@ -623,7 +630,7 @@ int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
     /* -2, NOT -1: this is the one TRANSIENT rejection this function has.
      * See this function's own doc comment for why the caller must be able
      * to tell it apart from every permanent failure. */
-    if (cloak_session_send_min_conn_free(sesh) < stream_relay_frame_cost_for(stream)) {
+    if (cloak_session_send_min_conn_free(sesh) < cloak_stream_relay_frame_cost(stream)) {
         return -2;
     }
 

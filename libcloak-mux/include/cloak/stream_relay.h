@@ -53,6 +53,22 @@
  * must be added to that same list. */
 typedef struct cloak_stream_relay cloak_stream_relay_t;
 
+/* The worst-case on-wire bytes a single full frame of `stream` can ever
+ * cost: the connection layer's record header, plus the frame header, plus
+ * a full payload, plus the maximum padding and AEAD tag
+ * cloak_frame_obfuscate can add. In other words, the amount of room in a
+ * connection's send queue that guarantees one more frame will fit no
+ * matter what.
+ *
+ * PUBLIC ONLY SO THE TWO RELAYS CANNOT DISAGREE. cloak_dgram_relay_t
+ * (cloak/dgram_relay.h) makes the same start-time rejection and the same
+ * per-read room check against the same quantity, and a second copy of a
+ * wire-format formula that must match this one is exactly the drift this
+ * tree has paid for before. The derivation and an operational note about
+ * what happens when conn_send_queue_cap sits just below it live at the
+ * definition, in libcloak-mux/src/stream_relay.c. */
+size_t cloak_stream_relay_frame_cost(const cloak_stream_t *stream);
+
 /* Fired exactly once, when the relay finishes: the stream ended, the fd
  * ended, or either side errored. The fd is already closed and the stream
  * is already closed (but NOT released) by the time this fires. Never

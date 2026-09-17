@@ -368,20 +368,25 @@ static void fx_session_closing(const uint8_t uid[CLOAK_UID_LEN], uint32_t sessio
     cloak_proxy_session_aborted(NULL, uid, session_id, userdata);
 }
 
-/* cloak_proxy_prepare_session, EXCEPT for an unordered client, which it
- * refuses outright (cloak/proxy.h's obligation 5: this server has no
- * datagram data path, so it redirects to the cover site rather than
- * splicing a stream that would mangle the client's datagrams). This file
- * needs a server that lets such a handshake complete, because the only
- * way to observe what the CLIENT does with its own unordered flag is to
- * let it finish building a session -- see
- * test_connector_unordered_mode_reaches_both_sessions.
+/* cloak_proxy_prepare_session, EXCEPT for an unordered client, for which
+ * it does nothing at all and reports success.
  *
- * Every other case in this file is ordered and therefore reaches
- * cloak_proxy_prepare_session exactly as before; the unordered case is
- * the only one that takes the branch, and it never sends a byte through
- * the session it built, so the proxy context that branch skips is not
- * one anything later asks for. */
+ * THE REASON THIS SHIM EXISTS CHANGED IN MODULE 9 TASK 6, and it is kept
+ * rather than deleted. It was written because the real
+ * prepare_session REFUSED an unordered client outright (its old
+ * obligation 5: the server had no datagram data path), and this file
+ * needs such a handshake to complete -- the only way to observe what the
+ * CLIENT does with its own unordered flag is to let it finish building a
+ * session. That refusal is gone; the real function would now accept the
+ * handshake and build a proxy context for it. The shim stays because
+ * this file's unordered case never sends a byte through the session it
+ * builds, so a proxy context for it would be state nothing here asks
+ * for or drives -- and the server side of an unordered session is
+ * covered end to end where it belongs, in
+ * libcloak-server/tests/test_proxy_udp.c.
+ *
+ * Every other case in this file is ordered and reaches
+ * cloak_proxy_prepare_session exactly as before. */
 static int fx_prepare_session(cloak_dispatcher_t *d, const cloak_server_clientinfo_t *info,
                               cloak_session_config_t *config, void *userdata) {
     if (info->unordered) {

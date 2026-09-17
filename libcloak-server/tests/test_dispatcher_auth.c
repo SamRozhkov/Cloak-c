@@ -737,11 +737,13 @@ static void test_invalid_encryption_method_redirects(void) {
  * exactly that mutation (dispatcher.c step 8b replaced by a fixed
  * CLOAK_SESSION_ORDERING_ORDERED), which this case is what fails.
  *
- * This file's prepare_cb accepts everything, which is what lets an
- * unordered handshake get as far as a session here -- the real
- * cloak_proxy_prepare_session refuses one (cloak/proxy.h obligation 5)
- * because this port has no datagram data path yet. That refusal is a
- * policy one layer above this one, and it is tested where it lives. */
+ * This file's prepare_cb accepts everything, which is what let an
+ * unordered handshake get as far as a session here when the real
+ * cloak_proxy_prepare_session still refused one. It no longer does
+ * (module 9 task 6 removed that refusal along with the premise behind
+ * it), so this case would now reach a session either way; the stub is
+ * still what keeps this file about the DISPATCHER rather than about the
+ * proxy. */
 static void test_unordered_flag_selects_the_session_ordering(void) {
     const int cases[2] = {0, 1};
     for (int i = 0; i < 2; i++) {
@@ -779,46 +781,77 @@ static void test_unordered_flag_selects_the_session_ordering(void) {
     }
 }
 
-/* 14. THE ORDERING MODE IS FIXED BY A SESSION'S FIRST CONNECTION AND IS
- * NEVER RE-CHECKED -- pinned here as it BEHAVES TODAY, which is not how
- * it should behave, and this comment is the handover.
+/* 14. A SECOND CONNECTION WHOSE ORDERING FLAG DISAGREES WITH THE LIVE
+ * SESSION IS REFUSED AT JOIN -- a deliberate divergence from Go, which
+ * splices it on silently.
  *
- * Step 8 finds an existing (uid, session_id) and skips the whole of 8b,
- * so the `unordered` flag of the second and every later connection is
- * decrypted, parsed into info, and then discarded. A peer that opens a
- * session ordered and attaches a second connection claiming unordered is
- * SPLICED ONTO THE ORDERED SESSION, and the mirror image likewise. It is
- * the exact analogue of the LIVE-KEY RULE the same step documents for
- * obfuscator.session_key -- the first connection's value wins -- except
- * that for the key that is correct and deliberate, and for the ordering
- * mode it is neither.
+ * THIS CASE USED TO ASSERT THE OPPOSITE, and the change is the point.
+ * Until module 9 task 6, step 8's registry-hit branch discarded
+ * info.unordered exactly as it discards everything else a joining
+ * connection declares: the mode the session was created with won, which
+ * is the same rule as the LIVE-KEY RULE for obfuscator.session_key. For
+ * the KEY that is correct. For the ORDERING MODE it was only harmless
+ * while nothing read sesh->ordering; the moment the two modes frame
+ * differently (this module), a spliced connection's frames are
+ * interpreted under the SESSION's mode rather than its own -- datagrams
+ * fed to a byte-stream reassembler, or a byte stream chopped into
+ * datagrams -- with no error at either end and corruption as the first
+ * symptom. The previous version of this case asserted the splice, on
+ * purpose, so that the task which made the modes differ would inherit a
+ * failing test rather than a note to remember; this is that task making
+ * the change it was left.
  *
- * WHY THIS IS A TEST AND NOT A FIX. Nothing reads sesh->ordering yet
- * (module 9 tasks 3-7 are what give the two modes different behaviour),
- * so today this is genuinely inert: an unordered connection spliced onto
- * an ordered session moves bytes exactly as an ordered one would. The
- * moment the modes differ it stops being inert -- one connection of a
- * session would be framing datagrams into a stream reassembler -- and
- * this project has already ruled on the answer: such a connection is to
- * be REFUSED AT JOIN with a named error, a deliberate divergence from Go,
- * which splices silently. That refusal belongs to the task that makes the
- * modes differ (task 6), not here.
+ * WHY REFUSE RATHER THAN ACCEPT-AND-LOG. A legitimate peer cannot produce
+ * this: all NumConn connections of one Cloak session carry the same flag,
+ * because it comes from one client's one config. So refusing costs
+ * nothing against an honest peer, and against a broken or hostile one it
+ * converts a silent misinterpretation into a loud, immediate failure.
+ * Go's user.GetSession returns the existing session and drops the new
+ * seshConfig on the floor, which is the silent behaviour this deliberately
+ * does not port.
  *
- * So what this case buys is that the change cannot be forgotten: it
- * asserts the CURRENT behaviour, which means the task that implements the
- * refusal inherits a FAILING TEST it has to come and change, with the
- * reasoning attached, rather than a note somebody has to remember to
- * read. Measured: teaching step 8 to re-derive the mode on the
- * registry-hit path -- the smallest thing resembling the eventual fix --
- * fails the final assertion below in BOTH directions (two failures, one
- * per row, `1 != 2` and `2 != 1`) and nothing else in the 69-test suite.
- * When you are here to change it: replace the assertions with the
- * named refusal, keep both directions, and delete this paragraph. */
-static void test_second_connection_cannot_change_the_ordering_mode(void) {
-    /* first connection's flag, second connection's flag -- both
-     * directions, because a dispatcher that re-derived the mode from
-     * whichever connection arrived LAST would keep the ordered session
-     * ordered in the first row and only betray itself in the second. */
+ * WHAT "A NAMED ERROR" MEANS HERE, and why the assertion below is on a
+ * COUNTER rather than on anything the client can see. From outside, this
+ * refusal is byte-for-byte the cover-site redirect every other
+ * authentication failure produces -- deliberately, because a refusal a
+ * probe could tell apart from a bad UID would be an oracle for "this is a
+ * Cloak server". The name therefore lives on the OPERATOR's side, in
+ * cloak_dispatcher_t::ordering_mismatch_refusals and the log line beside
+ * it. Asserting that counter, and not merely "the connection did not
+ * attach", is what makes this case fail for the right reason: a
+ * dispatcher that refused every additional connection (for any reason at
+ * all, including a bug) would satisfy "did not attach" and would also
+ * fail test_existing_session_uses_live_key; only the counter says the
+ * refusal was THIS decision.
+ *
+ * Both directions are driven, for the reason the original case gave: a
+ * dispatcher that re-derived the mode from whichever connection arrived
+ * LAST, instead of refusing, would leave the first row's session ordered
+ * and only betray itself in the second.
+ *
+ * WATCHED TO FAIL -- four mutations, all run, with what each one actually
+ * did rather than what it was expected to do:
+ *
+ *  (a) DELETE THE CHECK, i.e. the pre-task-6 behaviour this case used to
+ *      assert. Fails the redirect, the counter and the attach count, in
+ *      BOTH rows -- and nothing else in the 73-test suite, which is the
+ *      measurement that says this refusal costs no other behaviour.
+ *  (b) RE-DERIVE INSTEAD OF REFUSING (sesh->ordering = asked, the
+ *      smallest thing that looks like a fix). Fails the same three AND
+ *      the surviving-mode assertion, `1 != 2` in the first row and
+ *      `2 != 1` in the second.
+ *  (c) COUNT BUT DO NOT REFUSE. Fails the redirect and the attach count
+ *      while the counter assertion passes -- which is why "it did not
+ *      attach" is asserted alongside the counter and not instead of it.
+ *  (d) CHECK ONLY ONE DIRECTION (`asked == UNORDERED && ...`, the
+ *      half-implementation somebody writes when they think of the
+ *      datagram case first). Fails the SECOND ROW ONLY, five assertions,
+ *      the first row passing throughout. That is what both rows are for.
+ *
+ * The one mutation NOT killed here is "refuse every additional
+ * connection", which is what case 15 below exists for. */
+static void test_second_connection_with_the_opposite_ordering_is_refused(void) {
+    /* first connection's flag -- the second always carries the opposite. */
     const int first_flag[2] = {0, 1};
     const uint32_t sid[2] = {3201u, 3202u};
 
@@ -843,6 +876,10 @@ static void test_second_connection_cannot_change_the_ordering_mode(void) {
         ASSERT_EQ_INT(0, read_reply(fx.reactor, client1, reply1, sizeof(reply1), &reply1_len));
         ASSERT_EQ_INT(1, fx.attached.calls);
         ASSERT_EQ_INT(1, fx.attached.last_created);
+        ASSERT_EQ_INT(0, (int)fx.d.ordering_mismatch_refusals);
+
+        cloak_session_t *first_sesh = fx.attached.last_sesh;
+        ASSERT_TRUE(first_sesh != NULL);
 
         /* The second connection to the SAME (uid, session_id), carrying
          * the OPPOSITE flag. */
@@ -857,28 +894,89 @@ static void test_second_connection_cannot_change_the_ordering_mode(void) {
         ASSERT_TRUE(client2 >= 0);
         ASSERT_TRUE(write(client2, record2, len2) == (ssize_t)len2);
 
-        uint8_t reply2[512];
-        size_t reply2_len = 0;
-        ASSERT_EQ_INT(0, read_reply(fx.reactor, client2, reply2, sizeof(reply2), &reply2_len));
+        /* IT IS REDIRECTED, exactly as an unauthorised UID would be: the
+         * cover site receives its first packet byte for byte. Waiting on
+         * the cover site rather than on a reply is also what makes this
+         * bounded -- there is no reply to read. */
+        struct len_wait w = {&fx.cover, len2};
+        ASSERT_TRUE(pump_until(fx.reactor, cover_has_len, &w, 300, 10));
+        ASSERT_EQ_INT((int)len2, (int)fx.cover.len);
+        ASSERT_MEM_EQ(fx.cover.buf, record2, len2);
 
-        /* It JOINED -- today's behaviour, and the half a future refusal
-         * changes: no new session, no redirect, the reply composed and
-         * sent exactly as for any additional connection. */
-        ASSERT_EQ_INT(2, fx.attached.calls);
-        ASSERT_EQ_INT(0, fx.attached.last_created);
+        /* THE NAMED DIAGNOSIS, and the reason this is not just "it did
+         * not attach". */
+        ASSERT_EQ_INT(1, (int)fx.d.ordering_mismatch_refusals);
+
+        /* It did not join: no second attach, no new session, and the one
+         * session that exists is untouched -- still the first
+         * connection's, still in the first connection's mode. */
+        ASSERT_EQ_INT(1, fx.attached.calls);
         ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx.registry));
-
-        /* ...and the session it joined still carries the FIRST
-         * connection's mode. */
-        ASSERT_TRUE(fx.attached.last_sesh != NULL);
-        if (fx.attached.last_sesh != NULL) {
-            ASSERT_EQ_INT((int)(first_flag[i] ? CLOAK_SESSION_ORDERING_UNORDERED
-                                              : CLOAK_SESSION_ORDERING_ORDERED),
-                          (int)fx.attached.last_sesh->ordering);
-        }
+        ASSERT_EQ_INT((int)(first_flag[i] ? CLOAK_SESSION_ORDERING_UNORDERED
+                                          : CLOAK_SESSION_ORDERING_ORDERED),
+                      (int)first_sesh->ordering);
 
         close(client1);
         close(client2);
+        fixture_destroy(&fx);
+    }
+}
+
+/* 15. THE SAME FLAG STILL JOINS, which is what stops case 14's refusal
+ * from being "refuse every additional connection" -- the mutation a
+ * refusal test is most likely to leave alive.
+ *
+ * test_existing_session_uses_live_key already drives a second connection
+ * to a live session, but only in the ORDERED mode both connections get by
+ * default. This drives both modes explicitly and asserts the join in each:
+ * an unordered session, joined by a second unordered connection, is the
+ * combination module 9 actually ships, and nothing else in the suite
+ * reaches it. */
+static void test_second_connection_with_the_same_ordering_joins(void) {
+    const int flag[2] = {0, 1};
+    const uint32_t sid[2] = {3301u, 3302u};
+
+    for (int i = 0; i < 2; i++) {
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+        int64_t now = (int64_t)time(NULL);
+        /* BOTH CONNECTIONS STAY OPEN until the assertions are done.
+         * Closing the first before opening the second retires its session
+         * -- the registry drops a session whose last connection went away
+         * -- and the second connection would then legitimately CREATE
+         * one, which is a different case from the join this asserts. */
+        int client[2] = {-1, -1};
+        for (int c = 0; c < 2; c++) {
+            uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+            uint8_t shared[CLOAK_AEAD_KEY_LEN];
+            size_t len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                             (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid[i],
+                                             flag[i], record, sizeof(record), shared);
+            ASSERT_TRUE(len > 0);
+
+            client[c] = client_connect(front_port(&fx));
+            ASSERT_TRUE(client[c] >= 0);
+            ASSERT_TRUE(write(client[c], record, len) == (ssize_t)len);
+
+            uint8_t reply[512];
+            size_t reply_len = 0;
+            ASSERT_EQ_INT(0, read_reply(fx.reactor, client[c], reply, sizeof(reply), &reply_len));
+            ASSERT_EQ_INT(c + 1, fx.attached.calls);
+            ASSERT_EQ_INT(c == 0 ? 1 : 0, fx.attached.last_created);
+        }
+
+        ASSERT_EQ_INT(0, (int)fx.d.ordering_mismatch_refusals);
+        ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx.registry));
+        ASSERT_TRUE(fx.attached.last_sesh != NULL);
+        if (fx.attached.last_sesh != NULL) {
+            ASSERT_EQ_INT((int)(flag[i] ? CLOAK_SESSION_ORDERING_UNORDERED
+                                        : CLOAK_SESSION_ORDERING_ORDERED),
+                          (int)fx.attached.last_sesh->ordering);
+        }
+
+        close(client[0]);
+        close(client[1]);
         fixture_destroy(&fx);
     }
 }
@@ -897,5 +995,6 @@ TEST_MAIN_BEGIN()
     test_write_error_closes_not_redirect();
     test_invalid_encryption_method_redirects();
     test_unordered_flag_selects_the_session_ordering();
-    test_second_connection_cannot_change_the_ordering_mode();
+    test_second_connection_with_the_opposite_ordering_is_refused();
+    test_second_connection_with_the_same_ordering_joins();
 TEST_MAIN_END()

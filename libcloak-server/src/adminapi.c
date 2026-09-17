@@ -30,9 +30,11 @@
  * the client got no answer and nothing distinguishing it from a peer that
  * hung up. That is Go's bug 6 (internal/client/piper.go's 8192-byte
  * reader against datagrams of up to 16132) in this port's own admin
- * reader. It is reachable: dispatcher.c refuses unordered clients only on
- * the PROXY path, and says so in its own comment -- an admin session that
- * sets the flag is built UNORDERED.
+ * reader. It is reachable, and MORE reachable since module 9 task 6 than
+ * when this was written: an admin session that sets the flag has always
+ * been built UNORDERED, and the proxy path -- which used to redirect
+ * every unordered client -- now carries them too, so nothing anywhere
+ * refuses one.
  *
  * 16384 is chosen to exceed the largest datagram a session at the
  * shipping max_on_wire_size of 16401 can ever deliver: Go's

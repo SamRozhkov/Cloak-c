@@ -573,6 +573,11 @@ static int proxy_streams_eq(void *ctx) {
     return cloak_proxy_stream_count(w->p) == w->want;
 }
 
+static int proxy_sessions_eq(void *ctx) {
+    struct count_wait *w = ctx;
+    return cloak_proxy_session_count(w->p) == w->want;
+}
+
 /* ---- tests ---------------------------------------------------------------- */
 
 /* 1. One stream, bytes both ways: the whole module in one test. */
@@ -1013,13 +1018,20 @@ static void test_relay_start_rejection_retries_then_gives_up(void) {
     fixture_destroy(&fx);
 }
 
-/* Shared body for the two redirect cases: a handshake that is valid in
- * every respect the dispatcher itself checks must still be redirected to
- * the cover site, with nothing left in the registry and no proxy session
- * context created. Asserted exactly the way test_dispatcher_auth.c
- * asserts its own redirects: the cover site receives the client's own
- * first packet byte for byte. */
-static void expect_redirect(struct fixture *fx, int unordered) {
+/* Shared body for the two cases that used to be redirects and are now
+ * ACCEPTANCES -- see the two of them below for what changed and why.
+ * A handshake that is valid in every respect the dispatcher checks must
+ * now also be accepted by cloak_proxy_prepare_session: the session lands
+ * in the registry, the proxy builds a context for it, and NOTHING reaches
+ * the cover site (which is what would happen on a redirect, and is
+ * asserted here rather than merely not asserted).
+ *
+ * The cover site is checked by pumping for a bounded window and finding
+ * it still empty. That is a NEGATIVE assertion and therefore weaker than
+ * the positive one it replaced -- it can only be "nothing arrived within
+ * this window" -- which is exactly why the registry and proxy-context
+ * counts are asserted alongside it: a redirect would satisfy neither. */
+static void expect_attach(struct fixture *fx, int unordered) {
     int64_t now = (int64_t)time(NULL);
     uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
     uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
@@ -1035,32 +1047,56 @@ static void expect_redirect(struct fixture *fx, int unordered) {
     }
     ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
 
-    struct len_wait w = {&fx->cover, record_len};
-    ASSERT_TRUE(pump_until(fx->reactor, cover_has_len, &w, 300, 10));
-    ASSERT_EQ_INT((int)record_len, (int)fx->cover.len);
-    ASSERT_MEM_EQ(fx->cover.buf, record, record_len);
+    struct count_wait cw = {&fx->proxy, 1};
+    ASSERT_TRUE(pump_until(fx->reactor, proxy_sessions_eq, &cw, 300, 10));
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx->registry));
+    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&fx->proxy));
 
-    ASSERT_EQ_INT(0, (int)cloak_server_registry_count(&fx->registry));
-    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&fx->proxy));
+    /* Nothing was redirected. The handshake reply went to the client, not
+     * one byte to the cover site, and no upstream was dialed either --
+     * this handshake opened no stream. */
+    ASSERT_EQ_INT(0, (int)fx->cover.len);
     ASSERT_EQ_INT(0, fx->up.accept_count);
 
     close(client);
 }
 
-/* 8. Obligation 5: the unordered flag redirects rather than attaching. */
-static void test_unordered_redirects(void) {
+/* 8. THE UNORDERED FLAG NO LONGER REFUSES ANYTHING, which is the whole of
+ * module 9 task 6 as seen from this file.
+ *
+ * This case used to assert the opposite -- cloak_proxy_prepare_session's
+ * obligation 5 redirected any client that asked for datagrams, because
+ * the server had no datagram data path and handing such a client an
+ * ordered stream would have reassembled its datagrams into a byte stream,
+ * corruption it could not have diagnosed. There is a data path now
+ * (cloak/dgram_relay.h), the dispatcher builds the session in the mode
+ * the flag asks for, and the flag is no longer this function's business.
+ *
+ * NOTE WHICH UPSTREAM THIS IS: "tcp". An unordered SESSION against a
+ * STREAM upstream is a legal combination and gets the ordinary stream
+ * relay -- the two questions are independent, and Go decides neither.
+ * The datagram upstream's own end-to-end coverage is test_proxy_udp.c;
+ * what this case pins is only that nothing refuses here any more. */
+static void test_unordered_session_attaches(void) {
     struct fixture fx;
     ASSERT_EQ_INT(0, fixture_init(&fx, "tcp"));
-    expect_redirect(&fx, 1);
+    expect_attach(&fx, 1);
     fixture_destroy(&fx);
 }
 
-/* 9. A ProxyBook entry declared "udp" redirects for the same reason: a
- * SOCK_DGRAM upstream has no stream to splice. */
-static void test_udp_proxy_book_entry_redirects(void) {
+/* 9. AND NOR DOES A "udp" ProxyBook ENTRY. It used to redirect because
+ * cloak_stream_relay_t splices a stream with a STREAM socket and had no
+ * framing with which to preserve datagram boundaries. The socket type now
+ * selects cloak_dgram_relay_t instead, at relay-start time.
+ *
+ * The client here is ORDERED against a datagram upstream, which is the
+ * other legal combination and, again, the one Go also permits: each read
+ * of the byte stream becomes one datagram. Asserted here only as far as
+ * "it attaches"; nothing in this file drives bytes through it. */
+static void test_udp_proxy_book_entry_attaches(void) {
     struct fixture fx;
     ASSERT_EQ_INT(0, fixture_init(&fx, "udp"));
-    expect_redirect(&fx, 0);
+    expect_attach(&fx, 0);
     fixture_destroy(&fx);
 }
 
@@ -1775,8 +1811,8 @@ test_large_transfer_round_trip();
 test_upstream_close_ends_stream();
 test_client_close_closes_upstream();
 test_refused_upstream_closes_only_that_stream();
-test_unordered_redirects();
-test_udp_proxy_book_entry_redirects();
+test_unordered_session_attaches();
+test_udp_proxy_book_entry_attaches();
 test_relay_start_rejection_retries_then_gives_up();
 test_permanent_start_failure_is_not_retried();
 test_per_session_stream_cap();

@@ -160,16 +160,24 @@ static void proxy_stream_teardown(cloak_proxy_stream_t *pst) {
          * correctness, and it is stated at this site and not only in the
          * header because this is where it is easy to get backwards.
          *
-         * cloak_stream_relay_stop closes the stream (so the peer
-         * actually learns the stream ended) and the relay's own fd; it
-         * deliberately does NOT fire on_done, and deliberately does NOT
-         * release the stream -- cloak/stream_relay.h is explicit that
-         * releasing is ours. Releasing FIRST would free the
+         * Either stop closes the stream (so the peer actually learns the
+         * stream ended) and the relay's own fd; both deliberately do NOT
+         * fire on_done, and both deliberately do NOT release the stream
+         * -- cloak/stream_relay.h and cloak/dgram_relay.h are explicit
+         * that releasing is ours. Releasing FIRST would free the
          * cloak_stream_t while the relay still holds it as a raw pointer
          * it cannot validate, and the stop below would then write a
-         * close through freed memory. */
+         * close through freed memory.
+         *
+         * relay_is_dgram picks which object is live. It is only ever read
+         * while relaying is set, which is the window in which
+         * proxy_try_start_relay has already set both. */
         pst->relaying = 0;
-        cloak_stream_relay_stop(&pst->relay);
+        if (pst->relay_is_dgram) {
+            cloak_dgram_relay_stop(&pst->dgram);
+        } else {
+            cloak_stream_relay_stop(&pst->relay);
+        }
     }
     if (pst->fd_pending >= 0) {
         /* The retry window: no relay has taken this descriptor yet, so
@@ -256,6 +264,7 @@ static cloak_proxy_session_t *proxy_find_session(cloak_proxy_t *p,
 /* ---- relay start, with the retry the interface forces on us ------------- */
 
 static void proxy_on_relay_done(cloak_stream_relay_t *sr, void *userdata);
+static void proxy_on_dgram_relay_done(cloak_dgram_relay_t *dr, void *userdata);
 static void proxy_on_retry_timer(cloak_reactor_t *r, void *userdata);
 
 /* Attempts to splice pst->stream with the descriptor currently held in
@@ -272,13 +281,42 @@ static void proxy_try_start_relay(cloak_proxy_stream_t *pst) {
         return;
     }
 
-    int rc = cloak_stream_relay_start(&pst->relay, p->cfg.reactor, ps->sesh, pst->stream,
-                                      pst->fd_pending, p->cfg.relay_buf_cap, proxy_on_relay_done,
-                                      pst);
+    /* THE UPSTREAM'S SOCKET TYPE, AND NOTHING ELSE, PICKS THE RELAY.
+     *
+     * Not the session's ordering mode, which is a separate question with
+     * a separate answer: the mode says how the CLIENT's application
+     * framed what it sent, and the socket type says what the UPSTREAM can
+     * receive. All four combinations are legal and all four are what Go
+     * does, because Go picks nothing at all -- it dials whatever the
+     * ProxyBook says and runs the same copy loop over it. An unordered
+     * session against a "tcp" entry gets the stream relay (boundaries are
+     * lost at the TCP socket, as they would be in Go, and there is
+     * nowhere else they could survive); an ordered session against a
+     * "udp" entry gets this one, and each read of the byte stream becomes
+     * one datagram, which is again exactly Go's behaviour.
+     *
+     * Deciding on the socket type also keeps the decision where the
+     * information is: cloak_server_init resolved "udp" to SOCK_DGRAM
+     * once, at config time, and ps->upstream has pointed at that resolved
+     * address since prepare_session. */
+    int rc;
+    int is_dgram = ps->upstream != NULL && ps->upstream->socktype != SOCK_STREAM;
+    if (is_dgram) {
+        /* No buf_cap: the datagram relay derives its one buffer from the
+         * stream's own max_payload_per_frame, because any other value
+         * could only be wrong. See cloak_dgram_relay_start. */
+        rc = cloak_dgram_relay_start(&pst->dgram, p->cfg.reactor, ps->sesh, pst->stream,
+                                     pst->fd_pending, proxy_on_dgram_relay_done, pst);
+    } else {
+        rc = cloak_stream_relay_start(&pst->relay, p->cfg.reactor, ps->sesh, pst->stream,
+                                      pst->fd_pending, p->cfg.relay_buf_cap,
+                                      proxy_on_relay_done, pst);
+    }
     if (rc == 0) {
         /* Ownership of fd is the relay's from here; see this module's
          * header for the fd_pending == -1 rule this implements. */
         pst->fd_pending = -1;
+        pst->relay_is_dgram = is_dgram;
         pst->relaying = 1;
         return;
     }
@@ -339,6 +377,20 @@ static void proxy_on_retry_timer(cloak_reactor_t *r, void *userdata) {
  * later turn on which this context could otherwise be reclaimed. */
 static void proxy_on_relay_done(cloak_stream_relay_t *sr, void *userdata) {
     (void)sr;
+    cloak_proxy_stream_t *pst = userdata;
+    pst->relaying = 0;
+    proxy_stream_teardown(pst);
+}
+
+/* The datagram upstream's identical ending. Two functions rather than one
+ * because the two relays' done callbacks have different signatures, and
+ * only the first parameter differs; everything either of them does is the
+ * one line below plus the shared teardown. The same "freeing pst from
+ * inside on_done is safe" argument applies unchanged --
+ * libcloak-mux/src/dgram_relay.c's teardown fires on_done as its final
+ * statement and every caller returns immediately afterwards. */
+static void proxy_on_dgram_relay_done(cloak_dgram_relay_t *dr, void *userdata) {
+    (void)dr;
     cloak_proxy_stream_t *pst = userdata;
     pst->relaying = 0;
     proxy_stream_teardown(pst);
@@ -494,7 +546,11 @@ static void proxy_on_stream_data(cloak_session_t *sesh, cloak_stream_t *stream, 
              * yet and needs no notification: its data waits in its own
              * receive buffer and the relay's initial pump collects it. */
             if (pst->relaying) {
-                cloak_stream_relay_notify_stream_data(&pst->relay);
+                if (pst->relay_is_dgram) {
+                    cloak_dgram_relay_notify_stream_data(&pst->dgram);
+                } else {
+                    cloak_stream_relay_notify_stream_data(&pst->relay);
+                }
             }
             return; /* pst may already be freed */
         }
@@ -535,7 +591,11 @@ static void proxy_on_writable(cloak_session_t *sesh, void *userdata) {
     while (pst != NULL) {
         cloak_proxy_stream_t *next = pst->next;
         if (pst->relaying) {
-            cloak_stream_relay_notify_writable(&pst->relay);
+            if (pst->relay_is_dgram) {
+                cloak_dgram_relay_notify_writable(&pst->dgram);
+            } else {
+                cloak_stream_relay_notify_writable(&pst->relay);
+            }
         }
         pst = next;
     }
@@ -603,14 +663,16 @@ int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_client
         return -1;
     }
 
-    /* Obligation 5. See this function's doc comment in cloak/proxy.h for
-     * why a create-path check is the COMPLETE check, and why a redirect
-     * (rather than a stream that would quietly mangle the client's
-     * datagrams) is the right answer. */
-    if (info->unordered) {
-        return -1;
-    }
-
+    /* NOTHING IS REFUSED HERE FOR ASKING FOR DATAGRAMS ANY MORE. Until
+     * module 9 this function began by rejecting info->unordered outright
+     * -- obligation 5, correct while this server had no datagram data
+     * path, because a client whose datagrams were silently reassembled
+     * into a byte stream could not have diagnosed it. It now has one, in
+     * both of the places that needed it: an unordered SESSION is built by
+     * the dispatcher from this same flag, and a datagram UPSTREAM is
+     * spliced by cloak_dgram_relay_t. The flag is therefore no longer
+     * this function's business at all -- see its doc comment for what the
+     * four cases became. */
     const cloak_addr_t *upstream = cloak_server_lookup_proxy(p->cfg.srv, info->proxy_method);
     if (upstream == NULL) {
         /* TWO WAYS TO GET HERE, and neither may dereference NULL.
@@ -631,13 +693,15 @@ int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_client
          * Either way, degrade to a redirect. */
         return -1;
     }
-    if (upstream->socktype != SOCK_STREAM) {
-        /* A ProxyBook entry declared "udp". cloak_stream_relay_t splices
-         * a stream with a stream socket and has no way to preserve
-         * datagram boundaries; datagram upstreams are out of scope for
-         * this module, so nothing here half-works silently. */
-        return -1;
-    }
+    /* NOR IS A "udp" ProxyBook ENTRY REFUSED ANY MORE. It used to be, for
+     * a reason that was true of the code rather than of the protocol:
+     * cloak_stream_relay_t splices a stream with a STREAM socket and has
+     * no framing with which to preserve datagram boundaries. The socket
+     * type is now read at relay-start time instead
+     * (proxy_try_start_relay), where it selects cloak_dgram_relay_t; it
+     * is deliberately NOT re-checked here, because a check here could
+     * only ever duplicate that one and would then be free to disagree
+     * with it. */
 
     cloak_proxy_session_t *ps = calloc(1, sizeof(*ps));
     if (ps == NULL) {

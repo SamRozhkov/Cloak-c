@@ -7,6 +7,7 @@ add_library(cloak-mux STATIC
     src/switchboard.c
     src/session.c
     src/stream_relay.c
+    src/dgram_relay.c
     src/valve.c
     src/ws_frame.c
 )

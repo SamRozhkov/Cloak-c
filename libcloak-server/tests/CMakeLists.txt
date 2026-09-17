@@ -163,6 +163,21 @@ set_tests_properties(test_proxy_stream PROPERTIES TIMEOUT 60)
 # stays a build-time choice, not a per-run skip.
 set_tests_properties(test_proxy_stream PROPERTIES LABELS "slow")
 
+# The server's DATAGRAM upstream (module 9 task 6). NOT labelled "slow":
+# it forks nothing -- its "upstream" is one bound AF_INET SOCK_DGRAM
+# socket driven by the same reactor as everything else -- so it belongs in
+# the `ctest -L fast` edit loop, which is where a relay this fiddly most
+# needs to be re-run.
+add_executable(test_proxy_udp test_proxy_udp.c)
+target_include_directories(test_proxy_udp PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_proxy_udp PRIVATE cloak-server)
+add_test(NAME test_proxy_udp COMMAND test_proxy_udp)
+# 60 s matches every other end-to-end file in this directory and is a
+# BACKSTOP, not the mechanism: every wait inside the file is a
+# clock-bounded pump_until of 4 s, so a wholly unresponsive run still
+# reports its own named assertion rather than being truncated by ctest.
+set_tests_properties(test_proxy_udp PROPERTIES TIMEOUT 60)
+
 add_executable(test_proxy_teardown test_proxy_teardown.c)
 target_include_directories(test_proxy_teardown PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_proxy_teardown PRIVATE cloak-server)
@@ -330,6 +345,7 @@ foreach(_cloak_harness_test
         test_dispatcher_auth
         test_dispatcher_limits
         test_proxy_stream
+        test_proxy_udp
         test_proxy_teardown
         test_server_e2e
         test_dispatcher_users
