@@ -134,13 +134,29 @@
  * CLOAK_CLIENT_STACK_DEFAULT_MAX_ON_WIRE_SIZE / its server twin, so
  * max_payload_per_frame is Go's maxStreamUnitWrite exactly. */
 #define MAX_ON_WIRE 16401u
-#define MAX_DGRAM   (MAX_ON_WIRE - CLOAK_FRAME_HEADER_LEN - CLOAK_FRAME_MAX_EXTRA_LEN) /* 16132 */
+/* 16401 - 14 (frame header) - 255 (padding + tag) = Go's maxStreamUnitWrite.
+ *
+ * A LITERAL, NOT AN EXPRESSION OVER THE SHIPPED CONSTANTS, and the two
+ * are not the same test. Written as
+ * MAX_ON_WIRE - CLOAK_FRAME_HEADER_LEN - CLOAK_FRAME_MAX_EXTRA_LEN it
+ * moves with the implementation: change the header size and this file
+ * still "passes", having quietly changed what it expects. The ladder's
+ * own rungs are already literals (16132, 16133) for exactly that reason;
+ * this makes the cap that feeds them one too, so a change to any of the
+ * three constants is a FAILURE here rather than a silent re-derivation. */
+#define MAX_DGRAM   16132u
 
 /* internal/client/piper.go: RouteUDP's `data := make([]byte, 8192)` and
  * its reader goroutine's `buf := make([]byte, 8192)`. Both bugs 6 and 7
  * are this one number. READ FROM GO'S SOURCE, and then MEASURED by case
  * 1's role A, whose expected received lengths are min(sent, this). */
 #define GO_UDP_BUF 8192u
+
+/* Go's obfs.go pads the first five frames of every stream, and so does
+ * cloak_frame_obfuscate. THE LITERAL 5, not CLOAK_FRAME_PAD_FIRST_N_FRAMES
+ * -- see PAD_STREAMS below for why an expectation taken from the symbol
+ * the implementation branches on is not an expectation at all. */
+#define PAD_BOUNDARY 5
 
 /* ------------------------------------------------------------------ */
 /* Budgets. Every one is set from the worst FAILING run.                */
@@ -357,6 +373,48 @@ static int listen_on(int *port_out) {
     }
     *port_out = ntohs(a.sin_port);
     return fd;
+}
+
+/* THE SAME PROBE, BUT AS A DATAGRAM SOCKET -- and the distinction is a
+ * flake this branch has already paid for.
+ *
+ * free_port() above binds a TCP ephemeral port, reads the number and
+ * closes it. Handing that number to something that then binds it as UDP
+ * is the exact mechanism behind the test_udp_piper failures that cost
+ * this branch four observations and a dedicated investigation before they
+ * were diagnosed: EPHEMERAL PORT RANGES ARE SHARED ACROSS PROTOCOL
+ * FAMILIES, so a free TCP port says nothing about the same UDP port, and
+ * any concurrent process -- including the other five forking tests in
+ * this file's own `slow` tier -- can take it in the window. The commit
+ * directly above this work ("Ask the socket its type instead of guessing
+ * from a port") removed that pattern; this file must not reintroduce it.
+ *
+ * The residual TOCTOU window -- the port is free when we look and the
+ * CHILD binds it a moment later -- is inherent to telling a child a port
+ * number in a configuration file and is what every forking test in this
+ * tree lives with. What is removed here is the cross-family half, which
+ * is the half that is not a race at all but a category error. */
+static int free_udp_port(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t len = sizeof(a);
+    if (getsockname(fd, (struct sockaddr *)&a, &len) != 0) {
+        close(fd);
+        return -1;
+    }
+    int port = ntohs(a.sin_port);
+    close(fd);
+    return port;
 }
 
 static int dial(int port) {
@@ -1028,7 +1086,8 @@ static void run_ladder(const uscenario_t *sc, int capture) {
     set_nonblock(h.relay.listen_fd);
     h.relay.server_port = server_port;
 
-    int local_port = free_port();
+    /* free_udp_port, not free_port: both clients BIND this as UDP. */
+    int local_port = free_udp_port();
     ASSERT_TRUE(local_port > 0);
 
     char scfg[160];
@@ -1227,8 +1286,11 @@ static void run_ladder(const uscenario_t *sc, int capture) {
      * the APP sends to 8192 first, so a reply larger than Go's 8192-byte
      * receive buffer has to be manufactured behind the server. Our client
      * must deliver it; Go's must lose it AND tear the stream down, after
-     * which a later datagram still crosses on a NEW stream (piper.go
-     * deletes the map entry before closing). */
+     * which a later datagram still crosses. THAT IT CROSSES IS MEASURED;
+     * that it does so on a NEW stream is READ from piper.go, which
+     * deletes the map entry before closing -- nothing in this harness
+     * observes a stream id on Go's side, so the assertion below claims
+     * only the crossing. */
     h.amplify_next = GO_UDP_BUF + 1;
     long amp = uh_probe(&h, out, 8, sc->client_can_receive_large ? PROBE_MS : QUIET_MS);
     if (sc->client_can_receive_large) {
@@ -1611,13 +1673,13 @@ static void test_seq_is_still_generated_and_monotonic(void) {
      * 240 -- so it is pinned statistically in case 4 instead. */
     size_t padded_early = 0;
     for (size_t i = 0; i < seen_n; i++) {
-        if (seen[i].seq >= CLOAK_FRAME_PAD_FIRST_N_FRAMES) {
+        if (seen[i].seq >= PAD_BOUNDARY) {
             if (seen[i].extra_len != 16) {
                 fprintf(stderr,
                         "FAIL %s:%d: frame seq %llu carried extra_len %zu; past frame %d a "
                         "frame must carry the 16-byte tag and nothing else\n",
                         __FILE__, __LINE__, (unsigned long long)seen[i].seq, seen[i].extra_len,
-                        CLOAK_FRAME_PAD_FIRST_N_FRAMES);
+                        PAD_BOUNDARY);
                 cloak_test_failures++;
             }
         } else if (seen[i].extra_len > 16) {
@@ -1625,7 +1687,7 @@ static void test_seq_is_still_generated_and_monotonic(void) {
         }
     }
     printf("   %zu of the first-%d-frame slots carried padding on the wire\n", padded_early,
-           CLOAK_FRAME_PAD_FIRST_N_FRAMES);
+           PAD_BOUNDARY);
 }
 
 /* ================================================================== */
@@ -1949,12 +2011,11 @@ static void mb_turn(mb_env_t *e) {
     mb_pump(&e->mb);
 }
 
-static void mb_run(mb_env_t *e, int ms) {
-    uint64_t deadline = now_ms() + (uint64_t)ms;
-    while (now_ms() < deadline) {
-        mb_turn(e);
-    }
-}
+/* There is deliberately NO plain "pump for N milliseconds" helper here.
+ * There was one, and both cases that used it were converted to wait on an
+ * event instead (case 2 after it failed under ASan, case 5 on review), so
+ * leaving it in place would be an invitation to write the third. Every
+ * wait below is "until this happened, with a clock backstop". */
 
 /* Turns until the peer session has seen its first frame, or ms expires. */
 static void mb_run_until_new_stream(mb_env_t *e, int ms);
@@ -2199,7 +2260,16 @@ static void run_replay(cloak_session_ordering_t ordering, const char *label) {
     uint8_t a[48];
     memset(a, 0xA1, sizeof(a));
     ASSERT_EQ_INT(48, cloak_stream_write(cs, a, sizeof(a)));
-    mb_run(&e, 200);
+    /* WAITS ON THE EVENT, NOT ON A BUDGET. This was mb_run(&e, 200) --
+     * 200 ms of continuous pumping, which is clock-bounded and therefore
+     * satisfies the letter of the rule, and is still the same
+     * fixed-budget shape case 2 had to replace with an event after it
+     * passed in Debug and failed under ASan. Two records (the frame and
+     * its replay) is the thing being waited for, so that is what is
+     * waited on; mb_run_until already exists and its 1000 ms is a
+     * backstop rather than the mechanism. */
+    mb_run_until(&e, 2, 1000);
+    mb_run_until_new_stream(&e, 1000);
 
     ASSERT_EQ_INT(1, e.sh.new_stream_count);
     cloak_stream_t *ss = e.sh.last_new_stream;
@@ -2208,9 +2278,9 @@ static void run_replay(cloak_session_ordering_t ordering, const char *label) {
         mb_env_close(&e);
         return;
     }
-    /* The replay really happened: three records left the middle box for
-     * the two the client wrote. Without this the case could pass because
-     * nothing was ever duplicated. */
+    /* The replay really happened: TWO records left the middle box for the
+     * ONE datagram the client has written so far. Without this the case
+     * could pass because nothing was ever duplicated. */
     ASSERT_EQ_INT(0, e.mb.armed);
     ASSERT_EQ_INT(2, (long long)e.mb.released);
 
@@ -2221,7 +2291,9 @@ static void run_replay(cloak_session_ordering_t ordering, const char *label) {
     memset(b, 0xB2, sizeof(b));
     long w2 = cloak_stream_write(cs, b, sizeof(b));
     ASSERT_EQ_INT(48, w2);
-    mb_run(&e, 200);
+    /* Three records now: the frame, its replay, and this one. The policy
+     * has already disarmed, so this one is not duplicated. */
+    mb_run_until(&e, 3, 1000);
 
     uint8_t got[256];
     if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
@@ -2318,9 +2390,26 @@ static void test_duplicate_and_late_frame_replay(void) {
  * constant seq every frame is seq 0, every frame is padded, and the
  * boundary assertion below fails; under a per-frame reset the same. */
 
-#define PAD_STREAMS 4800u
-#define PAD_PER_STREAM CLOAK_FRAME_PAD_FIRST_N_FRAMES
-#define PAD_DRAWS (PAD_STREAMS * PAD_PER_STREAM) /* 24000 */
+/* 40000 streams x 5 padded frames = 200,000 draws.
+ *
+ * RAISED FROM 4800 (24,000 draws) BECAUSE THE THRESHOLD WAS NOT A BOUND.
+ * The 420.0 below is test_frame.c's, and test_frame draws 200,000; this
+ * case reused the number with ONE EIGHTH of the sample, which is a value
+ * that looks like a bound and is not one. MEASURED, by the mutation that
+ * exposed it: `cloak_random_below(max_inclusive)` instead of
+ * `(max_inclusive + 1)`, so pad length 239 is never drawn, scores chi2
+ * 1047.3 at 200,000 draws and is caught -- and scored 372.9 at 24,000,
+ * 11 % UNDER the threshold, i.e. a coin flip on the seed. A 2x bias (the
+ * byte modulo this port shipped) is loud enough at 24,000; a 1-in-240
+ * range defect is not, and "where module 9 would hide a fifth bias" has
+ * to mean the quiet ones too.
+ *
+ * PAD_PER_STREAM IS THE LITERAL 5, not CLOAK_FRAME_PAD_FIRST_N_FRAMES:
+ * the boundary is what this case asserts, so taking it from the symbol
+ * the implementation uses would make a change to it invisible here. */
+#define PAD_STREAMS 40000u
+#define PAD_PER_STREAM 5u
+#define PAD_DRAWS (PAD_STREAMS * PAD_PER_STREAM) /* 200000 */
 #define PAD_BINS 240
 /* MEASURED, in the dev image, on this exact loop -- 15 runs of the shipped
  * sampler and 5 of the mutated one (mutation M3, which restores the byte
@@ -2333,10 +2422,14 @@ static void test_duplicate_and_late_frame_replay(void) {
  * +8 sigma -- deliberately loose, because a flaky distribution test gets
  * deleted and a strict one catches nothing a 2x bias would not also trip. */
 #define PAD_CHI2_THRESHOLD 420.0
-/* Expected 24000 * 16/240 = 1600, sigma = sqrt(24000 * (1/15)(14/15)) =
- * 38.6; the bracket is +/- 6 sigma. The biased sampler lands near 3000. */
-#define PAD_LOW_MIN 1368ul
-#define PAD_LOW_MAX 1832ul
+/* Expected 200000 * 16/240 = 13333.3, sigma = sqrt(200000 * (1/15)(14/15))
+ * = 111.6; the bracket is +/- 6 sigma, and it is the SAME bracket
+ * test_frame.c uses because it is now the same sample size -- which is
+ * the point of the rescaling above. The byte-modulo sampler lands near
+ * 25000 here (it measured 2976..3055 at 24,000 draws, i.e. 2.2x its
+ * share, and the ratio does not depend on N). */
+#define PAD_LOW_MIN 12664ul
+#define PAD_LOW_MAX 14003ul
 
 typedef struct {
     unsigned long counts[PAD_BINS];
@@ -2359,7 +2452,7 @@ static int pad_sink(void *userdata, const uint8_t *bytes, size_t len) {
         p->out_of_range++;
         return 0;
     }
-    if (p->frames > PAD_PER_STREAM) {
+    if (p->frames > PAD_BOUNDARY) {
         /* Frames past the boundary, counted separately below. */
     }
     p->counts[pad]++;
@@ -2385,7 +2478,7 @@ static int boundary_sink(void *userdata, const uint8_t *bytes, size_t len) {
 static void test_padding_distribution_unordered(void) {
     printf("-- case4a: the pad/no-pad boundary at frame %d and the padding-length "
            "distribution, UNORDERED (NO ORACLE)\n",
-           CLOAK_FRAME_PAD_FIRST_N_FRAMES);
+           PAD_BOUNDARY);
 
     const uint8_t payload[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
 
@@ -2408,12 +2501,12 @@ static void test_padding_distribution_unordered(void) {
          * half that is a theorem, and it is the half a "seq = 0"
          * simplification breaks -- with a constant seq every frame here
          * carries padding and every one of these seven assertions fails. */
-        for (size_t i = PAD_PER_STREAM; i < b.n; i++) {
+        for (size_t i = PAD_BOUNDARY; i < b.n; i++) {
             if (b.extra[i] != 16) {
                 fprintf(stderr,
                         "FAIL %s:%d: unordered frame %zu carried extra_len %zu; past frame %d "
                         "there must be no padding at all\n",
-                        __FILE__, __LINE__, i, b.extra[i], CLOAK_FRAME_PAD_FIRST_N_FRAMES);
+                        __FILE__, __LINE__, i, b.extra[i], PAD_BOUNDARY);
                 cloak_test_failures++;
             }
         }
@@ -2423,7 +2516,7 @@ static void test_padding_distribution_unordered(void) {
          * is padded, which over five independent draws fails with
          * probability 240^-5 ~= 1.3e-12. */
         int any_padded = 0;
-        for (size_t i = 0; i < PAD_PER_STREAM && i < b.n; i++) {
+        for (size_t i = 0; i < PAD_BOUNDARY && i < b.n; i++) {
             if (b.extra[i] > 16) {
                 any_padded = 1;
             }
@@ -2503,17 +2596,46 @@ static void test_padding_distribution_unordered(void) {
  * matter by three orders of magnitude -- an always-pick-connection-0
  * switchboard scores 72000 here (mutation M8, run).
  *
- * WHAT THIS DOES NOT CATCH, and it is worth writing down rather than
- * leaving as an unexamined pass: a ROUND-ROBIN pick is perfectly uniform
- * and sails through both assertions. Mutation M9 replaced the xorshift
- * with `counter++ % conns_len` and NOT ONE of the 75 tests failed, even
- * though round robin is wire-visible -- a passive observer sees the
- * connections used in strict rotation, which no other Cloak
- * implementation produces. A chi-square tests the marginal distribution,
- * not independence, and nothing in this tree tests independence. */
+ * WHAT THIS ALONE DOES NOT CATCH: a ROUND-ROBIN pick is perfectly
+ * uniform and sails through both of these assertions. That is what the
+ * pair-transition block below is for, and it is why this case measures
+ * two axes rather than one. */
 #define PICK_SENDS 24000ul
 #define PICK_CHI2_4 30.0
 #define PICK_CHI2_3 25.0
+
+/* AND THE SECOND AXIS: INDEPENDENCE.
+ *
+ * The block above ends by naming its own blind spot -- a chi-square tests
+ * the MARGINAL distribution, and a ROUND-ROBIN pick is perfectly uniform.
+ * Mutation M9 (`counter++ % conns_len` in cloak_switchboard_send) failed
+ * NOT ONE of the 75 tests, even though strict rotation is wire-visible: a
+ * censor watching a client's N connections sees the frames alternate, a
+ * signature no other Cloak implementation emits and one that needs no
+ * decryption to extract.
+ *
+ * The first version of this file called closing that "out of scope". It
+ * was wrong, and the review that found it also wrote the fix, which is
+ * this: a chi-square over the nconn x nconn matrix of CONSECUTIVE picks,
+ * inside the loop that was already running, with no new fixture and no
+ * measurable runtime. Credit for the probe and for its measured
+ * separation belongs to that review; it is landed here as written.
+ *
+ * MEASURED, 5 runs of each by the reviewer and re-measured here:
+ *              4 connections (15 d.f.)   3 connections (8 d.f.)
+ *   shipped        11.93 ..  23.58          1.57 ..  18.04
+ *   round robin        71997                    47998
+ * Three orders of magnitude apart, so the thresholds sit far from both:
+ * 60 is ~8 sigma above the 15-d.f. mean of 15, and 40 is ~11 sigma above
+ * the 8-d.f. mean of 8.
+ *
+ * WHAT IT STILL DOES NOT COVER, said plainly rather than left implicit: a
+ * lag-1 transition matrix catches rotation and any other first-order
+ * dependence. A generator with a period of, say, four whose pair
+ * transitions happen to be flat would still pass. That is a narrower gap
+ * than the one this closes, and it is not closed here. */
+#define PICK_PAIR_CHI2_4 60.0
+#define PICK_PAIR_CHI2_3 40.0
 
 static void sb_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len,
                            void *userdata) {
@@ -2529,7 +2651,7 @@ static void sb_on_broken(cloak_switchboard_t *sb, void *userdata) {
     (*broken)++;
 }
 
-static void measure_pick(size_t nconn, double threshold) {
+static void measure_pick(size_t nconn, double threshold, double pair_threshold) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
     int broken = 0;
@@ -2546,28 +2668,70 @@ static void measure_pick(size_t nconn, double threshold) {
     }
 
     unsigned long counts[8];
+    /* The lag-1 transition matrix, flattened: pairs[prev * nconn + cur].
+     * 64 covers the 8-connection ceiling `peer` already imposes. */
+    static unsigned long pairs[64];
     memset(counts, 0, sizeof(counts));
+    memset(pairs, 0, sizeof(pairs));
+    unsigned long ambiguous = 0;
+    int prev = -1;
     uint8_t payload[1] = {0xAB};
     uint8_t sink[4096];
     for (unsigned long i = 0; i < PICK_SENDS; i++) {
         ASSERT_EQ_INT(0, cloak_switchboard_send(&sb, payload, sizeof(payload)));
+        /* EXACTLY ONE CONNECTION MUST HAVE TAKEN EXACTLY ONE FRAME, and
+         * that is asserted rather than assumed. cloak_conn_send drains
+         * inline, so a 6-byte record (5 record header + 1 payload) is on
+         * its socket before this returns; if a send were ever left queued,
+         * two picks would collapse into one read and the TRANSITION
+         * matrix -- which depends on knowing the order -- would be
+         * quietly wrong while the marginal counts stayed right. A count
+         * of ambiguous turns makes that visible instead. */
+        int cur = -1;
+        unsigned long frames = 0;
         for (size_t c = 0; c < nconn; c++) {
             ssize_t n = read(peer[c], sink, sizeof(sink));
             if (n > 0) {
-                /* 5 record header + 1 payload per send, so a read that
-                 * caught several is several picks. */
+                cur = (int)c;
+                frames += (unsigned long)n / 6u;
                 counts[c] += (unsigned long)n / 6u;
             }
         }
+        if (frames != 1 || cur < 0) {
+            ambiguous++;
+            prev = -1; /* the chain is broken; do not invent a transition */
+            continue;
+        }
+        if (prev >= 0) {
+            pairs[(size_t)prev * nconn + (size_t)cur]++;
+        }
+        prev = cur;
     }
+    ASSERT_EQ_INT(0, (long long)ambiguous);
+
     unsigned long total = 0;
     for (size_t c = 0; c < nconn; c++) {
         total += counts[c];
     }
     ASSERT_EQ_INT((long long)PICK_SENDS, (long long)total);
     ASSERT_UNIFORM_CHI_SQUARE(counts, nconn, PICK_SENDS, threshold);
-    printf("   %zu connections, %lu picks, chi2 = %.2f\n", nconn, total,
-           cloak_test_chi_square_uniform(counts, nconn, PICK_SENDS));
+
+    /* AXIS TWO: is the pick INDEPENDENT of the one before it? Every
+     * ordered pair of consecutive picks must be equally likely, which
+     * round robin violates absolutely -- it puts all its mass on the n
+     * cells of a single cycle and leaves n*(n-1) cells empty. */
+    unsigned long pair_total = 0;
+    size_t cells = nconn * nconn;
+    for (size_t k = 0; k < cells; k++) {
+        pair_total += pairs[k];
+    }
+    ASSERT_EQ_INT((long long)(PICK_SENDS - 1), (long long)pair_total);
+    ASSERT_UNIFORM_CHI_SQUARE(pairs, cells, pair_total, pair_threshold);
+
+    printf("   %zu connections, %lu picks: marginal chi2 = %.2f, pair chi2 = %.2f over %zu "
+           "cells\n",
+           nconn, total, cloak_test_chi_square_uniform(counts, nconn, PICK_SENDS),
+           cloak_test_chi_square_uniform(pairs, cells, pair_total), cells);
 
     cloak_switchboard_destroy(&sb);
     cloak_reactor_destroy(r);
@@ -2577,10 +2741,10 @@ static void measure_pick(size_t nconn, double threshold) {
 }
 
 static void test_connection_pick_is_unbiased(void) {
-    printf("-- case4b: the switchboard's connection pick (flagged for measurement by the plan "
-           "and never measured)\n");
-    measure_pick(4, PICK_CHI2_4);
-    measure_pick(3, PICK_CHI2_3);
+    printf("-- case4b: the switchboard's connection pick -- UNIFORM (flagged for measurement "
+           "by the plan and never measured) and INDEPENDENT (NO ORACLE)\n");
+    measure_pick(4, PICK_CHI2_4, PICK_PAIR_CHI2_4);
+    measure_pick(3, PICK_CHI2_3, PICK_PAIR_CHI2_3);
 }
 
 /* ------------------------------------------------------------------ */

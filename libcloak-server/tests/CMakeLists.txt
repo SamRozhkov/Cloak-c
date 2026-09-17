@@ -593,10 +593,13 @@ add_test(NAME test_unordered_proof COMMAND test_unordered_proof)
 
 # TIMEOUT 150, set from the worst FAILING run and not the passing one.
 #
-# MEASURED, idle, on the dev image: a passing run is 4.0-4.2 s in Debug
-# (10 consecutive runs) and 7.3-8.5 s under ASan+UBSan (8 consecutive
-# runs). Four child processes, 24 datagram probes, 24000 padded frames and
-# 48000 switchboard picks.
+# MEASURED, idle, on the dev image, AT THIS COMMIT: a passing run is
+# 3.68-3.83 s in Debug (5 consecutive runs) and 7.18-7.40 s under
+# ASan+UBSan (3 consecutive runs). Four child processes, 24 datagram
+# probes, 200000 padded frames and 48000 switchboard picks -- the padded
+# frames went up 8x in this round (see PAD_STREAMS in the test file) and
+# the wall time went DOWN, because case 5 stopped spending two fixed
+# 200 ms budgets and now waits on events.
 #
 # What the number has to cover is a run where the two ends cannot exchange
 # a datagram at all, which is the defect this file exists to catch and
@@ -606,8 +609,8 @@ add_test(NAME test_unordered_proof COMMAND test_unordered_proof)
 # EXIT_MS teardowns -- about 27 s -- so both roles are ~54 s. A run whose
 # LADDER stalls instead costs nine PROBE_MS (2 s each) per role on top,
 # i.e. ~36 s more. The white-box cases fork nothing and every one of their
-# loops is clock-bounded at 1 s or less, and their measured cost is 1.0 s
-# (Debug) / 1.2 s (ASan). The worst failing path is therefore ~95 s,
+# loops is clock-bounded at 1 s or less, and their measured cost is 0.63 s
+# (Debug). The worst failing path is therefore ~95 s,
 # inside this timeout with enough room that even a wholly unresponsive run
 # prints its own named assertion instead of being truncated as
 # "***Timeout".
@@ -615,10 +618,25 @@ add_test(NAME test_unordered_proof COMMAND test_unordered_proof)
 # 150 rather than the 120 this directory uses elsewhere, for one reason:
 # that 120 covers ONE stalled transfer, and this file has TWO stalled
 # roles plus a nine-rung ladder in each of them.
-
+#
 # LABELS "slow": this file forks and execs four real Cloak binaries, two of
 # them Go's. `ctest -L fast` excludes it; the default `ctest` still runs it.
-set_tests_properties(test_unordered_proof PROPERTIES LABELS "slow")
+#
+# THE TWO PROPERTIES ARE SET IN ONE CALL, DELIBERATELY, AND THAT IS A
+# REPAIR RATHER THAN A STYLE CHOICE. They were two calls separated by the
+# comment above, and a later edit that rewrote the comment took the
+# TIMEOUT call with it -- leaving thirty lines deriving 150 from a ~95 s
+# worst failing path, and a generated CTestTestfile.cmake carrying only
+#     set_tests_properties(test_unordered_proof PROPERTIES  LABELS "slow" ...)
+# so the test ran at ctest's DEFAULT 1500 s. A justification for a number
+# that is not in the build is worse than no justification, because it
+# stops the next reader from checking; the two oracle roles this comment
+# reasons about would have hung the suite for 25 minutes instead of
+# failing at 150 s with a named assertion. One call means a future comment
+# rewrite cannot orphan one property without orphaning the other, and the
+# check that matters is on the GENERATED file:
+#     grep test_unordered_proof build/libcloak-server/tests/CTestTestfile.cmake
+set_tests_properties(test_unordered_proof PROPERTIES TIMEOUT 150 LABELS "slow")
 
 # Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's own
 # comment on cloak_label_fast_tests() for what this call does and why it
