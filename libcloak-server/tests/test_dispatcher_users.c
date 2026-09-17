@@ -1373,6 +1373,75 @@ static void test_reply_write_failure_releases_the_user(void) {
  * live. It is recorded here as UNCOVERED rather than left looking tested,
  * which is what the rest of this file would otherwise imply. */
 
+/* (c) THE ORDERING-MISMATCH REFUSAL, UNDER A PANEL -- and the finding is
+ * that its release call is a structural NO-OP rather than an untested
+ * one.
+ *
+ * WHAT WAS ASKED FOR AND WHY IT CANNOT BE PINNED. A review mutated
+ * dispatcher.c step 8 to delete dispatcher_release_user from the
+ * ordering-mismatch refusal and found the whole suite still passing,
+ * reading that as the same defect case (b) above exists to prevent. It is
+ * not, and the reason is structural: that refusal is only reachable on
+ * the registry-HIT path, i.e. exactly when cloak_server_registry_find has
+ * just returned a LIVE session for this (uid, session_id). So the user
+ * being refused still has at least one session, and
+ * cloak_userpanel_notify_session_closed is documented as a no-op for a
+ * user that still has sessions. MEASURED, not argued: with that call
+ * deleted this case passes unchanged, and so does the rest of the suite.
+ * The call is kept anyway -- it costs one predicted branch and it keeps
+ * the invariant dispatcher.c states ("steps 7, 8 and 9 each call
+ * dispatcher_release_user") true of the code rather than only of the
+ * comment, which matters if the refusal is ever moved to a path where a
+ * session is NOT guaranteed.
+ *
+ * WHAT THIS CASE DOES PIN, which nothing did before: the refusal is
+ * ACCOUNTING-NEUTRAL for a metered user. The honest session that was
+ * joined keeps its user active and keeps its place in the registry, and
+ * the refusal neither deactivates the user (which would bill and
+ * terminate them mid-session) nor admits a second session. The mutation
+ * it kills is the plausible over-correction -- answering a mismatch by
+ * terminating the user's sessions rather than by turning one connection
+ * away -- which fails the registry count and the panel lookup below. */
+static void test_ordering_mismatch_refusal_leaves_the_metered_user_alone(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    mk_uid(uid, 0x83);
+    put_user(fx.mgr, uid, 4, START_CREDIT, START_CREDIT, T_EXPIRY);
+
+    /* An ORDERED session first (the flag byte is 0 in make_record). */
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, uid, 10003));
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count_for_uid(&fx.registry, uid));
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) != NULL);
+    ASSERT_EQ_INT(0, (int)fx.d.ordering_mismatch_refusals);
+
+    /* A second connection to the SAME key with the opposite flag. */
+    uint8_t rec[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    size_t rec_len = build_client_record(fx.server_pub, uid, "ss",
+                                         (uint8_t)CLOAK_AEAD_AES_256_GCM, (int64_t)time(NULL),
+                                         10003, 1 /* unordered */, rec, sizeof(rec), shared);
+    ASSERT_TRUE(rec_len > 0);
+
+    uint8_t got[128];
+    size_t n = probe_response(&fx, rec, rec_len, got, sizeof(got));
+    ASSERT_EQ_INT((int)DU_BANNER_LEN, (int)n);
+    ASSERT_MEM_EQ(got, DU_BANNER, DU_BANNER_LEN);
+    ASSERT_EQ_INT(1, (int)fx.d.ordering_mismatch_refusals);
+
+    /* The honest session is untouched: still exactly one, still this
+     * user's, and the user is still active with its rates intact. */
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count_for_uid(&fx.registry, uid));
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) != NULL);
+    ASSERT_EQ_INT(1, (int)cloak_userpanel_active_count(fx.panel));
+    ASSERT_EQ_INT(0, fx.aborted_calls);
+
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
 test_database_user_authenticates_and_is_metered();
 test_every_refusal_is_the_same_redirect();
@@ -1382,6 +1451,7 @@ test_no_panel_keeps_bypass_only_policy();
 test_terminated_user_stops_its_relays();
 test_cap_zero_refusal_releases_the_user();
 test_prepare_session_refusal_releases_the_user();
+test_ordering_mismatch_refusal_leaves_the_metered_user_alone();
 test_get_or_create_failure_releases_the_user();
 test_reply_write_failure_releases_the_user();
 TEST_MAIN_END()

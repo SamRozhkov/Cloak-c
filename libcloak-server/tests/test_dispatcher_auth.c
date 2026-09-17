@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cloak/dispatcher.h"
+#include "cloak/log.h"
 #include "cloak/base64.h"
 #include "cloak/clienthello.h"
 #include "cloak/common.h"
@@ -890,6 +891,32 @@ static void test_second_connection_with_the_opposite_ordering_is_refused(void) {
                                           first_flag[i] ? 0 : 1, record2, sizeof(record2), shared2);
         ASSERT_TRUE(len2 > 0);
 
+        /* THE REFUSAL PATH MUST BE SILENT, and this capture is the pin
+         * that keeps it so. The log is installed for exactly the window
+         * of the refusal -- not the accepted handshake above, which is
+         * free to say whatever it likes.
+         *
+         * WHY A LOG ASSERTION IS A TIMING ASSERTION HERE. This refusal's
+         * whole justification is that a prober cannot separate it from a
+         * bad UID; the bytes and the teardown are identical, so the only
+         * way to leak is a side effect with a cost. It shipped with a
+         * CLOAK_LOGW and a review measured exactly that: 13-18 us slower
+         * at p10 over 150 refusals per arm, 3 runs of 3, with the two
+         * arms coinciding to within half a microsecond once the line was
+         * suppressed. cloak_log_write is a blocking fprintf to unbuffered
+         * stderr called from inside a reactor callback.
+         *
+         * Asserting emptiness rather than a duration is deliberate: a
+         * timing assertion in a suite that runs under ASan at -j4 would
+         * be flaky, while the CAUSE is binary and this catches any future
+         * line added to this path, at any level at or above the shipping
+         * one, whatever its cost turns out to be. */
+        char *logbuf = NULL;
+        size_t loglen = 0;
+        FILE *logmem = open_memstream(&logbuf, &loglen);
+        ASSERT_TRUE(logmem != NULL);
+        cloak_log_set_stream(logmem);
+
         int client2 = client_connect(front_port(&fx));
         ASSERT_TRUE(client2 >= 0);
         ASSERT_TRUE(write(client2, record2, len2) == (ssize_t)len2);
@@ -902,6 +929,14 @@ static void test_second_connection_with_the_opposite_ordering_is_refused(void) {
         ASSERT_TRUE(pump_until(fx.reactor, cover_has_len, &w, 300, 10));
         ASSERT_EQ_INT((int)len2, (int)fx.cover.len);
         ASSERT_MEM_EQ(fx.cover.buf, record2, len2);
+
+        cloak_log_set_stream(NULL);
+        if (logmem != NULL) {
+            fflush(logmem);
+            fclose(logmem);
+        }
+        ASSERT_EQ_INT(0, (int)loglen);
+        free(logbuf);
 
         /* THE NAMED DIAGNOSIS, and the reason this is not just "it did
          * not attach". */

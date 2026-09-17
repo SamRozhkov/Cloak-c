@@ -675,8 +675,18 @@ struct cloak_dispatcher {
      * be an oracle a prober could use to confirm this is a Cloak server
      * at all (see this file's step-6 comment for the same argument about
      * the four authorisation failures). So the diagnosis belongs on the
-     * operator's side only: this counter, and the CLOAK_LOGW line beside
+     * operator's side only: this counter, and a CLOAK_LOGD line beside
      * the check in dispatcher.c that names the session and both modes.
+     *
+     * DEBUG, NOT WARN, AND THAT IS PART OF THE SAME ARGUMENT RATHER THAN
+     * A STYLE CHOICE. The line shipped at WARN for one round and was
+     * measured to make this refusal 13-18 microseconds slower at p10 than
+     * a bad-UID refusal -- identical bytes, identical teardown,
+     * distinguishable clock. A blocking write from inside a reactor
+     * callback is exactly the kind of side effect that turns "looks the
+     * same" into "measures different"; see the check's own comment in
+     * dispatcher.c for the measurement and for the test that keeps the
+     * refusal path silent.
      *
      * WHAT A NON-ZERO VALUE MEANS. Not congestion, not an attack this
      * server was under, and never something a legitimate client does: all

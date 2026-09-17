@@ -415,6 +415,22 @@ static int open_unordered_client(struct fixture *fx, client_session_t *cs, uint3
                                session_id, 1, &ccfg);
 }
 
+/* The same handshake with the flag CLEAR and an ORDERED local session:
+ * the other half of the "the upstream's socket type, and nothing else,
+ * picks the relay" claim, which case 6 exists to pin. */
+static int open_ordered_client(struct fixture *fx, client_session_t *cs, uint32_t session_id) {
+    cloak_session_config_t ccfg;
+    memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
+    ccfg.max_on_wire_size = 16401;
+    ccfg.stream_recv_capacity = 65536;
+    ccfg.stream_max_pending_frames = 64;
+    ccfg.conn_send_queue_cap = 262144;
+    ccfg.inactivity_timeout_ms = 60000;
+    return client_session_open(cs, fx->reactor, front_port(fx), fx->server_pub, fx->uid_ok, "ss",
+                               session_id, 0, &ccfg);
+}
+
 /* ---- client-side datagram reader ---------------------------------------
  *
  * Polls cloak_stream_read from inside the pump predicate, exactly as
@@ -561,19 +577,24 @@ static void test_datagram_round_trip_preserves_boundaries(void) {
         return;
     }
 
-    const size_t sizes[3] = {1, 1500, 8191};
-    uint8_t *sent[3];
-    for (int i = 0; i < 3; i++) {
+    /* 8192 and 8193 are the exact edge of the window Go loses (its
+     * client reads replies into an 8192-byte buffer and breaks out of its
+     * loop on the short-buffer error), so both are driven rather than
+     * approached: the nearest pins used to be 8191 here and 16132 in case
+     * 2, leaving the first byte Go actually drops untested. */
+    const size_t sizes[5] = {1, 1500, 8191, 8192, 8193};
+    uint8_t *sent[5];
+    for (int i = 0; i < 5; i++) {
         sent[i] = malloc(sizes[i]);
         ASSERT_TRUE(sent[i] != NULL);
         fill_pattern(sent[i], sizes[i], (uint8_t)(0x40 + i));
         ASSERT_EQ_INT((int)sizes[i], (int)cloak_stream_write(st, sent[i], sizes[i]));
     }
 
-    struct up_wait uw = {&fx.up, 3};
+    struct up_wait uw = {&fx.up, 5};
     ASSERT_TRUE(pump_until(fx.reactor, up_received, &uw, WAIT_TURNS, WAIT_MS));
-    ASSERT_EQ_INT(3, (int)fx.up.count);
-    for (int i = 0; i < 3; i++) {
+    ASSERT_EQ_INT(5, (int)fx.up.count);
+    for (int i = 0; i < 5 && i < (int)fx.up.count; i++) {
         ASSERT_EQ_INT((int)sizes[i], (int)fx.up.len[i]);
         ASSERT_TRUE(fx.up.bytes[i] != NULL);
         ASSERT_MEM_EQ(fx.up.bytes[i], sent[i], sizes[i]);
@@ -582,18 +603,18 @@ static void test_datagram_round_trip_preserves_boundaries(void) {
     reader_t rd;
     memset(&rd, 0, sizeof(rd));
     rd.stream = st;
-    struct reader_wait rw = {&rd, 3};
+    struct reader_wait rw = {&rd, 5};
     ASSERT_TRUE(pump_until(fx.reactor, reader_received, &rw, WAIT_TURNS, WAIT_MS));
     ASSERT_EQ_INT(0, rd.ended);
     ASSERT_EQ_INT(0, rd.short_buf);
-    ASSERT_EQ_INT(3, (int)rd.count);
-    for (int i = 0; i < 3; i++) {
+    ASSERT_EQ_INT(5, (int)rd.count);
+    for (int i = 0; i < 5 && i < (int)rd.count; i++) {
         ASSERT_EQ_INT((int)sizes[i], (int)rd.len[i]);
         ASSERT_TRUE(rd.bytes[i] != NULL);
         ASSERT_MEM_EQ(rd.bytes[i], sent[i], sizes[i]);
     }
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         free(sent[i]);
     }
     reader_free(&rd);
@@ -668,7 +689,16 @@ static void test_maximum_datagram_round_trips_and_one_more_is_refused(void) {
     ASSERT_TRUE(pump_until(fx.reactor, up_received, &uw, WAIT_TURNS, WAIT_MS));
     ASSERT_EQ_INT(1, (int)fx.up.count);
     ASSERT_EQ_INT((int)big, (int)fx.up.len[0]);
-    ASSERT_MEM_EQ(fx.up.bytes[0], payload, big);
+    /* GUARDED, and the guard is not decoration: a regression that fails
+     * the count above leaves this pointer NULL, and a segfault here takes
+     * every LATER case in the file with it -- including case 5, the one
+     * that exists for a mutation that already escaped once. Three
+     * assertions in this file died that way under a reviewer's mutation
+     * before these guards were added. */
+    ASSERT_TRUE(fx.up.bytes[0] != NULL);
+    if (fx.up.bytes[0] != NULL) {
+        ASSERT_MEM_EQ(fx.up.bytes[0], payload, big);
+    }
 
     reader_t rd;
     memset(&rd, 0, sizeof(rd));
@@ -679,7 +709,10 @@ static void test_maximum_datagram_round_trips_and_one_more_is_refused(void) {
     ASSERT_EQ_INT(0, rd.short_buf);
     ASSERT_EQ_INT(1, (int)rd.count);
     ASSERT_EQ_INT((int)big, (int)rd.len[0]);
-    ASSERT_MEM_EQ(rd.bytes[0], payload, big);
+    ASSERT_TRUE(rd.bytes[0] != NULL);
+    if (rd.bytes[0] != NULL) {
+        ASSERT_MEM_EQ(rd.bytes[0], payload, big);
+    }
 
     free(payload);
     reader_free(&rd);
@@ -763,8 +796,13 @@ static void test_oversize_upstream_datagram_is_dropped_not_truncated(void) {
     ASSERT_EQ_INT(0, rd.ended);
     ASSERT_EQ_INT(0, rd.short_buf);
     ASSERT_EQ_INT(2, (int)rd.count);
-    ASSERT_EQ_INT((int)sizeof(after), (int)rd.len[1]);
-    ASSERT_MEM_EQ(rd.bytes[1], after, sizeof(after));
+    if (rd.count >= 2) {
+        ASSERT_EQ_INT((int)sizeof(after), (int)rd.len[1]);
+        ASSERT_TRUE(rd.bytes[1] != NULL);
+        if (rd.bytes[1] != NULL) {
+            ASSERT_MEM_EQ(rd.bytes[1], after, sizeof(after));
+        }
+    }
 
     free(payload);
     reader_free(&rd);
@@ -838,8 +876,13 @@ static void test_zero_length_upstream_datagram_is_swallowed(void) {
     ASSERT_EQ_INT(0, rd.ended);
     ASSERT_EQ_INT(0, rd.short_buf);
     ASSERT_EQ_INT(1, (int)rd.count);
-    ASSERT_EQ_INT((int)sizeof(pong), (int)rd.len[0]);
-    ASSERT_MEM_EQ(rd.bytes[0], pong, sizeof(pong));
+    if (rd.count >= 1) {
+        ASSERT_EQ_INT((int)sizeof(pong), (int)rd.len[0]);
+        ASSERT_TRUE(rd.bytes[0] != NULL);
+        if (rd.bytes[0] != NULL) {
+            ASSERT_MEM_EQ(rd.bytes[0], pong, sizeof(pong));
+        }
+    }
 
     reader_free(&rd);
     client_session_close(&cs);
@@ -934,10 +977,98 @@ static void test_a_paused_read_is_resumed_when_the_pool_drains(void) {
     for (int i = 0; i < burst && i < (int)rd.count; i++) {
         fill_pattern(payload, big, (uint8_t)(0x60 + i));
         ASSERT_EQ_INT((int)big, (int)rd.len[i]);
-        ASSERT_MEM_EQ(rd.bytes[i], payload, big);
+        ASSERT_TRUE(rd.bytes[i] != NULL);
+        if (rd.bytes[i] != NULL) {
+            ASSERT_MEM_EQ(rd.bytes[i], payload, big);
+        }
     }
 
     free(payload);
+    reader_free(&rd);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* 6. AN ORDERED SESSION AGAINST A DATAGRAM UPSTREAM -- the combination
+ *    that pins "the upstream's socket type, and NOTHING ELSE, picks the
+ *    relay".
+ *
+ *    That sentence is this module's headline design decision, argued at
+ *    length in proxy.c, in proxy.h and in the commit message, and until
+ *    this case it was pinned by nothing: a review swapped the
+ *    discriminator for the SESSION's ordering mode -- `is_dgram =
+ *    sesh->ordering == UNORDERED`, which is exactly the mistake the prose
+ *    argues against -- and all 73 tests passed, because every case that
+ *    moved a byte through a datagram upstream also happened to have an
+ *    unordered session.
+ *
+ *    WHAT MAKES THIS CASE DECIDE IT is the zero-length reply, not the
+ *    round trip. Bytes cross either relay here: an ordered stream spliced
+ *    to a datagram socket works in both, because each read of the byte
+ *    stream simply becomes one datagram (which is also what Go does, and
+ *    is why this combination is legal rather than refused). What does NOT
+ *    survive the wrong relay is an empty datagram: cloak_stream_relay_t
+ *    reads its fd with read(2) and treats 0 as END OF STREAM, so under
+ *    the swapped discriminator this stream dies on the empty packet and
+ *    the reply after it never arrives. The datagram relay swallows it and
+ *    carries on.
+ *
+ *    So the follow-up datagram is the assertion, exactly as in case 4 --
+ *    and "we did not receive an empty one" would pass against both. */
+static void test_an_ordered_session_against_a_datagram_upstream(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_ordered_client(&fx, &cs, 4106));
+    if (cs.sesh.ordering != CLOAK_SESSION_ORDERING_ORDERED) {
+        fixture_destroy(&fx);
+        return;
+    }
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+
+    fx.up.echo = 0; /* the upstream answers by injection only */
+    static const uint8_t ping[4] = {'p', 'i', 'n', 'g'};
+    ASSERT_EQ_INT(4, (int)cloak_stream_write(st, ping, sizeof(ping)));
+
+    /* The ordered stream's bytes reach the upstream as ONE datagram --
+     * one read of the byte stream, one send -- which is Go's behaviour
+     * for this combination too. */
+    struct up_wait uw = {&fx.up, 1};
+    ASSERT_TRUE(pump_until(fx.reactor, up_received, &uw, WAIT_TURNS, WAIT_MS));
+    ASSERT_EQ_INT(1, (int)fx.up.count);
+    ASSERT_EQ_INT(4, (int)fx.up.len[0]);
+    ASSERT_TRUE(fx.up.bytes[0] != NULL);
+    if (fx.up.bytes[0] != NULL) {
+        ASSERT_MEM_EQ(fx.up.bytes[0], ping, sizeof(ping));
+    }
+
+    ASSERT_EQ_INT(0, up_inject(&fx.up, (const uint8_t *)"", 0));
+    static const uint8_t pong[4] = {'p', 'o', 'n', 'g'};
+    ASSERT_EQ_INT(0, up_inject(&fx.up, pong, sizeof(pong)));
+
+    reader_t rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.stream = st;
+    struct reader_wait rw = {&rd, 1};
+    ASSERT_TRUE(pump_until(fx.reactor, reader_received, &rw, WAIT_TURNS, WAIT_MS));
+    ASSERT_EQ_INT(0, rd.ended);
+    ASSERT_EQ_INT(1, (int)rd.count);
+    if (rd.count >= 1) {
+        ASSERT_EQ_INT((int)sizeof(pong), (int)rd.len[0]);
+        ASSERT_TRUE(rd.bytes[0] != NULL);
+        if (rd.bytes[0] != NULL) {
+            ASSERT_MEM_EQ(rd.bytes[0], pong, sizeof(pong));
+        }
+    }
+
     reader_free(&rd);
     client_session_close(&cs);
     fixture_destroy(&fx);
@@ -949,4 +1080,5 @@ TEST_MAIN_BEGIN()
     test_oversize_upstream_datagram_is_dropped_not_truncated();
     test_zero_length_upstream_datagram_is_swallowed();
     test_a_paused_read_is_resumed_when_the_pool_drains();
+    test_an_ordered_session_against_a_datagram_upstream();
 TEST_MAIN_END()

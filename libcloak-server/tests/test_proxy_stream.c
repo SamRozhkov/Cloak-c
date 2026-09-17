@@ -1084,6 +1084,85 @@ static void test_unordered_session_attaches(void) {
     fixture_destroy(&fx);
 }
 
+/* 8b. THE FOURTH COMBINATION, AND THE ONLY ONE NOTHING CARRIED A BYTE
+ * THROUGH: an UNORDERED session against a STREAM upstream. Case 8 above
+ * proves such a handshake attaches; this proves the pairing actually
+ * works, which is the half a review found unexercised when it swapped the
+ * relay's discriminator from the upstream's socket type to the session's
+ * ordering mode and watched all 73 tests pass.
+ *
+ * IT GETS THE STREAM RELAY, and the assertion is written to say so
+ * honestly. One datagram from the client leaves the server as bytes on a
+ * TCP socket; the echo comes back as bytes and is chopped into whatever
+ * datagrams the relay's reads happen to produce, each clamped to one
+ * frame's payload. So the count of datagrams on the way back is NOT a
+ * property this combination has -- the boundary is lost at the TCP
+ * socket, in this port exactly as in Go -- and what is asserted is the
+ * byte total, plus a size (16132, the largest one frame can carry) that
+ * makes the clamp the stream relay applies in unordered mode load-bearing
+ * rather than incidental. */
+static void test_unordered_session_over_a_stream_upstream_carries_bytes(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, "tcp"));
+
+    client_session_t cs;
+    cloak_session_config_t ccfg;
+    memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_UNORDERED;
+    ccfg.max_on_wire_size = 16401;
+    ccfg.stream_recv_capacity = 65536;
+    ccfg.stream_max_pending_frames = 64;
+    ccfg.conn_send_queue_cap = 262144;
+    ccfg.inactivity_timeout_ms = 60000;
+    ASSERT_EQ_INT(0, client_session_open(&cs, fx.reactor, front_port(&fx), fx.server_pub,
+                                         fx.uid_ok, "ss", 1101, 1 /* unordered */, &ccfg));
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(16132, (int)st->max_payload_per_frame);
+
+    size_t n = st->max_payload_per_frame;
+    uint8_t *payload = malloc(n);
+    ASSERT_TRUE(payload != NULL);
+    if (payload == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        payload[i] = (uint8_t)(0x20 + (i * 7u) + (i >> 8));
+    }
+    ASSERT_EQ_INT((int)n, (int)cloak_stream_write(st, payload, n));
+
+    struct up_wait uw = {&fx.up, 0, n};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw, 600, 5));
+    ASSERT_EQ_INT(1, fx.up.accept_count);
+    ASSERT_EQ_INT((int)n, (int)fx.up.conns[0].in_len);
+    ASSERT_MEM_EQ(fx.up.conns[0].in, payload, n);
+
+    uint8_t *back = malloc(n + 64);
+    ASSERT_TRUE(back != NULL);
+    if (back != NULL) {
+        reader_t rd = {st, back, n, 0, 0};
+        struct reader_wait rw = {&rd, n};
+        ASSERT_TRUE(pump_until(fx.reactor, reader_has, &rw, 600, 5));
+        ASSERT_EQ_INT(0, rd.ended);
+        ASSERT_EQ_INT((int)n, (int)rd.len);
+        ASSERT_MEM_EQ(rd.buf, payload, n);
+        free(back);
+    }
+
+    free(payload);
+    cloak_session_release_stream(&cs.sesh, st);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
 /* 9. AND NOR DOES A "udp" ProxyBook ENTRY. It used to redirect because
  * cloak_stream_relay_t splices a stream with a STREAM socket and had no
  * framing with which to preserve datagram boundaries. The socket type now
@@ -1812,6 +1891,7 @@ test_upstream_close_ends_stream();
 test_client_close_closes_upstream();
 test_refused_upstream_closes_only_that_stream();
 test_unordered_session_attaches();
+test_unordered_session_over_a_stream_upstream_carries_bytes();
 test_udp_proxy_book_entry_attaches();
 test_relay_start_rejection_retries_then_gives_up();
 test_permanent_start_failure_is_not_retried();

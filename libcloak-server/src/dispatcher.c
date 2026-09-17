@@ -682,16 +682,42 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
          * the one a bad UID gets -- see step 6's comment for why every
          * refusal this function makes must look alike from outside. The
          * diagnosis is therefore operator-side only: the counter below
-         * and this log line. Asserted by test_dispatcher_auth.c's
+         * and, at DEBUG, the line beside it. Asserted by
+         * test_dispatcher_auth.c's
          * test_second_connection_with_the_opposite_ordering_is_refused,
          * with test_second_connection_with_the_same_ordering_joins
          * bounding it on the other side so it cannot decay into "refuse
-         * every additional connection". */
+         * every additional connection".
+         *
+         * AND THE LOG IS AT DEBUG BECAUSE A WARN HERE WAS A TIMING
+         * ORACLE -- measured, not feared. This line shipped at
+         * CLOAK_LOGW for one round, and a review timed 150 refusals per
+         * arm through this very function: an ordering mismatch came back
+         * 13-18 microseconds slower at p10 than an unauthorised UID, 3
+         * runs out of 3, and suppressing the line alone made the two
+         * distributions coincide to within half a microsecond. The cause
+         * is not the registry lookup, it is the write: cloak_log_write is
+         * an fprintf to unbuffered stderr, i.e. a blocking write(2) from
+         * inside a reactor callback, and behind a slow consumer it is
+         * much worse than 18 us. It was also the ONLY log on any refusal
+         * path in this file -- every other refusal here (bad UID, replay,
+         * stale timestamp, unknown method, the caps) says nothing -- and
+         * it was unthrottled, one line per probe.
+         *
+         * So the whole argument for making this refusal look like every
+         * other one rested on a line that made it measurably different.
+         * At DEBUG nothing is emitted at the shipping level, and a
+         * deployment that turns DEBUG on is noisy enough everywhere else
+         * that a comparison between two refusal paths means nothing.
+         * test_second_connection_with_the_opposite_ordering_is_refused
+         * captures the log stream across the refusal and asserts it stays
+         * EMPTY, so a future line added here fails a test rather than
+         * quietly reintroducing the oracle. */
         cloak_session_ordering_t asked = info.unordered ? CLOAK_SESSION_ORDERING_UNORDERED
                                                         : CLOAK_SESSION_ORDERING_ORDERED;
         if (sesh->ordering != asked) {
             d->ordering_mismatch_refusals++;
-            CLOAK_LOGW("dispatcher: refusing a connection to session %u -- it asked for %s while "
+            CLOAK_LOGD("dispatcher: refusing a connection to session %u -- it asked for %s while "
                        "the live session is %s; no legitimate client varies this flag between the "
                        "connections of one session",
                        info.session_id, asked == CLOAK_SESSION_ORDERING_UNORDERED ? "unordered"
