@@ -116,6 +116,39 @@ static size_t stream_relay_fd_read_budget(cloak_stream_relay_t *sr, uint64_t *ou
     if (budget > STREAM_RELAY_CHUNK) {
         budget = STREAM_RELAY_CHUNK;
     }
+    /* AND, IN UNORDERED MODE, NEVER MORE THAN ONE FRAME'S PAYLOAD.
+     *
+     * STREAM_RELAY_CHUNK is 16384 and max_payload_per_frame is 16132 at
+     * the max_on_wire_size both ends of this tunnel actually use, so the
+     * clamp above can hand back a budget 252 bytes LARGER than the
+     * biggest write an unordered stream will accept. cloak_stream_write
+     * refuses such a write outright (CLOAK_STREAM_ERR_SHORT_BUFFER --
+     * splitting it would be silent corruption, because the far end does
+     * no reassembly in this mode), and pump_fd_to_stream treats every
+     * negative as fatal, so ONE large read would kill a live stream. The
+     * failure needs a local peer that writes more than 16132 bytes in one
+     * go, which is ordinary for a bulk transfer, and it would look like a
+     * connection that dies at random.
+     *
+     * Nothing could reach it before module 9: no session was ever
+     * unordered. It is clamped rather than distinguished at the write
+     * site because the refusal is not a condition this object can
+     * recover from -- the bytes are already out of the socket by then,
+     * and there is nowhere to put them back.
+     *
+     * THE ORDERED PATH IS UNTOUCHED, deliberately: it splits freely, so a
+     * clamp there would cost an extra read(2) per chunk for nothing. That
+     * is why this is conditioned on the mode rather than applied
+     * unconditionally, and it is why no existing test's behaviour
+     * changes. Pinned by
+     * libcloak-client/tests/test_udp_piper.c's
+     * test_relay_read_budget_respects_the_unordered_write_limit, which
+     * fails with the relay torn down and zero bytes delivered if this
+     * block is removed. */
+    if (sr->stream->ordering == CLOAK_SESSION_ORDERING_UNORDERED &&
+        budget > sr->stream->max_payload_per_frame) {
+        budget = sr->stream->max_payload_per_frame;
+    }
 
     /* rx/tx here are the SERVER's directions, NOT the user manager's
      * up/down -- see cloak/valve.h before touching this line. A relay

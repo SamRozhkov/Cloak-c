@@ -150,3 +150,34 @@ set_tests_properties(test_client_stack PROPERTIES TIMEOUT 60)
 # made from here rather than from that file). Every test above ends up
 # labelled "fast".
 cloak_label_fast_tests()
+
+# cloak_udp_piper_t: the client's UDP local listener. Unlike every test
+# above it does NOT link cloak-server, and that is a statement about the
+# object rather than an omission. The far end these cases need is one this
+# test drives datagram by datagram -- every case turns on what happens to
+# ONE peer's datagram queue while another peer's is healthy, and a real
+# server would decide for itself when to reply -- so the far end is a
+# second real cloak_session_t over a socketpair, the harness
+# libcloak-mux/tests/test_stream_relay.c uses. cloak-client already links
+# cloak-mux transitively, which supplies both the session and the
+# cloak_stream_relay_t that case 7 pins.
+#
+# Case 7 tests a libcloak-mux object from a libcloak-client test, which is
+# the one thing here that looks out of place: it pins the unordered read
+# budget of cloak_stream_relay_t, which module 9 task 5 was dispatched to
+# resolve, and it lives here only because a sibling's fix to the READ side
+# of that same file was in flight in libcloak-mux/tests when this was
+# written.
+add_executable(test_udp_piper test_udp_piper.c)
+target_include_directories(test_udp_piper PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_udp_piper PRIVATE cloak-client)
+add_test(NAME test_udp_piper COMMAND test_udp_piper)
+set_tests_properties(test_udp_piper PROPERTIES TIMEOUT 120)
+
+# This file forks nothing either, so the cloak_label_fast_tests() call
+# above -- which labels every test registered in this directory -- covers
+# it. Registered after that call deliberately: it labels what has been
+# registered so far, so a new test must come before it... which this one
+# does not, and so it is labelled here explicitly rather than by moving
+# the call and silently relabelling everything else.
+set_tests_properties(test_udp_piper PROPERTIES LABELS "fast")

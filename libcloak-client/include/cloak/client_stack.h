@@ -338,7 +338,15 @@ typedef struct {
      *   attempt, exactly as in Go.
      *   server_pub_key, uid, proxy_method, encryption_method, browser,
      *   transport, num_conn, singleplex, udp (-> the session's unordered
-     *   flag), remote_host/remote_port (resolved once, here),
+     *   flag AND, since module 9, WHICH LOCAL LISTENER IS BUILT: 1 gives
+     *   a cloak_udp_piper_t -- one datagram socket, one unordered stream
+     *   per source address -- instead of a TCP cloak_listener_t and a
+     *   cloak_client_piper_t. The two are alternatives, never both, and
+     *   the choice is made once here. udp WITH singleplex is REFUSED as
+     *   ERR_CONFIG: Go supports the combination and this build does not,
+     *   and quietly sharing one session where the user asked for one per
+     *   flow would give none of the isolation the mode exists for),
+     *   remote_host/remote_port (resolved once, here),
      *   local_host/local_port (the listener), stream_timeout_sec (-> the
      *   piper's first-byte deadline, which is Go's own use of
      *   StreamTimeout in RouteTCP).
@@ -582,7 +590,9 @@ void cloak_client_stack_close(cloak_client_stack_t *s);
  * is returned here is a counter or a scalar, and nothing else. */
 
 /* The port the local listener is actually bound to, which is what a
- * LocalPort of "0" makes worth asking. -1 for a NULL stack. */
+ * LocalPort of "0" makes worth asking. In UDP mode this is the datagram
+ * socket's port -- the same question, a different socket. -1 for a NULL
+ * stack. */
 int cloak_client_stack_local_port(const cloak_client_stack_t *s);
 
 /* SHARED MODE: the id of the session currently live, or 0 when none is.

@@ -2,6 +2,12 @@
 
 #include "cloak/client_stack.h"
 
+#include "cloak/udp_piper.h" /* UDP MODE: a different local listener entirely --
+                              * one datagram socket multiplexing many peers,
+                              * with no accept and no cloak_stream_relay_t.
+                              * See stack_install_piper for the three seams
+                              * the two modes share. */
+
 #include "cloak/common.h"
 #include "cloak/log.h"
 #include "cloak/session.h"
@@ -99,6 +105,15 @@ struct cloak_client_stack {
     cloak_client_piper_t piper;
     int piper_ready;
 
+    /* UDP MODE (the config's `udp`, Go's -u). The two local listeners are
+     * alternatives, never both: exactly one of piper_ready and
+     * udp_ready is ever set, and udp_mode says which -- read it rather
+     * than testing the config again at every seam, so the decision is
+     * made once, at open, where it is validated. */
+    int udp_mode;
+    cloak_udp_piper_t udp;
+    int udp_ready;
+
     cloak_listener_t local;
     int have_local;
     int local_port;
@@ -120,6 +135,15 @@ struct cloak_client_stack {
 static int stack_valid(const cloak_client_stack_t *s) {
     return s != NULL && s->self == (const void *)s;
 }
+
+/* THE ONE PLACE THE TWO LOCAL LISTENERS DIVERGE ON THE SESSION TEMPLATE,
+ * and it carries edge E1 for both: whichever piper this stack is running,
+ * ALL FOUR of the session's callbacks are its, and they must be installed
+ * BEFORE cloak_client_connector_init copies the template by value. A
+ * session built from a template with no callbacks in it establishes
+ * perfectly and then carries nothing, forever, with no error anywhere --
+ * which is the same silent failure in either mode. */
+static void stack_install_piper(cloak_client_stack_t *s, cloak_session_config_t *tmpl);
 
 /* ------------------------------------------------------------------ */
 /* Error reporting                                                      */
@@ -475,7 +499,7 @@ static int stack_start_round(cloak_client_stack_t *s, stack_slot_t *sl, int by_r
      * forever, with no error anywhere. E3 is that this runs for EVERY
      * round, not only the first -- a replacement session wired without
      * it is the same silent failure arriving minutes later. */
-    cloak_client_piper_install(&s->piper, &cc.session_template);
+    stack_install_piper(s, &cc.session_template);
 
     if (cloak_client_connector_init(&sl->c, &cc) != 0) {
         return -1;
@@ -587,7 +611,11 @@ static void stack_conn_done(cloak_client_connector_t *c, cloak_client_connector_
         stack_emit(s, CLOAK_CLIENT_STACK_EVENT_SESSION_UP, sl->session_id, sl->round, 0);
 
         if (sl->shared) {
-            cloak_client_piper_set_session(&s->piper, &sl->sesh);
+            if (s->udp_mode) {
+                cloak_udp_piper_set_session(&s->udp, &sl->sesh);
+            } else {
+                cloak_client_piper_set_session(&s->piper, &sl->sesh);
+            }
             return;
         }
         cloak_client_piper_conn_t *ctx = sl->ctx;
@@ -891,6 +919,22 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
         cloak_client_stack_close(s);
         return CLOAK_CLIENT_STACK_ERR_CONFIG;
     }
+    if (c->udp && c->singleplex) {
+        /* SINGLEPLEX IS NOT IMPLEMENTED FOR THE UDP LISTENER, and is
+         * refused here rather than silently ignored -- a client that
+         * quietly shared one session when the user asked for one per flow
+         * would give exactly the isolation the mode exists to provide and
+         * none of it. Go's RouteUDP does support the combination; the
+         * seam it needs is cloak_client_piper_t's new_session/
+         * cancel_session pair plus somewhere to hold a peer's first
+         * DATAGRAM while its session handshakes, and a shared datagram
+         * socket has no kernel buffer to leave it in the way a TCP
+         * connection does (cloak/udp_piper.h states the gap). */
+        stack_err(err, err_cap,
+                  "client config: UDP mode with singleplex is not supported by this build");
+        cloak_client_stack_close(s);
+        return CLOAK_CLIENT_STACK_ERR_CONFIG;
+    }
     if (c->stream_timeout_sec < 0) {
         stack_err(err, err_cap, "client config: StreamTimeout %d is negative",
                   c->stream_timeout_sec);
@@ -959,7 +1003,28 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
      * deadline, and cloak/client_piper.h is explicit that in singleplex
      * it is cancelled when a stream opens rather than when the byte
      * arrives. */
-    {
+    s->udp_mode = c->udp ? 1 : 0;
+    if (s->udp_mode) {
+        /* UDP MODE: one datagram socket, one unordered stream per source
+         * address, no accept and no relay. The peer deadline is the
+         * config's StreamTimeout -- Go applies exactly that quantity to a
+         * UDP peer's stream (RouteUDP's SetReadDeadline) and to a TCP
+         * connection's first byte (RouteTCP's), so both listeners read it
+         * from the same field here rather than offering a second knob. */
+        cloak_udp_piper_config_t uc;
+        memset(&uc, 0, sizeof(uc));
+        uc.reactor = s->reactor;
+        uc.peer_timeout_ms = (uint64_t)c->stream_timeout_sec * 1000u;
+        uc.max_peers = s->cfg.max_local_conns;
+        uc.chain = stack_on_broken;
+        uc.chain_userdata = s;
+        if (cloak_udp_piper_init(&s->udp, &uc) != 0) {
+            stack_err(err, err_cap, "local piper: cloak_udp_piper_init failed");
+            cloak_client_stack_close(s);
+            return CLOAK_CLIENT_STACK_ERR_PIPER;
+        }
+        s->udp_ready = 1;
+    } else {
         cloak_client_piper_config_t pc;
         memset(&pc, 0, sizeof(pc));
         pc.reactor = s->reactor;
@@ -991,15 +1056,28 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
         char addr[CLOAK_MAX_HOST_LEN + CLOAK_MAX_PORT_LEN + 4];
         char sub[200] = {0};
         join_hostport(addr, sizeof(addr), c->local_host, c->local_port);
-        if (cloak_listener_open(&s->local, s->reactor, addr, cloak_client_piper_on_accept,
-                                &s->piper, sub, sizeof(sub)) != 0) {
+        if (s->udp_mode) {
+            /* The UDP piper binds its own socket and is its own listener,
+             * so there is no cloak_listener_t in this mode and
+             * s->have_local stays 0 -- the teardown's listener step is
+             * guarded on it, and the piper's own step closes the socket. */
+            if (cloak_udp_piper_open(&s->udp, addr, sub, sizeof(sub)) != 0) {
+                stack_err(err, err_cap, "local address: \"%s\": %s", addr,
+                          sub[0] != '\0' ? sub : "bind failed");
+                cloak_client_stack_close(s);
+                return CLOAK_CLIENT_STACK_ERR_LISTEN;
+            }
+            s->local_port = cloak_udp_piper_port(&s->udp);
+        } else if (cloak_listener_open(&s->local, s->reactor, addr, cloak_client_piper_on_accept,
+                                       &s->piper, sub, sizeof(sub)) != 0) {
             stack_err(err, err_cap, "local address: \"%s\": %s", addr,
                       sub[0] != '\0' ? sub : "listen failed");
             cloak_client_stack_close(s);
             return CLOAK_CLIENT_STACK_ERR_LISTEN;
+        } else {
+            s->have_local = 1;
+            s->local_port = cloak_listener_port(&s->local);
         }
-        s->have_local = 1;
-        s->local_port = cloak_listener_port(&s->local);
     }
 
     /* ================= shared mode: round 1 =================
@@ -1019,6 +1097,14 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
 
     *out = s;
     return 0;
+}
+
+static void stack_install_piper(cloak_client_stack_t *s, cloak_session_config_t *tmpl) {
+    if (s->udp_mode) {
+        cloak_udp_piper_install(&s->udp, tmpl);
+        return;
+    }
+    cloak_client_piper_install(&s->piper, tmpl);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1059,6 +1145,16 @@ void cloak_client_stack_close(cloak_client_stack_t *s) {
         cloak_client_piper_destroy(&s->piper);
         s->piper_ready = 0;
     }
+    /* THE UDP PIPER IS STEP 1 AND STEP 2 AT ONCE, which is why it sits
+     * here rather than beside the listener above: it OWNS its socket (a
+     * datagram socket is both the listener and every connection on it),
+     * so destroying it stops new datagrams arriving AND releases every
+     * peer's stream -- and the second of those must happen before any
+     * session is destroyed, exactly as the TCP piper's relays must. */
+    if (s->udp_ready) {
+        cloak_udp_piper_destroy(&s->udp);
+        s->udp_ready = 0;
+    }
 
     /* 3. every slot left: its retry timer, its connector (which tears
      * down dials and handshakes without firing on_done) and its session.
@@ -1078,7 +1174,16 @@ void cloak_client_stack_close(cloak_client_stack_t *s) {
 /* ------------------------------------------------------------------ */
 
 int cloak_client_stack_local_port(const cloak_client_stack_t *s) {
-    return (stack_valid(s) && s->have_local) ? s->local_port : -1;
+    if (!stack_valid(s)) {
+        return -1;
+    }
+    /* In UDP mode there is no cloak_listener_t and have_local stays 0, so
+     * the port comes from the piper's own socket -- which is also what
+     * makes a LocalPort of "0" answerable in that mode. */
+    if (s->udp_mode) {
+        return cloak_udp_piper_port(&s->udp);
+    }
+    return s->have_local ? s->local_port : -1;
 }
 
 uint32_t cloak_client_stack_session_id(const cloak_client_stack_t *s) {
@@ -1125,10 +1230,23 @@ size_t cloak_client_stack_sessions_down(const cloak_client_stack_t *s) {
     return stack_valid(s) ? s->sessions_down : 0;
 }
 
+/* IN UDP MODE BOTH ARE THE PEER COUNT, and they are equal rather than
+ * merely similar: a UDP peer is created BY its first datagram and opens
+ * its stream in the same breath, so D6's window -- the difference between
+ * these two numbers, which is a TCP connection that has connected and not
+ * yet spoken -- does not exist there. There is nothing to wait for. */
 size_t cloak_client_stack_local_conns(const cloak_client_stack_t *s) {
-    return stack_valid(s) ? cloak_client_piper_conn_count(&s->piper) : 0;
+    if (!stack_valid(s)) {
+        return 0;
+    }
+    return s->udp_mode ? cloak_udp_piper_peer_count(&s->udp)
+                       : cloak_client_piper_conn_count(&s->piper);
 }
 
 size_t cloak_client_stack_local_streams(const cloak_client_stack_t *s) {
-    return stack_valid(s) ? cloak_client_piper_stream_count(&s->piper) : 0;
+    if (!stack_valid(s)) {
+        return 0;
+    }
+    return s->udp_mode ? cloak_udp_piper_peer_count(&s->udp)
+                       : cloak_client_piper_stream_count(&s->piper);
 }
