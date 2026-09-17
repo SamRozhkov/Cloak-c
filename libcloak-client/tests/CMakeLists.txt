@@ -172,7 +172,7 @@ add_executable(test_udp_piper test_udp_piper.c)
 target_include_directories(test_udp_piper PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_udp_piper PRIVATE cloak-client)
 add_test(NAME test_udp_piper COMMAND test_udp_piper)
-set_tests_properties(test_udp_piper PROPERTIES TIMEOUT 120)
+set_tests_properties(test_udp_piper PROPERTIES TIMEOUT 60)
 
 # This file forks nothing either, so the cloak_label_fast_tests() call
 # above -- which labels every test registered in this directory -- covers

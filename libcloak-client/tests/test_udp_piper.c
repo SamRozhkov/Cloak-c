@@ -360,6 +360,12 @@ struct fixture {
     cloak_udp_piper_t pp;
     int conn_fds[2];
     int far_attached;
+    /* A SECOND connection on the NEAR session whose far end is never
+     * read, so it backs up while the first stays clear. That is the only
+     * shape in which the MINIMUM free space over the pool and the
+     * AGGREGATE free space differ, which is the whole of case 10. */
+    int conn2_fds[2];
+    int have_conn2;
     int ready;
 };
 
@@ -369,10 +375,13 @@ struct fixture {
  * so that "full" is reached in a handful of datagrams rather than
  * hundreds. */
 static int fixture_init_ex(struct fixture *fx, const cloak_udp_piper_config_t *pcfg_in,
-                           size_t wire, size_t recv_cap, size_t conn_cap, int attach_far) {
+                           size_t wire, size_t recv_cap, size_t conn_cap, int attach_far,
+                           int congested_conn) {
     memset(fx, 0, sizeof(*fx));
     fx->conn_fds[0] = -1;
     fx->conn_fds[1] = -1;
+    fx->conn2_fds[0] = -1;
+    fx->conn2_fds[1] = -1;
 
     fx->r = cloak_reactor_create();
     if (fx->r == NULL) {
@@ -431,6 +440,28 @@ static int fixture_init_ex(struct fixture *fx, const cloak_udp_piper_config_t *p
         fx->far_attached = 1;
     }
 
+    if (congested_conn) {
+        /* Added to the NEAR session only, with both ends' socket buffers
+         * shrunk to the kernel minimum so it backs up after a datagram or
+         * two rather than after the 200 KiB a default socketpair holds.
+         * Nothing ever reads its far end -- that is the point. */
+        int f2[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, f2) != 0) {
+            return -1;
+        }
+        int small = 4096;
+        (void)setsockopt(f2[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+        (void)setsockopt(f2[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+        if (cloak_session_add_conn(&fx->near_sesh, f2[0]) != 0) {
+            close(f2[0]);
+            close(f2[1]);
+            return -1;
+        }
+        fx->conn2_fds[0] = f2[0]; /* the session's now */
+        fx->conn2_fds[1] = f2[1]; /* ours, and never read */
+        fx->have_conn2 = 1;
+    }
+
     cloak_udp_piper_set_session(&fx->pp, &fx->near_sesh);
     fx->ready = 1;
     return 0;
@@ -438,7 +469,7 @@ static int fixture_init_ex(struct fixture *fx, const cloak_udp_piper_config_t *p
 
 static int fixture_init(struct fixture *fx, const cloak_udp_piper_config_t *pcfg_in, size_t wire,
                         size_t recv_cap) {
-    return fixture_init_ex(fx, pcfg_in, wire, recv_cap, 0, 1);
+    return fixture_init_ex(fx, pcfg_in, wire, recv_cap, 0, 1, 0);
 }
 
 static int fixture_attach_far(struct fixture *fx) {
@@ -469,6 +500,9 @@ static void fixture_destroy(struct fixture *fx) {
     cloak_session_destroy(&fx->far.sesh);
     if (!fx->far_attached && fx->conn_fds[1] >= 0) {
         close(fx->conn_fds[1]); /* never handed to a session, so ours */
+    }
+    if (fx->have_conn2 && fx->conn2_fds[1] >= 0) {
+        close(fx->conn2_fds[1]); /* the deliberately unread far end */
     }
     cloak_reactor_destroy(fx->r);
 }
@@ -657,7 +691,14 @@ static void test_two_peers_two_streams_no_crossing(void) {
     ASSERT_EQ_INT(2, (int)cloak_udp_piper_peer_count(&fx.pp));
     ASSERT_EQ_INT(2, (int)cloak_udp_piper_peers_created(&fx.pp));
     ASSERT_EQ_INT(2, fx.far.nstreams);
-    ASSERT_TRUE(fx.far.st[0].s->id != fx.far.st[1].s->id);
+    /* Guarded so that an implementation which produced ONE stream fails
+     * the assertion above and REPORTS it, rather than dereferencing a
+     * NULL st[1].s: a crash costs a mutation battery every result after
+     * this point, and this project has already recorded two tests that
+     * segfault instead of asserting under mutation. */
+    if (fx.far.nstreams == 2) {
+        ASSERT_TRUE(fx.far.st[0].s->id != fx.far.st[1].s->id);
+    }
     /* Each stream carried exactly one peer's payload, identified by the
      * tag byte the two peers do not share. */
     ASSERT_TRUE((fx.far.st[0].tag == 0xA1 && fx.far.st[1].tag == 0xB2) ||
@@ -1166,10 +1207,45 @@ static void test_silent_peer_is_retired_after_the_deadline(void) {
     ASSERT_EQ_INT(1, (int)cloak_udp_piper_peer_count(&fx.pp));
     ASSERT_EQ_INT(0, (int)cloak_udp_piper_peers_expired(&fx.pp));
 
-    /* 4c: SILENCE RETIRES IT. Bounded by the clock at 20x the deadline,
-     * so a failure is an assertion rather than a ctest timeout. */
+    /* 4c: SILENCE RETIRES IT, AND WITHIN A BRACKET.
+     *
+     * THE UPPER BOUND IS HALF THE ASSERTION AND IT WAS MISSING. 4a and 4b
+     * pin the lower side well -- 240 ms of activity against a 150 ms
+     * deadline, in both directions -- but "it eventually expired" is
+     * satisfied by a deadline ten or a hundred times too long, and a
+     * review measured exactly that: multiplying every deadline by ten
+     * passed this entire file. At the shipping StreamTimeout of 300 s
+     * that is a peer slot, a stream and a buffer held for fifty minutes
+     * instead of five, under an unauthenticated local source address's
+     * control -- which is the resource this timer exists to bound.
+     *
+     * t_last is taken BEFORE the last datagram is sent, so the peer's own
+     * last_activity_ms is necessarily >= it and the measured span is
+     * never shorter than the true one: the lower bound cannot fire
+     * spuriously. MEASURED at 151-156 ms on this machine in Debug and
+     * under ASan, against a 150 ms deadline; the ceiling is set at 600,
+     * four times the deadline, which leaves ~4x headroom for a loaded
+     * machine and still fails the 1500 ms a 10x deadline produces. */
+    uint8_t last_reply[48];
+    fill_pattern(last_reply, sizeof(last_reply), 0x3F);
+    uint64_t t_last = monotonic_ms();
+    ASSERT_EQ_INT(48, (int)cloak_stream_write(fs->s, last_reply, sizeof(last_reply)));
+    {
+        uint8_t got[128];
+        long n = -1;
+        uint64_t start = monotonic_ms();
+        while (monotonic_ms() - start < 2000 && n < 0) {
+            cloak_reactor_run_once(fx.r, 1);
+            n = peer_recv(&p, got, sizeof(got));
+        }
+        ASSERT_EQ_INT(48, (int)n);
+    }
+
     struct peers_ctx ctx = {&fx.pp, 0};
     ASSERT_EQ_INT(1, pump_until(fx.r, peer_count_is, &ctx, 3000, 1));
+    uint64_t expiry_ms = monotonic_ms() - t_last;
+    ASSERT_COUNT_IN_RANGE("peer expiry, ms after the last datagram (deadline 150)", expiry_ms, 150,
+                          600);
     ASSERT_EQ_INT(0, (int)cloak_udp_piper_peer_count(&fx.pp));
     ASSERT_EQ_INT(1, (int)cloak_udp_piper_peers_expired(&fx.pp));
 
@@ -1518,7 +1594,7 @@ static void test_pool_backpressure_pauses_the_socket_and_resumes(void) {
      * fit, so the pause arrives after the socketpair's own buffer has
      * filled and a handful more datagrams have queued -- tens of
      * datagrams, not thousands. */
-    ASSERT_EQ_INT(0, fixture_init_ex(&fx, &pcfg, 16401, 65536, 65536, 0));
+    ASSERT_EQ_INT(0, fixture_init_ex(&fx, &pcfg, 16401, 65536, 65536, 0, 0));
     if (!fx.ready) {
         fixture_destroy(&fx);
         return;
@@ -1585,6 +1661,272 @@ static void test_pool_backpressure_pauses_the_socket_and_resumes(void) {
     ASSERT_EQ_INT(1, (int)cloak_udp_piper_peer_count(&fx.pp));
 
     close(p.fd);
+    fixture_destroy(&fx);
+}
+
+/* ============ 10. the pool bound is the MINIMUM, not the aggregate ======= */
+
+/* TWO CONNECTIONS, ONE OF THEM CONGESTED -- the only shape in which the
+ * two candidate quantities differ, and the reason the module budgets off
+ * cloak_session_send_min_conn_free rather than the aggregate free space.
+ *
+ * WHY THE AGGREGATE IS NOT MERELY LESS PRECISE. cloak_switchboard_send
+ * hands each whole frame to ONE connection chosen uniformly at random,
+ * not spread across the pool. With one congested connection among two,
+ * the aggregate stays roomy (dominated by the clear one) right up until a
+ * random pick lands on the congested one and its own per-connection cap
+ * fires -- and that fires conn_mark_broken, which breaks the switchboard,
+ * the session, and every peer on it. The cost of the wrong quantity is
+ * therefore not a dropped datagram: it is the whole tunnel.
+ *
+ * THE CONDITION IS REACHABLE BY DEFAULT, which is why this is worth a
+ * case rather than a comment. An omitted NumConn makes config_client.c
+ * set singleplex, and singleplex is refused with UDP -- so every working
+ * UDP configuration sets NumConn explicitly, and more than one connection
+ * is the ordinary value.
+ *
+ * A review measured the gap: substituting the aggregate escaped all 72
+ * tests in the tree. This case is what fails instead. */
+static void test_pool_bound_is_the_minimum_connection_not_the_aggregate(void) {
+    static struct fixture fx;
+    cloak_udp_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.peer_timeout_ms = 60000;
+    /* Both connections attached to the near session; the FIRST one's far
+     * end is read normally (so the aggregate stays large), the second's
+     * is never read (so the minimum collapses). */
+    ASSERT_EQ_INT(0, fixture_init_ex(&fx, &pcfg, 16401, 65536, 65536, 1, 1));
+    if (!fx.ready) {
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(1, fx.have_conn2);
+
+    char err[200] = {0};
+    ASSERT_EQ_INT(0, cloak_udp_piper_open(&fx.pp, "127.0.0.1:0", err, sizeof(err)));
+    int port = cloak_udp_piper_port(&fx.pp);
+    ASSERT_TRUE(port > 0);
+
+    struct peer p;
+    memset(&p, 0, sizeof(p));
+    p.fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    ASSERT_TRUE(p.fd >= 0);
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port = htons((uint16_t)port);
+    memcpy(&p.piper, &to, sizeof(to));
+    p.piper_len = sizeof(to);
+
+    static uint8_t big[16132];
+    fill_pattern(big, sizeof(big), 0xA0);
+    for (int i = 0; i < 60 && cloak_udp_piper_pool_pauses(&fx.pp) == 0; i++) {
+        if (peer_send(&p, big, sizeof(big)) != 0) {
+            pump_quiesce(fx.r, 100);
+            continue;
+        }
+        pump_quiesce(fx.r, 100);
+    }
+
+    /* THE PAUSE HAPPENED -- the minimum saw the congested connection
+     * filling even while the aggregate stayed roomy. */
+    ASSERT_TRUE(cloak_udp_piper_pool_pauses(&fx.pp) > 0);
+    /* AND NOTHING BROKE. This is the assertion the aggregate bound fails:
+     * it keeps writing until a random pick lands on the congested
+     * connection with its queue over cap, which marks it broken, breaks
+     * the session, and takes every peer with it. */
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_peer_count(&fx.pp));
+    ASSERT_EQ_INT(0, cloak_session_is_closed(&fx.near_sesh));
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_peers_expired(&fx.pp));
+
+    close(p.fd);
+    fixture_destroy(&fx);
+}
+
+/* ============ 11. IPv6 peers are peers ================================== */
+
+/* Case 1 with AF_INET6, because peer identity is family-aware code and
+ * only the AF_INET half of it was exercised: making every IPv6 sender
+ * compare equal escaped the whole suite.
+ *
+ * WHAT THIS CANNOT ASSERT, stated rather than implied: sin6_flowinfo's
+ * deliberate EXCLUSION from a peer's identity. The kernel leaves
+ * sin6_flowinfo zero in the address recvfrom reports unless the socket
+ * asked for IPV6_RECVTCLASS/flowinfo, so a sender cannot vary it through
+ * this interface and the exclusion is unobservable here -- measured, not
+ * assumed (a probe in this image reported flowinfo 0 and scope 0 on a
+ * ::1 datagram). What IS asserted is the rest: family, address, port. */
+static void test_ipv6_peers_are_distinct_peers(void) {
+    static struct fixture fx;
+    cloak_udp_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.peer_timeout_ms = 60000;
+    ASSERT_EQ_INT(0, fixture_init(&fx, &pcfg, 16401, 65536));
+    if (!fx.ready) {
+        fixture_destroy(&fx);
+        return;
+    }
+    fx.far.echo = 1;
+
+    char err[200] = {0};
+    /* If this image had no IPv6 loopback the open would fail and the
+     * assertion would name it, rather than the case quietly skipping --
+     * a skip is how a family stops being covered without anyone noticing. */
+    ASSERT_EQ_INT(0, cloak_udp_piper_open(&fx.pp, "[::1]:0", err, sizeof(err)));
+    int port = cloak_udp_piper_port(&fx.pp);
+    ASSERT_TRUE(port > 0);
+
+    struct sockaddr_in6 to;
+    memset(&to, 0, sizeof(to));
+    to.sin6_family = AF_INET6;
+    to.sin6_addr = in6addr_loopback;
+    to.sin6_port = htons((uint16_t)port);
+
+    struct peer a;
+    struct peer b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    a.fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    b.fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    ASSERT_TRUE(a.fd >= 0 && b.fd >= 0);
+    memcpy(&a.piper, &to, sizeof(to));
+    a.piper_len = sizeof(to);
+    b.piper = a.piper;
+    b.piper_len = a.piper_len;
+
+    uint8_t pa[64];
+    uint8_t pb[64];
+    fill_pattern(pa, sizeof(pa), 0x61);
+    fill_pattern(pb, sizeof(pb), 0x62);
+    ASSERT_EQ_INT(0, peer_send(&a, pa, sizeof(pa)));
+    ASSERT_EQ_INT(0, peer_send(&b, pb, sizeof(pb)));
+
+    struct pair_ctx pc = {&fx.far, 2};
+    ASSERT_EQ_INT(1, pump_until(fx.r, far_streams_at_least, &pc, PUMP_MAX_TURNS, PUMP_TURN_MS));
+    ASSERT_EQ_INT(2, (int)cloak_udp_piper_peer_count(&fx.pp));
+    ASSERT_EQ_INT(2, fx.far.nstreams);
+    /* Guarded so that an implementation which produced ONE stream fails
+     * the assertion above and REPORTS it, rather than dereferencing a
+     * NULL st[1].s: a crash costs a mutation battery every result after
+     * this point, and this project has already recorded two tests that
+     * segfault instead of asserting under mutation. */
+    if (fx.far.nstreams == 2) {
+        ASSERT_TRUE(fx.far.st[0].s->id != fx.far.st[1].s->id);
+    }
+
+    /* The same per-peer reply check case 1 makes: two v6 sockets on ::1
+     * differ ONLY in their kernel-assigned port, so a reply arriving at
+     * the wrong one is exactly what an identity that ignores the port
+     * produces. */
+    uint8_t got[128];
+    long ga = -1;
+    long gb = -1;
+    uint64_t start = monotonic_ms();
+    while (monotonic_ms() - start < 2000 && (ga < 0 || gb < 0)) {
+        cloak_reactor_run_once(fx.r, 1);
+        if (ga < 0) {
+            ga = peer_recv(&a, got, sizeof(got));
+            if (ga > 0) {
+                ASSERT_EQ_INT(64, (int)ga);
+                for (long i = 0; i < ga; i++) {
+                    ASSERT_EQ_INT(pa[i] ^ 0xFF, got[i]);
+                }
+            }
+        }
+        if (gb < 0) {
+            gb = peer_recv(&b, got, sizeof(got));
+            if (gb > 0) {
+                ASSERT_EQ_INT(64, (int)gb);
+                for (long i = 0; i < gb; i++) {
+                    ASSERT_EQ_INT(pb[i] ^ 0xFF, got[i]);
+                }
+            }
+        }
+    }
+    ASSERT_EQ_INT(64, (int)ga);
+    ASSERT_EQ_INT(64, (int)gb);
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_dropped_datagrams(&fx.pp));
+
+    close(a.fd);
+    close(b.fd);
+    fixture_destroy(&fx);
+}
+
+/* ============ 12. a hard sendto error discards ONE datagram ============== */
+
+/* THE POLICY, WHICH WAS DECIDED IN CODE AND ASSERTED NOWHERE: a sendto
+ * that fails with something other than EAGAIN cannot be retried for THAT
+ * datagram, so the datagram is discarded and the peer is KEPT -- bounded
+ * by its deadline like any other. A review's mutation that retired the
+ * peer instead escaped the whole suite, which means either behaviour
+ * would have shipped.
+ *
+ * KEEPING IT IS THE RIGHT CALL because the error belongs to a datagram,
+ * not to the flow: an AF_UNIX peer that closed and re-bound, an ICMP
+ * report on a connected socket, a datagram larger than the send buffer.
+ * A peer that has gone for good is retired by the deadline anyway, which
+ * is the same bound every other wedged peer gets -- so keeping it costs a
+ * slot for at most one timeout and never leaks one.
+ *
+ * ECONNREFUSED from an AF_UNIX datagram send to a name whose socket is
+ * gone is the reproducible instance: measured in this image at errno 111. */
+static void test_hard_send_error_discards_the_datagram_and_keeps_the_peer(void) {
+    static struct fixture fx;
+    cloak_udp_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    pcfg.peer_timeout_ms = 200;
+    ASSERT_EQ_INT(0, fixture_init(&fx, &pcfg, 16401, 65536));
+    if (!fx.ready) {
+        fixture_destroy(&fx);
+        return;
+    }
+    struct sockaddr_storage piper_addr;
+    socklen_t piper_len;
+    int piper_fd = make_unix_dgram(&piper_addr, &piper_len, "hard-p", 0);
+    ASSERT_TRUE(piper_fd >= 0);
+    ASSERT_EQ_INT(0, cloak_udp_piper_adopt(&fx.pp, piper_fd));
+
+    struct peer p;
+    memset(&p, 0, sizeof(p));
+    p.fd = make_unix_dgram(&p.me, &p.me_len, "hard-c", 0);
+    ASSERT_TRUE(p.fd >= 0);
+    p.piper = piper_addr;
+    p.piper_len = piper_len;
+
+    uint8_t msg[32];
+    fill_pattern(msg, sizeof(msg), 0xC1);
+    ASSERT_EQ_INT(0, peer_send(&p, msg, sizeof(msg)));
+    struct pair_ctx pc = {&fx.far, 1};
+    ASSERT_EQ_INT(1, pump_until(fx.r, far_streams_at_least, &pc, PUMP_MAX_TURNS, PUMP_TURN_MS));
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_peer_count(&fx.pp));
+
+    /* The peer's socket goes away, so its abstract name no longer exists
+     * and every sendto to it fails with ECONNREFUSED -- permanently, for
+     * this address. */
+    close(p.fd);
+    p.fd = -1;
+
+    struct far_stream *fs = &fx.far.st[0];
+    uint8_t reply[64];
+    fill_pattern(reply, sizeof(reply), 0xC2);
+    ASSERT_EQ_INT(64, (int)cloak_stream_write(fs->s, reply, sizeof(reply)));
+    pump_quiesce(fx.r, 300);
+
+    /* DISCARDED, NOT RETRIED: this is not backpressure, so no stall was
+     * counted and no retry timer is running. */
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_send_stalls(&fx.pp));
+    /* AND THE PEER IS STILL HERE. */
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_peer_count(&fx.pp));
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_peers_expired(&fx.pp));
+    ASSERT_EQ_INT(0, fs->closed);
+
+    /* ...and is bounded by the ordinary deadline rather than kept
+     * forever, which is what makes "keep the peer" safe. */
+    struct peers_ctx gone = {&fx.pp, 0};
+    ASSERT_EQ_INT(1, pump_until(fx.r, peer_count_is, &gone, 3000, 1));
+    ASSERT_EQ_INT(1, (int)cloak_udp_piper_peers_expired(&fx.pp));
+
     fixture_destroy(&fx);
 }
 
@@ -1811,6 +2153,9 @@ test_sizes_are_carried_whole();
 test_the_size_limit_follows_the_session();
 test_peer_map_evicts_under_churn();
 test_pool_backpressure_pauses_the_socket_and_resumes();
+test_pool_bound_is_the_minimum_connection_not_the_aggregate();
+test_ipv6_peers_are_distinct_peers();
+test_hard_send_error_discards_the_datagram_and_keeps_the_peer();
 test_relay_read_budget_respects_the_unordered_write_limit();
 test_stack_udp_mode_binds_a_datagram_socket();
 TEST_MAIN_END()

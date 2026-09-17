@@ -330,6 +330,34 @@ static int open_client_unordered(struct fixture *fx, client_session_t *cs, uint3
                                fx->uid_ok, "ss", session_id, 1, &ccfg);
 }
 
+/* The unordered client again, but with a receive queue deep enough that
+ * no datagram can be dropped no matter how many frames arrive between two
+ * of this test's own polls.
+ *
+ * THIS IS NOT PADDING, it is the module-9 drop policy applied to a test:
+ * an unordered stream's receive queue DROPS the newest datagram when it
+ * is full (cloak/stream.h, recv_dropped_datagrams) and says nothing about
+ * it, and cloak_session_on_envelope feeds every frame a connection read
+ * produces before this file's pump predicate gets to drain any of them.
+ * At 65536 that is four 16132-byte datagrams, and a multi-frame response
+ * written in one turn would lose the fifth -- a truncated body, from the
+ * reader's side, with nothing to distinguish it from the defect case 24c
+ * is about to pin. Separate from open_client_unordered so the existing
+ * cases stay byte identical. */
+static int open_client_unordered_deep(struct fixture *fx, client_session_t *cs,
+                                      uint32_t session_id) {
+    cloak_session_config_t ccfg;
+    memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_UNORDERED;
+    ccfg.max_on_wire_size = 16401;
+    ccfg.stream_recv_capacity = 1u << 20;
+    ccfg.stream_max_pending_frames = 64;
+    ccfg.conn_send_queue_cap = 262144;
+    ccfg.inactivity_timeout_ms = 60000;
+    return client_session_open(cs, fx->reactor, cloak_listener_port(&fx->front), fx->server_pub,
+                               fx->uid_ok, "ss", session_id, 1, &ccfg);
+}
+
 /* ---- response accumulation ----------------------------------------------
  *
  * Reading is done by POLLING cloak_stream_read from inside the pump
@@ -2203,6 +2231,93 @@ static void test_unordered_request_larger_than_one_read_chunk(void) {
     fixture_destroy(&fx);
 }
 
+/* ---- 24c. An unordered admin session's RESPONSE, over one frame --------
+ *
+ * THE WRITE TWIN OF 24b, AND IT WAS A LIVE DEFECT. adminapi_write_budget
+ * returns frames * max_payload_per_frame, so a pool with room for two or
+ * more worst-case frames offers a chunk LARGER than one frame's payload --
+ * at the default 262144 it offers about 242 KB. An UNORDERED stream
+ * refuses any write over max_payload_per_frame outright
+ * (CLOAK_STREAM_ERR_SHORT_BUFFER: splitting a datagram would be silent
+ * corruption, since the far end does no reassembly), and
+ * adminapi_pump_write treats every negative return as terminal. So before
+ * this case the FIRST chunk of any response over 16132 bytes was refused,
+ * `finished` was set, and the stream was torn down having written NOTHING:
+ * an admin client saw a stream close with no response at all.
+ *
+ * IT IS REACHABLE, not theoretical: dispatcher.c builds an UNORDERED admin
+ * session whenever the client sets the flag, and says so in its own
+ * comment. Our ck-client cannot ask for it today (it refuses -u), but a
+ * Go or crafted client with an admin UID can.
+ *
+ * It is the same hazard module 9 task 5 fixed for cloak_stream_relay_t's
+ * read budget, in the third and last of the three places that hand a
+ * caller-sized buffer to cloak_stream_write. The fix is the same shape --
+ * clamp to one frame's payload in unordered mode, leave the ordered path
+ * untouched -- and this case is what pins it: with the clamp removed the
+ * status line never arrives at all. */
+static void test_unordered_response_larger_than_one_frame(void) {
+    struct fixture fx;
+    /* The DEFAULT pool, deliberately: 262144 leaves room for fifteen
+     * worst-case frames, which is exactly what makes the unclamped budget
+     * hand over an oversize chunk. A small pool would hide the defect. */
+    ASSERT_EQ_INT(0, fixture_init(&fx, "unordered_resp"));
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client_unordered_deep(&fx, &cs, 11));
+
+    seed_many_users(&fx);
+    size_t n_rows = 0;
+    ASSERT_EQ_INT(0, cloak_usermanager_list(fx.manager, NULL, 0, &n_rows));
+    ASSERT_EQ_INT(BIG_USERS, (int)n_rows);
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    resp_t r;
+    resp_init(&r, st);
+    ASSERT_TRUE(r.buf != NULL);
+    const char *getreq = "GET /admin/users HTTP/1.1\r\nHost: admin\r\n\r\n";
+    ASSERT_EQ_INT((int)strlen(getreq),
+                  (int)cloak_stream_write(st, (const uint8_t *)getreq, strlen(getreq)));
+
+    ASSERT_TRUE(pump_until(fx.reactor, resp_complete, &r, 600, 5));
+    ASSERT_EQ_INT(200, resp_status(&r));
+
+    long he = resp_header_end(&r);
+    ASSERT_TRUE(he > 0);
+    long cl = resp_content_length(&r, he);
+    /* THE ASSERTION THAT NAMES THE DEFECT: the body is longer than one
+     * frame's payload, which is the only reason this case differs from
+     * every other listing case in the file. */
+    ASSERT_TRUE(cl > 16132);
+    size_t blen = 0;
+    const char *body = resp_body(&r, &blen);
+    ASSERT_EQ_INT((int)cl, (int)blen);
+
+    /* Every byte, and an intact document: a delivery that lost a middle
+     * datagram would still end with ']' and fail this count. */
+    ASSERT_TRUE(blen >= 2);
+    if (blen >= 2) {
+        ASSERT_EQ_INT('[', body[0]);
+        ASSERT_EQ_INT(']', body[blen - 1]);
+    }
+    int objects = 0;
+    for (size_t i = 0; i < blen; i++) {
+        if (body[i] == '{') {
+            objects++;
+        }
+    }
+    ASSERT_EQ_INT(BIG_USERS, objects);
+
+    finish(&fx, &cs, st, &r);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
     test_list_empty();
     test_post_then_get_round_trip();
@@ -2228,4 +2343,5 @@ TEST_MAIN_BEGIN()
     test_userpanel_chain_forwards();
     test_argument_and_lifetime_edges();
     test_unordered_request_larger_than_one_read_chunk();
+    test_unordered_response_larger_than_one_frame();
 TEST_MAIN_END()

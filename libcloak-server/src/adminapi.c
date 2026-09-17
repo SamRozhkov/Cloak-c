@@ -328,7 +328,39 @@ static size_t adminapi_write_budget(const cloak_adminapi_stream_t *ast) {
     size_t frame_cost = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + s->max_payload_per_frame +
                         (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
     size_t frames = cloak_session_send_min_conn_free(ast->as->sesh) / frame_cost;
-    return frames * s->max_payload_per_frame;
+    size_t budget = frames * s->max_payload_per_frame;
+    /* AND, IN UNORDERED MODE, NEVER MORE THAN ONE FRAME'S PAYLOAD.
+     *
+     * THIS WAS A LIVE DEFECT, not a precaution. Two frames' room offers a
+     * chunk of 2 * max_payload_per_frame; an unordered stream REFUSES any
+     * write over max_payload_per_frame outright (cloak/stream.h:
+     * CLOAK_STREAM_ERR_SHORT_BUFFER -- splitting a datagram would be
+     * silent corruption, because the far end does no reassembly in this
+     * mode), and adminapi_pump_write reads every negative return as
+     * terminal. So at the ordinary pool size the FIRST chunk of any
+     * response over 16132 bytes was refused and the stream was torn down
+     * having written nothing: an admin client saw its stream close with
+     * no response at all. It is reachable -- dispatcher.c builds an
+     * unordered admin session whenever the client's auth record sets the
+     * flag -- and pinned by test_adminapi.c's
+     * test_unordered_response_larger_than_one_frame, which sees no status
+     * line at all without this clamp.
+     *
+     * THE THIRD AND LAST OF THE THREE PLACES that size a buffer for
+     * cloak_stream_write: stream_relay_fd_read_budget carries the same
+     * clamp with the same argument, and cloak_client_piper_t's first read
+     * is already below one frame by construction. A response delivered as
+     * several datagrams is what an unordered stream can carry; it is not
+     * a byte stream and never was.
+     *
+     * THE ORDERED PATH IS UNTOUCHED, deliberately: it chunks freely, so
+     * clamping there would cost an extra frame's worth of loop iterations
+     * for nothing and would change what every existing case in that file
+     * measures. */
+    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED && budget > s->max_payload_per_frame) {
+        budget = s->max_payload_per_frame;
+    }
+    return budget;
 }
 
 /* Drains as much of the composed response as certainly fits, and tears
