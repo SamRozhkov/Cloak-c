@@ -595,6 +595,17 @@ void cloak_client_stack_close(cloak_client_stack_t *s);
  * stack. */
 int cloak_client_stack_local_port(const cloak_client_stack_t *s);
 
+/* Whether the local listener holds its port as a datagram socket, asked
+ * of the socket itself (SO_TYPE) rather than inferred from a bind at
+ * that port number succeeding or failing -- a port number can be held by
+ * any concurrent process in another protocol family, so it proves
+ * nothing about THIS socket. Returns 1 in UDP mode with a datagram
+ * socket, 0 in UDP mode if the socket is somehow not one (or once this
+ * stack is not in UDP mode -- its listener is a stream socket by
+ * construction), or -1 for a NULL stack or a UDP-mode stack with no
+ * socket yet. */
+int cloak_client_stack_local_is_datagram(const cloak_client_stack_t *s);
+
 /* SHARED MODE: the id of the session currently live, or 0 when none is.
  * SINGLEPLEX: always 0 -- there is no single session to name.
  *

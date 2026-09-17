@@ -2051,12 +2051,24 @@ static void test_relay_read_budget_respects_the_unordered_write_limit(void) {
  * cloak_stream_relay_t hazard case 7 pins.
  *
  * THE ASSERTION IS AN INVERSION, not a presence check. Binding the local
- * port as UDP must FAIL (the stack holds it) and binding it as TCP must
- * SUCCEED (the stack does not). A wiring that still opened the TCP
- * listener passes neither half; a test that only checked
- * cloak_client_stack_local_port > 0 passes both wirings. The probe socket
- * deliberately does NOT set SO_REUSEADDR: Linux lets two UDP sockets
- * share an address only when both ask to. */
+ * port as UDP must FAIL (the stack holds it) and the stack's own socket
+ * must NOT be a stream socket (it does not hold the port as TCP). A
+ * wiring that still opened a TCP listener passes neither half; a test
+ * that only checked cloak_client_stack_local_port > 0 passes both
+ * wirings. The UDP half is genuinely a question about OUR OWN socket: if
+ * anyone else held this exact port as UDP, our own open() could not have
+ * claimed it, so there is no third party to race against, and the probe
+ * socket deliberately does NOT set SO_REUSEADDR (Linux lets two UDP
+ * sockets share an address only when both ask to). The TCP half is NOT
+ * checked by attempting a TCP bind at the same port number -- ephemeral
+ * port ranges are shared ACROSS protocol families by the kernel, so any
+ * concurrent process (another test in this same ctest run) can be
+ * holding that number as TCP for reasons that have nothing to do with
+ * us, and such a probe can fail even when our listener is correctly a
+ * datagram socket. Instead it asks the stack's own descriptor what it
+ * is, via cloak_client_stack_local_is_datagram (getsockopt(SO_TYPE)
+ * underneath), which is decided by our fd alone and cannot be perturbed
+ * by any other process holding any port number. */
 static void test_stack_udp_mode_binds_a_datagram_socket(void) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
@@ -2113,10 +2125,11 @@ static void test_stack_udp_mode_binds_a_datagram_socket(void) {
     ASSERT_TRUE(bind(u, (struct sockaddr *)&a, sizeof(a)) != 0); /* the stack holds it, as UDP */
     close(u);
 
-    int t = socket(AF_INET, SOCK_STREAM, 0);
-    ASSERT_TRUE(t >= 0);
-    ASSERT_EQ_INT(0, bind(t, (struct sockaddr *)&a, sizeof(a))); /* and NOT as TCP */
-    close(t);
+    /* NOT a TCP bind probe at this port number: see this test's opening
+     * comment for why that would be racing every other process on the
+     * machine instead of testing our own socket. Ask the stack's own fd
+     * directly. */
+    ASSERT_EQ_INT(1, cloak_client_stack_local_is_datagram(st));
 
     /* No peer has spoken, so both local counters are zero -- and in this
      * mode they are the same number, because a UDP peer opens its stream

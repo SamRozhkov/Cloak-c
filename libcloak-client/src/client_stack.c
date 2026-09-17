@@ -1224,6 +1224,18 @@ int cloak_client_stack_local_port(const cloak_client_stack_t *s) {
     return s->have_local ? s->local_port : -1;
 }
 
+int cloak_client_stack_local_is_datagram(const cloak_client_stack_t *s) {
+    if (!stack_valid(s)) {
+        return -1;
+    }
+    if (s->udp_mode) {
+        return cloak_udp_piper_is_datagram(&s->udp);
+    }
+    /* No UDP piper in this mode; the local listener is a stream socket
+     * by construction, whether or not it has accepted anything yet. */
+    return 0;
+}
+
 uint32_t cloak_client_stack_session_id(const cloak_client_stack_t *s) {
     if (!stack_valid(s) || s->config.singleplex) {
         return 0;

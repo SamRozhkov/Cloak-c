@@ -964,6 +964,18 @@ int cloak_udp_piper_port(const cloak_udp_piper_t *pp) {
     return (pp == NULL || pp->fd < 0) ? -1 : pp->port;
 }
 
+int cloak_udp_piper_is_datagram(const cloak_udp_piper_t *pp) {
+    if (pp == NULL || pp->fd < 0) {
+        return -1;
+    }
+    int type = 0;
+    socklen_t len = sizeof(type);
+    if (getsockopt(pp->fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) {
+        return -1;
+    }
+    return (type == SOCK_DGRAM) ? 1 : 0;
+}
+
 void cloak_udp_piper_destroy(cloak_udp_piper_t *pp) {
     if (pp == NULL) {
         return;

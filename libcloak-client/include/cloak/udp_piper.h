@@ -520,6 +520,16 @@ int cloak_udp_piper_adopt(cloak_udp_piper_t *pp, int fd);
  * port (an AF_UNIX one). */
 int cloak_udp_piper_port(const cloak_udp_piper_t *pp);
 
+/* Asks the piper's OWN socket what it is, via getsockopt(SO_TYPE), rather
+ * than inferring it from whether some other bind on the same port number
+ * succeeds -- a port number is shared ephemeral-range real estate, not
+ * proof of anything, and any concurrent process (another test in the
+ * same run) can hold that number in another protocol family. Returns 1
+ * if the socket is SOCK_DGRAM, 0 if it is a socket of some other type,
+ * or -1 if pp is NULL, this piper has no socket, or the getsockopt call
+ * itself fails. */
+int cloak_udp_piper_is_datagram(const cloak_udp_piper_t *pp);
+
 /* Retires every peer -- cancelling both of its timers, releasing its
  * stream back to its session and freeing it -- then unregisters and
  * closes the socket.
