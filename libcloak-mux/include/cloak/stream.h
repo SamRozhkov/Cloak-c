@@ -174,7 +174,7 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
 
 void cloak_stream_destroy(cloak_stream_t *s);
 
-/* Chunks in[0,in_len) into one or more frames (each up to
+/* ORDERED: chunks in[0,in_len) into one or more frames (each up to
  * max_payload_per_frame bytes), obfuscates and hands each to the sink, in
  * order. On success returns in_len (all bytes were chunked and handed off
  * -- matching Go's Stream.Write, which never partially writes in ordered
@@ -182,7 +182,38 @@ void cloak_stream_destroy(cloak_stream_t *s);
  * an obfuscate/sink call fails partway through (some frames may already
  * have reached the sink in this case -- the stream should be considered
  * broken and torn down by the caller, exactly as a mid-write failure in
- * Go leaves the stream in an unusable state). */
+ * Go leaves the stream in an unusable state).
+ *
+ * UNORDERED: THERE IS NO CHUNKING. One write is one datagram is one
+ * frame, and a write LARGER than max_payload_per_frame is REFUSED with
+ * CLOAK_STREAM_ERR_SHORT_BUFFER, having sent nothing at all -- not a
+ * partial write, not a split, no sequence number consumed, and the write
+ * side left open and usable. Go: `if s.session.Unordered { err =
+ * io.ErrShortBuffer; return }` with n still 0 (stream.go:127-137).
+ * Splitting would be silent corruption in this mode, because the far end
+ * is a datagramBufferedPipe that does no reassembly: two frames arrive as
+ * two datagrams, and the application reads half a message.
+ *
+ * WHERE THE BOUNDARY IS, and why it is not a number this header invents:
+ * max_payload_per_frame is max_on_wire_size - CLOAK_FRAME_HEADER_LEN -
+ * CLOAK_FRAME_MAX_EXTRA_LEN, exactly Go's maxStreamUnitWrite
+ * (session.go:111). With the 16401 both ck-client and ck-server use
+ * (appDataMaxLength, internal/client/TLS.go:11) that is 16401 - 14 - 255
+ * = 16132, and 16133 is the first size refused. MEASURED against
+ * unmodified upstream v2.12.0 at that configuration -- 16132 -> one frame
+ * on the wire, 16133 -> zero frames and io.ErrShortBuffer, and the same
+ * 16133 in ordered mode -> two frames -- and asserted here by
+ * libcloak-mux/tests/test_stream_unordered.c's
+ * test_oversize_write_refused_unordered_split_ordered, which pins the
+ * derivation, both return values AND the frame counts.
+ *
+ * in_len == 0 returns 0 and sends nothing, in BOTH modes. See
+ * test_zero_length_write_sends_nothing for why this port does not carry a
+ * zero-length datagram even though it deliberately carries the 8193..16132
+ * range Go loses: Go's frame encoder refuses an empty payload outright
+ * (obfs.go:65-67), so the frame would be one no Go peer ever emits, and
+ * its 30-byte record is a length no Go Cloak produces. That is the
+ * "wire-visible" exception the plan's D7 wrote in. */
 long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len);
 
 /* Sends a single closing-only frame (CLOAK_FRAME_CLOSING_STREAM or
@@ -265,10 +296,21 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type);
  * data, and it loses it in Go too. */
 int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame);
 
-/* cloak_stream_read's UNORDERED-only return: out_cap was smaller than the
- * datagram at the head of the queue. THE DATAGRAM IS STILL QUEUED --
- * call again with a buffer of at least that many bytes and it is still
- * there. Go's io.ErrShortBuffer, from datagramBufferedPipe.go:58-60.
+/* UNORDERED-only, and returned by BOTH directions -- Go uses one error,
+ * io.ErrShortBuffer, for both, and so does this port:
+ *
+ *   cloak_stream_read   out_cap was smaller than the datagram at the head
+ *                       of the queue. THE DATAGRAM IS STILL QUEUED --
+ *                       call again with a buffer of at least that many
+ *                       bytes and it is still there
+ *                       (datagramBufferedPipe.go:58-60).
+ *   cloak_stream_write  in_len exceeded max_payload_per_frame, so the
+ *                       datagram could not be sent without splitting it.
+ *                       NOTHING WAS SENT (stream.go:127-137).
+ *
+ * The two are the same shape -- "your buffer and this datagram are the
+ * wrong sizes for each other, nothing has been consumed, try again" --
+ * which is why one value carries both.
  *
  * A DISTINCT VALUE RATHER THAN -1 because -1 already means end of stream,
  * and those two call for opposite reactions: EOF means stop reading this

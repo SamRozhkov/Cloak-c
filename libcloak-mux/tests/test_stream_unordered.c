@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
-/* THE UNORDERED (DATAGRAM) RECEIVE PATH -- module 9 task 3.
+/* THE UNORDERED (DATAGRAM) PATH -- module 9 tasks 3 (receive) and 4
+ * (send).
  *
  * This file exercises cloak_stream_t with ordering ==
  * CLOAK_SESSION_ORDERING_UNORDERED, i.e. the port of Go Cloak's
@@ -424,7 +425,18 @@ static void test_full_queue_drops_newest_and_counts(void) {
     ASSERT_EQ_INT(cloak_stream_init(&tx, 31, &o, max_on_wire, recv_cap, MAX_PENDING,
                                     CLOAK_SESSION_ORDERING_UNORDERED, wire_sink, &w),
                   0);
-    ASSERT_EQ_INT(cloak_stream_write(&tx, payload, sizeof(payload)), (long)sizeof(payload));
+    /* ONE WRITE PER FRAME, and it has to be: this tx stream is UNORDERED
+     * and its max_payload_per_frame is 4, so the single 160-byte write
+     * this case was originally written with is exactly the write module 9
+     * task 4 now REFUSES (cloak_stream_write returns
+     * CLOAK_STREAM_ERR_SHORT_BUFFER and emits nothing). Forty 4-byte
+     * writes produce the identical wire: the same forty frames, the same
+     * seq 0..39, the same payload bytes. See
+     * test_oversize_write_refused_unordered_split_ordered below for the
+     * refusal itself. */
+    for (size_t i = 0; i < n_frames; i++) {
+        ASSERT_EQ_INT(cloak_stream_write(&tx, payload + i * 4, 4), 4);
+    }
     ASSERT_EQ_INT(w.frame_count, n_frames);
 
     cloak_stream_t rx;
@@ -513,12 +525,278 @@ static void test_payload_larger_than_the_queue_is_rejected(void) {
     wire_free(&w);
 }
 
+/* Deobfuscates frame `idx` into `scratch` (which must be at least
+ * w->frame_lens[idx] bytes) and returns the decoded header and payload --
+ * `feed`'s twin, for cases that want to look at a frame rather than
+ * deliver it. The returned frame's payload points into `scratch`. */
+static cloak_frame_t peek(const wire_t *w, const cloak_obfuscator_t *o, uint8_t *scratch,
+                          size_t idx) {
+    size_t len = w->frame_lens[idx];
+    memcpy(scratch, w->frames_data + wire_offset(w, idx), len);
+    cloak_frame_t f;
+    memset(&f, 0, sizeof(f));
+    ASSERT_EQ_INT(cloak_frame_deobfuscate(o, &f, scratch, len), 0);
+    return f;
+}
+
+/* ------------------------------------------------------------------ 6 --
+ * THE WHOLE OF THE SEND SIDE OF UNORDERED MODE -- module 9 task 4, and
+ * Go's other one-line difference between the two modes
+ * (stream.go:127-137: `if s.session.Unordered { err = io.ErrShortBuffer;
+ * return }` where the ordered path would have split).
+ *
+ * THE BRACKET IS 16132/16133 AND IT WAS MEASURED, not read off a comment.
+ * Go's maxStreamUnitWrite is MsgOnWireSizeLimit - frameHeaderLength -
+ * maxExtraLen (session.go:111), and both ck-client and ck-server set
+ * MsgOnWireSizeLimit to appDataMaxLength == 16401 (internal/client/TLS.go
+ * :11, internal/server/TLS.go:16), so 16401 - 14 - 255 = 16132. Run
+ * against unmodified upstream v2.12.0 with that configuration, Go's
+ * Stream.Write reports:
+ *
+ *   unordered  Write(16132) -> n=16132, err=nil,             1 frame sent
+ *   unordered  Write(16133) -> n=0,     err=short buffer,    0 frames sent
+ *   unordered  Write(0)     -> n=0,     err=nil,             0 frames sent
+ *   ordered    Write(16132) -> n=16132, err=nil,             1 frame sent
+ *   ordered    Write(16133) -> n=16133, err=nil,             2 frames sent
+ *
+ * (measured with a counting net.Conn attached to a real MakeSession, see
+ * this task's report; the numbers below are those numbers.)
+ *
+ * WHY THE FRAME COUNT IS ASSERTED AND NOT JUST THE RETURN CODE. The
+ * mutation this case exists to kill is a refusal that discovers the
+ * problem AFTER handing the first 16132 bytes to the sink -- returning
+ * the right error, having already put half a datagram on the wire and
+ * consumed a sequence number. Every return-code-only assertion passes
+ * against that implementation, and the far end then reassembles a
+ * truncated datagram out of it, silently. So: w.frame_count before and
+ * after, and then a following write whose seq must still be the next one.
+ *
+ * MAX_ON_WIRE here is 16401, the real one, which is why this case can
+ * name 16132 as a literal at all: the derivation itself is asserted on
+ * the line above the bracket, so a change to CLOAK_FRAME_HEADER_LEN or
+ * CLOAK_FRAME_MAX_EXTRA_LEN fails here rather than silently moving the
+ * boundary this case claims to be testing. */
+static void test_oversize_write_refused_unordered_split_ordered(void) {
+    const size_t limit = 16132; /* 16401 - 14 - 255 */
+
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+
+    uint8_t *buf = (uint8_t *)malloc(limit + 1);
+    for (size_t i = 0; i < limit + 1; i++) buf[i] = (uint8_t)(i * 7 + 1);
+    uint8_t *scratch = (uint8_t *)malloc(MAX_ON_WIRE);
+
+    /* --- UNORDERED: the boundary fits, one past it is refused outright. */
+    wire_t wu;
+    wire_init(&wu);
+    cloak_stream_t u;
+    init_stream(&u, 51, &o, CLOAK_SESSION_ORDERING_UNORDERED, &wu);
+    ASSERT_EQ_INT(u.max_payload_per_frame, limit);
+
+    ASSERT_EQ_INT(cloak_stream_write(&u, buf, limit), (long)limit);
+    ASSERT_EQ_INT(wu.frame_count, 1);
+    {
+        cloak_frame_t f = peek(&wu, &o, scratch, 0);
+        ASSERT_EQ_INT(f.payload_len, limit); /* ONE frame, whole -- not the first of two */
+        ASSERT_EQ_INT(f.seq, 0);
+    }
+
+    /* One byte more. Nothing on the wire, and NOT -1: -1 is "this stream
+     * is broken", and a refused oversize datagram breaks nothing. */
+    ASSERT_EQ_INT(cloak_stream_write(&u, buf, limit + 1), CLOAK_STREAM_ERR_SHORT_BUFFER);
+    ASSERT_EQ_INT(wu.frame_count, 1); /* still 1: not a partial write, not a split */
+
+    /* The refusal consumed no sequence number and did not close the write
+     * side -- the stream is still usable, and the next frame is seq 1.
+     * This is what catches an implementation that obfuscates the first
+     * chunk (++next_write_seq) and only then decides to refuse. */
+    ASSERT_EQ_INT(cloak_stream_write(&u, buf, 3), 3);
+    ASSERT_EQ_INT(wu.frame_count, 2);
+    {
+        cloak_frame_t f = peek(&wu, &o, scratch, 1);
+        ASSERT_EQ_INT(f.seq, 1);
+        ASSERT_EQ_INT(f.payload_len, 3);
+        ASSERT_MEM_EQ(f.payload, buf, 3);
+    }
+
+    /* And the boundary datagram survives the round trip as ONE datagram,
+     * which is the reason the limit is what it is. */
+    cloak_stream_t rx;
+    init_stream(&rx, 51, &o, CLOAK_SESSION_ORDERING_UNORDERED, &wu);
+    ASSERT_EQ_INT(feed(&wu, &o, &rx, 0), 0);
+    {
+        uint8_t *out = (uint8_t *)malloc(limit);
+        ASSERT_EQ_INT(cloak_stream_read(&rx, out, limit), (long)limit);
+        ASSERT_MEM_EQ(out, buf, limit);
+        free(out);
+    }
+    cloak_stream_destroy(&rx);
+    cloak_stream_destroy(&u);
+    wire_free(&wu);
+
+    /* --- ORDERED, the same two sizes and the same fixture: 16133 SPLITS.
+     * Without this half the case would pass against an implementation
+     * that refused in both modes -- i.e. against a port that had made the
+     * datagram limit a property of the frame size rather than of the
+     * MODE, which is the whole thing under test. */
+    wire_t wo;
+    wire_init(&wo);
+    cloak_stream_t ord;
+    init_stream(&ord, 51, &o, CLOAK_SESSION_ORDERING_ORDERED, &wo);
+    ASSERT_EQ_INT(ord.max_payload_per_frame, limit);
+
+    ASSERT_EQ_INT(cloak_stream_write(&ord, buf, limit), (long)limit);
+    ASSERT_EQ_INT(wo.frame_count, 1);
+
+    ASSERT_EQ_INT(cloak_stream_write(&ord, buf, limit + 1), (long)(limit + 1));
+    ASSERT_EQ_INT(wo.frame_count, 3); /* 1 + 2: split into 16132 + 1 */
+    {
+        cloak_frame_t f1 = peek(&wo, &o, scratch, 1);
+        ASSERT_EQ_INT(f1.seq, 1);
+        ASSERT_EQ_INT(f1.payload_len, limit);
+        cloak_frame_t f2 = peek(&wo, &o, scratch, 2);
+        ASSERT_EQ_INT(f2.seq, 2);
+        ASSERT_EQ_INT(f2.payload_len, 1);
+    }
+    cloak_stream_destroy(&ord);
+    wire_free(&wo);
+
+    /* --- THE SAME BRACKET AT A LIMIT OF 4, and this third section is not
+     * decoration: everything above runs at MAX_ON_WIRE 16401, so an
+     * implementation that refused writes longer than a HARDCODED 16132 --
+     * rather than longer than this stream's own max_payload_per_frame --
+     * passes every assertion above. This project has already shipped one
+     * hardcoded constant that passed an entire suite. max_on_wire 273
+     * gives max_payload_per_frame 273 - 14 - 255 = 4, the same
+     * configuration test_full_queue_drops_newest_and_counts uses, and the
+     * refusal has to move with it. (It also separates
+     * max_payload_per_frame from write_buf_cap, which is 273 here: a
+     * guard written against the buffer size would let 5 through and split
+     * it.) */
+    const size_t small_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 4;
+    const size_t small_recv_cap = small_on_wire - CLOAK_FRAME_HEADER_LEN;
+
+    wire_t ws;
+    wire_init(&ws);
+    cloak_stream_t su;
+    ASSERT_EQ_INT(cloak_stream_init(&su, 52, &o, small_on_wire, small_recv_cap, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_UNORDERED, wire_sink, &ws),
+                  0);
+    ASSERT_EQ_INT(su.max_payload_per_frame, 4);
+    ASSERT_EQ_INT(cloak_stream_write(&su, buf, 4), 4);
+    ASSERT_EQ_INT(ws.frame_count, 1);
+    ASSERT_EQ_INT(cloak_stream_write(&su, buf, 5), CLOAK_STREAM_ERR_SHORT_BUFFER);
+    ASSERT_EQ_INT(ws.frame_count, 1);
+    cloak_stream_destroy(&su);
+    wire_free(&ws);
+
+    wire_t wso;
+    wire_init(&wso);
+    cloak_stream_t so;
+    ASSERT_EQ_INT(cloak_stream_init(&so, 52, &o, small_on_wire, small_recv_cap, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &wso),
+                  0);
+    ASSERT_EQ_INT(cloak_stream_write(&so, buf, 5), 5);
+    ASSERT_EQ_INT(wso.frame_count, 2); /* 4 + 1 */
+    cloak_stream_destroy(&so);
+    wire_free(&wso);
+
+    free(scratch);
+    free(buf);
+}
+
+/* ------------------------------------------------------------------ 7 --
+ * A ZERO-LENGTH WRITE SENDS NOTHING, IN BOTH MODES -- the plan's D7, and
+ * the one of this module's four datagram-size divergences that was
+ * settled AGAINST diverging.
+ *
+ * The plan said to carry a zero-length datagram unless doing so is
+ * wire-visible in a way that distinguishes this port from Go. It is, and
+ * the measurement is in three parts, all against unmodified upstream
+ * v2.12.0 (commit c3d5470, the revision the dev image's go-ck-client and
+ * go-ck-server are built from):
+ *
+ *   1. THE SHIPPED BINARIES SWALLOW IT, END TO END. go-ck-client -u and
+ *      go-ck-server, a real session over loopback, a UDP echo upstream: a
+ *      zero-length UDP datagram sent to the client's local port produces
+ *      NOTHING -- the upstream echo never sees it, no reply comes back,
+ *      neither binary logs anything, and the session is unharmed (4-byte
+ *      datagrams sent immediately before and after round-trip normally,
+ *      which is what makes this a measurement rather than a broken
+ *      tunnel). So no Go deployment ever puts a zero-length frame on the
+ *      wire.
+ *   2. AND IT IS THE ENCODER THAT STOPS IT, not just Stream.Write's loop:
+ *      obfuscate returns `errors.New("payload cannot be empty")` for a
+ *      zero-length payload (internal/multiplex/obfs.go:65-67), measured
+ *      by calling it. This port's cloak_frame_obfuscate returns -1 on the
+ *      same condition (libcloak-mux/src/frame.c), so "carry it" was never
+ *      reachable from stream.c anyway.
+ *   3. SO THE RECORD WOULD BE A LENGTH GO NEVER PRODUCES. Hand-building
+ *      the frame Go refuses to build gives a 30-byte record (14 header +
+ *      0 payload + 0 pad + 16 tag); the shortest frame Go can emit past
+ *      the first five of a stream -- where padding is zero -- is 31. Fed
+ *      to a real Go receive path (Session.recvDataFromRemote, both modes;
+ *      the binaries cannot be induced to emit one and the session key
+ *      makes forging one from outside impossible, so this half was
+ *      measured by executing upstream's own package rather than its
+ *      binaries) it is ACCEPTED without complaint -- no error, session
+ *      stays open, nothing after it is poisoned, and it surfaces to the
+ *      application as a Read returning (0, nil). What rules it out is
+ *      therefore NOT the peer's reaction: it is that 30 bytes is a length
+ *      no Go Cloak on earth emits, in the one place this project pays
+ *      attention to length distributions (see the chi-square in
+ *      test_frame.c).
+ *
+ * So this port does what Go does, and the loss is what Go loses: an
+ * application datagram of length zero. Go's own RouteUDP reads a
+ * zero-length UDP packet off the local socket and calls Stream.Write with
+ * it (internal/client/piper.go:83), which swallows it silently. Same
+ * here.
+ *
+ * ASSERTED IN BOTH MODES because nothing about it is mode-specific and a
+ * guard written as `in_len == 0 || in_len > max` in the unordered branch
+ * alone would be invisible otherwise. */
+static void test_zero_length_write_sends_nothing(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+
+    const cloak_session_ordering_t modes[2] = {CLOAK_SESSION_ORDERING_UNORDERED,
+                                               CLOAK_SESSION_ORDERING_ORDERED};
+    for (int i = 0; i < 2; i++) {
+        wire_t w;
+        wire_init(&w);
+        cloak_stream_t s;
+        init_stream(&s, 61, &o, modes[i], &w);
+
+        /* A valid pointer with zero length, which is what a relay pumping
+         * a zero-length datagram off a socket actually has in hand. */
+        const uint8_t byte = 0x5A;
+        ASSERT_EQ_INT(cloak_stream_write(&s, &byte, 0), 0); /* accepted, not an error */
+        ASSERT_EQ_INT(w.frame_count, 0);                    /* and nothing on the wire */
+
+        /* No sequence number was burned either: the next real write is
+         * seq 0. A zero-length frame that was built and then dropped
+         * would show up here. */
+        ASSERT_EQ_INT(cloak_stream_write(&s, &byte, 1), 1);
+        ASSERT_EQ_INT(w.frame_count, 1);
+        uint8_t scratch[MAX_ON_WIRE];
+        cloak_frame_t f = peek(&w, &o, scratch, 0);
+        ASSERT_EQ_INT(f.seq, 0);
+        ASSERT_EQ_INT(f.payload_len, 1);
+
+        cloak_stream_destroy(&s);
+        wire_free(&w);
+    }
+}
+
 TEST_MAIN_BEGIN()
     test_out_of_order_is_arrival_order_unordered_sorted_ordered();
     test_duplicate_accepted_twice_unordered_rejected_ordered();
     test_short_read_buffer_does_not_consume_the_datagram();
     test_closing_frame_closes_immediately_unordered();
     test_message_boundaries_survive();
+    test_oversize_write_refused_unordered_split_ordered();
+    test_zero_length_write_sends_nothing();
     test_full_queue_drops_newest_and_counts();
     test_payload_larger_than_the_queue_is_rejected();
 TEST_MAIN_END()

@@ -185,6 +185,49 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
     if (s->write_closed) {
         return -1;
     }
+    /* UNORDERED MODE REFUSES TO SPLIT, AND REFUSES BEFORE SENDING
+     * ANYTHING. This is the entire send-side difference between the two
+     * modes, and in Go it is two lines inside the loop below
+     * (stream.go:127-137): where the ordered path takes
+     * `in[n : maxStreamUnitWrite+n]` and goes round again, the unordered
+     * path sets `err = io.ErrShortBuffer` and returns with n still 0.
+     *
+     * HOISTED OUT OF THE LOOP DELIBERATELY. Inside the loop the refusal
+     * can only ever fire on the first iteration -- if the data fits, the
+     * loop sends one frame and ends -- so the two placements are
+     * equivalent today, and this one makes "zero frames reached the sink"
+     * structural rather than a consequence a reader has to derive. The
+     * mutation that matters is the other order: obfuscate and send the
+     * first 16132 bytes, THEN notice the remainder and return the error.
+     * That implementation returns exactly the right value, has already
+     * put a truncated datagram on the wire, and has burned a sequence
+     * number; libcloak-mux/tests/test_stream_unordered.c's
+     * test_oversize_write_refused_unordered_split_ordered asserts the
+     * sink's frame count and the next frame's seq, which is what fails
+     * against it.
+     *
+     * CLOAK_STREAM_ERR_SHORT_BUFFER, not -1, and Go agrees: this is
+     * io.ErrShortBuffer, the same error its Stream.Read gives for a read
+     * buffer too small for the datagram at the head of the queue. -1 in
+     * this file means "the write side is finished" -- a caller that saw
+     * -1 would be right to tear the stream down, and an oversize datagram
+     * breaks nothing: the write side stays open, next_write_seq is
+     * untouched, and the very next write of a legal size goes out
+     * normally.
+     *
+     * A ZERO-LENGTH WRITE IS NOT REFUSED AND NOT SENT: 0 > max is false,
+     * the loop below runs zero times, and this returns 0. That is Go
+     * (Stream.Write's `for n < len(in)`), and the plan's D7 chose it over
+     * carrying a zero-length datagram because carrying one is wire-
+     * visible -- Go's own obfuscate rejects an empty payload outright
+     * ("payload cannot be empty", internal/multiplex/obfs.go:65-67, which
+     * is why cloak_frame_obfuscate rejects it too), and the record it
+     * would have produced is 30 bytes where the shortest frame Go can
+     * emit past a stream's first five is 31. See
+     * test_zero_length_write_sends_nothing for the measurement. */
+    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED && in_len > s->max_payload_per_frame) {
+        return CLOAK_STREAM_ERR_SHORT_BUFFER;
+    }
     size_t n = 0;
     while (n < in_len) {
         size_t remaining = in_len - n;
