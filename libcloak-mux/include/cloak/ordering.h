@@ -69,11 +69,17 @@
  * site in place -- fails test_session and nothing else; deleting it from
  * cloak_stream_init fails test_stream and nothing else; writing it as
  * `ordering == CLOAK_SESSION_ORDERING_INVALID`, so that 3 and 255 are
- * accepted while 0 is still rejected, fails test_session; and replacing
- * either end's derivation of the mode from the handshake's unordered flag
- * with a fixed ORDERED fails test_client_connector (both ends) and
- * test_dispatcher_auth (the server's). Numbers from this module's task 2;
- * see its report for the full mutation table. */
+ * accepted while 0 is still rejected, fails test_session; moving the
+ * check after the other field checks fails test_session at ONE assertion
+ * (its zeroed-config case, the only thing in the tree that pins the
+ * order); and replacing either end's derivation of the mode from the
+ * handshake's unordered flag with a fixed ORDERED fails
+ * test_client_connector (both ends) and test_dispatcher_auth (the
+ * server's). Numbers from this module's task 2 and its fix round; the
+ * per-assertion table lives beside the cases themselves, in
+ * test_session.c's own case 1 -- read it before deleting either half of
+ * that case, because this branch's first attempt at that table had the
+ * two halves the wrong way round. */
 typedef enum {
     CLOAK_SESSION_ORDERING_INVALID   = 0, /* deliberate: an un-updated call site FAILS construction */
     CLOAK_SESSION_ORDERING_ORDERED   = 1, /* Go's Unordered == false: reassembled byte stream */

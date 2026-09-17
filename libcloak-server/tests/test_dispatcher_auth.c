@@ -779,6 +779,110 @@ static void test_unordered_flag_selects_the_session_ordering(void) {
     }
 }
 
+/* 14. THE ORDERING MODE IS FIXED BY A SESSION'S FIRST CONNECTION AND IS
+ * NEVER RE-CHECKED -- pinned here as it BEHAVES TODAY, which is not how
+ * it should behave, and this comment is the handover.
+ *
+ * Step 8 finds an existing (uid, session_id) and skips the whole of 8b,
+ * so the `unordered` flag of the second and every later connection is
+ * decrypted, parsed into info, and then discarded. A peer that opens a
+ * session ordered and attaches a second connection claiming unordered is
+ * SPLICED ONTO THE ORDERED SESSION, and the mirror image likewise. It is
+ * the exact analogue of the LIVE-KEY RULE the same step documents for
+ * obfuscator.session_key -- the first connection's value wins -- except
+ * that for the key that is correct and deliberate, and for the ordering
+ * mode it is neither.
+ *
+ * WHY THIS IS A TEST AND NOT A FIX. Nothing reads sesh->ordering yet
+ * (module 9 tasks 3-7 are what give the two modes different behaviour),
+ * so today this is genuinely inert: an unordered connection spliced onto
+ * an ordered session moves bytes exactly as an ordered one would. The
+ * moment the modes differ it stops being inert -- one connection of a
+ * session would be framing datagrams into a stream reassembler -- and
+ * this project has already ruled on the answer: such a connection is to
+ * be REFUSED AT JOIN with a named error, a deliberate divergence from Go,
+ * which splices silently. That refusal belongs to the task that makes the
+ * modes differ (task 6), not here.
+ *
+ * So what this case buys is that the change cannot be forgotten: it
+ * asserts the CURRENT behaviour, which means the task that implements the
+ * refusal inherits a FAILING TEST it has to come and change, with the
+ * reasoning attached, rather than a note somebody has to remember to
+ * read. Measured: teaching step 8 to re-derive the mode on the
+ * registry-hit path -- the smallest thing resembling the eventual fix --
+ * fails the final assertion below in BOTH directions (two failures, one
+ * per row, `1 != 2` and `2 != 1`) and nothing else in the 69-test suite.
+ * When you are here to change it: replace the assertions with the
+ * named refusal, keep both directions, and delete this paragraph. */
+static void test_second_connection_cannot_change_the_ordering_mode(void) {
+    /* first connection's flag, second connection's flag -- both
+     * directions, because a dispatcher that re-derived the mode from
+     * whichever connection arrived LAST would keep the ordered session
+     * ordered in the first row and only betray itself in the second. */
+    const int first_flag[2] = {0, 1};
+    const uint32_t sid[2] = {3201u, 3202u};
+
+    for (int i = 0; i < 2; i++) {
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+        int64_t now = (int64_t)time(NULL);
+        uint8_t record1[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+        uint8_t shared1[CLOAK_AEAD_KEY_LEN];
+        size_t len1 = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                          (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid[i],
+                                          first_flag[i], record1, sizeof(record1), shared1);
+        ASSERT_TRUE(len1 > 0);
+
+        int client1 = client_connect(front_port(&fx));
+        ASSERT_TRUE(client1 >= 0);
+        ASSERT_TRUE(write(client1, record1, len1) == (ssize_t)len1);
+
+        uint8_t reply1[512];
+        size_t reply1_len = 0;
+        ASSERT_EQ_INT(0, read_reply(fx.reactor, client1, reply1, sizeof(reply1), &reply1_len));
+        ASSERT_EQ_INT(1, fx.attached.calls);
+        ASSERT_EQ_INT(1, fx.attached.last_created);
+
+        /* The second connection to the SAME (uid, session_id), carrying
+         * the OPPOSITE flag. */
+        uint8_t record2[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+        uint8_t shared2[CLOAK_AEAD_KEY_LEN];
+        size_t len2 = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                          (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid[i],
+                                          first_flag[i] ? 0 : 1, record2, sizeof(record2), shared2);
+        ASSERT_TRUE(len2 > 0);
+
+        int client2 = client_connect(front_port(&fx));
+        ASSERT_TRUE(client2 >= 0);
+        ASSERT_TRUE(write(client2, record2, len2) == (ssize_t)len2);
+
+        uint8_t reply2[512];
+        size_t reply2_len = 0;
+        ASSERT_EQ_INT(0, read_reply(fx.reactor, client2, reply2, sizeof(reply2), &reply2_len));
+
+        /* It JOINED -- today's behaviour, and the half a future refusal
+         * changes: no new session, no redirect, the reply composed and
+         * sent exactly as for any additional connection. */
+        ASSERT_EQ_INT(2, fx.attached.calls);
+        ASSERT_EQ_INT(0, fx.attached.last_created);
+        ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx.registry));
+
+        /* ...and the session it joined still carries the FIRST
+         * connection's mode. */
+        ASSERT_TRUE(fx.attached.last_sesh != NULL);
+        if (fx.attached.last_sesh != NULL) {
+            ASSERT_EQ_INT((int)(first_flag[i] ? CLOAK_SESSION_ORDERING_UNORDERED
+                                              : CLOAK_SESSION_ORDERING_ORDERED),
+                          (int)fx.attached.last_sesh->ordering);
+        }
+
+        close(client1);
+        close(client2);
+        fixture_destroy(&fx);
+    }
+}
+
 TEST_MAIN_BEGIN()
     test_valid_handshake_attaches();
     test_existing_session_uses_live_key();
@@ -793,4 +897,5 @@ TEST_MAIN_BEGIN()
     test_write_error_closes_not_redirect();
     test_invalid_encryption_method_redirects();
     test_unordered_flag_selects_the_session_ordering();
+    test_second_connection_cannot_change_the_ordering_mode();
 TEST_MAIN_END()

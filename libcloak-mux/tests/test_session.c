@@ -682,23 +682,52 @@ static void test_zeroed_config_fails_with_invalid_ordering(void) {
     cloak_obfuscator_t obfuscator;
     make_obfuscator(&obfuscator);
 
-    /* 1a. The literal un-updated call site: nothing but a memset. Every
-     * other field is invalid too, so this case pins the ORDER of the
-     * checks as much as the check itself -- an implementation that
-     * validated ordering last would report -1 here and leave a caller
-     * hunting max_on_wire_size for a mistake they did not make. */
+    /* 1a. THE LOAD-BEARING HALF OF THIS CASE. The literal un-updated call
+     * site: nothing but a memset. Every other field is invalid too, which
+     * is exactly why this half is the strong one AND WHY THAT IS ONLY
+     * TRUE BECAUSE IT ASSERTS THE NAMED CODE: an implementation that
+     * validated ordering last, or not at all, still fails this config --
+     * on max_on_wire_size == 0, with -1 -- and an assertion written
+     * `!= 0` would have accepted that. Against ASSERT_EQ_INT(..., -2) it
+     * does not, so this single line pins both the check and its POSITION.
+     *
+     * MEASURED, against libcloak-mux/src/session.c, one mutation at a
+     * time, recording which of this file's ordering assertions each one
+     * fails (the three columns are this assertion, 1b's below it, and the
+     * out-of-range loop in case 3):
+     *
+     *   mutation of the ordering check           1a   1b   case 3
+     *   delete it outright                      KILL KILL KILL
+     *   write it as `== INVALID`                 --   --  KILL   (accepts 3/255)
+     *   write it as `> UNORDERED`               KILL KILL  --    (accepts 0)
+     *   move it after the other field checks    KILL  --   --
+     *   return -1 instead of the named code     KILL KILL KILL
+     *   fire only for a FULLY zeroed config      --  KILL KILL   (contrived)
+     *
+     * So: 1a kills every mutation 1b kills except one written specifically
+     * to evade it, and it is the ONLY case in this file that kills the
+     * check-order mutation. An earlier version of this comment (and of
+     * this branch's task report) claimed the opposite -- that 1b was the
+     * half that mattered and 1a the weaker one. That was asserted, never
+     * measured, and it was wrong in the most expensive possible direction:
+     * acting on it means deleting the only assertion that pins the order.
+     * DO NOT DELETE 1a. */
     cloak_session_config_t zeroed;
     memset(&zeroed, 0, sizeof(zeroed));
     cloak_session_t sesh;
     ASSERT_EQ_INT(cloak_session_init(&sesh, 1, r, &zeroed), CLOAK_SESSION_ERR_INVALID_ORDERING);
     cloak_session_destroy(&sesh); /* documented safe on a rejected init */
 
-    /* 1b. The case that actually dies when the validation is deleted:
-     * every other field is VALID and only the mode was forgotten, so
-     * there is nothing else for cloak_session_init to object to. Without
-     * 1b, deleting the ordering check from cloak_session_init leaves 1a
-     * still failing (on max_on_wire_size == 0) and reporting the wrong
-     * code -- which a non-zero assertion would have accepted. */
+    /* 1b. The documentation half, and the answer to the one question 1a
+     * leaves open: every other field is VALID and only the mode was
+     * forgotten, so there is nothing else for cloak_session_init to
+     * object to and the -2 it returns cannot be a coincidence of some
+     * other check. It is kept for that reason and because it is the only
+     * thing standing between this file and a validator that fires solely
+     * on a fully zeroed config (the last row of 1a's table) -- but it is
+     * NOT the half that carries the mechanism, and it does not pin the
+     * check's position at all. If exactly one of these two ever has to
+     * go, it is this one. */
     cloak_session_config_t forgotten;
     fill_valid_config(&forgotten, &obfuscator, CLOAK_SESSION_ORDERING_ORDERED);
     forgotten.ordering = CLOAK_SESSION_ORDERING_INVALID;

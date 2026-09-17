@@ -412,7 +412,31 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     compose the reply with sesh->obfuscator.session_key, never a fresh
  *     one (cloak/registry.h's own get_or_create doc comment explains why
  *     composing with fresh material here silently breaks every frame on
- *     this connection with no error at the handshake). If not found:
+ *     this connection with no error at the handshake).
+ *
+ *     AND THE SAME THING HAPPENS TO THE ORDERING MODE, WHICH IS A KNOWN
+ *     GAP RATHER THAN A RULE. This path skips the whole of 8b, so
+ *     info.unordered -- decrypted and parsed like every other field of
+ *     this connection's own auth record -- is DISCARDED here: the mode
+ *     the session was created with, by whichever connection got here
+ *     first, is the mode this connection joins. A peer that opens
+ *     (uid, session_id) ordered and then attaches a second connection
+ *     with the flag set is spliced onto the ordered session, and the
+ *     mirror image likewise, with no error anywhere. For the KEY, first
+ *     wins is correct and deliberate. For the ORDERING MODE it is not:
+ *     the two connections of that session would be framing different
+ *     things down the same pipe as soon as the modes differ at all.
+ *     Inert today only because nothing reads sesh->ordering yet (module
+ *     9's tasks 3-7 are what change that), and pinned as it stands by
+ *     test_dispatcher_auth.c's
+ *     test_second_connection_cannot_change_the_ordering_mode, whose own
+ *     comment carries the reasoning and the decision already taken: such
+ *     a connection is to be REFUSED AT JOIN with a named error -- a
+ *     deliberate divergence from Go, which splices silently -- by the
+ *     task that makes the modes differ. That test fails the moment
+ *     anything here starts re-deriving the mode, which is how the
+ *     decision reaches whoever makes it rather than being remembered.
+ *     If not found:
  *
  *     8a. THE PER-USER SESSIONS CAP, asked only on this path and only of
  *         a metered user. Go asks it in exactly the same place
@@ -632,7 +656,18 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
         /* THE LIVE-KEY RULE: an existing session's config (obfuscator
          * included) was fixed at whatever creation first used -- read
          * ITS key back out rather than generating a fresh one. See
-         * cloak/registry.h's own get_or_create doc comment. */
+         * cloak/registry.h's own get_or_create doc comment.
+         *
+         * NOTE WHAT ELSE IS FIXED HERE, because it is a gap and not a
+         * rule: this branch never looks at info.unordered, so a
+         * connection whose auth record disagrees with this session's
+         * ordering mode joins it anyway, silently. Read this function's
+         * own step-8 narrative above for why that is inert today, why it
+         * stops being inert in this module, and where the refusal it will
+         * become is already specified; test_dispatcher_auth.c's
+         * test_second_connection_cannot_change_the_ordering_mode pins the
+         * current behaviour and fails the moment anything here changes
+         * it. */
         memcpy(session_key, sesh->obfuscator.session_key, CLOAK_AEAD_KEY_LEN);
     } else {
         /* 8a. The per-user sessions cap. `user` is NULL for a dispatcher

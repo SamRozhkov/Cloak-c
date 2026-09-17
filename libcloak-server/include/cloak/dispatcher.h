@@ -448,7 +448,17 @@ typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_
  * irrelevant and always replaced. THE ORDERING MODE IS OVERWRITTEN FOR
  * THE SAME REASON THE VALVE IS: it is per-SESSION and chosen by the
  * client, while this template is per-DISPATCHER, and one server serves
- * ordered and unordered clients simultaneously. THE VALVE IS
+ * ordered and unordered clients simultaneously. BUT ONLY ON THE CREATE
+ * PATH, and that is a known gap rather than a design: an additional
+ * connection to an EXISTING (uid, session_id) never revisits the mode, so
+ * its own unordered flag is discarded and it joins whatever mode the
+ * session's first connection chose -- the same "first connection wins"
+ * the live-key rule states, which is right for the key and wrong for the
+ * mode. Inert until module 9 makes the modes differ, specified to become
+ * a refusal at join, and pinned meanwhile by
+ * test_dispatcher_auth.c's test_second_connection_cannot_change_the_
+ * ordering_mode; dispatcher.c's step-8 narrative carries the full
+ * reasoning. THE VALVE IS
  * OVERWRITTEN RATHER THAN DEFAULTED-TO because a
  * valve is per-USER and this template is per-DISPATCHER: a template
  * valve would meter every user on the server into one counter, which is
