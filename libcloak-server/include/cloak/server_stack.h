@@ -207,10 +207,14 @@ typedef struct {
      * above; a NON-zero field is used verbatim and is VALIDATED at
      * cloak_server_stack_open (see that function's TEMPLATE paragraph).
      *
-     * valve, on_broken and the three stream callbacks are ignored here,
-     * and are CLEARED rather than merely documented as ignored: the panel
-     * supplies the valve per user, the registry overwrites on_broken
-     * (cloak/registry.h), and prepare_session installs the other three. */
+     * ordering, valve, on_broken and the three stream callbacks are
+     * ignored here, and are CLEARED rather than merely documented as
+     * ignored: the ordering mode is the CLIENT's per-session declaration
+     * and the dispatcher sets it from the auth record it just decrypted
+     * (one server serves both modes at once, so there is no server-wide
+     * answer to put here), the panel supplies the valve per user, the
+     * registry overwrites on_broken (cloak/registry.h), and
+     * prepare_session installs the other three. */
     cloak_session_config_t session_config_template;
 
     /* The clock, shared by the user manager and the panel. NULL ->

@@ -357,12 +357,14 @@ typedef struct {
      * above; a NON-zero field is used verbatim and is VALIDATED at open
      * (see that function's TEMPLATE paragraph).
      *
-     * obfuscator, valve and the four callbacks are ignored here and are
-     * CLEARED rather than merely documented as ignored: the connector
-     * overwrites the obfuscator with the agreed key, the valve is a
-     * server-side concept, and all four callbacks belong to the piper
-     * (edge E2 -- an on_broken of a caller's own is a use-after-free,
-     * not a customisation). */
+     * obfuscator, ordering, valve and the four callbacks are ignored here
+     * and are CLEARED rather than merely documented as ignored: the
+     * connector overwrites the obfuscator with the agreed key, it
+     * likewise sets the session's ordering mode from `udp` above (the
+     * same bit it puts in the auth record, so the session and its own
+     * handshake cannot disagree), the valve is a server-side concept, and
+     * all four callbacks belong to the piper (edge E2 -- an on_broken of
+     * a caller's own is a use-after-free, not a customisation). */
     cloak_session_config_t session_template;
 
     /* 0 selects the connector's own defaults. dial_timeout_ms bounds one

@@ -6,6 +6,7 @@
 
 #include "cloak/frame.h"
 #include "cloak/bytequeue.h"
+#include "cloak/ordering.h" /* cloak_session_ordering_t, CLOAK_SESSION_ERR_INVALID_ORDERING */
 
 /* Returns 0 on success (bytes accepted for transmission -- the connection
  * layer may still buffer them internally), or -1 on a hard failure (the
@@ -38,6 +39,15 @@ typedef struct {
  * on backpressure -- see its own doc comment. */
 typedef struct {
     uint32_t id;
+
+    /* The mode of the session that owns this stream, copied in at
+     * construction. Never CLOAK_SESSION_ORDERING_INVALID on a constructed
+     * stream. A stream cannot disagree with its session about this: every
+     * stream this session ever creates -- locally opened or discovered by
+     * an inbound frame -- is initialised from the one value the session
+     * stored at cloak_session_init, and nothing writes it afterwards. See
+     * cloak/ordering.h for what the two modes mean. */
+    cloak_session_ordering_t ordering;
 
     const cloak_obfuscator_t *obfuscator; /* not owned -- must outlive the stream */
     cloak_stream_frame_sink_t sink;
@@ -79,11 +89,22 @@ typedef struct {
  * cap, not unboundedly, but this is a real per-frame cost to weigh when
  * choosing the value, not just a memory bound.
  *
+ * ordering is the owning session's mode, and is a PARAMETER here for a
+ * reason that does not apply one layer up: this is a function, so a call
+ * site that predates the mode does not compile at all -- there is no
+ * zeroed struct to forget a field in. The trap that matters is on
+ * cloak_session_config_t (cloak/ordering.h says why); this parameter's job
+ * is only to make it impossible to construct a stream that disagrees with
+ * its session, and to reject the zero value at this layer too so that the
+ * session is not the single point holding the invariant up.
+ *
  * sink must be non-NULL (rejected with -1 otherwise). max_pending_frames
  * == 0 is silently treated as 1 (a minimum of one out-of-order frame can
  * always be buffered) rather than rejected.
  *
- * Returns 0 on success, -1 on allocation failure or invalid parameters
+ * Returns 0 on success, CLOAK_SESSION_ERR_INVALID_ORDERING if ordering is
+ * not one of the two real modes (checked FIRST, before any other
+ * parameter), and -1 on allocation failure or invalid parameters
  * (max_on_wire_size too small to fit a header, recv_capacity == 0, or
  * recv_capacity smaller than max_on_wire_size - CLOAK_FRAME_HEADER_LEN --
  * too small to ever hold this stream's own largest possible frame
@@ -91,6 +112,7 @@ typedef struct {
  * stream permanently). */
 int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *obfuscator,
                        size_t max_on_wire_size, size_t recv_capacity, size_t max_pending_frames,
+                       cloak_session_ordering_t ordering,
                        cloak_stream_frame_sink_t sink, void *sink_userdata);
 
 void cloak_stream_destroy(cloak_stream_t *s);

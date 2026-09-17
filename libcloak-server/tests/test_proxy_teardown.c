@@ -583,6 +583,7 @@ static int open_client_as(struct fixture *fx, client_session_t *cs,
                           const char *proxy_method) {
     cloak_session_config_t ccfg;
     memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     ccfg.max_on_wire_size = 16401;
     ccfg.stream_recv_capacity = 65536;
     ccfg.stream_max_pending_frames = 64;
@@ -1189,6 +1190,7 @@ static void test_foreign_session_reaches_chain_untouched(void) {
     cloak_session_config_t scfg;
     memset(&scfg, 0, sizeof(scfg));
     scfg.obfuscator.method = CLOAK_AEAD_AES_256_GCM;
+    scfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     scfg.max_on_wire_size = 16401;
     scfg.stream_recv_capacity = 65536;
     scfg.stream_max_pending_frames = 64;
@@ -1261,6 +1263,7 @@ static void test_registry_full_reclaims_prepared_context(void) {
     cloak_session_config_t scfg;
     memset(&scfg, 0, sizeof(scfg));
     scfg.obfuscator.method = CLOAK_AEAD_AES_256_GCM;
+    scfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     scfg.max_on_wire_size = 16401;
     scfg.stream_recv_capacity = 65536;
     scfg.stream_max_pending_frames = 64;

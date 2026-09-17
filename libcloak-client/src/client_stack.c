@@ -748,6 +748,15 @@ static void fill_template_defaults(cloak_session_config_t *t) {
      * window in which a relay bound to a dying session can be stopped,
      * which is a use-after-free rather than a customisation. */
     memset(&t->obfuscator, 0, sizeof(t->obfuscator));
+    /* The ordering mode joins this list for the same reason: it is
+     * per-session and derived from the client config's `udp` where the
+     * session is actually built (client_connector.c's assemble), so a
+     * value left here is one a caller could believe in. Cleared to
+     * CLOAK_SESSION_ORDERING_INVALID -- if anything ever DOES try to
+     * construct a session straight from this template without supplying
+     * the mode, it fails loudly instead of running in whichever mode the
+     * caller happened to type. */
+    t->ordering = CLOAK_SESSION_ORDERING_INVALID;
     t->valve = NULL;
     t->on_broken = NULL;
     t->on_broken_userdata = NULL;
@@ -896,8 +905,19 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
      * first happens inside the first bring-up, where the connector
      * reports CLOAK_CLIENT_CONNECTOR_ERR_SESSION and nothing more. */
     {
+        /* The ordering mode is the one field the probe has to supply
+         * itself: it is per-SESSION and derived from `udp` at assemble
+         * time (client_connector.c), so the template never carries it --
+         * fill_template_defaults clears it for the same reason it clears
+         * the obfuscator. Probing with the mode this client will actually
+         * use, rather than a fixed ORDERED, is what keeps this check
+         * exact if a later task ever makes the two modes demand different
+         * things of the other fields. */
+        cloak_session_config_t probe_cfg = s->cfg.session_template;
+        probe_cfg.ordering =
+            c->udp ? CLOAK_SESSION_ORDERING_UNORDERED : CLOAK_SESSION_ORDERING_ORDERED;
         cloak_session_t probe;
-        if (cloak_session_init(&probe, 1, s->reactor, &s->cfg.session_template) != 0) {
+        if (cloak_session_init(&probe, 1, s->reactor, &probe_cfg) != 0) {
             stack_err(err, err_cap,
                       "session template: cloak_session_init rejected it "
                       "(max_on_wire_size=%zu, stream_recv_capacity=%zu, "

@@ -446,6 +446,7 @@ static int front_port(struct fixture *fx) {
 static int open_client(struct fixture *fx, client_session_t *cs, uint32_t session_id) {
     cloak_session_config_t ccfg;
     memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     ccfg.max_on_wire_size = 16401;
     ccfg.stream_recv_capacity = 65536;
     ccfg.stream_max_pending_frames = 64;

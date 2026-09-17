@@ -659,6 +659,25 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
         cloak_session_config_t session_cfg = d->cfg.session_config_template;
         session_cfg.obfuscator.method = (cloak_aead_method_t)info.encryption_method;
         memcpy(session_cfg.obfuscator.session_key, session_key, CLOAK_AEAD_KEY_LEN);
+        /* THE ORDERING MODE. Per-SESSION and declared by the CLIENT, in
+         * the flag byte of the auth record step 5 just decrypted, so --
+         * exactly like the obfuscator and the valve around it -- it can
+         * never come from the template: one server serves ordered and
+         * unordered clients at the same time. Deriving it here is what
+         * makes a session's mode structurally equal to the mode its peer
+         * asked for rather than equal by coincidence.
+         *
+         * Nothing reads this field yet (module 9's tasks 3-7 are what
+         * give the two modes different behaviour), and the only path that
+         * currently refuses an unordered client does so ABOVE this point
+         * and for its own reasons -- cloak_proxy_prepare_session's
+         * obligation 5, which runs at step 8c below and redirects rather
+         * than building a stream that would mangle datagrams. An admin
+         * session that set the flag reaches here and is built UNORDERED;
+         * that is the honest record of what the client asked for, and it
+         * is inert until those tasks land. See cloak/ordering.h. */
+        session_cfg.ordering = info.unordered ? CLOAK_SESSION_ORDERING_UNORDERED
+                                              : CLOAK_SESSION_ORDERING_ORDERED;
         /* THE METER. Per-USER (it is the panel's, shared by every session
          * that user holds) installed into a per-SESSION config, which is
          * why it is set here and can never come from the template. NULL

@@ -113,14 +113,26 @@ static int try_drain(cloak_stream_t *s) {
 
 int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *obfuscator,
                        size_t max_on_wire_size, size_t recv_capacity, size_t max_pending_frames,
+                       cloak_session_ordering_t ordering,
                        cloak_stream_frame_sink_t sink, void *sink_userdata) {
     memset(s, 0, sizeof(*s));
+    /* FIRST, before every other parameter: the caller who gets this wrong
+     * is the caller who does not know the parameter exists, and telling
+     * them about some other field they also left at zero sends them
+     * looking in the wrong place. Enumerating the two real modes rather
+     * than testing `!= CLOAK_SESSION_ORDERING_INVALID` is what makes 3 and
+     * 255 fail too -- see cloak/ordering.h. */
+    if (ordering != CLOAK_SESSION_ORDERING_ORDERED &&
+        ordering != CLOAK_SESSION_ORDERING_UNORDERED) {
+        return CLOAK_SESSION_ERR_INVALID_ORDERING;
+    }
     if (max_on_wire_size <= CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN ||
         recv_capacity == 0 || recv_capacity < max_on_wire_size - CLOAK_FRAME_HEADER_LEN ||
         sink == NULL) {
         return -1;
     }
     s->id = id;
+    s->ordering = ordering;
     s->obfuscator = obfuscator;
     s->sink = sink;
     s->sink_userdata = sink_userdata;

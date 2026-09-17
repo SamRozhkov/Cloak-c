@@ -471,6 +471,7 @@ static void test_session_add_conn_framing(void) {
     memset(&scfg, 0, sizeof(scfg));
     scfg.obfuscator.method = CLOAK_AEAD_AES_256_GCM;
     cloak_random_bytes(scfg.obfuscator.session_key, sizeof(scfg.obfuscator.session_key));
+    scfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     scfg.max_on_wire_size = 2048;
     scfg.stream_recv_capacity = 65536;
     scfg.stream_max_pending_frames = 64;

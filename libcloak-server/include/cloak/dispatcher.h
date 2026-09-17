@@ -435,15 +435,21 @@ typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_
  *
  * session_config_template is copied by value into every NEWLY created
  * session's config (cloak_server_registry_find found nothing): the
- * dispatcher overwrites exactly three fields of the copy before passing
+ * dispatcher overwrites exactly four fields of the copy before passing
  * it to cloak_server_registry_get_or_create --
  * obfuscator.method (the client's authenticated, wire-validated
  * encryption method), obfuscator.session_key (a fresh
- * cloak_random_bytes key), and valve (the authorised user's own meter,
- * cloak_userpanel_user_valve, which is NULL both for a bypass user and
- * for a dispatcher with no panel at all) -- so whatever this template's
- * own obfuscator and valve fields hold is irrelevant and always
- * replaced. THE VALVE IS OVERWRITTEN RATHER THAN DEFAULTED-TO because a
+ * cloak_random_bytes key), ordering (CLOAK_SESSION_ORDERING_UNORDERED
+ * iff the client set the auth record's unordered flag, ORDERED
+ * otherwise -- see cloak/ordering.h), and valve (the authorised user's
+ * own meter, cloak_userpanel_user_valve, which is NULL both for a bypass
+ * user and for a dispatcher with no panel at all) -- so whatever this
+ * template's own obfuscator, ordering and valve fields hold is
+ * irrelevant and always replaced. THE ORDERING MODE IS OVERWRITTEN FOR
+ * THE SAME REASON THE VALVE IS: it is per-SESSION and chosen by the
+ * client, while this template is per-DISPATCHER, and one server serves
+ * ordered and unordered clients simultaneously. THE VALVE IS
+ * OVERWRITTEN RATHER THAN DEFAULTED-TO because a
  * valve is per-USER and this template is per-DISPATCHER: a template
  * valve would meter every user on the server into one counter, which is
  * not a weaker version of the right answer but a wrong one. on_broken/

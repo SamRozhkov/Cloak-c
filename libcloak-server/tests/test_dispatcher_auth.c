@@ -723,6 +723,62 @@ static void test_invalid_encryption_method_redirects(void) {
     fixture_destroy(&fx);
 }
 
+/* 13. THE UNORDERED FLAG DECIDES THE SESSION'S ORDERING MODE. The flag
+ * byte of the auth record has been parsed since module 3
+ * (cloak_server_clientinfo_t::unordered) and, until this module, was read
+ * by nothing that built a session -- so a client asking for datagrams got
+ * a byte-stream session and no part of this suite noticed.
+ *
+ * Both values are driven, and the assertion is on the session the
+ * dispatcher actually created, not on info: a dispatcher that ignored the
+ * flag and left every session in whichever mode a template carried would
+ * pass every other case in this file, including the one above that
+ * already builds a session and inspects its obfuscator. Measured against
+ * exactly that mutation (dispatcher.c step 8b replaced by a fixed
+ * CLOAK_SESSION_ORDERING_ORDERED), which this case is what fails.
+ *
+ * This file's prepare_cb accepts everything, which is what lets an
+ * unordered handshake get as far as a session here -- the real
+ * cloak_proxy_prepare_session refuses one (cloak/proxy.h obligation 5)
+ * because this port has no datagram data path yet. That refusal is a
+ * policy one layer above this one, and it is tested where it lives. */
+static void test_unordered_flag_selects_the_session_ordering(void) {
+    const int cases[2] = {0, 1};
+    for (int i = 0; i < 2; i++) {
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+        int64_t now = (int64_t)time(NULL);
+        uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+        uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
+        size_t record_len =
+            build_client_record(fx.server_pub, fx.uid_ok, "ss", (uint8_t)CLOAK_AEAD_AES_256_GCM,
+                                now, (uint32_t)(3101 + i), cases[i], record, sizeof(record),
+                                shared_secret);
+        ASSERT_TRUE(record_len > 0);
+
+        int client = client_connect(front_port(&fx));
+        ASSERT_TRUE(client >= 0);
+        ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
+
+        uint8_t reply[512];
+        size_t reply_len = 0;
+        ASSERT_EQ_INT(0, read_reply(fx.reactor, client, reply, sizeof(reply), &reply_len));
+
+        ASSERT_EQ_INT(1, fx.attached.calls);
+        ASSERT_EQ_INT(1, fx.attached.last_created);
+        ASSERT_TRUE(fx.attached.last_sesh != NULL);
+        if (fx.attached.last_sesh != NULL) {
+            ASSERT_EQ_INT((int)(cases[i] ? CLOAK_SESSION_ORDERING_UNORDERED
+                                         : CLOAK_SESSION_ORDERING_ORDERED),
+                          (int)fx.attached.last_sesh->ordering);
+        }
+
+        close(client);
+        fixture_destroy(&fx);
+    }
+}
+
 TEST_MAIN_BEGIN()
     test_valid_handshake_attaches();
     test_existing_session_uses_live_key();
@@ -736,4 +792,5 @@ TEST_MAIN_BEGIN()
     test_write_resumes_after_eagain();
     test_write_error_closes_not_redirect();
     test_invalid_encryption_method_redirects();
+    test_unordered_flag_selects_the_session_ordering();
 TEST_MAIN_END()

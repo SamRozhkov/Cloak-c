@@ -356,7 +356,7 @@ static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_by
     cloak_stream_t *stream = &entry->stream;
     if (cloak_stream_init(stream, frame.stream_id, &sesh->obfuscator,
                            sesh->max_on_wire_size, sesh->stream_recv_capacity,
-                           sesh->stream_max_pending_frames,
+                           sesh->stream_max_pending_frames, sesh->ordering,
                            session_stream_sink_adapter, sesh) != 0) {
         free(entry);
         return;
@@ -404,6 +404,20 @@ static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_by
 int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reactor,
                         const cloak_session_config_t *config) {
     memset(sesh, 0, sizeof(*sesh));
+    /* THE ORDERING MODE, CHECKED BEFORE ANYTHING ELSE. A caller who
+     * forgot this field is a caller who memset a config and filled in the
+     * fields they knew about, so their config is invalid in several other
+     * ways too and whichever check runs first is the diagnosis they get.
+     * Ordering runs first deliberately: it is the one that names the
+     * field they actually do not know exists. See cloak/ordering.h for
+     * why the zero value is a construction failure rather than a default,
+     * and test_session.c's ordering block for the case that fails if this
+     * check is deleted, the case that fails if it runs later, and the
+     * case that fails if it is written as `!= INVALID`. */
+    if (config->ordering != CLOAK_SESSION_ORDERING_ORDERED &&
+        config->ordering != CLOAK_SESSION_ORDERING_UNORDERED) {
+        return CLOAK_SESSION_ERR_INVALID_ORDERING;
+    }
     if (config->max_on_wire_size <= CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN ||
         config->stream_recv_capacity == 0 ||
         config->stream_recv_capacity < config->max_on_wire_size - CLOAK_FRAME_HEADER_LEN ||
@@ -414,6 +428,7 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
 
     sesh->id = id;
     sesh->reactor = reactor;
+    sesh->ordering = config->ordering;
     sesh->obfuscator = config->obfuscator;
     sesh->next_stream_id = 1; /* matches Go's MakeSession: nextStreamID starts at 1 */
     sesh->max_on_wire_size = config->max_on_wire_size;
@@ -504,7 +519,7 @@ cloak_stream_t *cloak_session_open_stream(cloak_session_t *sesh, uint32_t *out_i
     cloak_stream_t *stream = &entry->stream;
     if (cloak_stream_init(stream, id, &sesh->obfuscator, sesh->max_on_wire_size,
                            sesh->stream_recv_capacity, sesh->stream_max_pending_frames,
-                           session_stream_sink_adapter, sesh) != 0) {
+                           sesh->ordering, session_stream_sink_adapter, sesh) != 0) {
         free(entry);
         return NULL;
     }

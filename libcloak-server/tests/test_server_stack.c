@@ -491,6 +491,7 @@ static int front_port(const cloak_server_stack_t *st) {
 
 static void client_config(cloak_session_config_t *ccfg) {
     memset(ccfg, 0, sizeof(*ccfg));
+    ccfg->ordering = CLOAK_SESSION_ORDERING_ORDERED;
     ccfg->max_on_wire_size = CLOAK_SERVER_STACK_DEFAULT_MAX_ON_WIRE_SIZE;
     ccfg->stream_recv_capacity = CLOAK_SERVER_STACK_DEFAULT_STREAM_RECV_CAPACITY;
     ccfg->stream_max_pending_frames = CLOAK_SERVER_STACK_DEFAULT_STREAM_MAX_PENDING;

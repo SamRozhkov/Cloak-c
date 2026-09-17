@@ -74,6 +74,7 @@ static void init_session_pair(cloak_session_t *client, sesh_harness_t *client_h,
     cloak_session_config_t client_cfg;
     memset(&client_cfg, 0, sizeof(client_cfg));
     client_cfg.obfuscator = *shared_obfuscator;
+    client_cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     client_cfg.max_on_wire_size = MAX_ON_WIRE;
     client_cfg.stream_recv_capacity = STREAM_RECV_CAP;
     client_cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -165,6 +166,7 @@ static void test_multiple_streams_multiple_conns_byte_exact(void) {
     cloak_session_config_t client_cfg;
     memset(&client_cfg, 0, sizeof(client_cfg));
     client_cfg.obfuscator = obfuscator;
+    client_cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     client_cfg.max_on_wire_size = MAX_ON_WIRE;
     client_cfg.stream_recv_capacity = STREAM_RECV_CAP;
     client_cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -326,6 +328,7 @@ static void test_inactivity_timeout_closes_session(void) {
     cloak_session_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.obfuscator = obfuscator;
+    cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = MAX_ON_WIRE;
     cfg.stream_recv_capacity = STREAM_RECV_CAP;
     cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -403,6 +406,7 @@ static void test_on_new_stream_closing_session_is_safe(void) {
     cloak_session_config_t client_cfg;
     memset(&client_cfg, 0, sizeof(client_cfg));
     client_cfg.obfuscator = obfuscator;
+    client_cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     client_cfg.max_on_wire_size = MAX_ON_WIRE;
     client_cfg.stream_recv_capacity = STREAM_RECV_CAP;
     client_cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -473,6 +477,7 @@ static void test_close_stream_after_peer_disconnect_is_safe(void) {
     cloak_session_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.obfuscator = obfuscator;
+    cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = MAX_ON_WIRE;
     cfg.stream_recv_capacity = STREAM_RECV_CAP;
     cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -526,6 +531,7 @@ static void test_stream_write_after_peer_disconnect_is_safe(void) {
     cloak_session_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.obfuscator = obfuscator;
+    cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = MAX_ON_WIRE;
     cfg.stream_recv_capacity = STREAM_RECV_CAP;
     cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -582,6 +588,7 @@ static void test_on_broken_destroying_and_freeing_heap_session_is_safe(void) {
     cloak_session_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.obfuscator = obfuscator;
+    cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = MAX_ON_WIRE;
     cfg.stream_recv_capacity = STREAM_RECV_CAP;
     cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -622,6 +629,7 @@ static void test_destroy_after_failed_init_is_safe(void) {
     cloak_session_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.obfuscator = obfuscator;
+    cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = 0; /* invalid -- too small to fit a header */
     cfg.stream_recv_capacity = STREAM_RECV_CAP;
     cfg.stream_max_pending_frames = STREAM_MAX_PENDING;
@@ -635,6 +643,190 @@ static void test_destroy_after_failed_init_is_safe(void) {
     cloak_reactor_destroy(r);
 }
 
+/* ---- the session's ordering mode --------------------------------------
+ *
+ * WHAT THESE FOUR CASES ARE FOR, and why "construction failed" is not
+ * enough for any of them. cloak_session_config_t is built the way every
+ * config in this tree is built -- memset, then assignments -- so the
+ * failure mode this mode has to survive is a call site that never learns
+ * the field exists. Nothing in a round-trip test can see that: both ends
+ * of every test in this file are ours, and a pair of sessions that are
+ * both ordered and a pair that are both unordered pass every assertion
+ * above identically (cloak/ordering.h's own comment makes the same point
+ * about the C-to-C blindness this mechanism exists to cover). So the only
+ * thing that can see a forgotten field is construction refusing to
+ * proceed, and the only thing that can tell "the implementation read the
+ * field" apart from "the implementation failed for some other reason" is
+ * the SPECIFIC error code -- which is why every assertion below names
+ * CLOAK_SESSION_ERR_INVALID_ORDERING rather than testing for non-zero.
+ * The same test written against != 0 passes unchanged on an
+ * implementation that never looks at ordering at all, because the zeroed
+ * config it feeds is invalid in four other ways too. */
+
+static void fill_valid_config(cloak_session_config_t *cfg, const cloak_obfuscator_t *o,
+                              cloak_session_ordering_t ordering) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->ordering = ordering;
+    cfg->obfuscator = *o;
+    cfg->max_on_wire_size = MAX_ON_WIRE;
+    cfg->stream_recv_capacity = STREAM_RECV_CAP;
+    cfg->stream_max_pending_frames = STREAM_MAX_PENDING;
+    cfg->conn_send_queue_cap = CONN_SEND_QUEUE_CAP;
+    cfg->inactivity_timeout_ms = 60000;
+}
+
+/* Case 1: a memset-zeroed config fails with the NAMED code. */
+static void test_zeroed_config_fails_with_invalid_ordering(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    cloak_obfuscator_t obfuscator;
+    make_obfuscator(&obfuscator);
+
+    /* 1a. The literal un-updated call site: nothing but a memset. Every
+     * other field is invalid too, so this case pins the ORDER of the
+     * checks as much as the check itself -- an implementation that
+     * validated ordering last would report -1 here and leave a caller
+     * hunting max_on_wire_size for a mistake they did not make. */
+    cloak_session_config_t zeroed;
+    memset(&zeroed, 0, sizeof(zeroed));
+    cloak_session_t sesh;
+    ASSERT_EQ_INT(cloak_session_init(&sesh, 1, r, &zeroed), CLOAK_SESSION_ERR_INVALID_ORDERING);
+    cloak_session_destroy(&sesh); /* documented safe on a rejected init */
+
+    /* 1b. The case that actually dies when the validation is deleted:
+     * every other field is VALID and only the mode was forgotten, so
+     * there is nothing else for cloak_session_init to object to. Without
+     * 1b, deleting the ordering check from cloak_session_init leaves 1a
+     * still failing (on max_on_wire_size == 0) and reporting the wrong
+     * code -- which a non-zero assertion would have accepted. */
+    cloak_session_config_t forgotten;
+    fill_valid_config(&forgotten, &obfuscator, CLOAK_SESSION_ORDERING_ORDERED);
+    forgotten.ordering = CLOAK_SESSION_ORDERING_INVALID;
+    ASSERT_EQ_INT(cloak_session_init(&sesh, 1, r, &forgotten), CLOAK_SESSION_ERR_INVALID_ORDERING);
+    cloak_session_destroy(&sesh);
+
+    cloak_reactor_destroy(r);
+}
+
+/* Case 2: both real modes construct, and the session keeps the one it was
+ * given. The second half is not decoration: a validator that accepted
+ * both values and then stored a constant would pass the first half, and
+ * every stream on that session would inherit the wrong mode. */
+static void test_both_orderings_construct(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    cloak_obfuscator_t obfuscator;
+    make_obfuscator(&obfuscator);
+
+    const cloak_session_ordering_t modes[2] = {CLOAK_SESSION_ORDERING_ORDERED,
+                                               CLOAK_SESSION_ORDERING_UNORDERED};
+    for (int i = 0; i < 2; i++) {
+        cloak_session_config_t cfg;
+        fill_valid_config(&cfg, &obfuscator, modes[i]);
+        cloak_session_t sesh;
+        ASSERT_EQ_INT(cloak_session_init(&sesh, (uint32_t)(i + 1), r, &cfg), 0);
+        ASSERT_EQ_INT(sesh.ordering, modes[i]);
+        cloak_session_destroy(&sesh);
+    }
+
+    cloak_reactor_destroy(r);
+}
+
+/* Case 3: a value outside the enum fails with the SAME named code. 3 is
+ * the next one up (the value a caller who copied conn.h's four-valued
+ * framing enum would land on); 255 is the arbitrary-garbage end. A
+ * validator written as `ordering != INVALID` passes case 1 and case 2 and
+ * dies here, which is the only reason this case exists. */
+static void test_out_of_range_ordering_fails(void) {
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    cloak_obfuscator_t obfuscator;
+    make_obfuscator(&obfuscator);
+
+    const int bogus[2] = {3, 255};
+    for (int i = 0; i < 2; i++) {
+        cloak_session_config_t cfg;
+        fill_valid_config(&cfg, &obfuscator, CLOAK_SESSION_ORDERING_ORDERED);
+        cfg.ordering = (cloak_session_ordering_t)bogus[i];
+        cloak_session_t sesh;
+        ASSERT_EQ_INT(cloak_session_init(&sesh, 1, r, &cfg), CLOAK_SESSION_ERR_INVALID_ORDERING);
+        cloak_session_destroy(&sesh);
+    }
+
+    cloak_reactor_destroy(r);
+}
+
+/* Case 4: a stream cannot disagree with the session that owns it, on
+ * EITHER of the two ways a stream comes into existence -- opened locally
+ * (cloak_session_open_stream) and discovered by an inbound frame
+ * (session_on_envelope's new-stream path). Both modes are exercised
+ * because a session.c that passed a literal CLOAK_SESSION_ORDERING_ORDERED
+ * to cloak_stream_init instead of sesh->ordering would pass the ordered
+ * half of this test and every other test in this tree. */
+static void ordering_pair_case(cloak_session_ordering_t ordering) {
+    cloak_reactor_t *client_r = cloak_reactor_create();
+    cloak_reactor_t *server_r = cloak_reactor_create();
+    ASSERT_TRUE(client_r != NULL && server_r != NULL);
+
+    cloak_obfuscator_t obfuscator;
+    make_obfuscator(&obfuscator);
+
+    sesh_harness_t client_h, server_h;
+    memset(&client_h, 0, sizeof(client_h));
+    memset(&server_h, 0, sizeof(server_h));
+
+    cloak_session_config_t client_cfg;
+    fill_valid_config(&client_cfg, &obfuscator, ordering);
+    client_cfg.on_new_stream = on_new_stream;
+    client_cfg.on_new_stream_userdata = &client_h;
+    client_cfg.on_broken = on_broken;
+    client_cfg.on_broken_userdata = &client_h;
+    cloak_session_t client;
+    ASSERT_EQ_INT(cloak_session_init(&client, 1, client_r, &client_cfg), 0);
+
+    cloak_session_config_t server_cfg = client_cfg;
+    server_cfg.on_new_stream_userdata = &server_h;
+    server_cfg.on_broken_userdata = &server_h;
+    cloak_session_t server;
+    ASSERT_EQ_INT(cloak_session_init(&server, 2, server_r, &server_cfg), 0);
+
+    int fds[2];
+    ASSERT_EQ_INT(make_nonblocking_socketpair(fds), 0);
+    ASSERT_EQ_INT(cloak_session_add_conn(&client, fds[0]), 0);
+    ASSERT_EQ_INT(cloak_session_add_conn(&server, fds[1]), 0);
+
+    uint32_t stream_id;
+    cloak_stream_t *client_stream = cloak_session_open_stream(&client, &stream_id);
+    ASSERT_TRUE(client_stream != NULL);
+    ASSERT_EQ_INT(client_stream->ordering, ordering);
+    ASSERT_EQ_INT(client_stream->ordering, client.ordering);
+
+    const char *msg = "ordering";
+    ASSERT_EQ_INT(cloak_stream_write(client_stream, (const uint8_t *)msg, strlen(msg)),
+                  (long)strlen(msg));
+
+    int always_false = 0;
+    pump_until(client_r, server_r, &always_false, 5);
+
+    ASSERT_EQ_INT(server_h.new_stream_count, 1);
+    cloak_stream_t *server_stream = server_h.last_new_stream;
+    ASSERT_TRUE(server_stream != NULL);
+    ASSERT_EQ_INT(server_stream->ordering, ordering);
+    ASSERT_EQ_INT(server_stream->ordering, server.ordering);
+
+    cloak_session_release_stream(&client, client_stream);
+    cloak_session_release_stream(&server, server_stream);
+    cloak_session_destroy(&client);
+    cloak_session_destroy(&server);
+    cloak_reactor_destroy(client_r);
+    cloak_reactor_destroy(server_r);
+}
+
+static void test_streams_inherit_session_ordering(void) {
+    ordering_pair_case(CLOAK_SESSION_ORDERING_ORDERED);
+    ordering_pair_case(CLOAK_SESSION_ORDERING_UNORDERED);
+}
+
 TEST_MAIN_BEGIN()
     test_single_stream_single_conn_round_trip();
     test_multiple_streams_multiple_conns_byte_exact();
@@ -646,4 +838,8 @@ TEST_MAIN_BEGIN()
     test_stream_write_after_peer_disconnect_is_safe();
     test_on_broken_destroying_and_freeing_heap_session_is_safe();
     test_destroy_after_failed_init_is_safe();
+    test_zeroed_config_fails_with_invalid_ordering();
+    test_both_orderings_construct();
+    test_out_of_range_ordering_fails();
+    test_streams_inherit_session_ordering();
 TEST_MAIN_END()
