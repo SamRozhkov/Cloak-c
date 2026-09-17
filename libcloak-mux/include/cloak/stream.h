@@ -6,6 +6,7 @@
 
 #include "cloak/frame.h"
 #include "cloak/bytequeue.h"
+#include "cloak/msgqueue.h"
 #include "cloak/ordering.h" /* cloak_session_ordering_t, CLOAK_SESSION_ERR_INVALID_ORDERING */
 
 /* Returns 0 on success (bytes accepted for transmission -- the connection
@@ -29,14 +30,31 @@ typedef struct {
 
 /* One multiplexed logical stream's framing state: chunks outbound bytes
  * into frames (obfuscating and handing each to a caller-supplied sink),
- * and reassembles inbound frames (received out of order, since a session
- * spreads one stream's frames across multiple underlying connections) back
- * into an ordered byte stream via a sequence-number min-heap -- the
- * single-threaded, non-blocking equivalent of Go Cloak's
- * Stream+streamBuffer+streamBufferedPipe. Unlike Go, nothing here ever
- * blocks: cloak_stream_read returns 0 immediately if no data is ready yet
- * (never blocks waiting for it), and cloak_stream_feed_frame never blocks
- * on backpressure -- see its own doc comment. */
+ * and turns inbound frames back into something readable. Unlike Go,
+ * nothing here ever blocks: cloak_stream_read returns 0 immediately if no
+ * data is ready yet (never blocks waiting for it), and
+ * cloak_stream_feed_frame never blocks on backpressure -- see its own doc
+ * comment.
+ *
+ * THE RECEIVE SIDE IS TWO DIFFERENT MACHINES AND `ordering` PICKS WHICH,
+ * exactly as Go's makeStream picks between two recvBuffer implementations
+ * from one bit (stream.go:59-63). Every field below is annotated with the
+ * mode it belongs to, because roughly half of them are dead in either
+ * mode and a reader who does not know that will look for bugs in the
+ * wrong half:
+ *
+ *   ORDERED    heap + next_recv_seq + recv_bytes. Frames are sorted by
+ *              sequence number into a gap-free byte stream; an
+ *              out-of-order frame waits in the min-heap until its
+ *              predecessors arrive. Go's streamBuffer wrapping a
+ *              streamBufferedPipe.
+ *   UNORDERED  recv_msgs alone. No sequence state at all, no heap, no
+ *              duplicate check: one frame in is one whole datagram out,
+ *              immediately, in arrival order, duplicates included. Go's
+ *              datagramBufferedPipe.
+ *
+ * The two never both run: cloak_stream_init constructs only the queue its
+ * mode uses, and cloak_stream_destroy tears down only that one. */
 typedef struct {
     uint32_t id;
 
@@ -59,13 +77,42 @@ typedef struct {
     uint64_t next_write_seq;
     int write_closed;
 
-    cloak_bytequeue_t recv_bytes;
-    uint64_t next_recv_seq;
-    cloak_pending_frame_t *heap; /* owned, binary min-heap by .seq */
-    size_t heap_len;
-    size_t heap_cap;
-    size_t max_pending_frames; /* defensive cap on out-of-order buffering */
-    int recv_closing_seen;     /* a closing frame has been drained into order */
+    cloak_bytequeue_t recv_bytes;     /* ORDERED only -- zeroed and unused when UNORDERED */
+    uint64_t next_recv_seq;           /* ORDERED only */
+    cloak_pending_frame_t *heap;      /* ORDERED only: owned, binary min-heap by .seq */
+    size_t heap_len;                  /* ORDERED only */
+    size_t heap_cap;                  /* ORDERED only */
+    size_t max_pending_frames;        /* ORDERED only: defensive cap on out-of-order buffering */
+
+    cloak_msgqueue_t recv_msgs;       /* UNORDERED only -- zeroed and unused when ORDERED */
+
+    /* UNORDERED only. Datagrams dropped because recv_msgs was full when
+     * they arrived, i.e. the count of this port's one deliberate,
+     * declared divergence from Go on the receive path: Go's
+     * datagramBufferedPipe blocks the writing goroutine until the reader
+     * makes room (datagramBufferedPipe.go:72-81), which a single-threaded
+     * reactor cannot do, so a full queue drops the NEWEST datagram
+     * instead. Dropping the newest rather than the oldest is the plan's
+     * Ruling 2: nothing already accepted is ever discarded, which is what
+     * a full socket receive buffer does and what a UDP application is
+     * already written against. The counter exists because a silent drop
+     * with no evidence is the thing that makes packet loss
+     * un-diagnosable; it is not read by anything in the mux layer, and is
+     * here for the relays (module 9 tasks 5 and 6) and for tests. A drop
+     * is NOT an error: cloak_stream_feed_frame still returns 0, because
+     * returning -1 would retire a stream over transient backpressure. */
+    uint64_t recv_dropped_datagrams;
+
+    /* BOTH modes, with subtly different meanings. ORDERED: a closing
+     * frame has been drained INTO ORDER (it reached next_recv_seq).
+     * UNORDERED: a closing frame has ARRIVED, full stop -- there is no
+     * order for it to reach. The difference is divergence (c) of the
+     * scouting report's §6.3 and it is observable: in unordered mode a
+     * closing frame closes the stream before an earlier data frame that
+     * is still in flight, which is what Go does
+     * (datagramBufferedPipe.go:83-87 sets closed the moment the frame
+     * lands, without consulting any sequence number). */
+    int recv_closing_seen;
 } cloak_stream_t;
 
 /* max_on_wire_size is the same quantity as Go's SessionConfig.MsgOnWireSizeLimit
@@ -73,6 +120,16 @@ typedef struct {
  * this function derives the actual per-frame payload budget from it the
  * same way Go's Session does (accounting for the frame header and the
  * worst-case padding/AEAD overhead).
+ *
+ * IN UNORDERED MODE recv_capacity SIZES THE DATAGRAM QUEUE INSTEAD and
+ * max_pending_frames IS IGNORED ENTIRELY (there is no out-of-order
+ * buffering to bound -- nothing is ever held back). The recv_capacity
+ * bound below is deliberately left exactly as it is for both modes even
+ * though the datagram queue's true requirement is 251 bytes laxer (see
+ * cloak_msgqueue_write): one rule about which configurations are legal,
+ * so the two modes cannot disagree about it, and so a session that
+ * validated its capacity once at cloak_session_init does not have to
+ * revalidate per mode.
  *
  * recv_capacity is the reassembled-byte-queue's fixed capacity (Go's
  * streamBufferedPipe has no real cap in practice -- 1<<31-1 -- because Go
@@ -154,30 +211,112 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type);
  * cloak_stream_recv_available), not as rejected frames, except for the
  * defensive max_pending_frames cap itself.
  *
- * Returns 0 (accepted, delivered and/or buffered for reassembly), 1 (a
- * closing frame was drained into order -- the caller should tear this
- * stream down after this call), or -1 (protocol violation: frame->seq is
- * a duplicate/already-delivered sequence number, frame->payload_len
- * exceeds the receive queue's total capacity (can never fit, regardless
- * of current free space), the out-of-order buffer's max_pending_frames
- * cap was exceeded, or an allocation failure).
+ * (That paragraph describes ORDERED mode. In UNORDERED mode there is no
+ * reorder buffer and no deep copy at all: the payload is copied straight
+ * into the datagram queue if it fits and DROPPED if it does not -- see
+ * recv_dropped_datagrams, and cloak_msgqueue_write for why a drop is the
+ * only non-blocking answer available.)
  *
- * Note: a closing frame that arrives out of order may not drain
- * immediately -- if it's buffered because earlier frames are still
+ * Returns 0 (accepted, delivered and/or buffered for reassembly), 1 (a
+ * closing frame -- the caller should tear this stream down after this
+ * call), or -1 (protocol violation).
+ *
+ * WHAT -1 MEANS DIFFERS BY MODE, AND THIS IS THE SHARPEST EDGE IN THE
+ * WHOLE FILE, because cloak_session_on_envelope reacts to a -1 by
+ * RETIRING the stream (libcloak-mux/src/session.c:320-337 and :393-396:
+ * `if (rc == 1 || rc == -1) session_retire_stream(...)`). A return value
+ * is therefore a decision to kill a stream, not a diagnostic.
+ *
+ *   ORDERED    -1 for: a duplicate or already-delivered frame->seq, a
+ *              frame->payload_len exceeding the receive queue's total
+ *              capacity (can never fit, regardless of current free
+ *              space), the max_pending_frames cap being exceeded, or an
+ *              allocation failure. Unchanged by module 9; the
+ *              duplicate-kills-the-stream behaviour is a deliberate,
+ *              documented improvement over Go (which has no error path
+ *              there at all) and test_stream.c pins it.
+ *   UNORDERED  -1 ONLY for a frame->payload_len that exceeds the datagram
+ *              queue's total capacity. Nothing else: a duplicate seq, a
+ *              late seq, a seq that skips ahead, a full queue -- all
+ *              return 0. THE DUPLICATE CASE IS THE ONE THAT MATTERS. Our
+ *              own sender never duplicates a frame, so every C-to-C test
+ *              in this tree agrees with itself either way; a real Go peer
+ *              spreading one stream over NumConn connections reorders as
+ *              a matter of course, and Go's datagramBufferedPipe accepts
+ *              every one of those frames. Keeping the ordered path's
+ *              duplicate check here would retire a stream that Go keeps
+ *              alive, over traffic Go considers normal. See the scouting
+ *              report's §6.3, divergences (b), (c) and (d): all three
+ *              route through this single return value.
+ *
+ * Note: in ORDERED mode a closing frame that arrives out of order may not
+ * drain immediately -- if it's buffered because earlier frames are still
  * missing, or if draining is backpressured, the close is only detected
  * later, when cloak_stream_read internally re-attempts the drain. A
  * caller must therefore also treat cloak_stream_read's own -1
  * (end-of-stream) return as a close signal, not rely solely on this
- * function ever returning 1. */
+ * function ever returning 1. In UNORDERED mode the 1 is immediate and
+ * unconditional -- a closing frame closes the stream on arrival, ahead of
+ * any earlier data frame still in flight, and that earlier frame is then
+ * discarded (this function returns 1 again for it, matching Go's
+ * datagramBufferedPipe.Write returning toBeClosed on a closed pipe,
+ * datagramBufferedPipe.go:73-75). Datagrams that arrived BEFORE the close
+ * stay readable until drained; only the close-then-data order loses
+ * data, and it loses it in Go too. */
 int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame);
 
-/* Copies up to out_cap reassembled bytes into out. Returns bytes copied
- * (0 if none are ready yet -- not an error, just "nothing to read right
- * now"), or -1 once the stream has both seen a closing frame drain into
- * order AND fully delivered every byte before it (end of stream). Calling
- * this after a previous -1 return continues to return -1. */
+/* cloak_stream_read's UNORDERED-only return: out_cap was smaller than the
+ * datagram at the head of the queue. THE DATAGRAM IS STILL QUEUED --
+ * call again with a buffer of at least that many bytes and it is still
+ * there. Go's io.ErrShortBuffer, from datagramBufferedPipe.go:58-60.
+ *
+ * A DISTINCT VALUE RATHER THAN -1 because -1 already means end of stream,
+ * and those two call for opposite reactions: EOF means stop reading this
+ * stream forever, short buffer means read it again with a bigger buffer.
+ * Go distinguishes them (io.EOF versus io.ErrShortBuffer) and its own
+ * client still conflates them in effect -- piper.go's reader goroutine
+ * breaks out of its loop on ANY error, which is why a reply of 8193..16132
+ * bytes silently tears the peer's tunnel down (scouting report §6.6, bug
+ * 6, measured against ck-client v2.12.0). -2 rather than -1 is what lets
+ * this port's relays not repeat that.
+ *
+ * -2 specifically, following CLOAK_CONN_ERR_INVALID_FRAMING and
+ * CLOAK_SESSION_ERR_INVALID_ORDERING: in this tree a second named
+ * negative on an existing -1 contract is -2. */
+#define CLOAK_STREAM_ERR_SHORT_BUFFER (-2)
+
+/* ORDERED: copies up to out_cap reassembled bytes into out. Returns bytes
+ * copied (0 if none are ready yet -- not an error, just "nothing to read
+ * right now"), or -1 once the stream has both seen a closing frame drain
+ * into order AND fully delivered every byte before it (end of stream).
+ * Calling this after a previous -1 return continues to return -1.
+ *
+ * UNORDERED: copies exactly ONE whole datagram and returns its length --
+ * never part of one, never two concatenated. Boundaries are preserved end
+ * to end: three writes of 1, 1500 and 8191 bytes come back as three reads
+ * of exactly 1, 1500 and 8191. Returns 0 if no datagram is queued yet, -1
+ * at end of stream (closed AND drained -- queued datagrams outlive the
+ * close), or CLOAK_STREAM_ERR_SHORT_BUFFER if out_cap is too small for
+ * the datagram at the head, WITHOUT consuming it.
+ *
+ * ONE DELIBERATE DIVERGENCE FROM GO, in unordered mode only: out_cap == 0
+ * with a datagram queued returns CLOAK_STREAM_ERR_SHORT_BUFFER, where
+ * Go's Stream.Read short-circuits `if len(buf) == 0 { return 0, nil }`
+ * before ever reaching its recvBuffer (stream.go:83-85). Go's answer
+ * makes a zero-length read indistinguishable from "nothing to read",
+ * which on a non-blocking reactor is an invitation to spin; ours reports
+ * the truth. It is not wire-visible, no caller in this tree passes 0, and
+ * saying so here is cheaper than a reader later finding the difference
+ * and assuming it is a bug. */
 long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap);
 
+/* Readable APPLICATION bytes waiting: ORDERED, reassembled bytes in the
+ * byte queue; UNORDERED, the total payload of all queued datagrams (the
+ * queue's own per-datagram length prefixes are not counted -- see
+ * cloak_msgqueue_payload_bytes). In unordered mode this is a
+ * backpressure number, not a read size: a caller sizing a read buffer
+ * wants the NEXT datagram's length, which is what a short-buffer return
+ * from cloak_stream_read tells it to go and find. */
 size_t cloak_stream_recv_available(const cloak_stream_t *s);
 
 #endif

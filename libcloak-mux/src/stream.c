@@ -144,22 +144,40 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
     }
     s->write_buf_cap = max_on_wire_size;
 
-    if (cloak_bytequeue_init(&s->recv_bytes, recv_capacity) != 0) {
+    /* ONE receive queue, never both -- Go's makeStream picks one
+     * recvBuffer implementation from the same bit (stream.go:59-63). The
+     * unused one stays as memset left it, which is why every read of
+     * either must be behind the same branch this is; see cloak/stream.h's
+     * per-field mode annotations. */
+    if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        if (cloak_msgqueue_init(&s->recv_msgs, recv_capacity) != 0) {
+            free(s->write_buf);
+            s->write_buf = NULL;
+            return -1;
+        }
+    } else if (cloak_bytequeue_init(&s->recv_bytes, recv_capacity) != 0) {
         free(s->write_buf);
         s->write_buf = NULL;
         return -1;
     }
+    /* Meaningless in unordered mode (nothing is ever held back), but set
+     * unconditionally rather than left at 0 so that no future reader of
+     * this field has to know which mode they are in to interpret it. */
     s->max_pending_frames = max_pending_frames > 0 ? max_pending_frames : 1;
     return 0;
 }
 
 void cloak_stream_destroy(cloak_stream_t *s) {
     free(s->write_buf);
-    cloak_bytequeue_destroy(&s->recv_bytes);
-    for (size_t i = 0; i < s->heap_len; i++) {
-        free(s->heap[i].payload);
+    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        cloak_msgqueue_destroy(&s->recv_msgs);
+    } else {
+        cloak_bytequeue_destroy(&s->recv_bytes);
+        for (size_t i = 0; i < s->heap_len; i++) {
+            free(s->heap[i].payload);
+        }
+        free(s->heap);
     }
-    free(s->heap);
     memset(s, 0, sizeof(*s));
 }
 
@@ -236,7 +254,71 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type) {
     return 0;
 }
 
+/* THE UNORDERED RECEIVE PATH, and the whole of it -- Go's
+ * datagramBufferedPipe.Write (datagramBufferedPipe.go:69-95) with the
+ * sync.Cond wait replaced by a drop, because a reactor cannot block.
+ *
+ * Read the list of things this deliberately does NOT do before deciding
+ * something is missing: it does not look at frame->seq, it does not
+ * compare against any expected sequence number, it does not detect
+ * duplicates, and it does not buffer anything out of order. Go's
+ * datagramBufferedPipe does none of those either, and a real Go peer
+ * spreading one stream across NumConn connections produces reordered and
+ * (on retransmit paths) repeated frames as normal traffic. Anything
+ * "fixed" here becomes a stream this port kills and Go does not. */
+static int feed_frame_unordered(cloak_stream_t *s, const cloak_frame_t *frame) {
+    /* Already closed. Go returns (toBeClosed=true, io.ErrClosedPipe)
+     * here, which Stream.recvFrame turns into another passiveClose;
+     * returning 1 is this port's equivalent (the session treats 1 and -1
+     * identically -- session.c:320-337 -- but 1 is the honest one: this
+     * is a close, not a protocol violation). The frame is discarded. */
+    if (s->recv_closing_seen) {
+        return 1;
+    }
+
+    /* A CLOSING FRAME CLOSES THE STREAM NOW, before any earlier data
+     * frame still in flight, and its payload (random anti-fingerprinting
+     * padding) is discarded. Go checks Closing before touching the buffer
+     * at all (datagramBufferedPipe.go:83-87) and consults no sequence
+     * number, so an unordered close is not ordered with respect to the
+     * data around it. This is divergence (c) of the scouting report's
+     * §6.3 and it is the reason recv_closing_seen means something
+     * slightly different in each mode. */
+    if (frame->closing != CLOAK_FRAME_CLOSING_NOTHING) {
+        s->recv_closing_seen = 1;
+        cloak_msgqueue_close(&s->recv_msgs);
+        return 1;
+    }
+
+    int rc = cloak_msgqueue_write(&s->recv_msgs, frame->payload, frame->payload_len);
+    if (rc == CLOAK_MSGQUEUE_ERR_TOO_LARGE) {
+        /* The ONLY -1 on this path, and therefore the only thing that
+         * retires an unordered stream. It is not backpressure: this
+         * payload exceeds the queue's whole capacity, so no amount of
+         * draining would ever admit it, and a peer sending it has
+         * exceeded the frame size both ends agreed on. The ordered path
+         * rejects the same condition for the same reason. */
+        return -1;
+    }
+    if (rc != 0) {
+        /* CLOAK_MSGQUEUE_ERR_FULL. Drop it, count it, and carry on --
+         * NOT -1, which would retire a stream over transient
+         * backpressure that will clear as soon as the reader drains.
+         * Go blocks the writing goroutine instead; see
+         * recv_dropped_datagrams in cloak/stream.h for why dropping the
+         * newest is the answer here and what it costs. (ERR_CLOSED
+         * cannot reach this line -- recv_closing_seen is checked above
+         * and is set in the same breath as the close.) */
+        s->recv_dropped_datagrams++;
+        return 0;
+    }
+    return 0;
+}
+
 int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
+    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        return feed_frame_unordered(s, frame);
+    }
     if (s->recv_closing_seen) {
         return -1;
     }
@@ -273,6 +355,24 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
 }
 
 long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
+    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        long n = cloak_msgqueue_read(&s->recv_msgs, out, out_cap);
+        if (n == CLOAK_MSGQUEUE_SHORT_BUFFER) {
+            /* The datagram is still queued -- cloak_msgqueue_read returns
+             * before it pops anything, exactly as Go returns at
+             * datagramBufferedPipe.go:58-60 one line ahead of the pop at
+             * :62. Translated to this layer's own named error so a caller
+             * cannot mistake it for the -1 that means end of stream. */
+            return CLOAK_STREAM_ERR_SHORT_BUFFER;
+        }
+        if (n == CLOAK_MSGQUEUE_EMPTY) {
+            /* Closed AND drained is end of stream; closed with datagrams
+             * still queued is not (recvBuffer.go:12-16: "Closure is only
+             * relevant when the buffer is empty"). */
+            return cloak_msgqueue_is_eof(&s->recv_msgs) ? -1 : 0;
+        }
+        return n;
+    }
     size_t n = cloak_bytequeue_read(&s->recv_bytes, out, out_cap);
     if (n > 0) {
         try_drain(s);
@@ -285,5 +385,11 @@ long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
 }
 
 size_t cloak_stream_recv_available(const cloak_stream_t *s) {
+    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        /* Application bytes, not queued bytes: the datagram queue's own
+         * per-message length prefixes are its private overhead and must
+         * not show up in a number callers compare against payload sizes. */
+        return cloak_msgqueue_payload_bytes(&s->recv_msgs);
+    }
     return cloak_bytequeue_len(&s->recv_bytes);
 }

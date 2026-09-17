@@ -8,6 +8,12 @@ target_include_directories(test_stream PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-comm
 target_link_libraries(test_stream PRIVATE cloak-mux)
 add_test(NAME test_stream COMMAND test_stream)
 
+add_executable(test_stream_unordered test_stream_unordered.c)
+target_include_directories(test_stream_unordered PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_stream_unordered PRIVATE cloak-mux)
+add_test(NAME test_stream_unordered COMMAND test_stream_unordered)
+set_tests_properties(test_stream_unordered PROPERTIES TIMEOUT 120)
+
 add_executable(test_strmtab test_strmtab.c)
 target_include_directories(test_strmtab PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_strmtab PRIVATE cloak-mux)
