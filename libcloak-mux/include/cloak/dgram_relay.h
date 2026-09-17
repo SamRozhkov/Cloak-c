@@ -205,7 +205,17 @@ struct cloak_dgram_relay {
  *      surface later as a silent stall, and EXPECTED under ordinary
  *      congestion. A caller should wait and try again.
  *
- * On any failure sr is left safe to pass to cloak_dgram_relay_stop. */
+ * On any failure sr is left safe to pass to cloak_dgram_relay_stop.
+ *
+ * NAMED for the reason cloak/stream_relay.h's
+ * CLOAK_STREAM_RELAY_ERR_POOL_FULL gives at length: -2 from a relay start
+ * and -2 from cloak_stream_read/_write (CLOAK_STREAM_ERR_SHORT_BUFFER)
+ * are different conditions with the same number, reached through the same
+ * objects. Same value here as there -- this IS the same condition as the
+ * stream relay's, checked against the same quantity -- and it keeps its
+ * own name so a dgram-relay site reads as a dgram-relay site. */
+#define CLOAK_DGRAM_RELAY_ERR_POOL_FULL (-2)
+
 int cloak_dgram_relay_start(cloak_dgram_relay_t *sr, cloak_reactor_t *r, cloak_session_t *sesh,
                              cloak_stream_t *stream, int fd, cloak_dgram_relay_done_cb on_done,
                              void *userdata);

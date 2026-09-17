@@ -71,13 +71,52 @@ enable_testing()
 # COUNT stays exactly what CLOAK_REQUIRE_GO already made a contract (68
 # with a Go toolchain, visibly 67 without one): this split changes what the
 # QUICK loop selects, never what the DEFAULT run covers.
+#
+# AND THE SAME SWEEP SETS A TIMEOUT, IN THE SAME set_tests_properties CALL.
+#
+# The final whole-branch review of module 9 read the GENERATED
+# CTestTestfile.cmake files and found 44 tests at TIMEOUT 60, 8 at 120, 1
+# at 150 -- and 20 carrying LABELS and NO TIMEOUT AT ALL, so they ran at
+# ctest's default of 1500 s. All 20 were in-process unit tests with no
+# fork, no exec and no sleep, so the exposure was small; the SHAPE was
+# not. It is the same orphaning that hid a missing TIMEOUT 150 on
+# test_unordered_proof one task earlier: a property set in one place and
+# a property set in another, with nothing tying them together, so losing
+# one looks exactly like never having needed it.
+#
+# The fix the earlier round chose is generalised here rather than
+# re-litigated: LABELS and TIMEOUT go into ONE call, on every test, from
+# the one function every directory already calls. A test added tomorrow
+# with no properties of its own gets both, or neither and no label --
+# which `ctest -L fast` makes loud immediately.
+#
+# CLOAK_DEFAULT_TEST_TIMEOUT is 60 because 60 is what 44 of the 75 tests
+# already chose explicitly; this makes the majority the default instead of
+# an accident. A test that sets its own TIMEOUT at its add_test site KEEPS
+# it -- the value is read back here and re-applied, never overwritten --
+# which is what leaves the 8 at 120 and test_unordered_proof's 150 exactly
+# where their own comments say they are, for the reasons those comments
+# give.
+set(CLOAK_DEFAULT_TEST_TIMEOUT 60)
+
 function(cloak_label_fast_tests)
     get_property(_cloak_dir_tests DIRECTORY PROPERTY TESTS)
     foreach(_cloak_test_name ${_cloak_dir_tests})
         get_test_property(${_cloak_test_name} LABELS _cloak_test_labels)
-        if(NOT _cloak_test_labels MATCHES "slow")
-            set_tests_properties(${_cloak_test_name} PROPERTIES LABELS "fast")
+        if(_cloak_test_labels MATCHES "slow")
+            set(_cloak_labels "${_cloak_test_labels}")
+        else()
+            set(_cloak_labels "fast")
         endif()
+        # get_test_property answers NOTFOUND for an unset property, which
+        # if() treats as false -- so this is "the test did not set one".
+        get_test_property(${_cloak_test_name} TIMEOUT _cloak_test_timeout)
+        if(NOT _cloak_test_timeout)
+            set(_cloak_test_timeout ${CLOAK_DEFAULT_TEST_TIMEOUT})
+        endif()
+        set_tests_properties(${_cloak_test_name} PROPERTIES
+            LABELS "${_cloak_labels}"
+            TIMEOUT ${_cloak_test_timeout})
     endforeach()
 endfunction()
 

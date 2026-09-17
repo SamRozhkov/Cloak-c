@@ -210,10 +210,10 @@ static void piper_try_start_relay(cloak_client_piper_conn_t *ctx) {
          *    (cloak/session.h); an overrun surfaces one layer down as a
          *    broken connection that takes the whole pool and every other
          *    stream with it. The ONLY proof of room this module ever has
-         *    is cloak_stream_relay_start's own -2 check, which it has
+         *    is cloak_stream_relay_start's own pool-full check, which it has
          *    just passed -- room for one worst-case frame. Writing first
-         *    would be writing with no such proof, and writing on the -2
-         *    path would be writing into a pool that has just said it has
+         *    would be writing with no such proof, and writing on the
+         *    pool-full path would be writing into a pool that has just said it has
          *    no room at all.
          *  - It is safe with respect to ordering, which is the thing that
          *    made Go write first: cloak_stream_relay_start's initial pump
@@ -242,7 +242,10 @@ static void piper_try_start_relay(cloak_client_piper_conn_t *ctx) {
 
     /* Either way below, fd is still ours: cloak_stream_relay_start leaves
      * the descriptor with the caller on EVERY failure. */
-    if (rc != -2) {
+    /* NAMED, not -2: cloak_stream_write's -2 is
+     * CLOAK_STREAM_ERR_SHORT_BUFFER, and this function compares against
+     * both meanings within thirty lines of each other. */
+    if (rc != CLOAK_STREAM_RELAY_ERR_POOL_FULL) {
         /* PERMANENT (-1): bad arguments, allocation failure, or a reactor
          * registration failure. Nothing about this session will change to
          * make the identical call succeed later, so retrying would hold

@@ -2578,14 +2578,21 @@ static void test_padding_distribution_unordered(void) {
  * signal -- connection load ratios that no other implementation produces
  * -- and, like every other distribution, no round-trip test can see it.
  *
- * MEASURED HERE, NOT ASSUMED: cloak_switchboard_send is
- * `xorshift32(&state) % conns_len`. With conns_len a power of two the
- * modulo is exact, so what is actually under test is xorshift32's LOW
- * BITS, which is the half of a linear generator most likely to be weak.
- * A non-power-of-two pool is measured too, where the modulo itself could
- * bias (it does not: the reduction is over 2^32, not over 256, so the
- * worst-case excess is about 1 in 1.4 billion -- which is why the
- * 240-value byte modulo was a 2x defect and this is not). */
+ * MEASURED HERE, NOT ASSUMED: cloak_switchboard_send reduces a 32-bit
+ * CSPRNG draw onto [0, conns_len) by rejection sampling
+ * (switchboard.c's switchboard_random_below). Both a power-of-two pool
+ * and a non-power-of-two one are measured, because it is the
+ * non-power-of-two that the reduction could bias -- and the rejection
+ * step is exactly what stops it, the same fix module 8 applied to the
+ * one-byte pad draw whose `% 240` had put a measured 2.009x bias on the
+ * wire.
+ *
+ * THE COMMENT THAT USED TO BE HERE described the shipped generator as
+ * `xorshift32(&state) % conns_len` and said this case tested "xorshift32's
+ * LOW BITS, which is the half of a linear generator most likely to be
+ * weak". It was accurate about the code and about the risk, and the two
+ * chi-squares below still passed -- see the third axis further down for
+ * what that cost and what now pins it. */
 /* MEASURED, 15 runs each: 4 connections chi2 0.27 .. 10.31 (3 d.f.,
  * expected 3), 3 connections chi2 0.17 .. 9.87 (2 d.f., expected 2). So
  * the pick IS unbiased, which is the answer the plan asked for and did
@@ -2637,6 +2644,93 @@ static void test_padding_distribution_unordered(void) {
 #define PICK_PAIR_CHI2_4 60.0
 #define PICK_PAIR_CHI2_3 40.0
 
+/* AND THE THIRD AXIS, WHICH IS THE ONE THAT MATTERED: IS THE PICK
+ * PREDICTABLE?
+ *
+ * The two blocks above test DISTRIBUTIONS. Both of them passed, cleanly
+ * and with margin, against a shipped switchboard whose next pick a censor
+ * could compute exactly after watching thirty-two frames go by. That is
+ * not a hypothetical: through module 9 cloak_switchboard_send drew from
+ * `xorshift32(&state) % conns_len`, xorshift32 is F2-linear, and the
+ * final whole-branch review measured it -- Gaussian elimination over
+ * GF(2) on the 64 bits carried by 32 OBSERVED PICKS recovered the exact
+ * 32-bit state in 4 of 4 seeds and then predicted 100,000 of 100,000
+ * subsequent picks, against a 25% chance baseline. The marginal chi2 over
+ * those same draws was 0.09-2.38 against this file's threshold of 30, and
+ * the lag-1 chi2 was 10.50-16.22 against 60.
+ *
+ * So a THIRD distribution test would have proved nothing, and this is not
+ * one. Berlekamp-Massey computes the length of the shortest linear
+ * feedback shift register over GF(2) that generates an observed bit
+ * sequence -- i.e. exactly "how much of this stream does a censor need
+ * before he can extrapolate it". It is the statistic that separates the
+ * two generators, and it separates them deterministically rather than
+ * probabilistically:
+ *
+ *     low bit of 512 consecutive picks, 4 connections
+ *       xorshift32 (what shipped)   L = 32, 32, 32, 32   (4 seeds)
+ *       CSPRNG      (what is here)  L = 255 .. 257       (12 runs of this
+ *                                                        very assertion)
+ *
+ * The bound is set at 200 because the two populations are nowhere near
+ * each other: an L of 32 fails it by a factor of six, while for a truly
+ * random 512-bit sequence P(L <= 200) is on the order of 2^-112 -- this
+ * assertion cannot flake in the life of the project, and it is the only
+ * assertion in the suite that would have caught the defect.
+ *
+ * WHY THE LOW BIT AND NOT THE PICK. With conns_len == 4 the pick is two
+ * bits and the low one is exactly bit 0 of the generator's output -- the
+ * bit a linear generator is weakest in and the one the review measured,
+ * so the numbers above are comparable to the ones on record. The 3-
+ * connection pool is deliberately NOT measured this way: rejection
+ * sampling over a non-power-of-two makes the low bit of the REDUCED value
+ * a nonlinear function of the draw, which would muddy the statistic
+ * without testing anything the 4-connection case does not.
+ *
+ * WHAT IT STILL DOES NOT COVER: linear complexity sees F2-linear
+ * structure. A non-linear but still deterministic generator (a counter
+ * through a fixed S-box, say) could score high here. Nothing in the tree
+ * tests for that, and the defence against it is not a statistic -- it is
+ * switchboard.h's requirement that the generator be cryptographic, and
+ * the fact that the pick now comes from RAND_bytes rather than from
+ * arithmetic on a state word. */
+#define PICK_LC_BITS 512
+#define PICK_LC_MIN 200
+#define PICK_LC_MAX 512
+
+/* Berlekamp-Massey over GF(2). Returns the length of the shortest LFSR
+ * that generates s[0..n). Textbook form; n is bounded by PICK_LC_BITS so
+ * the working arrays are static rather than allocated. */
+static int pick_linear_complexity(const unsigned char *s, int n) {
+    static unsigned char c[PICK_LC_BITS];
+    static unsigned char b[PICK_LC_BITS];
+    static unsigned char t[PICK_LC_BITS];
+    memset(c, 0, sizeof(c));
+    memset(b, 0, sizeof(b));
+    c[0] = 1;
+    b[0] = 1;
+    int L = 0;
+    int m = -1;
+    for (int N = 0; N < n; N++) {
+        int d = s[N];
+        for (int i = 1; i <= L; i++) {
+            d ^= c[i] & s[N - i];
+        }
+        if (d) {
+            memcpy(t, c, sizeof(c));
+            for (int i = 0; i + N - m < n; i++) {
+                c[i + N - m] ^= b[i];
+            }
+            if (L <= N / 2) {
+                L = N + 1 - L;
+                m = N;
+                memcpy(b, t, sizeof(b));
+            }
+        }
+    }
+    return L;
+}
+
 static void sb_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len,
                            void *userdata) {
     (void)sb;
@@ -2651,7 +2745,8 @@ static void sb_on_broken(cloak_switchboard_t *sb, void *userdata) {
     (*broken)++;
 }
 
-static void measure_pick(size_t nconn, double threshold, double pair_threshold) {
+static void measure_pick(size_t nconn, double threshold, double pair_threshold,
+                         int measure_linear_complexity) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
     int broken = 0;
@@ -2675,6 +2770,12 @@ static void measure_pick(size_t nconn, double threshold, double pair_threshold) 
     memset(pairs, 0, sizeof(pairs));
     unsigned long ambiguous = 0;
     int prev = -1;
+    /* The low bit of the first PICK_LC_BITS unambiguous picks, in order,
+     * for the Berlekamp-Massey axis. Filled from the loop that is already
+     * running, like the transition matrix beside it: no second fixture and
+     * no measurable runtime. */
+    static unsigned char lc_bits[PICK_LC_BITS];
+    size_t lc_len = 0;
     uint8_t payload[1] = {0xAB};
     uint8_t sink[4096];
     for (unsigned long i = 0; i < PICK_SENDS; i++) {
@@ -2706,6 +2807,9 @@ static void measure_pick(size_t nconn, double threshold, double pair_threshold) 
             pairs[(size_t)prev * nconn + (size_t)cur]++;
         }
         prev = cur;
+        if (lc_len < PICK_LC_BITS) {
+            lc_bits[lc_len++] = (unsigned char)(cur & 1);
+        }
     }
     ASSERT_EQ_INT(0, (long long)ambiguous);
 
@@ -2728,10 +2832,26 @@ static void measure_pick(size_t nconn, double threshold, double pair_threshold) 
     ASSERT_EQ_INT((long long)(PICK_SENDS - 1), (long long)pair_total);
     ASSERT_UNIFORM_CHI_SQUARE(pairs, cells, pair_total, pair_threshold);
 
+    /* AXIS THREE: is the pick UNPREDICTABLE? The two axes above both pass
+     * against a generator whose state a censor recovers from 32 frames;
+     * this is the one that does not. */
+    int lc = -1;
+    if (measure_linear_complexity) {
+        ASSERT_EQ_INT((long long)PICK_LC_BITS, (long long)lc_len);
+        lc = pick_linear_complexity(lc_bits, PICK_LC_BITS);
+        ASSERT_COUNT_IN_RANGE("linear complexity of the low bit of 512 consecutive picks",
+                              (unsigned long)lc, PICK_LC_MIN, PICK_LC_MAX);
+    }
+
     printf("   %zu connections, %lu picks: marginal chi2 = %.2f, pair chi2 = %.2f over %zu "
            "cells\n",
            nconn, total, cloak_test_chi_square_uniform(counts, nconn, PICK_SENDS),
            cloak_test_chi_square_uniform(pairs, cells, pair_total), cells);
+    if (measure_linear_complexity) {
+        printf("   linear complexity of the pick's low bit over %d picks = %d (bound %d; the "
+               "xorshift32 this replaced scored 32)\n",
+               PICK_LC_BITS, lc, PICK_LC_MIN);
+    }
 
     cloak_switchboard_destroy(&sb);
     cloak_reactor_destroy(r);
@@ -2740,11 +2860,11 @@ static void measure_pick(size_t nconn, double threshold, double pair_threshold) 
     }
 }
 
-static void test_connection_pick_is_unbiased(void) {
+static void test_connection_pick_is_unpredictable(void) {
     printf("-- case4b: the switchboard's connection pick -- UNIFORM (flagged for measurement "
-           "by the plan and never measured) and INDEPENDENT (NO ORACLE)\n");
-    measure_pick(4, PICK_CHI2_4, PICK_PAIR_CHI2_4);
-    measure_pick(3, PICK_CHI2_3, PICK_PAIR_CHI2_3);
+           "by the plan and never measured), INDEPENDENT, and UNPREDICTABLE (NO ORACLE)\n");
+    measure_pick(4, PICK_CHI2_4, PICK_PAIR_CHI2_4, 1);
+    measure_pick(3, PICK_CHI2_3, PICK_PAIR_CHI2_3, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2785,7 +2905,7 @@ int main(void) {
     test_deliberate_reordering();
     test_seq_is_still_generated_and_monotonic();
     test_padding_distribution_unordered();
-    test_connection_pick_is_unbiased();
+    test_connection_pick_is_unpredictable();
     test_duplicate_and_late_frame_replay();
     uint64_t t2 = now_ms();
 

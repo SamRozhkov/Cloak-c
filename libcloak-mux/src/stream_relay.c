@@ -147,7 +147,18 @@ static size_t stream_relay_fd_read_budget(cloak_stream_relay_t *sr, uint64_t *ou
      * clamp there would cost an extra read(2) per chunk for nothing. That
      * is why this is conditioned on the mode rather than applied
      * unconditionally, and it is why no existing test's behaviour
-     * changes. Pinned by
+     * changes.
+     *
+     * THAT EXEMPTION IS ITSELF PINNED NOW, by
+     * libcloak-mux/tests/test_stream_relay.c's
+     * test_ordered_read_budget_is_not_clamped_to_one_frame. It had to be:
+     * a whole-branch review deleted the mode condition below, so the
+     * clamp applied in both modes, and killed 0 of 69 tests -- because on
+     * a stream socket the two budgets produce a byte-identical wire and
+     * differ only in the number of read(2) calls. The new test reads the
+     * budget out through a datagram socket, where a short read discards
+     * the rest of the datagram and the difference becomes 252 lost bytes.
+     * Pinned in the other direction by
      * libcloak-client/tests/test_udp_piper.c's
      * test_relay_read_budget_respects_the_unordered_write_limit, which
      * fails with the relay torn down and zero bytes delivered if this
@@ -627,11 +638,13 @@ int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
      * cloak_conn_init/cloak_session_init -- silently stalls the very
      * first read). Checked against the SAME per-connection quantity the
      * running budget uses, so the two can never drift apart. */
-    /* -2, NOT -1: this is the one TRANSIENT rejection this function has.
-     * See this function's own doc comment for why the caller must be able
-     * to tell it apart from every permanent failure. */
+    /* CLOAK_STREAM_RELAY_ERR_POOL_FULL (-2), NOT -1: this is the one
+     * TRANSIENT rejection this function has. See this function's own doc
+     * comment for why the caller must be able to tell it apart from every
+     * permanent failure -- and for why it is spelled out by name, given
+     * that cloak_stream_read's -2 means something entirely different. */
     if (cloak_session_send_min_conn_free(sesh) < cloak_stream_relay_frame_cost(stream)) {
-        return -2;
+        return CLOAK_STREAM_RELAY_ERR_POOL_FULL;
     }
 
     if (cloak_bytequeue_init(&sr->to_fd, buf_cap) != 0) {

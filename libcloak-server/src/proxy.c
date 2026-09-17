@@ -323,7 +323,13 @@ static void proxy_try_start_relay(cloak_proxy_stream_t *pst) {
 
     /* Either way below, fd_pending is still ours: cloak_stream_relay_start
      * leaves the descriptor with the caller on EVERY failure. */
-    if (rc != -2) {
+    /* NAMED, not -2: cloak_stream_read's -2 is CLOAK_STREAM_ERR_SHORT_BUFFER
+     * and this file handles both kinds of relay. rc came from whichever of
+     * cloak_stream_relay_start / cloak_dgram_relay_start the upstream
+     * socket type selected above; the two spell this same condition with
+     * their own constants, which have the same value because it IS the
+     * same condition, checked against the same pool quantity. */
+    if (rc != CLOAK_STREAM_RELAY_ERR_POOL_FULL) {
         /* PERMANENT (-1): bad arguments, allocation failure, or a reactor
          * registration failure. Nothing about this session will change to
          * make the identical call succeed later, so retrying would hold a

@@ -8,6 +8,90 @@
 #include "cloak/reactor.h"
 #include "cloak/valve.h"
 
+/* ---------------------------------------------------------------------
+ * THE CONNECTION PICK MUST BE UNPREDICTABLE, NOT MERELY UNIFORM.
+ *
+ * cloak_switchboard_send chooses which of the pool's NumConn connections
+ * carries each frame. This block is the rationale for the generator that
+ * choice uses. It exists because the field below used to cite a rationale
+ * in this header that had never been written, and the generator it was
+ * silently justifying was wrong -- see WHAT THIS REPLACED at the end.
+ *
+ * WHAT THE GENERATOR MUST PROVIDE, in the order these actually bind:
+ *
+ *  1. UNPREDICTABILITY FROM THE SEQUENCE ITSELF. The pick is public. One
+ *     frame is one TLS record on exactly one of the pool's connections,
+ *     all of them open to the same destination; a censor on the path
+ *     reads "which connection carried record k" off the wire with no
+ *     decryption and no key. UNORDERED MODE MAKES THIS MAXIMAL: Go drops
+ *     Stream.assignedConn there ("not used in unordered connection
+ *     mode"), so every datagram of every stream takes a fresh draw, and
+ *     the censor gets one observation per datagram. So the sequence of
+ *     picks is an output stream handed to an adversary who can collect
+ *     as much of it as the session is long, and the requirement is the
+ *     one a keystream has: seeing any prefix must not let him compute the
+ *     next term. That is a cryptographic requirement, and nothing weaker
+ *     states it -- a generator can be perfectly uniform in its marginal
+ *     distribution AND in its lag-1 transitions and still hand its entire
+ *     internal state to thirty-two observations.
+ *
+ *  2. UNIFORMITY OVER [0, conns_len), EXACTLY -- not "close enough".
+ *     Connection load ratios are aggregatable across sessions and across
+ *     users; a skew no other Cloak implementation produces is a
+ *     fingerprint of THIS implementation. In particular the reduction
+ *     onto conns_len must be rejection-sampled, never `%` on the raw
+ *     draw: module 8 spent a whole fix wave removing exactly that shape
+ *     from a one-byte pad draw in frame.c after it put a measured 2.009x
+ *     bias on the wire.
+ *
+ *  3. INDEPENDENCE BETWEEN CONSECUTIVE PICKS. Round-robin satisfies (2)
+ *     perfectly and is wire-visible on sight.
+ *
+ * (1) implies (3) and, with (2)'s rejection sampling bolted on, (2). That
+ * is why the answer is a CSPRNG and not a better non-cryptographic
+ * generator: the three requirements collapse into one.
+ *
+ * WHAT GO DOES, checked against Go rather than remembered. At the pinned
+ * c3d5470 / v2.12.0, internal/multiplex/switchboard.go makes the pool
+ *     randPool: sync.Pool{New: func() interface{} {
+ *         var state [32]byte
+ *         common.CryptoRandRead(state[:])
+ *         return rand.New(rand.NewChaCha8(state)) }}
+ * and pickRandConn draws `randReader.Uint32N(connsCount)`. The import is
+ * "math/rand/v2", whose NewChaCha8 is documented in the Go source as "a
+ * ChaCha8-based cryptographically strong random number generator", seeded
+ * here from crypto/rand. Uint32N is unbiased by construction (Lemire's
+ * reduction with the rejection step, math/rand/v2/rand.go's uint64n). So
+ * Go's pick satisfies (1), (2) and (3) and always has: math/rand/v2 has
+ * been ChaCha8-backed since Go 1.22, and this module's go.mod says
+ * go 1.24.0. "math/rand means a weak generator" is a pre-1.22 habit.
+ *
+ * WHAT THIS PORT DOES: cloak_random_bytes (OpenSSL RAND_bytes) buffered
+ * in the pool 256 bytes at a time, reduced by rejection sampling --
+ * switchboard.c's switchboard_random_u32 and switchboard_random_below,
+ * where the measured costs are. Structurally Go's arrangement: a CSPRNG
+ * whose output is refilled in blocks, not consulted per draw.
+ *
+ * WHAT THIS REPLACED, recorded because the reason it survived matters
+ * more than the defect. Through module 9 this line was
+ * `xorshift32(&state) % conns_len`, and module 8's final fix wave looked
+ * straight at it and left it, writing down as its reason "a 32-bit
+ * non-crypto draw that matches Go's own pool". That reason was false --
+ * Go's pool is ChaCha8, quoted above -- and nobody checked it against Go.
+ * xorshift32 is F2-linear, so every output bit is a fixed XOR of the
+ * state bits: Gaussian elimination over GF(2) on the 64 bits carried by
+ * 32 OBSERVED PICKS recovered the exact 32-bit state in 4 of 4 seeds and
+ * then predicted 100,000 of 100,000 subsequent picks (chance: 25%).
+ * Berlekamp-Massey linear complexity of the pick's low bit over 512
+ * picks: 32, 32, 32, 32, against 256 for a CSPRNG control.
+ *
+ * Both chi-squares in the suite passed it cleanly -- marginal 0.09-2.38
+ * against a threshold of 30, lag-1 pair-transition 10.50-16.22 against
+ * 60 -- which is the whole lesson: uniformity tests cannot see this, so
+ * the property pinned in libcloak-server/tests/test_unordered_proof.c is
+ * LINEAR COMPLEXITY, not a third distribution.
+ * ------------------------------------------------------------------- */
+
 typedef struct cloak_switchboard cloak_switchboard_t;
 
 /* frame_bytes/len: an already record-header-stripped, still-obfuscated
@@ -45,7 +129,14 @@ struct cloak_switchboard {
     size_t max_frame_len;
     size_t conn_send_queue_cap;
 
-    uint32_t rng_state; /* xorshift32, seeded once at init -- NOT cryptographic, see this file's header comment */
+    /* The connection pick's randomness -- see THE CONNECTION PICK MUST BE
+     * UNPREDICTABLE, NOT MERELY UNIFORM at the top of this file for what
+     * this must provide, and switchboard.c's switchboard_random_u32 for
+     * how it provides it. CSPRNG bytes (cloak_random_bytes, i.e.
+     * OpenSSL RAND_bytes) held four-at-a-time-ahead, never a recurrence
+     * of any kind. rng_pos == sizeof(rng_buf) means "empty, refill". */
+    uint8_t rng_buf[256];
+    size_t rng_pos;
 
     int broken;
     cloak_switchboard_envelope_cb on_envelope;

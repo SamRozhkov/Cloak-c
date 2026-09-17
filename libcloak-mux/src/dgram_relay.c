@@ -502,14 +502,14 @@ int cloak_dgram_relay_start(cloak_dgram_relay_t *sr, cloak_reactor_t *r, cloak_s
         return -1;
     }
 
-    /* -2, NOT -1: the one TRANSIENT rejection this function has, and the
+    /* CLOAK_DGRAM_RELAY_ERR_POOL_FULL (-2), NOT -1: the one TRANSIENT rejection this function has, and the
      * same check (against the same quantity) cloak_stream_relay_start
      * makes. A relay started against a pool that cannot hold one
      * worst-case frame would compute "no room" on its very first read
      * forever, with nothing ever queued to prompt a drain-driven resume,
      * and would hang holding an open socket with no error anywhere. */
     if (cloak_session_send_min_conn_free(sesh) < cloak_stream_relay_frame_cost(stream)) {
-        return -2;
+        return CLOAK_DGRAM_RELAY_ERR_POOL_FULL;
     }
 
     /* EXACTLY max_payload_per_frame, for the reason cloak/dgram_relay.h

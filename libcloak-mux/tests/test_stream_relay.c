@@ -1730,6 +1730,129 @@ static void test_unordered_undeliverable_datagram_finishes_rather_than_wedges(vo
     cloak_reactor_destroy(r);
 }
 
+/* THE ORDERED PATH'S EXEMPTION FROM THE UNORDERED READ-BUDGET CLAMP.
+ *
+ * stream_relay_fd_read_budget clamps the budget to one frame's payload
+ * (16132) in UNORDERED mode only, and says so at the site: "THE ORDERED
+ * PATH IS UNTOUCHED, deliberately: it splits freely, so a clamp there
+ * would cost an extra read(2) per chunk for nothing. That is why this is
+ * conditioned on the mode rather than applied unconditionally, and it is
+ * why no existing test's behaviour changes."
+ *
+ * The final whole-branch review mutated exactly that -- dropped the mode
+ * condition so the clamp applied in both modes -- and killed 0 of 69.
+ * The comment's claim was true, which is precisely the problem: nothing
+ * held the ordered path's larger budget, so the exemption could be lost,
+ * or "simplified" away, with a green suite.
+ *
+ * WHY IT TAKES A DATAGRAM SOCKET TO SEE IT. On a stream socket the
+ * difference really is invisible: pump_fd_to_stream loops until EAGAIN,
+ * so 16384 bytes leave the socket either way, and an ordered stream
+ * splits them into the same 16132 + 252 frames either way. The wire is
+ * byte-identical; only the number of read(2) calls differs, and a test
+ * cannot see a syscall count. So this relay's fd is an AF_UNIX SOCK_DGRAM
+ * socket, which turns the budget into an OBSERVABLE: read(2) on a
+ * datagram socket delivers at most one datagram and DISCARDS whatever
+ * did not fit. A single 16384-byte datagram therefore arrives whole under
+ * the shipped 16384-byte budget and arrives 252 bytes SHORT, permanently,
+ * under the clamped one.
+ *
+ * The socket type is a measuring instrument, not a claim that the proxy
+ * ever splices an ordered stream to a datagram socket (it does not --
+ * proxy.c picks the dgram relay for a datagram upstream). What is being
+ * pinned is the budget, and this is the only way to read it out from
+ * outside the module. */
+static void test_ordered_read_budget_is_not_clamped_to_one_frame(void) {
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    struct endpoint b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+
+    cloak_session_config_t cfg_a;
+    cloak_session_config_t cfg_b;
+    fill_config(&cfg_a, &a, &obfs); /* ORDERED -- that is the whole point */
+    fill_config(&cfg_b, &b, &obfs);
+    ASSERT_EQ_INT(CLOAK_SESSION_ORDERING_ORDERED, (int)cfg_b.ordering);
+
+    ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 1, r, &cfg_a));
+    ASSERT_EQ_INT(0, cloak_session_init(&b.sesh, 1, r, &cfg_b));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&a.sesh, fds[0]));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&b.sesh, fds[1]));
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        return;
+    }
+    /* One byte so b accepts the stream, exactly as the other tests here
+     * do; it leaves through the relay's initial pump and is never read
+     * back. */
+    ASSERT_EQ_INT(1, (int)cloak_stream_write(s, (const uint8_t *)"x", 1));
+    for (int i = 0; i < 200 && b.new_stream_calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, b.new_stream_calls);
+
+    int dgram[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_DGRAM, 0, dgram));
+    int flags = fcntl(dgram[1], F_GETFL, 0);
+    ASSERT_TRUE(flags != -1);
+    ASSERT_EQ_INT(0, fcntl(dgram[1], F_SETFL, flags | O_NONBLOCK));
+
+    struct done_capture cap;
+    memset(&cap, 0, sizeof(cap));
+    cloak_stream_relay_t sr;
+    ASSERT_EQ_INT(0, cloak_stream_relay_start(&sr, r, &b.sesh, b.accepted, dgram[0], 16384,
+                                              on_relay_done, &cap));
+    b.sr = &sr;
+
+    /* 16384 = STREAM_RELAY_CHUNK, i.e. the whole unclamped budget and 252
+     * bytes more than one frame's payload (16132). One datagram. */
+    static uint8_t out[16384];
+    for (size_t i = 0; i < sizeof(out); i++) {
+        out[i] = (uint8_t)(i * 31u + 17u);
+    }
+    ASSERT_EQ_INT((int)sizeof(out), (int)write(dgram[1], out, sizeof(out)));
+
+    static uint8_t got[16384 + 512];
+    size_t total = 0;
+    for (int i = 0; i < 400 && total < sizeof(out); i++) {
+        cloak_reactor_run_once(r, 10);
+        long n = cloak_stream_read(s, got + total, sizeof(got) - total);
+        if (n > 0) {
+            total += (size_t)n;
+        }
+    }
+
+    /* THE ASSERTION THE MUTATION FAILS. Clamped to 16132, the read takes
+     * the datagram's first 16132 bytes and the kernel throws the other
+     * 252 away -- so this stalls at 16132 and the payload comparison
+     * never even runs. */
+    ASSERT_EQ_INT((int)sizeof(out), (int)total);
+    ASSERT_MEM_EQ(got, out, sizeof(out));
+    ASSERT_EQ_INT(0, cap.calls); /* and the relay is still alive */
+
+    cloak_stream_relay_stop(&sr);
+    close(dgram[1]);
+    cloak_session_release_stream(&b.sesh, b.accepted);
+    cloak_session_release_stream(&a.sesh, s);
+    cloak_session_destroy(&a.sesh);
+    cloak_session_destroy(&b.sesh);
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_forwards_both_directions();
     test_large_transfer_survives_backpressure();
@@ -1746,4 +1869,5 @@ TEST_MAIN_BEGIN()
     test_session_survives_one_congested_connection_among_many();
     test_unordered_short_buffer_is_backpressure_not_eof();
     test_unordered_undeliverable_datagram_finishes_rather_than_wedges();
+    test_ordered_read_budget_is_not_clamped_to_one_frame();
 TEST_MAIN_END()
