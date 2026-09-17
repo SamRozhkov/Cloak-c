@@ -167,17 +167,35 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
     return 0;
 }
 
+/* DELIBERATELY NOT BRANCHED ON `ordering`, unlike every other function in
+ * this file that touches the receive side. Three reasons, and the third
+ * is the one that turned an earlier branched version into a trap:
+ *
+ *   1. Both teardowns are no-ops on the queue their mode did not build.
+ *      cloak_stream_init constructs exactly one of the two and leaves the
+ *      other as memset left it; cloak_msgqueue_destroy and
+ *      cloak_bytequeue_destroy on a zeroed struct are free(NULL) plus a
+ *      memset. So running both is correct in either mode and costs
+ *      nothing.
+ *   2. It makes a SECOND destroy safe ON PURPOSE rather than by accident.
+ *      This function ends with memset(s, 0, sizeof(*s)), which zeroes
+ *      `ordering` to CLOAK_SESSION_ORDERING_INVALID -- so a branched
+ *      version ran the ORDERED teardown on a second call regardless of
+ *      what the stream had been, and was benign only because every
+ *      pointer it touched was already NULL. That is a property nobody
+ *      stated and anybody could break.
+ *   3. The pending-frame heap is freed unconditionally for the same
+ *      reason. It is always NULL and heap_len always 0 in unordered mode
+ *      TODAY; inside an `else` it would leak silently the first day that
+ *      stopped being true. */
 void cloak_stream_destroy(cloak_stream_t *s) {
     free(s->write_buf);
-    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
-        cloak_msgqueue_destroy(&s->recv_msgs);
-    } else {
-        cloak_bytequeue_destroy(&s->recv_bytes);
-        for (size_t i = 0; i < s->heap_len; i++) {
-            free(s->heap[i].payload);
-        }
-        free(s->heap);
+    cloak_msgqueue_destroy(&s->recv_msgs);
+    cloak_bytequeue_destroy(&s->recv_bytes);
+    for (size_t i = 0; i < s->heap_len; i++) {
+        free(s->heap[i].payload);
     }
+    free(s->heap);
     memset(s, 0, sizeof(*s));
 }
 

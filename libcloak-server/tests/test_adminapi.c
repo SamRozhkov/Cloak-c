@@ -310,6 +310,26 @@ static int open_client(struct fixture *fx, client_session_t *cs, uint32_t sessio
                                fx->uid_ok, "ss", session_id, 0, &ccfg);
 }
 
+
+/* The same client, but with the auth record's unordered flag set and a
+ * matching client-side session mode -- so the dispatcher builds its half
+ * UNORDERED too (dispatcher.c derives session_cfg.ordering from
+ * info.unordered) and every stream on this session is a datagram stream.
+ * Separate from open_client rather than a parameter on it so the existing
+ * cases stay byte identical. */
+static int open_client_unordered(struct fixture *fx, client_session_t *cs, uint32_t session_id) {
+    cloak_session_config_t ccfg;
+    memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_UNORDERED;
+    ccfg.max_on_wire_size = 16401;
+    ccfg.stream_recv_capacity = 65536;
+    ccfg.stream_max_pending_frames = 64;
+    ccfg.conn_send_queue_cap = 262144;
+    ccfg.inactivity_timeout_ms = 60000;
+    return client_session_open(cs, fx->reactor, cloak_listener_port(&fx->front), fx->server_pub,
+                               fx->uid_ok, "ss", session_id, 1, &ccfg);
+}
+
 /* ---- response accumulation ----------------------------------------------
  *
  * Reading is done by POLLING cloak_stream_read from inside the pump
@@ -2098,6 +2118,88 @@ static void test_argument_and_lifetime_edges(void) {
     cloak_reactor_destroy(reactor);
 }
 
+/* ---- an unordered admin session, with a request larger than one read --
+ *
+ * THIS IS GO'S BUG 6 IN THIS PORT'S OWN ADMIN READER. Module 9 task 3
+ * gave cloak_stream_read a third return value for datagram streams:
+ * CLOAK_STREAM_ERR_SHORT_BUFFER (-2), meaning "your buffer is smaller
+ * than the whole datagram at the head, and the datagram is still there".
+ * adminapi_drain read into a fixed ADMINAPI_READ_CHUNK buffer and treated
+ * every negative return as end-of-stream, tearing the stream down -- so
+ * an admin request that arrived as one datagram larger than that chunk
+ * got no answer at all, and the client saw the stream close mid-exchange
+ * with nothing to distinguish it from a peer that hung up.
+ *
+ * Reachable exactly as dispatcher.c's own comment says: the proxy path
+ * refuses unordered clients above that point, but an admin session that
+ * set the flag reaches the session construction below it and is built
+ * UNORDERED.
+ *
+ * The body is padded with whitespace INSIDE the JSON object rather than
+ * with junk, so the assertion is 201 plus the database row rather than a
+ * 400: this proves the whole datagram was read and parsed, not merely
+ * that something came back. cJSON skips whitespace between tokens, so the
+ * padding changes the size and nothing else. The sizes matter -- the body
+ * is over 4096 (the chunk this reader used to have) and under 16132 (Go's
+ * maxStreamUnitWrite, so it is still ONE frame and therefore ONE
+ * datagram, which is the whole point). */
+static void test_unordered_request_larger_than_one_read_chunk(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, "unordered_big"));
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client_unordered(&fx, &cs, 9));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    make_uid(uid, 0x33);
+    char up[64];
+    uid_url(uid, up, sizeof(up));
+
+    const size_t pad = 6000;
+    char *json = malloc(pad + 256);
+    ASSERT_TRUE(json != NULL);
+    if (json == NULL) {
+        fixture_destroy(&fx);
+        return;
+    }
+    json[0] = '{';
+    memset(json + 1, ' ', pad);
+    snprintf(json + 1 + pad, 255,
+             "\"SessionsCap\":7,\"UpRate\":11,\"DownRate\":22,"
+             "\"UpCredit\":33,\"DownCredit\":44,\"ExpiryTime\":1789000001}");
+    size_t json_len = strlen(json);
+    ASSERT_TRUE(json_len > 4096);  /* larger than the old ADMINAPI_READ_CHUNK */
+    ASSERT_TRUE(json_len < 16132); /* still one frame, so still one datagram */
+
+    char *reqbuf = malloc(json_len + 512);
+    ASSERT_TRUE(reqbuf != NULL);
+    if (reqbuf == NULL) {
+        free(json);
+        fixture_destroy(&fx);
+        return;
+    }
+    snprintf(reqbuf, json_len + 512,
+             "POST /admin/users/%s HTTP/1.1\r\nHost: admin\r\nContent-Type: application/json\r\n"
+             "Content-Length: %zu\r\n\r\n%s",
+             up, json_len, json);
+
+    resp_t r;
+    cloak_stream_t *st = request(&fx, &cs, reqbuf, &r);
+    ASSERT_EQ_INT(201, resp_status(&r));
+    finish(&fx, &cs, st, &r);
+
+    cloak_user_info_t got;
+    memset(&got, 0, sizeof(got));
+    ASSERT_EQ_INT(0, cloak_usermanager_get(fx.manager, uid, &got));
+    ASSERT_EQ_INT(7, got.sessions_cap);
+    ASSERT_EQ_INT(11, (int)got.up_rate);
+    ASSERT_EQ_INT(1789000001, (int)got.expiry_time);
+
+    free(reqbuf);
+    free(json);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
     test_list_empty();
     test_post_then_get_round_trip();
@@ -2122,4 +2224,5 @@ TEST_MAIN_BEGIN()
     test_listing_cap_refuses();
     test_userpanel_chain_forwards();
     test_argument_and_lifetime_edges();
+    test_unordered_request_larger_than_one_read_chunk();
 TEST_MAIN_END()

@@ -324,7 +324,30 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame);
  *
  * -2 specifically, following CLOAK_CONN_ERR_INVALID_FRAMING and
  * CLOAK_SESSION_ERR_INVALID_ORDERING: in this tree a second named
- * negative on an existing -1 contract is -2. */
+ * negative on an existing -1 contract is -2.
+ *
+ * EVERY CALLER OF cloak_stream_read MUST HANDLE THIS SEPARATELY FROM -1,
+ * and this paragraph exists because the two that already shipped did not.
+ * Adding a third negative to a function whose callers were written
+ * against "negative means the stream is over" made both of them reproduce
+ * Go's bug 6:
+ *
+ *   libcloak-mux/src/stream_relay.c  read into a buffer sized by the free
+ *       space in its outbound queue, so ordinary backpressure shrank it
+ *       below the next datagram and PERMANENTLY ENDED A LIVE STREAM. Now
+ *       treats a short buffer as backpressure, except when its queue is
+ *       already empty (nothing could ever free more room), where it ends
+ *       the stream deliberately rather than wedging.
+ *   libcloak-server/src/adminapi.c   read 4096-byte chunks against
+ *       datagrams of up to 16132 and tore the stream down with no answer
+ *       to the client. Its chunk is now 16384 -- above the largest
+ *       datagram any session at the shipping max_on_wire_size can produce
+ *       -- and a short buffer has its own named branch.
+ *
+ * A new caller that writes `if (n < 0)` and stops there is correct for an
+ * ordered stream and silently loses data on an unordered one. There is no
+ * compiler check for this; there is only this paragraph and the two tests
+ * named above, each of which fails if its -2 arm is folded back in. */
 #define CLOAK_STREAM_ERR_SHORT_BUFFER (-2)
 
 /* ORDERED: copies up to out_cap reassembled bytes into out. Returns bytes

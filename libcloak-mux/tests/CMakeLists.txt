@@ -14,6 +14,12 @@ target_link_libraries(test_stream_unordered PRIVATE cloak-mux)
 add_test(NAME test_stream_unordered COMMAND test_stream_unordered)
 set_tests_properties(test_stream_unordered PROPERTIES TIMEOUT 120)
 
+add_executable(test_msgqueue_property test_msgqueue_property.c)
+target_include_directories(test_msgqueue_property PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_msgqueue_property PRIVATE cloak-mux)
+add_test(NAME test_msgqueue_property COMMAND test_msgqueue_property)
+set_tests_properties(test_msgqueue_property PROPERTIES TIMEOUT 120)
+
 add_executable(test_strmtab test_strmtab.c)
 target_include_directories(test_strmtab PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_strmtab PRIVATE cloak-mux)

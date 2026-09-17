@@ -236,7 +236,23 @@ static void sync_interest(cloak_stream_relay_t *sr) {
  * currently has. Returns the number of bytes moved (0 if none), and sets
  * sr->stream_ended if the stream reported end-of-stream while filling.
  * "Nothing ready right now" and "stream ended" are both ordinary
- * terminal conditions for a single call, not errors. */
+ * terminal conditions for a single call, not errors.
+ *
+ * THE THIRD TERMINAL CONDITION, AND IT IS NOT AN END. On an UNORDERED
+ * (datagram) stream cloak_stream_read reads one whole datagram or none,
+ * and answers CLOAK_STREAM_ERR_SHORT_BUFFER when `want` is smaller than
+ * the datagram at the head -- leaving that datagram queued. This function
+ * used to fold that into `if (n < 0)` alongside end-of-stream, which was
+ * wrong in the worst available way: `want` here is sized by the free
+ * space in to_fd, so ORDINARY BACKPRESSURE from a slow fd shrinks it
+ * below the next datagram and PERMANENTLY ENDED A LIVE STREAM, silently
+ * discarding everything after the point where to_fd happened to be full.
+ * That is Go's own bug 6 (internal/client/piper.go's reader breaking out
+ * of its loop on io.ErrShortBuffer, losing every reply of 8193..16132
+ * bytes and tearing the peer's tunnel down) reproduced here. Pinned by
+ * test_stream_relay.c's
+ * test_unordered_short_buffer_is_backpressure_not_eof, which fails on
+ * three named assertions if the -2 is folded back in. */
 static size_t try_fill_from_stream(cloak_stream_relay_t *sr) {
     uint8_t buf[STREAM_RELAY_CHUNK];
     size_t total = 0;
@@ -250,6 +266,31 @@ static size_t try_fill_from_stream(cloak_stream_relay_t *sr) {
         }
         size_t want = room < sizeof(buf) ? room : sizeof(buf);
         long n = cloak_stream_read(sr->stream, buf, want);
+        if (n == CLOAK_STREAM_ERR_SHORT_BUFFER) {
+            /* TRANSIENT if anything is still queued for the fd: draining
+             * to_fd grows `room`, and to_fd draining is exactly the event
+             * pump_stream_to_fd's own do/while and
+             * cloak_stream_relay_notify_writable already re-drive this
+             * call on. Identical in shape to the `room == 0` break above.
+             *
+             * PERMANENT if to_fd is EMPTY and the datagram still does not
+             * fit, because nothing can ever free more room than an empty
+             * queue already has and no event will ever resume this relay.
+             * Pausing there would leave it alive forever holding an open
+             * fd with no error anywhere -- the same permanent stall
+             * cloak_stream_relay_start's frame-cost rejection exists to
+             * make impossible in the other direction -- so the relay
+             * finishes instead, which at least reports something to its
+             * owner. Reachable only when buf_cap or STREAM_RELAY_CHUNK
+             * (16384) is below the peer's largest datagram, i.e. never
+             * for a session at the usual max_on_wire_size of 16401, whose
+             * largest possible datagram is 16132. Pinned by
+             * test_unordered_undeliverable_datagram_finishes_rather_than_wedges. */
+            if (cloak_bytequeue_len(&sr->to_fd) == 0) {
+                sr->stream_ended = 1;
+            }
+            break;
+        }
         if (n < 0) {
             sr->stream_ended = 1; /* peer closed: flush, then finish */
             break;

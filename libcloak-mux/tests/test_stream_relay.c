@@ -1517,6 +1517,219 @@ static void test_session_survives_one_congested_connection_among_many(void) {
     cloak_reactor_destroy(r);
 }
 
+/* ---- unordered mode: a short read buffer is BACKPRESSURE, not EOF ------
+ *
+ * Module 9 task 3 added CLOAK_STREAM_ERR_SHORT_BUFFER (-2) to
+ * cloak_stream_read for unordered (datagram) streams: the caller's buffer
+ * was smaller than the whole datagram at the head, and the datagram is
+ * still queued. This file's own reader had `if (n < 0) { stream_ended = 1;
+ * }`, which folds that -2 into the end-of-stream arm -- and the buffer it
+ * reads with is sized by `min(free space in to_fd, 16384)`, so ORDINARY
+ * BACKPRESSURE from a slow fd shrinks it below the next datagram and
+ * permanently ends a live stream, silently dropping everything after the
+ * point where the queue happened to be full.
+ *
+ * That is Go's bug 6 (a reply of 8193..16132 bytes lost because
+ * piper.go's reader breaks out of its loop on io.ErrShortBuffer) in this
+ * port's own relay. These two cases pin both halves of the answer: a
+ * short buffer with bytes still queued in to_fd is transient and must
+ * resume, and a short buffer with to_fd already EMPTY is permanent and
+ * must end the stream rather than wedge the relay forever holding an
+ * open fd. */
+
+/* Fills cfg for an unordered session. Separate from fill_config rather
+ * than a parameter on it so the twelve ordered cases above stay byte
+ * identical. */
+static void fill_config_unordered(cloak_session_config_t *cfg, struct endpoint *ep,
+                                  const cloak_obfuscator_t *obfs) {
+    fill_config(cfg, ep, obfs);
+    cfg->ordering = CLOAK_SESSION_ORDERING_UNORDERED;
+}
+
+/* Reads from a non-blocking fd until `want` bytes have accumulated or the
+ * pump runs out of turns. Returns the number of bytes accumulated. */
+static size_t drain_outer(cloak_reactor_t *r, int fd, uint8_t *out, size_t want, int turns) {
+    size_t got = 0;
+    for (int i = 0; i < turns && got < want; i++) {
+        ssize_t n = read(fd, out + got, want - got);
+        if (n > 0) {
+            got += (size_t)n;
+            continue;
+        }
+        cloak_reactor_run_once(r, 10);
+    }
+    return got;
+}
+
+static void test_unordered_short_buffer_is_backpressure_not_eof(void) {
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    struct endpoint b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+
+    cloak_session_config_t cfg_a;
+    cloak_session_config_t cfg_b;
+    fill_config_unordered(&cfg_a, &a, &obfs);
+    fill_config_unordered(&cfg_b, &b, &obfs);
+
+    ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 21, r, &cfg_a));
+    ASSERT_EQ_INT(0, cloak_session_init(&b.sesh, 21, r, &cfg_b));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&a.sesh, fds[0]));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&b.sesh, fds[1]));
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        return;
+    }
+
+    /* TWO datagrams of 3000 bytes, both queued at b BEFORE the relay
+     * exists, and a relay buffer of 4096. The first read takes the whole
+     * first datagram (3000 <= 4096); the second sees only 1096 bytes of
+     * room and cannot take a 3000-byte datagram whole -- a short buffer
+     * with 3000 bytes still sitting in to_fd, i.e. the transient case.
+     * The sizes are chosen so 3000 + 3000 > 4096 > 3000: any relay buffer
+     * that fits both would not exercise this at all. */
+    uint8_t d1[3000];
+    uint8_t d2[3000];
+    for (size_t i = 0; i < sizeof(d1); i++) {
+        d1[i] = (uint8_t)(i & 0xff);
+        d2[i] = (uint8_t)((i + 7) & 0xff);
+    }
+    ASSERT_EQ_INT((long)sizeof(d1), cloak_stream_write(s, d1, sizeof(d1)));
+    for (int i = 0; i < 200 && b.new_stream_calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, b.new_stream_calls);
+
+    /* b.sr is still NULL, so nothing drains b.accepted: this second
+     * datagram is queued behind the first, which is the whole setup. */
+    ASSERT_EQ_INT((long)sizeof(d2), cloak_stream_write(s, d2, sizeof(d2)));
+    for (int i = 0; i < 200 && cloak_stream_recv_available(b.accepted) < 6000; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(6000, (long)cloak_stream_recv_available(b.accepted));
+
+    struct sockpair sp;
+    ASSERT_EQ_INT(0, sockpair_init(&sp));
+
+    struct done_capture cap;
+    memset(&cap, 0, sizeof(cap));
+
+    cloak_stream_relay_t sr;
+    ASSERT_EQ_INT(0, cloak_stream_relay_start(&sr, r, &b.sesh, b.accepted, sp.inner, 4096,
+                                              on_relay_done, &cap));
+    b.sr = &sr;
+
+    uint8_t got[6000];
+    memset(got, 0, sizeof(got));
+    size_t n = drain_outer(r, sp.outer, got, sizeof(got), 400);
+
+    /* BOTH datagrams, in order, and the relay still running. Under the
+     * folded-in -2 the second datagram never arrives and on_done has
+     * already fired. */
+    ASSERT_EQ_INT(6000, (long)n);
+    ASSERT_MEM_EQ(got, d1, sizeof(d1));
+    ASSERT_MEM_EQ(got + sizeof(d1), d2, sizeof(d2));
+    ASSERT_EQ_INT(0, cap.calls);
+
+    cloak_stream_relay_stop(&sr);
+    close(sp.outer);
+    cloak_session_release_stream(&b.sesh, b.accepted);
+    cloak_session_release_stream(&a.sesh, s);
+    cloak_session_destroy(&a.sesh);
+    cloak_session_destroy(&b.sesh);
+    cloak_reactor_destroy(r);
+}
+
+/* The other half, and the reason the fix is not simply "never treat -2 as
+ * the end": a datagram larger than the relay can EVER hand to the fd --
+ * to_fd is empty and it still does not fit -- is not backpressure, because
+ * nothing will ever free more room than an empty queue already has.
+ * Pausing on it would leave the relay alive forever holding an open fd
+ * with no event that could resume it, which is exactly the permanent
+ * stall cloak_stream_relay_start's own frame-cost rejection exists to
+ * prevent in the other direction. The relay finishes instead. */
+static void test_unordered_undeliverable_datagram_finishes_rather_than_wedges(void) {
+    int fds[2];
+    ASSERT_EQ_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+    cloak_reactor_t *r = cloak_reactor_create();
+    ASSERT_TRUE(r != NULL);
+    if (r == NULL) {
+        return;
+    }
+
+    cloak_obfuscator_t obfs;
+    make_obfuscator(&obfs);
+
+    struct endpoint a;
+    struct endpoint b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+
+    cloak_session_config_t cfg_a;
+    cloak_session_config_t cfg_b;
+    fill_config_unordered(&cfg_a, &a, &obfs);
+    fill_config_unordered(&cfg_b, &b, &obfs);
+
+    ASSERT_EQ_INT(0, cloak_session_init(&a.sesh, 22, r, &cfg_a));
+    ASSERT_EQ_INT(0, cloak_session_init(&b.sesh, 22, r, &cfg_b));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&a.sesh, fds[0]));
+    ASSERT_EQ_INT(0, cloak_session_add_conn(&b.sesh, fds[1]));
+
+    cloak_stream_t *s = cloak_session_open_stream(&a.sesh, NULL);
+    ASSERT_TRUE(s != NULL);
+    if (s == NULL) {
+        return;
+    }
+
+    uint8_t big[3000];
+    memset(big, 0x5a, sizeof(big));
+    ASSERT_EQ_INT((long)sizeof(big), cloak_stream_write(s, big, sizeof(big)));
+    for (int i = 0; i < 200 && b.new_stream_calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, b.new_stream_calls);
+
+    struct sockpair sp;
+    ASSERT_EQ_INT(0, sockpair_init(&sp));
+
+    struct done_capture cap;
+    memset(&cap, 0, sizeof(cap));
+
+    /* 2048 < 3000: this relay can never hand that datagram to its fd. */
+    cloak_stream_relay_t sr;
+    ASSERT_EQ_INT(0, cloak_stream_relay_start(&sr, r, &b.sesh, b.accepted, sp.inner, 2048,
+                                              on_relay_done, &cap));
+    b.sr = &sr;
+
+    for (int i = 0; i < 400 && cap.calls == 0; i++) {
+        cloak_reactor_run_once(r, 10);
+    }
+    ASSERT_EQ_INT(1, cap.calls);
+
+    cloak_stream_relay_stop(&sr);
+    close(sp.outer);
+    cloak_session_release_stream(&b.sesh, b.accepted);
+    cloak_session_release_stream(&a.sesh, s);
+    cloak_session_destroy(&a.sesh);
+    cloak_session_destroy(&b.sesh);
+    cloak_reactor_destroy(r);
+}
+
 TEST_MAIN_BEGIN()
     test_forwards_both_directions();
     test_large_transfer_survives_backpressure();
@@ -1531,4 +1744,6 @@ TEST_MAIN_BEGIN()
     test_start_rejects_when_no_connection_can_ever_fit_one_frame();
     test_start_boundary_is_exactly_one_worst_case_frame();
     test_session_survives_one_congested_connection_among_many();
+    test_unordered_short_buffer_is_backpressure_not_eof();
+    test_unordered_undeliverable_datagram_finishes_rather_than_wedges();
 TEST_MAIN_END()

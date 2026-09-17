@@ -450,9 +450,14 @@ static void test_full_queue_drops_newest_and_counts(void) {
 
     uint8_t out[8];
     size_t delivered = 0;
-    for (;;) {
+    /* Capped at n_frames rather than written as `for (;;)`: a mutant that
+     * never consumes a datagram would otherwise spin here until the
+     * ctest TIMEOUT, reporting a timeout where an assertion should name
+     * the defect. Nothing legal can deliver more than was fed. */
+    for (size_t guard = 0; guard <= n_frames; guard++) {
         long n = cloak_stream_read(&rx, out, sizeof(out));
         if (n == 0) break;
+        ASSERT_TRUE(guard < n_frames);
         ASSERT_EQ_INT(n, 4);
         /* The i-th surviving datagram must be the i-th one WRITTEN --
          * contiguous from the front, nothing skipped. */
@@ -492,8 +497,19 @@ static void test_payload_larger_than_the_queue_is_rejected(void) {
     wire_init(&w);
 
     /* The largest datagram this queue can ever hold is recv_capacity
-     * minus the queue's own 4-byte length prefix. */
-    const size_t largest = RECV_CAP - CLOAK_MSGQUEUE_LEN_PREFIX;
+     * minus the queue's own 4-byte length prefix.
+     *
+     * THE 4 IS WRITTEN OUT, NOT TAKEN FROM CLOAK_MSGQUEUE_LEN_PREFIX, and
+     * that is deliberate. A test that derives its expected boundary from
+     * the shipped constant it is testing follows that constant wherever
+     * it goes -- this project has had two of those, one of which let a
+     * ceiling be set 256 times too high without a single assertion
+     * noticing. The literal is checked against the symbol on the next
+     * line, so a deliberate change to the prefix width fails HERE, loudly,
+     * with a reader who then has to decide what the new boundary should
+     * be, instead of silently re-deriving one. */
+    ASSERT_EQ_INT(CLOAK_MSGQUEUE_LEN_PREFIX, 4);
+    const size_t largest = RECV_CAP - 4;
 
     uint8_t *buf = (uint8_t *)malloc(largest + 1);
     memset(buf, 0xA5, largest + 1);
@@ -789,6 +805,168 @@ static void test_zero_length_write_sends_nothing(void) {
     }
 }
 
+/* --------------------------------------------------------------- extra --
+ * N12 (task 3 review): a datagram that EXACTLY fills the remaining free
+ * space of a NON-EMPTY queue must be accepted.
+ *
+ * test_payload_larger_than_the_queue_is_rejected already pins exact fit
+ * into an EMPTY queue, and that is the easy half: the admission test is
+ * `len + 4 > cap - used`, and with used == 0 an off-by-one there is also
+ * an off-by-one against the whole capacity, which that case sees. With
+ * used > 0 it is a different arithmetic path through the same expression,
+ * and a one-line mutant that rejects only this case survived all 70 tests
+ * -- it was killed only by the reviewer's property test. If it were ever
+ * real it would be permanent single-datagram loss at steady state, i.e.
+ * the queue silently refusing the one datagram that fits perfectly, over
+ * and over, for the life of the stream.
+ *
+ * The capacity is tiny and the arithmetic is written out so the "exactly
+ * fills it" claim is checkable by reading, not by trusting a helper. */
+static void test_exact_fit_into_a_non_empty_queue_is_accepted(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+
+    /* max_payload_per_frame = 40; the queue's floor makes 40 + 255 = 295
+     * the smallest legal recv_capacity. */
+    const size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 40;
+    const size_t recv_cap = max_on_wire - CLOAK_FRAME_HEADER_LEN; /* 295 */
+
+    cloak_stream_t rx;
+    ASSERT_EQ_INT(cloak_stream_init(&rx, 55, &o, max_on_wire, recv_cap, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_UNORDERED, wire_sink, &w),
+                  0);
+
+    uint8_t buf[64];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t)(i + 1);
+
+    cloak_frame_t f;
+    f.stream_id = 55;
+    f.seq = 0;
+    f.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    f.payload = buf;
+
+    /* Three 30-byte datagrams cost 3 * (4 + 30) = 102 bytes of the 295,
+     * leaving 193 free -- so a datagram of exactly 193 - 4 = 189 bytes
+     * fills the queue to the last byte. 189 is over max_payload_per_frame,
+     * which only means no sender in this tree could produce it; the queue
+     * has no opinion about frame sizes and neither does this case. */
+    for (int i = 0; i < 3; i++) {
+        f.payload_len = 30;
+        ASSERT_EQ_INT(cloak_stream_feed_frame(&rx, &f), 0);
+    }
+    ASSERT_EQ_INT(cloak_stream_recv_available(&rx), 90);
+
+    uint8_t *big = (uint8_t *)malloc(190);
+    memset(big, 0x7e, 190);
+    f.payload = big;
+    f.payload_len = 189; /* 189 + 4 == 193 == exactly the free space */
+    ASSERT_EQ_INT(cloak_stream_feed_frame(&rx, &f), 0);
+    ASSERT_EQ_INT(rx.recv_dropped_datagrams, 0); /* accepted, not dropped */
+    ASSERT_EQ_INT(cloak_stream_recv_available(&rx), 90 + 189);
+
+    /* One more byte than fits is a DROP, not a rejection -- the other
+     * side of the same boundary, and the pair is what makes the
+     * off-by-one visible in either direction. */
+    f.payload_len = 1;
+    ASSERT_EQ_INT(cloak_stream_feed_frame(&rx, &f), 0);
+    ASSERT_EQ_INT(rx.recv_dropped_datagrams, 1);
+
+    /* And every byte of it comes back whole, in order. */
+    uint8_t out[256];
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ_INT(cloak_stream_read(&rx, out, sizeof(out)), 30);
+        ASSERT_MEM_EQ(out, buf, 30);
+    }
+    ASSERT_EQ_INT(cloak_stream_read(&rx, out, sizeof(out)), 189);
+    ASSERT_MEM_EQ(out, big, 189);
+    ASSERT_EQ_INT(cloak_stream_read(&rx, out, sizeof(out)), 0);
+
+    free(big);
+    cloak_stream_destroy(&rx);
+    wire_free(&w);
+}
+
+/* --------------------------------------------------------------- extra --
+ * THE ORDERED TWINS OF TWO CELLS THIS FILE ALREADY PINS FOR UNORDERED.
+ *
+ * Task 3's report tabulated, for ordered mode, "payload larger than the
+ * receive queue -> -1" and "any frame after a close -> -1". Both were
+ * true and neither had a test: the reviewer's N3 and N4 made each return
+ * 0 instead and all 70 tests passed. They are pre-existing gaps rather
+ * than anything this module introduced -- but this module added a mode
+ * branch to the front of cloak_stream_feed_frame, and "a new branch that
+ * quietly makes the OLD path lenient" is exactly the defect no new
+ * unordered test can see. The unordered halves are asserted in
+ * test_payload_larger_than_the_queue_is_rejected and
+ * test_closing_frame_closes_immediately_unordered; these are the halves
+ * that were missing.
+ *
+ * Both retire the stream at the session layer (session.c's
+ * `rc == 1 || rc == -1`), which is deliberate and, for the duplicate
+ * cell, a known divergence from Go that module 9 still owes a decision
+ * on. Asserting it is not endorsing it -- it is making the current
+ * behaviour impossible to change by accident. */
+static void test_ordered_mode_still_rejects_oversize_and_post_close_frames(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+
+    /* (a) A payload larger than the whole ordered receive queue. */
+    cloak_stream_t rx_big;
+    init_stream(&rx_big, 61, &o, CLOAK_SESSION_ORDERING_ORDERED, &w);
+
+    uint8_t *buf = (uint8_t *)malloc(RECV_CAP + 1);
+    memset(buf, 0x3c, RECV_CAP + 1);
+
+    cloak_frame_t f;
+    f.stream_id = 61;
+    f.seq = 0;
+    f.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    f.payload = buf;
+    f.payload_len = RECV_CAP + 1;
+    ASSERT_EQ_INT(cloak_stream_feed_frame(&rx_big, &f), -1);
+    ASSERT_EQ_INT(cloak_stream_recv_available(&rx_big), 0);
+
+    /* The ordered queue holds the whole capacity, unlike the datagram
+     * queue, which spends 4 bytes of it on the length prefix -- a 4-byte
+     * band where the two modes genuinely differ. Asserted so the
+     * difference is recorded rather than discovered. */
+    f.payload_len = RECV_CAP;
+    ASSERT_EQ_INT(cloak_stream_feed_frame(&rx_big, &f), 0);
+    ASSERT_EQ_INT(cloak_stream_recv_available(&rx_big), RECV_CAP);
+
+    free(buf);
+    cloak_stream_destroy(&rx_big);
+
+    /* (b) A frame arriving after a closing frame has drained into order. */
+    cloak_stream_t tx;
+    init_stream(&tx, 62, &o, CLOAK_SESSION_ORDERING_ORDERED, &w);
+    ASSERT_EQ_INT(cloak_stream_send_closing(&tx, CLOAK_FRAME_CLOSING_STREAM), 0); /* seq 0 */
+    ASSERT_EQ_INT(w.frame_count, 1);
+
+    cloak_stream_t rx_closed;
+    init_stream(&rx_closed, 62, &o, CLOAK_SESSION_ORDERING_ORDERED, &w);
+    ASSERT_EQ_INT(feed(&w, &o, &rx_closed, 0), 1); /* drained in order: close */
+
+    uint8_t small[4] = {1, 2, 3, 4};
+    f.stream_id = 62;
+    f.seq = 1;
+    f.closing = CLOAK_FRAME_CLOSING_NOTHING;
+    f.payload = small;
+    f.payload_len = sizeof(small);
+    ASSERT_EQ_INT(cloak_stream_feed_frame(&rx_closed, &f), -1);
+
+    uint8_t out[8];
+    ASSERT_EQ_INT(cloak_stream_read(&rx_closed, out, sizeof(out)), -1); /* still EOF */
+
+    cloak_stream_destroy(&rx_closed);
+    cloak_stream_destroy(&tx);
+    wire_free(&w);
+}
+
 TEST_MAIN_BEGIN()
     test_out_of_order_is_arrival_order_unordered_sorted_ordered();
     test_duplicate_accepted_twice_unordered_rejected_ordered();
@@ -799,4 +977,6 @@ TEST_MAIN_BEGIN()
     test_zero_length_write_sends_nothing();
     test_full_queue_drops_newest_and_counts();
     test_payload_larger_than_the_queue_is_rejected();
+    test_exact_fit_into_a_non_empty_queue_is_accepted();
+    test_ordered_mode_still_rejects_oversize_and_post_close_frames();
 TEST_MAIN_END()
