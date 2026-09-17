@@ -446,6 +446,7 @@ static int front_port(struct fixture *fx) {
 static int open_client(struct fixture *fx, client_session_t *cs, uint32_t session_id) {
     cloak_session_config_t ccfg;
     memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     ccfg.max_on_wire_size = 16401;
     ccfg.stream_recv_capacity = 65536;
     ccfg.stream_max_pending_frames = 64;
@@ -570,6 +571,11 @@ struct count_wait {
 static int proxy_streams_eq(void *ctx) {
     struct count_wait *w = ctx;
     return cloak_proxy_stream_count(w->p) == w->want;
+}
+
+static int proxy_sessions_eq(void *ctx) {
+    struct count_wait *w = ctx;
+    return cloak_proxy_session_count(w->p) == w->want;
 }
 
 /* ---- tests ---------------------------------------------------------------- */
@@ -1012,13 +1018,20 @@ static void test_relay_start_rejection_retries_then_gives_up(void) {
     fixture_destroy(&fx);
 }
 
-/* Shared body for the two redirect cases: a handshake that is valid in
- * every respect the dispatcher itself checks must still be redirected to
- * the cover site, with nothing left in the registry and no proxy session
- * context created. Asserted exactly the way test_dispatcher_auth.c
- * asserts its own redirects: the cover site receives the client's own
- * first packet byte for byte. */
-static void expect_redirect(struct fixture *fx, int unordered) {
+/* Shared body for the two cases that used to be redirects and are now
+ * ACCEPTANCES -- see the two of them below for what changed and why.
+ * A handshake that is valid in every respect the dispatcher checks must
+ * now also be accepted by cloak_proxy_prepare_session: the session lands
+ * in the registry, the proxy builds a context for it, and NOTHING reaches
+ * the cover site (which is what would happen on a redirect, and is
+ * asserted here rather than merely not asserted).
+ *
+ * The cover site is checked by pumping for a bounded window and finding
+ * it still empty. That is a NEGATIVE assertion and therefore weaker than
+ * the positive one it replaced -- it can only be "nothing arrived within
+ * this window" -- which is exactly why the registry and proxy-context
+ * counts are asserted alongside it: a redirect would satisfy neither. */
+static void expect_attach(struct fixture *fx, int unordered) {
     int64_t now = (int64_t)time(NULL);
     uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
     uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
@@ -1034,32 +1047,135 @@ static void expect_redirect(struct fixture *fx, int unordered) {
     }
     ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
 
-    struct len_wait w = {&fx->cover, record_len};
-    ASSERT_TRUE(pump_until(fx->reactor, cover_has_len, &w, 300, 10));
-    ASSERT_EQ_INT((int)record_len, (int)fx->cover.len);
-    ASSERT_MEM_EQ(fx->cover.buf, record, record_len);
+    struct count_wait cw = {&fx->proxy, 1};
+    ASSERT_TRUE(pump_until(fx->reactor, proxy_sessions_eq, &cw, 300, 10));
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx->registry));
+    ASSERT_EQ_INT(1, (int)cloak_proxy_session_count(&fx->proxy));
 
-    ASSERT_EQ_INT(0, (int)cloak_server_registry_count(&fx->registry));
-    ASSERT_EQ_INT(0, (int)cloak_proxy_session_count(&fx->proxy));
+    /* Nothing was redirected. The handshake reply went to the client, not
+     * one byte to the cover site, and no upstream was dialed either --
+     * this handshake opened no stream. */
+    ASSERT_EQ_INT(0, (int)fx->cover.len);
     ASSERT_EQ_INT(0, fx->up.accept_count);
 
     close(client);
 }
 
-/* 8. Obligation 5: the unordered flag redirects rather than attaching. */
-static void test_unordered_redirects(void) {
+/* 8. THE UNORDERED FLAG NO LONGER REFUSES ANYTHING, which is the whole of
+ * module 9 task 6 as seen from this file.
+ *
+ * This case used to assert the opposite -- cloak_proxy_prepare_session's
+ * obligation 5 redirected any client that asked for datagrams, because
+ * the server had no datagram data path and handing such a client an
+ * ordered stream would have reassembled its datagrams into a byte stream,
+ * corruption it could not have diagnosed. There is a data path now
+ * (cloak/dgram_relay.h), the dispatcher builds the session in the mode
+ * the flag asks for, and the flag is no longer this function's business.
+ *
+ * NOTE WHICH UPSTREAM THIS IS: "tcp". An unordered SESSION against a
+ * STREAM upstream is a legal combination and gets the ordinary stream
+ * relay -- the two questions are independent, and Go decides neither.
+ * The datagram upstream's own end-to-end coverage is test_proxy_udp.c;
+ * what this case pins is only that nothing refuses here any more. */
+static void test_unordered_session_attaches(void) {
     struct fixture fx;
     ASSERT_EQ_INT(0, fixture_init(&fx, "tcp"));
-    expect_redirect(&fx, 1);
+    expect_attach(&fx, 1);
     fixture_destroy(&fx);
 }
 
-/* 9. A ProxyBook entry declared "udp" redirects for the same reason: a
- * SOCK_DGRAM upstream has no stream to splice. */
-static void test_udp_proxy_book_entry_redirects(void) {
+/* 8b. THE FOURTH COMBINATION, AND THE ONLY ONE NOTHING CARRIED A BYTE
+ * THROUGH: an UNORDERED session against a STREAM upstream. Case 8 above
+ * proves such a handshake attaches; this proves the pairing actually
+ * works, which is the half a review found unexercised when it swapped the
+ * relay's discriminator from the upstream's socket type to the session's
+ * ordering mode and watched all 73 tests pass.
+ *
+ * IT GETS THE STREAM RELAY, and the assertion is written to say so
+ * honestly. One datagram from the client leaves the server as bytes on a
+ * TCP socket; the echo comes back as bytes and is chopped into whatever
+ * datagrams the relay's reads happen to produce, each clamped to one
+ * frame's payload. So the count of datagrams on the way back is NOT a
+ * property this combination has -- the boundary is lost at the TCP
+ * socket, in this port exactly as in Go -- and what is asserted is the
+ * byte total, plus a size (16132, the largest one frame can carry) that
+ * makes the clamp the stream relay applies in unordered mode load-bearing
+ * rather than incidental. */
+static void test_unordered_session_over_a_stream_upstream_carries_bytes(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, "tcp"));
+
+    client_session_t cs;
+    cloak_session_config_t ccfg;
+    memset(&ccfg, 0, sizeof(ccfg));
+    ccfg.ordering = CLOAK_SESSION_ORDERING_UNORDERED;
+    ccfg.max_on_wire_size = 16401;
+    ccfg.stream_recv_capacity = 65536;
+    ccfg.stream_max_pending_frames = 64;
+    ccfg.conn_send_queue_cap = 262144;
+    ccfg.inactivity_timeout_ms = 60000;
+    ASSERT_EQ_INT(0, client_session_open(&cs, fx.reactor, front_port(&fx), fx.server_pub,
+                                         fx.uid_ok, "ss", 1101, 1 /* unordered */, &ccfg));
+
+    cloak_stream_t *st = cloak_session_open_stream(&cs.sesh, NULL);
+    ASSERT_TRUE(st != NULL);
+    if (st == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    ASSERT_EQ_INT(16132, (int)st->max_payload_per_frame);
+
+    size_t n = st->max_payload_per_frame;
+    uint8_t *payload = malloc(n);
+    ASSERT_TRUE(payload != NULL);
+    if (payload == NULL) {
+        client_session_close(&cs);
+        fixture_destroy(&fx);
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        payload[i] = (uint8_t)(0x20 + (i * 7u) + (i >> 8));
+    }
+    ASSERT_EQ_INT((int)n, (int)cloak_stream_write(st, payload, n));
+
+    struct up_wait uw = {&fx.up, 0, n};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw, 600, 5));
+    ASSERT_EQ_INT(1, fx.up.accept_count);
+    ASSERT_EQ_INT((int)n, (int)fx.up.conns[0].in_len);
+    ASSERT_MEM_EQ(fx.up.conns[0].in, payload, n);
+
+    uint8_t *back = malloc(n + 64);
+    ASSERT_TRUE(back != NULL);
+    if (back != NULL) {
+        reader_t rd = {st, back, n, 0, 0};
+        struct reader_wait rw = {&rd, n};
+        ASSERT_TRUE(pump_until(fx.reactor, reader_has, &rw, 600, 5));
+        ASSERT_EQ_INT(0, rd.ended);
+        ASSERT_EQ_INT((int)n, (int)rd.len);
+        ASSERT_MEM_EQ(rd.buf, payload, n);
+        free(back);
+    }
+
+    free(payload);
+    cloak_session_release_stream(&cs.sesh, st);
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
+/* 9. AND NOR DOES A "udp" ProxyBook ENTRY. It used to redirect because
+ * cloak_stream_relay_t splices a stream with a STREAM socket and had no
+ * framing with which to preserve datagram boundaries. The socket type now
+ * selects cloak_dgram_relay_t instead, at relay-start time.
+ *
+ * The client here is ORDERED against a datagram upstream, which is the
+ * other legal combination and, again, the one Go also permits: each read
+ * of the byte stream becomes one datagram. Asserted here only as far as
+ * "it attaches"; nothing in this file drives bytes through it. */
+static void test_udp_proxy_book_entry_attaches(void) {
     struct fixture fx;
     ASSERT_EQ_INT(0, fixture_init(&fx, "udp"));
-    expect_redirect(&fx, 0);
+    expect_attach(&fx, 0);
     fixture_destroy(&fx);
 }
 
@@ -1774,8 +1890,9 @@ test_large_transfer_round_trip();
 test_upstream_close_ends_stream();
 test_client_close_closes_upstream();
 test_refused_upstream_closes_only_that_stream();
-test_unordered_redirects();
-test_udp_proxy_book_entry_redirects();
+test_unordered_session_attaches();
+test_unordered_session_over_a_stream_upstream_carries_bytes();
+test_udp_proxy_book_entry_attaches();
 test_relay_start_rejection_retries_then_gives_up();
 test_permanent_start_failure_is_not_retried();
 test_per_session_stream_cap();

@@ -723,6 +723,7 @@ static void client_on_broken(cloak_session_t *sesh, void *userdata) {
 
 static void client_session_config(cloak_session_config_t *ccfg) {
     memset(ccfg, 0, sizeof(*ccfg));
+    ccfg->ordering = CLOAK_SESSION_ORDERING_ORDERED;
     ccfg->max_on_wire_size = 16401;
     ccfg->stream_recv_capacity = 65536;
     ccfg->stream_max_pending_frames = 64;

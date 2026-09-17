@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "cloak/dgram_relay.h"
 #include "cloak/dispatcher.h"
 #include "cloak/net.h"
 #include "cloak/reactor.h"
@@ -17,9 +18,12 @@
  * front door has authenticated a connection and joined it to a
  * cloak_session_t. For every stream that session accepts, this dials the
  * upstream named by the client's authenticated proxy method and splices
- * the two together with a cloak_stream_relay_t. This is the C equivalent
- * of the goroutine Go Cloak's dispatchConnection spawns per accepted
- * stream (internal/server/dispatcher.go's proxy-book dial + Copy loop).
+ * the two together -- with a cloak_stream_relay_t for a STREAM upstream
+ * and a cloak_dgram_relay_t for a DATAGRAM one, chosen by the ProxyBook
+ * entry's own resolved socket type and by nothing else. This is the C
+ * equivalent of the goroutine Go Cloak's dispatchConnection spawns per
+ * accepted stream (internal/server/dispatcher.go's proxy-book dial +
+ * Copy loop), which likewise dials whatever the book names.
  *
  * WIRING: one cloak_proxy_t serves a whole server. It supplies two of the
  * dispatcher's session callbacks --
@@ -81,16 +85,19 @@
  * OWNERSHIP OF SOCKETS, stated once: cloak_proxy_t NEVER owns a socket
  * for longer than one narrow window. A dialed descriptor belongs to
  * cloak_dial_t until the dial callback fires; to cloak_proxy_stream_t's
- * own fd_pending from that instant until a cloak_stream_relay_start
- * succeeds; and to the relay from then on (which closes it on completion
- * or on cloak_stream_relay_stop). fd_pending is the ONE field that says
+ * own fd_pending from that instant until whichever relay-start succeeds;
+ * and to that relay from then on (which closes it on completion or on
+ * its own stop). Both relays make the same promise about a FAILED start
+ * -- the descriptor stays the caller's -- which is what lets one retry
+ * ladder drive either. fd_pending is the ONE field that says
  * which of the three currently holds it: it is -1 whenever the proxy does
  * not itself hold a descriptor, exactly as cloak_dispatch_conn_t::fd is
  * -1 whenever that connection does not (cloak/dispatcher.h).
  *
- * A STREAM IS RELEASED IN EXACTLY TWO PLACES, and nowhere else:
- * cloak_stream_relay_t's done callback (the ordinary end of a stream's
- * life -- either side finished) and the shared teardown walk that
+ * A STREAM IS RELEASED IN EXACTLY TWO PLACES, and nowhere else: the
+ * relay's done callback (the ordinary end of a stream's life -- either
+ * side finished; one such callback per relay kind, doing the same one
+ * thing) and the shared teardown walk that
  * cloak_proxy_destroy, cloak_proxy_registry_broken and
  * cloak_proxy_session_aborted all drive -- ONE walk, driven by three
  * entry points, deliberately: two copies of the most lifetime-sensitive
@@ -104,7 +111,13 @@ typedef struct cloak_proxy_session cloak_proxy_session_t;
 
 /* Per-direction buffer capacity handed to cloak_stream_relay_start, which
  * uses it for the stream-to-fd queue (the other direction needs none --
- * cloak_stream_write always accepts what it is given). The dispatcher's
+ * cloak_stream_write always accepts what it is given).
+ *
+ * NOT USED BY A DATAGRAM UPSTREAM, and deliberately not passed to one:
+ * cloak_dgram_relay_start takes no capacity at all, because its one
+ * buffer must be exactly the stream's max_payload_per_frame and any
+ * other value would either waste memory or wedge the stream. See that
+ * function's own doc comment. The dispatcher's
  * own CLOAK_DISPATCHER_DEFAULT_RELAY_BUF_CAP is the same value for the
  * same reason, and matching it deliberately: one upstream connection
  * should not cost more buffer than one redirected one.
@@ -282,10 +295,29 @@ typedef struct cloak_proxy_stream {
     cloak_dial_t dial; /* live only while dialing != 0 */
     int dialing;
 
-    cloak_stream_relay_t relay; /* live only while relaying != 0 */
+    /* THE RELAY, IN WHICHEVER OF THE TWO KINDS THIS UPSTREAM NEEDS.
+     * Exactly one of the two is live, and only while relaying != 0;
+     * relay_is_dgram says which, and is meaningless while relaying == 0.
+     *
+     * WHY BOTH ARE EMBEDDED BY VALUE rather than one being a pointer, or
+     * the pair a union: every reactor-driven object in this tree must
+     * stay at a fixed address until its terminal event, and a
+     * cloak_proxy_stream_t is already heap-allocated and never moved, so
+     * embedding satisfies that for free. A union would save a few dozen
+     * bytes per stream and would make every teardown path one mistaken
+     * discriminator away from running the wrong destructor over live
+     * state -- on the most lifetime-sensitive code in this module. The
+     * cost of not unioning is bounded by max_streams_total.
+     *
+     * WHICH ONE IS CHOSEN BY THE UPSTREAM'S SOCKET TYPE ALONE, never by
+     * the session's ordering mode -- see cloak_proxy_prepare_session's
+     * own doc comment for why those are two different questions. */
+    cloak_stream_relay_t relay;
+    cloak_dgram_relay_t dgram;
     int relaying;
+    int relay_is_dgram;
 
-    /* A transient cloak_stream_relay_start rejection, held over a timer.
+    /* A transient relay-start rejection, held over a timer.
      * fd_pending is the connected upstream descriptor across that window,
      * and -1 whenever this object does not hold one -- see this file's
      * top-of-file ownership paragraph. */
@@ -369,8 +401,10 @@ typedef struct {
     uint64_t dial_timeout_ms; /* 0 -> CLOAK_PROXY_DEFAULT_DIAL_TIMEOUT_MS */
 
     /* THE RETRY POLICY. cloak_stream_relay_start distinguishes its two
-     * failure kinds by return value, and this module branches on that
-     * distinction rather than guessing:
+     * failure kinds by return value -- and cloak_dgram_relay_start makes
+     * the identical distinction with the identical two values, which is
+     * what lets one ladder drive either upstream kind -- and this module
+     * branches on that distinction rather than guessing:
      *
      *   -1 PERMANENT (bad arguments, allocation, reactor registration).
      *      Failed immediately. Retrying cannot help, and would hold a
@@ -542,21 +576,9 @@ void cloak_proxy_destroy(cloak_proxy_t *p);
  *
  * Returns -1 -- which redirects the connection to the cover site exactly
  * as if authentication itself had failed, leaving nothing in the registry
- * -- in four cases:
+ * -- in two cases:
  *
- *  1. THE CLIENT ASKED FOR AN UNORDERED (DATAGRAM-ORIENTED) SESSION.
- *     This server has no UDP data path, and a client that got an ordered
- *     stream anyway would have its datagrams silently reassembled into a
- *     byte stream -- corruption it could not diagnose. A redirect is the
- *     kinder answer AND the safer one: the client learns nothing about
- *     this server and falls back, exactly as it would against any cover
- *     site. Checking only here, on the CREATE path, is the complete
- *     check and not an oversight: Go treats Unordered as a session-level
- *     property fixed when the session is created, so an additional
- *     connection joining an already-ordered session never reaches this
- *     callback at all and its own flag is meaningless.
- *
- *  2. THE PROXY METHOD HAS NO ProxyBook ENTRY. The dispatcher already
+ *  1. THE PROXY METHOD HAS NO ProxyBook ENTRY. The dispatcher already
  *     rejected unknown proxy methods before calling this, so a NULL from
  *     cloak_server_lookup_proxy here is a PROGRAMMING ERROR (a caller
  *     that wired this proxy to a different cloak_server_t than the
@@ -564,17 +586,55 @@ void cloak_proxy_destroy(cloak_proxy_t *p);
  *     than dereferencing NULL: a caller bug should degrade to a redirect,
  *     not a crash.
  *
- *  3. THE ProxyBook ENTRY IS A DATAGRAM UPSTREAM. An entry declared
- *     "udp" resolves to SOCK_DGRAM (cloak_server_init), and
- *     cloak_stream_relay_t splices a stream with a STREAM socket -- it
- *     has no framing with which to preserve datagram boundaries.
- *     Datagram upstreams are out of scope for this module entirely, so
- *     redirecting is the honest response; nothing here silently
- *     half-works.
+ *  2. Allocation failure.
  *
- *  4. Allocation failure.
+ * Returns 0 otherwise.
  *
- * Returns 0 otherwise. */
+ * TWO CASES WERE REMOVED IN MODULE 9, and what they were is worth more
+ * than a diff, because both were correct when written and neither is now:
+ *
+ *  GONE: "THE CLIENT ASKED FOR AN UNORDERED (DATAGRAM-ORIENTED)
+ *  SESSION." This used to be the first thing the function did. The
+ *  argument was that a server with no UDP data path should redirect such
+ *  a client rather than hand it an ordered stream that would silently
+ *  reassemble its datagrams -- corruption the client could not diagnose
+ *  -- and it was right for as long as the premise held. Module 9 removed
+ *  the premise: the dispatcher now builds the session in the mode the
+ *  flag asks for, and cloak_dgram_relay_t carries datagrams end to end.
+ *
+ *  AND ITS OLD JUSTIFICATION IS NOW FALSE IN A WAY THAT MATTERED. It
+ *  claimed a check on the CREATE path was the COMPLETE check, because Go
+ *  treats Unordered as a session-level property fixed at creation and an
+ *  additional connection joining an existing session never reaches this
+ *  callback. The first half is true and still is; the conclusion was
+ *  only true while every unordered client was refused outright. Once
+ *  they are not, a second connection whose flag DISAGREES with the live
+ *  session would be spliced onto it silently -- its frames interpreted
+ *  under the session's mode rather than its own. That hole is closed
+ *  where it lives, in dispatcher.c's step 8, which now REFUSES the
+ *  joining connection (see cloak_dispatcher_t::ordering_mismatch_
+ *  refusals): a deliberate divergence from Go, which splices. It is
+ *  named here, in the comment that used to assert the check was
+ *  complete, so that the correction is found by whoever finds the claim.
+ *
+ *  GONE: "THE ProxyBook ENTRY IS A DATAGRAM UPSTREAM." An entry declared
+ *  "udp" resolves to SOCK_DGRAM (cloak_server_init), and
+ *  cloak_stream_relay_t has no framing with which to preserve datagram
+ *  boundaries -- so refusing was the honest answer while it was the only
+ *  relay. There are now two, and the socket type is what chooses between
+ *  them, at relay-start time rather than here (proxy_try_start_relay).
+ *  Deliberately not re-checked in this function: a second check could
+ *  only duplicate that one and would then be free to disagree with it.
+ *
+ * THE TWO QUESTIONS ARE INDEPENDENT, which is the part that is easy to
+ * get wrong now that both are answered. The session's ordering mode says
+ * how the client's application framed what it sent; the upstream's
+ * socket type says what the far end can receive. All four combinations
+ * are legal and all four are what Go does -- Go chooses nothing, it
+ * dials whatever the ProxyBook names and runs one copy loop over it. An
+ * unordered session against a "tcp" upstream loses its boundaries at the
+ * TCP socket, in this port exactly as in Go, because there is nowhere
+ * else they could survive. */
 int cloak_proxy_prepare_session(cloak_dispatcher_t *d, const cloak_server_clientinfo_t *info,
                                  cloak_session_config_t *config, void *userdata);
 

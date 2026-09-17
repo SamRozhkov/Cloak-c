@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "cloak/frame.h"
+#include "cloak/ordering.h" /* cloak_session_ordering_t, CLOAK_SESSION_ERR_INVALID_ORDERING */
 #include "cloak/reactor.h"
 #include "cloak/strmtab.h"
 #include "cloak/stream.h"
@@ -134,6 +135,14 @@ typedef void (*cloak_session_stream_data_cb)(cloak_session_t *sesh, cloak_stream
                                               void *userdata);
 
 typedef struct {
+    /* REQUIRED -- 0 fails cloak_session_init with
+     * CLOAK_SESSION_ERR_INVALID_ORDERING, and cloak/ordering.h is the
+     * whole argument for why that is better than a default. Deliberately
+     * the FIRST field of this struct, where a reader filling one in is
+     * most likely to see it, and deliberately validated first. Forwarded
+     * to every cloak_stream_init this session performs, so a stream can
+     * never disagree with it. */
+    cloak_session_ordering_t ordering;
     cloak_obfuscator_t obfuscator;   /* copied by value into the session -- see this task's own file header comment for why */
     size_t max_on_wire_size;         /* forwarded to every cloak_stream_init and cloak_conn_init this session performs */
     size_t stream_recv_capacity;     /* forwarded to every cloak_stream_init this session performs */
@@ -162,6 +171,7 @@ typedef struct {
 struct cloak_session {
     uint32_t id;
     cloak_reactor_t *reactor;
+    cloak_session_ordering_t ordering; /* never CLOAK_SESSION_ORDERING_INVALID on a constructed session */
     cloak_obfuscator_t obfuscator;
 
     cloak_strmtab_t streams;
@@ -189,10 +199,14 @@ struct cloak_session {
     void *on_stream_data_userdata;
 };
 
-/* Returns 0 on success, -1 on invalid parameters (same validation
- * cloak_stream_init and cloak_conn_init/cloak_switchboard_init already
- * apply to max_on_wire_size/stream_recv_capacity/conn_send_queue_cap,
- * checked eagerly here as far as is possible without a stream/conn to
+/* Returns 0 on success, CLOAK_SESSION_ERR_INVALID_ORDERING if
+ * config->ordering is not one of the two real modes -- checked FIRST, so
+ * a memset-zeroed config is diagnosed as the forgotten mode it is rather
+ * than as whichever other field the same memset also left at zero -- and
+ * -1 on any other invalid parameter (same validation cloak_stream_init
+ * and cloak_conn_init/cloak_switchboard_init already apply to
+ * max_on_wire_size/stream_recv_capacity/conn_send_queue_cap, checked
+ * eagerly here as far as is possible without a stream/conn to
  * actually construct) or allocation failure. Schedules the initial
  * inactivity timer as part of construction (matching Go's MakeSession,
  * which does the same immediately after setting up the session). */

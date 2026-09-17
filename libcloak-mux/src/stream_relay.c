@@ -29,14 +29,21 @@ static void stream_relay_teardown(cloak_stream_relay_t *sr, int fire_done);
  * whose conn_send_queue_cap sits between 16403 and 16405 flips from
  * accepting streams to refusing every one of them at start -- correct
  * behaviour, since such a pool genuinely cannot hold a worst-case frame,
- * but silent and baffling from the outside. Raise conn_send_queue_cap. */
-static size_t stream_relay_frame_cost_for(const cloak_stream_t *stream) {
+ * but silent and baffling from the outside. Raise conn_send_queue_cap.
+ *
+ * EXPORTED (module 9 task 6) FOR ONE REASON: cloak_dgram_relay_t makes
+ * the identical start-time rejection and the identical per-read room
+ * check, and two copies of a wire-format cost formula that MUST agree is
+ * the kind of drift this tree pays for later. It stays declared in this
+ * header, with this comment, because this is where the reasoning lives;
+ * nothing about it is specific to a stream relay. */
+size_t cloak_stream_relay_frame_cost(const cloak_stream_t *stream) {
     return (size_t)CLOAK_CONN_RECORD_HEADER_LEN + stream->max_payload_per_frame +
            (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
 }
 
 static size_t stream_relay_frame_cost(const cloak_stream_relay_t *sr) {
-    return stream_relay_frame_cost_for(sr->stream);
+    return cloak_stream_relay_frame_cost(sr->stream);
 }
 
 /* The number of raw bytes it is currently safe to pull from the fd and
@@ -115,6 +122,50 @@ static size_t stream_relay_fd_read_budget(cloak_stream_relay_t *sr, uint64_t *ou
     size_t budget = frames * sr->stream->max_payload_per_frame;
     if (budget > STREAM_RELAY_CHUNK) {
         budget = STREAM_RELAY_CHUNK;
+    }
+    /* AND, IN UNORDERED MODE, NEVER MORE THAN ONE FRAME'S PAYLOAD.
+     *
+     * STREAM_RELAY_CHUNK is 16384 and max_payload_per_frame is 16132 at
+     * the max_on_wire_size both ends of this tunnel actually use, so the
+     * clamp above can hand back a budget 252 bytes LARGER than the
+     * biggest write an unordered stream will accept. cloak_stream_write
+     * refuses such a write outright (CLOAK_STREAM_ERR_SHORT_BUFFER --
+     * splitting it would be silent corruption, because the far end does
+     * no reassembly in this mode), and pump_fd_to_stream treats every
+     * negative as fatal, so ONE large read would kill a live stream. The
+     * failure needs a local peer that writes more than 16132 bytes in one
+     * go, which is ordinary for a bulk transfer, and it would look like a
+     * connection that dies at random.
+     *
+     * Nothing could reach it before module 9: no session was ever
+     * unordered. It is clamped rather than distinguished at the write
+     * site because the refusal is not a condition this object can
+     * recover from -- the bytes are already out of the socket by then,
+     * and there is nowhere to put them back.
+     *
+     * THE ORDERED PATH IS UNTOUCHED, deliberately: it splits freely, so a
+     * clamp there would cost an extra read(2) per chunk for nothing. That
+     * is why this is conditioned on the mode rather than applied
+     * unconditionally, and it is why no existing test's behaviour
+     * changes.
+     *
+     * THAT EXEMPTION IS ITSELF PINNED NOW, by
+     * libcloak-mux/tests/test_stream_relay.c's
+     * test_ordered_read_budget_is_not_clamped_to_one_frame. It had to be:
+     * a whole-branch review deleted the mode condition below, so the
+     * clamp applied in both modes, and killed 0 of 69 tests -- because on
+     * a stream socket the two budgets produce a byte-identical wire and
+     * differ only in the number of read(2) calls. The new test reads the
+     * budget out through a datagram socket, where a short read discards
+     * the rest of the datagram and the difference becomes 252 lost bytes.
+     * Pinned in the other direction by
+     * libcloak-client/tests/test_udp_piper.c's
+     * test_relay_read_budget_respects_the_unordered_write_limit, which
+     * fails with the relay torn down and zero bytes delivered if this
+     * block is removed. */
+    if (sr->stream->ordering == CLOAK_SESSION_ORDERING_UNORDERED &&
+        budget > sr->stream->max_payload_per_frame) {
+        budget = sr->stream->max_payload_per_frame;
     }
 
     /* rx/tx here are the SERVER's directions, NOT the user manager's
@@ -203,7 +254,23 @@ static void sync_interest(cloak_stream_relay_t *sr) {
  * currently has. Returns the number of bytes moved (0 if none), and sets
  * sr->stream_ended if the stream reported end-of-stream while filling.
  * "Nothing ready right now" and "stream ended" are both ordinary
- * terminal conditions for a single call, not errors. */
+ * terminal conditions for a single call, not errors.
+ *
+ * THE THIRD TERMINAL CONDITION, AND IT IS NOT AN END. On an UNORDERED
+ * (datagram) stream cloak_stream_read reads one whole datagram or none,
+ * and answers CLOAK_STREAM_ERR_SHORT_BUFFER when `want` is smaller than
+ * the datagram at the head -- leaving that datagram queued. This function
+ * used to fold that into `if (n < 0)` alongside end-of-stream, which was
+ * wrong in the worst available way: `want` here is sized by the free
+ * space in to_fd, so ORDINARY BACKPRESSURE from a slow fd shrinks it
+ * below the next datagram and PERMANENTLY ENDED A LIVE STREAM, silently
+ * discarding everything after the point where to_fd happened to be full.
+ * That is Go's own bug 6 (internal/client/piper.go's reader breaking out
+ * of its loop on io.ErrShortBuffer, losing every reply of 8193..16132
+ * bytes and tearing the peer's tunnel down) reproduced here. Pinned by
+ * test_stream_relay.c's
+ * test_unordered_short_buffer_is_backpressure_not_eof, which fails on
+ * three named assertions if the -2 is folded back in. */
 static size_t try_fill_from_stream(cloak_stream_relay_t *sr) {
     uint8_t buf[STREAM_RELAY_CHUNK];
     size_t total = 0;
@@ -217,6 +284,31 @@ static size_t try_fill_from_stream(cloak_stream_relay_t *sr) {
         }
         size_t want = room < sizeof(buf) ? room : sizeof(buf);
         long n = cloak_stream_read(sr->stream, buf, want);
+        if (n == CLOAK_STREAM_ERR_SHORT_BUFFER) {
+            /* TRANSIENT if anything is still queued for the fd: draining
+             * to_fd grows `room`, and to_fd draining is exactly the event
+             * pump_stream_to_fd's own do/while and
+             * cloak_stream_relay_notify_writable already re-drive this
+             * call on. Identical in shape to the `room == 0` break above.
+             *
+             * PERMANENT if to_fd is EMPTY and the datagram still does not
+             * fit, because nothing can ever free more room than an empty
+             * queue already has and no event will ever resume this relay.
+             * Pausing there would leave it alive forever holding an open
+             * fd with no error anywhere -- the same permanent stall
+             * cloak_stream_relay_start's frame-cost rejection exists to
+             * make impossible in the other direction -- so the relay
+             * finishes instead, which at least reports something to its
+             * owner. Reachable only when buf_cap or STREAM_RELAY_CHUNK
+             * (16384) is below the peer's largest datagram, i.e. never
+             * for a session at the usual max_on_wire_size of 16401, whose
+             * largest possible datagram is 16132. Pinned by
+             * test_unordered_undeliverable_datagram_finishes_rather_than_wedges. */
+            if (cloak_bytequeue_len(&sr->to_fd) == 0) {
+                sr->stream_ended = 1;
+            }
+            break;
+        }
         if (n < 0) {
             sr->stream_ended = 1; /* peer closed: flush, then finish */
             break;
@@ -546,11 +638,13 @@ int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
      * cloak_conn_init/cloak_session_init -- silently stalls the very
      * first read). Checked against the SAME per-connection quantity the
      * running budget uses, so the two can never drift apart. */
-    /* -2, NOT -1: this is the one TRANSIENT rejection this function has.
-     * See this function's own doc comment for why the caller must be able
-     * to tell it apart from every permanent failure. */
-    if (cloak_session_send_min_conn_free(sesh) < stream_relay_frame_cost_for(stream)) {
-        return -2;
+    /* CLOAK_STREAM_RELAY_ERR_POOL_FULL (-2), NOT -1: this is the one
+     * TRANSIENT rejection this function has. See this function's own doc
+     * comment for why the caller must be able to tell it apart from every
+     * permanent failure -- and for why it is spelled out by name, given
+     * that cloak_stream_read's -2 means something entirely different. */
+    if (cloak_session_send_min_conn_free(sesh) < cloak_stream_relay_frame_cost(stream)) {
+        return CLOAK_STREAM_RELAY_ERR_POOL_FULL;
     }
 
     if (cloak_bytequeue_init(&sr->to_fd, buf_cap) != 0) {

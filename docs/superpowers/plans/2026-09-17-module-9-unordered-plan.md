@@ -54,7 +54,7 @@ as a **field of `cloak_session_config_t`**, with a **distinct error code** so a 
 - **> 16132 bytes outbound**: refuse with the `io.ErrShortBuffer` analogue, matching Go's stream layer. Same as Go.
 - **8193 … 16132 bytes**: carry it. **Go loses it and tears down the stream** (bug #6). We do not.
 - **> 8192 bytes read from the local UDP socket**: read the whole datagram up to 16132. **Go silently truncates to 8192** (bug #7). We do not.
-- **zero-length datagram**: carry it. **Go swallows it** (bug #8). We do not. *(If carrying it turns out to be wire-visible in a way that distinguishes us from Go, reverse this one and say so — it is the only one of the four where fidelity might win.)*
+- **zero-length datagram**: **swallow it, matching Go.** *(Reversed from the original wording after Task 4 measured it. The criterion was whether carrying it is wire-visible; it is, and worse — "carry it" was never reachable in the first place. Go's frame **encoder** refuses an empty payload outright, not just `Stream.Write`'s loop, and our `cloak_frame_obfuscate` refuses identically, so `stream.c` could not have carried one. A Go receiver fed a hand-built zero-length frame accepts it silently, so the peer's reaction does not decide it — the 30-byte record does, against Go's 31-byte floor past seq 4. Bug #8 therefore stands as a Go observation we deliberately reproduce, not a divergence.)*
 
 ## Three more bugs in the Go original, all reproduced at the built `v2.12.0` binaries
 
@@ -188,8 +188,10 @@ Note the interaction that will bite: **`cloak_stream_feed_frame`'s `-1` return r
     the data is the failure this test exists to catch.
 2.  The same two sizes in ORDERED mode: 16133 splits into two frames and
     succeeds. Same fixture, both modes.
-3.  A zero-length write in unordered mode carries a zero-length datagram
-    (D7), and the negative: Go swallows it. Document as a divergence.
+3.  A zero-length write in unordered mode is SWALLOWED, matching Go --
+    see D7, which Task 4 reversed by measurement. Assert that nothing
+    reaches the wire, and say in the test that the frame encoder, not the
+    stream layer, is what refuses it.
 ```
 - [ ] **Step 2: Run to verify they fail**
 - [ ] **Step 3: Implement**
@@ -324,3 +326,141 @@ Every distribution; sequence-number generation and therefore AEAD nonce uniquene
 - **Type consistency:** `cloak_session_ordering_t` is produced in Task 2 and consumed in Tasks 3, 4, 6 and 7; the message queue in Task 3 and consumed in Tasks 5 and 6. Counts chain 68 → 68 → 69 → 70 → 70 → 71 → 72 → 72 → 73.
 - **The riskiest task is 5**, for the reason stated in it: no precedent in the tree, a model that does not translate from Go, and a correct behaviour under pressure that no test against Go can validate.
 - **The most consequential thing here is Task 1**, which is not about unordered mode at all. The direct path and the whole C client have never met foreign code, and the last time this port did that it discovered it could not exchange a single frame with Go.
+
+---
+
+## What this branch left for the next ones
+
+### The module's name was wrong, and settling that was the first useful thing scouting did
+
+This is **unordered semantics over TCP**, not UDP on the wire. The Cloak connection is always TCP
+(`internal/client/connector.go:29`, `cmd/ck-server/ck-server.go:183`); only the application and
+upstream sockets are datagrams, and `ProxyMethod`/`ProxyBook` picks the upstream socket type
+**independently** of the `Unordered` flag, with nothing cross-checking them. The whole behavioural
+surface in Go is **two lines** of `stream.go` — which receive buffer, and refusing to split rather
+than splitting. The frame layout does not change by a single bit.
+
+### Three more bugs in the Go original, all reproduced at the real binaries
+
+- **#6** — a reply of 8193…16132 bytes is **silently lost *and* tears down the peer's stream**. The
+  server writes up to 16132; the client's reader uses an 8192 buffer; `datagramBufferedPipe.Read`
+  returns `ErrShortBuffer` **without consuming**. Confirmed twice, independently.
+- **#7** — an outbound datagram over 8192 is **silently truncated**, with 16132 bytes of protocol
+  budget unused. Confirmed at the binaries: 8193, 12000, 16132 and 16133 all arrive as **exactly
+  8192**.
+- **#8** — a zero-length datagram is swallowed. Measured, then found to be unavoidable: **Go's frame
+  encoder refuses an empty payload outright**, and so does ours, so "carry it" was never reachable.
+  Bug #8 is therefore an observation this port deliberately reproduces.
+
+That is **eight** bugs this port has found in its reference. A ninth is recorded unconfirmed:
+`RouteUDP`'s reader goroutine deletes its map entry **by address**, so a stale goroutine can evict a
+live successor.
+
+### The sixth member of the distribution class, and why it matters more than the first five
+
+Module 8 found four biases no interop test could see. Module 9 found a fifth — a round-robin
+connection pick is perfectly uniform, so every chi-square passes, yet it is wire-visible — and added
+a **lag-1 pair-transition test** to close the independence axis.
+
+**Then the whole-branch review found a sixth, and the new axis passed against it.**
+`switchboard.c` picked connections with `xorshift32() % conns_len` where Go uses ChaCha8 + `Uint32N`.
+Measured: marginal chi-square **0.09–2.38** against a threshold of 30, pair-transition
+**10.50–16.22** against 60 — **both pass** — while **GF(2) elimination on 32 observed picks recovers
+the generator state in 4 of 4 seeds and predicts 100 000 of 100 000 subsequent picks.** Linear
+complexity of the pick's low bit: **32** against **257** for a CSPRNG.
+
+One datagram is one record on one connection, so **a censor who watches thirty-two datagrams
+predicts every later choice.**
+
+**The lesson is the general one: uniformity and independence are each necessary and jointly
+insufficient. The property that matters is unpredictability, and no chi-square of any order tests
+it.** The fix asserts **linear complexity** — restoring `xorshift32` now fails **only** that
+assertion, with both chi-squares passing on the way. Before 32, 32, 32, 32; after 255–257 over
+twelve runs, bound 200.
+
+Cost, measured over 2 M draws: `xorshift32` 2.0 ns, a direct CSPRNG call **644 ns (~320×)**, a
+256-byte buffered CSPRNG with rejection sampling **10.9 ns (~5.4×)**. Buffering is what Go's
+`rand.Rand` over ChaCha8 does too.
+
+### A written reason is not a checked reason
+
+**Module 8's final fix wave examined that exact site and deliberately left it**, recording: *"a
+32-bit non-crypto draw that matches Go's own pool."* **That was factually wrong** — Go's
+`math/rand/v2` has been ChaCha8-backed since 1.22 — and the header's pointer to where the rationale
+lived **pointed at nothing.** A decision taken inside the hunt designed to find this class, with its
+justification written down, was wrong because nobody checked the justification against the
+reference.
+
+**Recommendation for every later module: a comment that justifies a divergence from Go must cite the
+Go file and symbol, and a reviewer must check it there.** This branch corrected comments asserting
+unmeasured facts five times, including `TIMEOUT 150` documented in a thirty-line comment and **never
+set**, with the test running at ctest's default 1500 s.
+
+### What tests caught that no oracle could
+
+- **`seq = 0` — silent GCM nonce reuse — fails 2 of 75, and the entire size ladder stays green.**
+  Both Go oracle roles print clean under it. The white-box sequence test justified itself by
+  measurement.
+- The **synthesised reordering harness** is the only thing proving the mode does anything: over
+  loopback with `NumConn: 4` frames essentially never arrive out of order. Disabling the reversal
+  fails it 3/3.
+- And the trap measured **three** times here: **Go reorders rather than drops.** Forcing the wire
+  bit leaves every byte count identical and fails only the content comparison. **A size-only
+  assertion is green on exactly the corruption these tests exist to catch.**
+
+### Defects fixed that would have reached a user
+
+- `-u` was **parsed and never written into the config document** — removing the CLI refusal alone
+  would have shipped an accepted-and-ignored flag. And `-u=false` was silently TRUE.
+- On the **ssv** configuration path, `-u` logged `listening on TCP` while the config asked for UDP.
+- `adminapi`'s write budget returned **fifteen frames' worth**, so the first chunk of any admin
+  response over 16132 bytes was refused and read as terminal: **the stream was torn down having
+  written nothing** — measured at 0 of 800 objects.
+- The short-buffer return was **misread as EOF by both production readers**, so transient
+  backpressure permanently ended a live stream.
+
+### Flakes: four observations, two unrelated causes
+
+One was a genuine timing bound — `test_adminapi`'s 300 ms deadline, where `gap + elapsed` was
+constant at **301–309 ms across 0 to 12 CPU hogs**: the timer was never late, only the pre-`t0`
+consumption moved, and ASan inflated that gap fourfold. Fixed by **moving the origin, not widening
+the tolerance** — the tolerance was deleted.
+
+The other was **not a timing bound at all**: an assertion demanding that a **TCP** bind to the UDP
+listener's ephemeral port **succeed**, which any concurrent process can defeat, because ephemeral
+port ranges are shared across protocol families. It could also have **passed spuriously**. Now the
+test asks the socket its own type. Reproduced 10/10 with a deliberate port hog, 0/10 after.
+
+**I collapsed both under one cause in the ledger and would have sent someone hunting the wrong
+mechanism.** Two observations that look alike are not one finding.
+
+### Costs and budgets for module 10
+
+- **75 tests, 69 fast + 6 slow.** Debug ~25 s at `-j4`; ASan ~102 s, of which **`test_ck_client_cli`
+  is 61.6 s and `test_ck_server_cli` 40.9 s** — the suite's wall clock is now those two alone.
+- **Add nothing to `test_ck_client_cli`.** Its margin against `TIMEOUT 120` is a measured
+  **1.95–2.01×**, and the trick that funded the last addition — deleting a subprocess run and merging
+  its assertions — **is spent.**
+- **Split the two CLI tests into separate binaries.** That is the only remaining lever.
+- `detect_leaks=0` for children: **measured not to help** and it would delete the only leak check
+  against the two binaries.
+- **`PICK_PAIR_CHI2_3 = 40.0`** is the thinnest threshold on the branch (shipped observed to 18.04
+  at 8 d.f.) and is the first expected to flake if one ever does.
+- **Always rebuild before trusting a number.** We mandate `cp` over `mv` for mutation reverts because
+  `mv` preserves mtime and the build silently skips, giving a false **pass**. The cost of `cp` is the
+  opposite: a stale binary giving a false **fail**, which happened here.
+
+### Out of scope, carried forward
+
+**`-u` × CDN is unreachable** — the C client still refuses `Transport "cdn"`, which is module 8b's,
+and 8b needs a real TLS stack plus a fingerprint decision. `singleplex + udp` is unimplemented
+although Go supports it, and is refused by name. The linear-complexity assertion sees **F2-linear
+structure only**; a nonlinear deterministic generator would pass it, and the defence there is the
+header's stated requirement.
+
+### Tally
+
+Sixty-eight coverage defects across eight branches became **seventy-nine across nine**, plus three
+new bugs in the reference implementation and one shipped, wire-visible predictability defect that
+two orders of distribution testing could not see. Every one was found by measuring or mutating.
+**None was found by reading.**

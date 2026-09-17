@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "cloak/dispatcher.h"
+#include "cloak/log.h"
 #include "cloak/base64.h"
 #include "cloak/clienthello.h"
 #include "cloak/common.h"
@@ -723,6 +724,298 @@ static void test_invalid_encryption_method_redirects(void) {
     fixture_destroy(&fx);
 }
 
+/* 13. THE UNORDERED FLAG DECIDES THE SESSION'S ORDERING MODE. The flag
+ * byte of the auth record has been parsed since module 3
+ * (cloak_server_clientinfo_t::unordered) and, until this module, was read
+ * by nothing that built a session -- so a client asking for datagrams got
+ * a byte-stream session and no part of this suite noticed.
+ *
+ * Both values are driven, and the assertion is on the session the
+ * dispatcher actually created, not on info: a dispatcher that ignored the
+ * flag and left every session in whichever mode a template carried would
+ * pass every other case in this file, including the one above that
+ * already builds a session and inspects its obfuscator. Measured against
+ * exactly that mutation (dispatcher.c step 8b replaced by a fixed
+ * CLOAK_SESSION_ORDERING_ORDERED), which this case is what fails.
+ *
+ * This file's prepare_cb accepts everything, which is what let an
+ * unordered handshake get as far as a session here when the real
+ * cloak_proxy_prepare_session still refused one. It no longer does
+ * (module 9 task 6 removed that refusal along with the premise behind
+ * it), so this case would now reach a session either way; the stub is
+ * still what keeps this file about the DISPATCHER rather than about the
+ * proxy. */
+static void test_unordered_flag_selects_the_session_ordering(void) {
+    const int cases[2] = {0, 1};
+    for (int i = 0; i < 2; i++) {
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+        int64_t now = (int64_t)time(NULL);
+        uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+        uint8_t shared_secret[CLOAK_AEAD_KEY_LEN];
+        size_t record_len =
+            build_client_record(fx.server_pub, fx.uid_ok, "ss", (uint8_t)CLOAK_AEAD_AES_256_GCM,
+                                now, (uint32_t)(3101 + i), cases[i], record, sizeof(record),
+                                shared_secret);
+        ASSERT_TRUE(record_len > 0);
+
+        int client = client_connect(front_port(&fx));
+        ASSERT_TRUE(client >= 0);
+        ASSERT_TRUE(write(client, record, record_len) == (ssize_t)record_len);
+
+        uint8_t reply[512];
+        size_t reply_len = 0;
+        ASSERT_EQ_INT(0, read_reply(fx.reactor, client, reply, sizeof(reply), &reply_len));
+
+        ASSERT_EQ_INT(1, fx.attached.calls);
+        ASSERT_EQ_INT(1, fx.attached.last_created);
+        ASSERT_TRUE(fx.attached.last_sesh != NULL);
+        if (fx.attached.last_sesh != NULL) {
+            ASSERT_EQ_INT((int)(cases[i] ? CLOAK_SESSION_ORDERING_UNORDERED
+                                         : CLOAK_SESSION_ORDERING_ORDERED),
+                          (int)fx.attached.last_sesh->ordering);
+        }
+
+        close(client);
+        fixture_destroy(&fx);
+    }
+}
+
+/* 14. A SECOND CONNECTION WHOSE ORDERING FLAG DISAGREES WITH THE LIVE
+ * SESSION IS REFUSED AT JOIN -- a deliberate divergence from Go, which
+ * splices it on silently.
+ *
+ * THIS CASE USED TO ASSERT THE OPPOSITE, and the change is the point.
+ * Until module 9 task 6, step 8's registry-hit branch discarded
+ * info.unordered exactly as it discards everything else a joining
+ * connection declares: the mode the session was created with won, which
+ * is the same rule as the LIVE-KEY RULE for obfuscator.session_key. For
+ * the KEY that is correct. For the ORDERING MODE it was only harmless
+ * while nothing read sesh->ordering; the moment the two modes frame
+ * differently (this module), a spliced connection's frames are
+ * interpreted under the SESSION's mode rather than its own -- datagrams
+ * fed to a byte-stream reassembler, or a byte stream chopped into
+ * datagrams -- with no error at either end and corruption as the first
+ * symptom. The previous version of this case asserted the splice, on
+ * purpose, so that the task which made the modes differ would inherit a
+ * failing test rather than a note to remember; this is that task making
+ * the change it was left.
+ *
+ * WHY REFUSE RATHER THAN ACCEPT-AND-LOG. A legitimate peer cannot produce
+ * this: all NumConn connections of one Cloak session carry the same flag,
+ * because it comes from one client's one config. So refusing costs
+ * nothing against an honest peer, and against a broken or hostile one it
+ * converts a silent misinterpretation into a loud, immediate failure.
+ * Go's user.GetSession returns the existing session and drops the new
+ * seshConfig on the floor, which is the silent behaviour this deliberately
+ * does not port.
+ *
+ * WHAT "A NAMED ERROR" MEANS HERE, and why the assertion below is on a
+ * COUNTER rather than on anything the client can see. From outside, this
+ * refusal is byte-for-byte the cover-site redirect every other
+ * authentication failure produces -- deliberately, because a refusal a
+ * probe could tell apart from a bad UID would be an oracle for "this is a
+ * Cloak server". The name therefore lives on the OPERATOR's side, in
+ * cloak_dispatcher_t::ordering_mismatch_refusals and the log line beside
+ * it. Asserting that counter, and not merely "the connection did not
+ * attach", is what makes this case fail for the right reason: a
+ * dispatcher that refused every additional connection (for any reason at
+ * all, including a bug) would satisfy "did not attach" and would also
+ * fail test_existing_session_uses_live_key; only the counter says the
+ * refusal was THIS decision.
+ *
+ * Both directions are driven, for the reason the original case gave: a
+ * dispatcher that re-derived the mode from whichever connection arrived
+ * LAST, instead of refusing, would leave the first row's session ordered
+ * and only betray itself in the second.
+ *
+ * WATCHED TO FAIL -- four mutations, all run, with what each one actually
+ * did rather than what it was expected to do:
+ *
+ *  (a) DELETE THE CHECK, i.e. the pre-task-6 behaviour this case used to
+ *      assert. Fails the redirect, the counter and the attach count, in
+ *      BOTH rows -- and nothing else in the 73-test suite, which is the
+ *      measurement that says this refusal costs no other behaviour.
+ *  (b) RE-DERIVE INSTEAD OF REFUSING (sesh->ordering = asked, the
+ *      smallest thing that looks like a fix). Fails the same three AND
+ *      the surviving-mode assertion, `1 != 2` in the first row and
+ *      `2 != 1` in the second.
+ *  (c) COUNT BUT DO NOT REFUSE. Fails the redirect and the attach count
+ *      while the counter assertion passes -- which is why "it did not
+ *      attach" is asserted alongside the counter and not instead of it.
+ *  (d) CHECK ONLY ONE DIRECTION (`asked == UNORDERED && ...`, the
+ *      half-implementation somebody writes when they think of the
+ *      datagram case first). Fails the SECOND ROW ONLY, five assertions,
+ *      the first row passing throughout. That is what both rows are for.
+ *
+ * The one mutation NOT killed here is "refuse every additional
+ * connection", which is what case 15 below exists for. */
+static void test_second_connection_with_the_opposite_ordering_is_refused(void) {
+    /* first connection's flag -- the second always carries the opposite. */
+    const int first_flag[2] = {0, 1};
+    const uint32_t sid[2] = {3201u, 3202u};
+
+    for (int i = 0; i < 2; i++) {
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+        int64_t now = (int64_t)time(NULL);
+        uint8_t record1[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+        uint8_t shared1[CLOAK_AEAD_KEY_LEN];
+        size_t len1 = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                          (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid[i],
+                                          first_flag[i], record1, sizeof(record1), shared1);
+        ASSERT_TRUE(len1 > 0);
+
+        int client1 = client_connect(front_port(&fx));
+        ASSERT_TRUE(client1 >= 0);
+        ASSERT_TRUE(write(client1, record1, len1) == (ssize_t)len1);
+
+        uint8_t reply1[512];
+        size_t reply1_len = 0;
+        ASSERT_EQ_INT(0, read_reply(fx.reactor, client1, reply1, sizeof(reply1), &reply1_len));
+        ASSERT_EQ_INT(1, fx.attached.calls);
+        ASSERT_EQ_INT(1, fx.attached.last_created);
+        ASSERT_EQ_INT(0, (int)fx.d.ordering_mismatch_refusals);
+
+        cloak_session_t *first_sesh = fx.attached.last_sesh;
+        ASSERT_TRUE(first_sesh != NULL);
+
+        /* The second connection to the SAME (uid, session_id), carrying
+         * the OPPOSITE flag. */
+        uint8_t record2[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+        uint8_t shared2[CLOAK_AEAD_KEY_LEN];
+        size_t len2 = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                          (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid[i],
+                                          first_flag[i] ? 0 : 1, record2, sizeof(record2), shared2);
+        ASSERT_TRUE(len2 > 0);
+
+        /* THE REFUSAL PATH MUST BE SILENT, and this capture is the pin
+         * that keeps it so. The log is installed for exactly the window
+         * of the refusal -- not the accepted handshake above, which is
+         * free to say whatever it likes.
+         *
+         * WHY A LOG ASSERTION IS A TIMING ASSERTION HERE. This refusal's
+         * whole justification is that a prober cannot separate it from a
+         * bad UID; the bytes and the teardown are identical, so the only
+         * way to leak is a side effect with a cost. It shipped with a
+         * CLOAK_LOGW and a review measured exactly that: 13-18 us slower
+         * at p10 over 150 refusals per arm, 3 runs of 3, with the two
+         * arms coinciding to within half a microsecond once the line was
+         * suppressed. cloak_log_write is a blocking fprintf to unbuffered
+         * stderr called from inside a reactor callback.
+         *
+         * Asserting emptiness rather than a duration is deliberate: a
+         * timing assertion in a suite that runs under ASan at -j4 would
+         * be flaky, while the CAUSE is binary and this catches any future
+         * line added to this path, at any level at or above the shipping
+         * one, whatever its cost turns out to be. */
+        char *logbuf = NULL;
+        size_t loglen = 0;
+        FILE *logmem = open_memstream(&logbuf, &loglen);
+        ASSERT_TRUE(logmem != NULL);
+        cloak_log_set_stream(logmem);
+
+        int client2 = client_connect(front_port(&fx));
+        ASSERT_TRUE(client2 >= 0);
+        ASSERT_TRUE(write(client2, record2, len2) == (ssize_t)len2);
+
+        /* IT IS REDIRECTED, exactly as an unauthorised UID would be: the
+         * cover site receives its first packet byte for byte. Waiting on
+         * the cover site rather than on a reply is also what makes this
+         * bounded -- there is no reply to read. */
+        struct len_wait w = {&fx.cover, len2};
+        ASSERT_TRUE(pump_until(fx.reactor, cover_has_len, &w, 300, 10));
+        ASSERT_EQ_INT((int)len2, (int)fx.cover.len);
+        ASSERT_MEM_EQ(fx.cover.buf, record2, len2);
+
+        cloak_log_set_stream(NULL);
+        if (logmem != NULL) {
+            fflush(logmem);
+            fclose(logmem);
+        }
+        ASSERT_EQ_INT(0, (int)loglen);
+        free(logbuf);
+
+        /* THE NAMED DIAGNOSIS, and the reason this is not just "it did
+         * not attach". */
+        ASSERT_EQ_INT(1, (int)fx.d.ordering_mismatch_refusals);
+
+        /* It did not join: no second attach, no new session, and the one
+         * session that exists is untouched -- still the first
+         * connection's, still in the first connection's mode. */
+        ASSERT_EQ_INT(1, fx.attached.calls);
+        ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx.registry));
+        ASSERT_EQ_INT((int)(first_flag[i] ? CLOAK_SESSION_ORDERING_UNORDERED
+                                          : CLOAK_SESSION_ORDERING_ORDERED),
+                      (int)first_sesh->ordering);
+
+        close(client1);
+        close(client2);
+        fixture_destroy(&fx);
+    }
+}
+
+/* 15. THE SAME FLAG STILL JOINS, which is what stops case 14's refusal
+ * from being "refuse every additional connection" -- the mutation a
+ * refusal test is most likely to leave alive.
+ *
+ * test_existing_session_uses_live_key already drives a second connection
+ * to a live session, but only in the ORDERED mode both connections get by
+ * default. This drives both modes explicitly and asserts the join in each:
+ * an unordered session, joined by a second unordered connection, is the
+ * combination module 9 actually ships, and nothing else in the suite
+ * reaches it. */
+static void test_second_connection_with_the_same_ordering_joins(void) {
+    const int flag[2] = {0, 1};
+    const uint32_t sid[2] = {3301u, 3302u};
+
+    for (int i = 0; i < 2; i++) {
+        struct fixture fx;
+        ASSERT_EQ_INT(0, fixture_init(&fx, 0));
+
+        int64_t now = (int64_t)time(NULL);
+        /* BOTH CONNECTIONS STAY OPEN until the assertions are done.
+         * Closing the first before opening the second retires its session
+         * -- the registry drops a session whose last connection went away
+         * -- and the second connection would then legitimately CREATE
+         * one, which is a different case from the join this asserts. */
+        int client[2] = {-1, -1};
+        for (int c = 0; c < 2; c++) {
+            uint8_t record[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+            uint8_t shared[CLOAK_AEAD_KEY_LEN];
+            size_t len = build_client_record(fx.server_pub, fx.uid_ok, "ss",
+                                             (uint8_t)CLOAK_AEAD_AES_256_GCM, now, sid[i],
+                                             flag[i], record, sizeof(record), shared);
+            ASSERT_TRUE(len > 0);
+
+            client[c] = client_connect(front_port(&fx));
+            ASSERT_TRUE(client[c] >= 0);
+            ASSERT_TRUE(write(client[c], record, len) == (ssize_t)len);
+
+            uint8_t reply[512];
+            size_t reply_len = 0;
+            ASSERT_EQ_INT(0, read_reply(fx.reactor, client[c], reply, sizeof(reply), &reply_len));
+            ASSERT_EQ_INT(c + 1, fx.attached.calls);
+            ASSERT_EQ_INT(c == 0 ? 1 : 0, fx.attached.last_created);
+        }
+
+        ASSERT_EQ_INT(0, (int)fx.d.ordering_mismatch_refusals);
+        ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx.registry));
+        ASSERT_TRUE(fx.attached.last_sesh != NULL);
+        if (fx.attached.last_sesh != NULL) {
+            ASSERT_EQ_INT((int)(flag[i] ? CLOAK_SESSION_ORDERING_UNORDERED
+                                        : CLOAK_SESSION_ORDERING_ORDERED),
+                          (int)fx.attached.last_sesh->ordering);
+        }
+
+        close(client[0]);
+        close(client[1]);
+        fixture_destroy(&fx);
+    }
+}
+
 TEST_MAIN_BEGIN()
     test_valid_handshake_attaches();
     test_existing_session_uses_live_key();
@@ -736,4 +1029,7 @@ TEST_MAIN_BEGIN()
     test_write_resumes_after_eagain();
     test_write_error_closes_not_redirect();
     test_invalid_encryption_method_redirects();
+    test_unordered_flag_selects_the_session_ordering();
+    test_second_connection_with_the_opposite_ordering_is_refused();
+    test_second_connection_with_the_same_ordering_joins();
 TEST_MAIN_END()

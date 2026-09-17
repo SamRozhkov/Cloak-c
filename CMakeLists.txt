@@ -12,6 +12,114 @@ add_compile_options(-Wall -Wextra)
 
 enable_testing()
 
+# ---------------------------------------------------------------------------
+# The fast/slow label split (module 9 task 0).
+#
+# Module 9 is about to add several tests that fork external processes --
+# including two that fork Go binaries and a UDP echo each -- on top of the
+# four that already do today (test_proxy_stream and test_ws_interop in
+# libcloak-server/tests, test_ck_server_cli and test_ck_client_cli under
+# cmd/): every one of the four forks a real child with fork(2), three of the
+# four also exec a real binary, and grep across the whole tree for
+# fork/vfork/exec*/posix_spawn/system finds no other caller. THIS WAS
+# VERIFIED BY READING AND GREPPING THE TESTS, NOT ASSUMED: the inherited
+# claim from module 8 that "the four slowest tests all fork processes" does
+# NOT hold -- measured before this split (68/68 at -j4, ~24 s), the two
+# slowest tests by wall clock were test_adminapi and test_dispatcher_ws
+# (~12.5 s and ~12.4 s each), and NEITHER forks a process; of the four tests
+# that actually fork, three (test_proxy_stream, test_ws_interop and
+# test_ck_server_cli) are among the FASTEST tests in the whole suite in a
+# plain Debug build (0.26 s, 0.92 s and 0.32 s) -- the fork/exec cost only
+# bites under ASan+UBSan's LeakSanitizer exit scan on every child process,
+# per test_ck_server_cli's and test_ck_client_cli's own TIMEOUT comments
+# (~40 s and ~53 s under the sanitizer, ~0.2-9 s in Debug). So labelling by
+# "is currently slow" would mislabel test_adminapi and test_dispatcher_ws as
+# slow (they aren't the target -- they don't fork, and nothing about them
+# changes here) while mislabelling three of today's four forking tests as
+# fast. Labelling by fork-or-not is the durable split this task asks for:
+# it is exactly what module 9's new oracle tests will do, and it is what
+# turns brutal under a sanitizer build, which is where an edit loop most
+# needs to be cheap.
+#
+# EVERY TEST NOT EXPLICITLY LABELLED "slow" (at its own add_test site --
+# see libcloak-server/tests/CMakeLists.txt, cmd/ck-server/CMakeLists.txt and
+# cmd/ck-client/CMakeLists.txt for the four that are today) GETS "fast" via
+# a call to this function at the end of its own directory's test list file.
+# Defined once, here, and called once per directory rather than duplicated,
+# because set_tests_properties() and the TESTS directory property only see
+# tests added in the CURRENT directory scope -- a test added under
+# libcloak-server/tests cannot be labelled from this top-level file, only
+# from within that directory's own CMakeLists.txt (a function's body runs
+# in ITS CALLER's directory scope, which is what makes one shared
+# definition here reach every directory that calls it, unlike a foreach
+# over directory paths written directly in this file, which cannot resolve
+# tests belonging to a different directory scope at all).
+#
+# A test added anywhere in the tree tomorrow with no LABELS call of its own
+# is therefore "fast" by default, and a test that forks a process has to
+# OPT IN to "slow" explicitly. A directory that forgot to call this
+# function would leave its tests with NO label at all, which `ctest -L
+# fast` would then silently exclude -- a worse failure than a mislabelled
+# test, because it looks like the edit loop still works while it quietly
+# runs fewer and fewer tests. That is why every one of the six directories
+# that calls add_test also calls cloak_label_fast_tests() at the end of
+# its own CMakeLists.txt.
+#
+# `ctest -L fast` is the edit-loop target this task exists to create.
+# `ctest` WITH NO ARGUMENTS is untouched by any of this -- it runs each
+# directory's whole TESTS list regardless of label, so the suite's test
+# COUNT stays exactly what CLOAK_REQUIRE_GO already made a contract (68
+# with a Go toolchain, visibly 67 without one): this split changes what the
+# QUICK loop selects, never what the DEFAULT run covers.
+#
+# AND THE SAME SWEEP SETS A TIMEOUT, IN THE SAME set_tests_properties CALL.
+#
+# The final whole-branch review of module 9 read the GENERATED
+# CTestTestfile.cmake files and found 44 tests at TIMEOUT 60, 8 at 120, 1
+# at 150 -- and 20 carrying LABELS and NO TIMEOUT AT ALL, so they ran at
+# ctest's default of 1500 s. All 20 were in-process unit tests with no
+# fork, no exec and no sleep, so the exposure was small; the SHAPE was
+# not. It is the same orphaning that hid a missing TIMEOUT 150 on
+# test_unordered_proof one task earlier: a property set in one place and
+# a property set in another, with nothing tying them together, so losing
+# one looks exactly like never having needed it.
+#
+# The fix the earlier round chose is generalised here rather than
+# re-litigated: LABELS and TIMEOUT go into ONE call, on every test, from
+# the one function every directory already calls. A test added tomorrow
+# with no properties of its own gets both, or neither and no label --
+# which `ctest -L fast` makes loud immediately.
+#
+# CLOAK_DEFAULT_TEST_TIMEOUT is 60 because 60 is what 44 of the 75 tests
+# already chose explicitly; this makes the majority the default instead of
+# an accident. A test that sets its own TIMEOUT at its add_test site KEEPS
+# it -- the value is read back here and re-applied, never overwritten --
+# which is what leaves the 8 at 120 and test_unordered_proof's 150 exactly
+# where their own comments say they are, for the reasons those comments
+# give.
+set(CLOAK_DEFAULT_TEST_TIMEOUT 60)
+
+function(cloak_label_fast_tests)
+    get_property(_cloak_dir_tests DIRECTORY PROPERTY TESTS)
+    foreach(_cloak_test_name ${_cloak_dir_tests})
+        get_test_property(${_cloak_test_name} LABELS _cloak_test_labels)
+        if(_cloak_test_labels MATCHES "slow")
+            set(_cloak_labels "${_cloak_test_labels}")
+        else()
+            set(_cloak_labels "fast")
+        endif()
+        # get_test_property answers NOTFOUND for an unset property, which
+        # if() treats as false -- so this is "the test did not set one".
+        get_test_property(${_cloak_test_name} TIMEOUT _cloak_test_timeout)
+        if(NOT _cloak_test_timeout)
+            set(_cloak_test_timeout ${CLOAK_DEFAULT_TEST_TIMEOUT})
+        endif()
+        set_tests_properties(${_cloak_test_name} PROPERTIES
+            LABELS "${_cloak_labels}"
+            TIMEOUT ${_cloak_test_timeout})
+    endforeach()
+endfunction()
+
 add_subdirectory(third_party/cjson)
 add_subdirectory(third_party/sqlite)
 add_subdirectory(libcloak-common)
@@ -152,3 +260,32 @@ target_compile_definitions(test_ws_interop PRIVATE
     ORACLE_PATH="${_cloak_oracle_bin}")
 
 endif()
+
+# ---------------------------------------------------------------------------
+# test_go_interop's two in-tree dependencies (module 9 task 1).
+#
+# APPENDED here, after both cmd/ add_subdirectory calls above, for exactly
+# the reason the CLOAK_REQUIRE_GO block above is: the test is declared in
+# libcloak-server/tests, which is added BEFORE cmd/ck-server and
+# cmd/ck-client, so the two executables it drives as subprocesses do not
+# exist as targets yet at the point it is declared. $<TARGET_FILE:...>
+# resolves at generate time; the add_dependencies edges are what make a
+# plain `cmake --build` produce the binaries before the test runs.
+#
+# NOT inside the CLOAK_REQUIRE_GO guard: test_go_interop needs no Go
+# toolchain, only two prebuilt binaries at run time, and it reports their
+# absence itself. See its own comment in libcloak-server/tests/CMakeLists.txt.
+add_dependencies(test_go_interop ck-server ck-client)
+target_compile_definitions(test_go_interop PRIVATE
+    CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
+    CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
+
+# test_unordered_proof's two in-tree dependencies (module 9 task 8),
+# appended here for exactly the reason test_go_interop's are: the test is
+# declared in libcloak-server/tests, which is added BEFORE cmd/ck-server
+# and cmd/ck-client, so the two executables it drives as subprocesses do
+# not exist as targets yet at the point it is declared.
+add_dependencies(test_unordered_proof ck-server ck-client)
+target_compile_definitions(test_unordered_proof PRIVATE
+    CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
+    CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")

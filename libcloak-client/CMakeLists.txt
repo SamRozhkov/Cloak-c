@@ -31,3 +31,13 @@ target_sources(cloak-client PRIVATE src/client_piper.c)
 # piper were: the original dependency statement stays where a reader
 # looks for it.
 target_sources(cloak-client PRIVATE src/client_stack.c)
+
+# cloak_udp_piper_t: the client's UDP local listener -- one datagram
+# socket multiplexing many peers, one unordered stream each. It splices by
+# hand rather than with cloak_stream_relay_t (which owns an exclusive fd
+# and could not share one socket between peers), so this adds a source and
+# no new link: everything it needs -- the session, the stream, the reactor
+# -- is already supplied by the connector's cloak-mux dependency above.
+# Appended rather than folded in for the same reason every entry above
+# was.
+target_sources(cloak-client PRIVATE src/udp_piper.c)

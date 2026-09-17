@@ -161,6 +161,7 @@ static void make_obfuscator(cloak_obfuscator_t *o) {
 static void base_config(cloak_session_config_t *cfg, const cloak_obfuscator_t *obfs) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->obfuscator = *obfs;
+    cfg->ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg->max_on_wire_size = 16401;
     cfg->stream_recv_capacity = 65536;
     cfg->stream_max_pending_frames = 64;

@@ -188,6 +188,18 @@ static void assemble(cloak_client_connector_t *c) {
     cloak_session_config_t scfg = c->session_template;
     scfg.obfuscator.method = (cloak_aead_method_t)c->encryption_method;
     memcpy(scfg.obfuscator.session_key, c->conns[0].key, CLOAK_AEAD_KEY_LEN);
+    /* THE ORDERING MODE, and the one place on the client where it can be
+     * set without risking a session that contradicts its own handshake.
+     * `unordered` is the bit this connector already put in every auth
+     * record it sent (on_dial_done copies this same field into
+     * cloak_client_handshake_config_t::unordered), so deriving the
+     * session's mode from that same variable is what makes the two
+     * structurally equal rather than merely usually equal. It can never
+     * come from session_template for exactly the reason the obfuscator
+     * above cannot: the template is per-CLIENT and this is per-SESSION.
+     * See cloak/ordering.h. */
+    scfg.ordering = c->unordered ? CLOAK_SESSION_ORDERING_UNORDERED
+                                 : CLOAK_SESSION_ORDERING_ORDERED;
 
     if (cloak_session_init(c->session, c->session_id, c->reactor, &scfg) != 0) {
         fail(c, CLOAK_CLIENT_CONNECTOR_ERR_SESSION);

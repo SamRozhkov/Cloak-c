@@ -96,3 +96,10 @@ target_include_directories(test_signals PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_signals PRIVATE cloak-common)
 add_test(NAME test_signals COMMAND test_signals)
 set_tests_properties(test_signals PROPERTIES TIMEOUT 60)
+
+# None of this directory's tests fork a process (module 9 task 0's
+# fast/slow split; see the top-level CMakeLists.txt's own comment on
+# cloak_label_fast_tests() for what this call does and why it has to be
+# made from here rather than from that file). Every test above ends up
+# labelled "fast".
+cloak_label_fast_tests()

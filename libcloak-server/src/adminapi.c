@@ -17,11 +17,34 @@
 #include <string.h>
 
 /* How many bytes are pulled off a stream per cloak_stream_read call while
- * a request is being read. Nothing is bounded by this -- the parser's own
- * caps bound the request -- so it is purely how much stack the read loop
- * uses per turn. One page comfortably exceeds the largest real admin
- * request. */
-#define ADMINAPI_READ_CHUNK 4096
+ * a request is being read. On an ORDERED stream nothing is bounded by
+ * this -- the parser's own caps bound the request -- so it would be
+ * purely how much stack the read loop uses per turn.
+ *
+ * ON AN UNORDERED (DATAGRAM) STREAM IT IS A HARD FLOOR, WHICH IS WHY IT
+ * IS NO LONGER ONE PAGE. cloak_stream_read hands over one WHOLE datagram
+ * or none, and answers CLOAK_STREAM_ERR_SHORT_BUFFER for a buffer smaller
+ * than the datagram at the head. At 4096 this reader could not read any
+ * admin request that arrived as a single datagram above that size -- and
+ * it treated the refusal as end-of-stream and tore the stream down, so
+ * the client got no answer and nothing distinguishing it from a peer that
+ * hung up. That is Go's bug 6 (internal/client/piper.go's 8192-byte
+ * reader against datagrams of up to 16132) in this port's own admin
+ * reader. It is reachable, and MORE reachable since module 9 task 6 than
+ * when this was written: an admin session that sets the flag has always
+ * been built UNORDERED, and the proxy path -- which used to redirect
+ * every unordered client -- now carries them too, so nothing anywhere
+ * refuses one.
+ *
+ * 16384 is chosen to exceed the largest datagram a session at the
+ * shipping max_on_wire_size of 16401 can ever deliver: Go's
+ * maxStreamUnitWrite, 16401 - 14 (frame header) - 255 (padding/AEAD) =
+ * 16132. It is the same constant, for the same reason, as
+ * stream_relay.c's STREAM_RELAY_CHUNK. A session configured with a larger
+ * max_on_wire_size can still exceed it, which adminapi_drain now handles
+ * explicitly rather than by falling into the end-of-stream arm. Pinned by
+ * test_adminapi.c's test_unordered_request_larger_than_one_read_chunk. */
+#define ADMINAPI_READ_CHUNK 16384
 
 /* The routes, in one place so the 405 Allow headers and the OPTIONS
  * Access-Control-Allow-Methods cannot drift away from what is actually
@@ -305,7 +328,39 @@ static size_t adminapi_write_budget(const cloak_adminapi_stream_t *ast) {
     size_t frame_cost = (size_t)CLOAK_CONN_RECORD_HEADER_LEN + s->max_payload_per_frame +
                         (size_t)CLOAK_FRAME_HEADER_LEN + (size_t)CLOAK_FRAME_MAX_EXTRA_LEN;
     size_t frames = cloak_session_send_min_conn_free(ast->as->sesh) / frame_cost;
-    return frames * s->max_payload_per_frame;
+    size_t budget = frames * s->max_payload_per_frame;
+    /* AND, IN UNORDERED MODE, NEVER MORE THAN ONE FRAME'S PAYLOAD.
+     *
+     * THIS WAS A LIVE DEFECT, not a precaution. Two frames' room offers a
+     * chunk of 2 * max_payload_per_frame; an unordered stream REFUSES any
+     * write over max_payload_per_frame outright (cloak/stream.h:
+     * CLOAK_STREAM_ERR_SHORT_BUFFER -- splitting a datagram would be
+     * silent corruption, because the far end does no reassembly in this
+     * mode), and adminapi_pump_write reads every negative return as
+     * terminal. So at the ordinary pool size the FIRST chunk of any
+     * response over 16132 bytes was refused and the stream was torn down
+     * having written nothing: an admin client saw its stream close with
+     * no response at all. It is reachable -- dispatcher.c builds an
+     * unordered admin session whenever the client's auth record sets the
+     * flag -- and pinned by test_adminapi.c's
+     * test_unordered_response_larger_than_one_frame, which sees no status
+     * line at all without this clamp.
+     *
+     * THE THIRD AND LAST OF THE THREE PLACES that size a buffer for
+     * cloak_stream_write: stream_relay_fd_read_budget carries the same
+     * clamp with the same argument, and cloak_client_piper_t's first read
+     * is already below one frame by construction. A response delivered as
+     * several datagrams is what an unordered stream can carry; it is not
+     * a byte stream and never was.
+     *
+     * THE ORDERED PATH IS UNTOUCHED, deliberately: it chunks freely, so
+     * clamping there would cost an extra frame's worth of loop iterations
+     * for nothing and would change what every existing case in that file
+     * measures. */
+    if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED && budget > s->max_payload_per_frame) {
+        budget = s->max_payload_per_frame;
+    }
+    return budget;
 }
 
 /* Drains as much of the composed response as certainly fits, and tears
@@ -645,6 +700,23 @@ static void adminapi_drain(cloak_adminapi_stream_t *ast) {
         long n = cloak_stream_read(ast->stream, chunk, sizeof(chunk));
         if (n == 0) {
             return; /* nothing more right now */
+        }
+        if (n == CLOAK_STREAM_ERR_SHORT_BUFFER) {
+            /* Not an end of stream, and deliberately NOT folded into the
+             * arm below. An unordered peer sent one datagram larger than
+             * ADMINAPI_READ_CHUNK, which that constant is sized to make
+             * impossible for any session at the shipping
+             * max_on_wire_size -- so reaching here means a session
+             * configured above it, and the datagram is undeliverable to
+             * this reader no matter how many times it is re-read (the
+             * chunk is a compile-time size; nothing here grows). Tearing
+             * down is the only non-wedging answer available, exactly as
+             * in stream_relay.c's empty-queue case, but it is reached by
+             * its own named branch so the log and the next reader see a
+             * request too large to read rather than a client that hung
+             * up. */
+            adminapi_stream_teardown(ast);
+            return;
         }
         if (n < 0) {
             /* End of stream before the request finished: the client

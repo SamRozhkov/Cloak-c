@@ -42,3 +42,20 @@ add_test(NAME test_ck_server_cli COMMAND test_ck_server_cli)
 # is bounded by CLOCK_MONOTONIC, so this is a backstop and not the
 # mechanism.
 set_tests_properties(test_ck_server_cli PROPERTIES TIMEOUT 120)
+
+# LABELS "slow" (module 9 task 0's fast/slow split): this file forks
+# and execs ~40 real ck-server processes (see above) -- cheap in Debug
+# (~0.2 s) but ~40 s under ASan+UBSan purely from LeakSanitizer's exit
+# scan on each child, which is exactly the cost an edit loop cannot
+# afford to pay on every keystroke. `ctest -L fast` excludes it; the
+# default `ctest` with no arguments still runs it.
+set_tests_properties(test_ck_server_cli PROPERTIES LABELS "slow")
+
+# Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's
+# own comment on cloak_label_fast_tests() for what this call does and why
+# it has to be made from here rather than from that file). This directory
+# has exactly one test, already labelled "slow" above, so this call has
+# nothing left to label -- it is here anyway, for the same reason every
+# directory that calls add_test has it: a test added to this file later
+# with no LABELS call of its own must not end up with no label at all.
+cloak_label_fast_tests()

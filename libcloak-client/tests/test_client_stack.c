@@ -78,8 +78,10 @@
  * numbers. See this file's header. */
 #include "../src/client_stack.c"
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1204,6 +1206,198 @@ static void test_a_stack_carries_application_bytes_end_to_end(void) {
     int fds_after = count_open_fds();
     ASSERT_TRUE(fds_after > 0);
     ASSERT_EQ_INT(fds_before, fds_after);
+}
+
+
+/* ---- case 1b: udp = 1 selects the UNORDERED DATA PATH ------------------- */
+
+/* THE GAP THAT WAS NOT A REFUSAL.
+ *
+ * client_stack.c has always done `cc.unordered = c->udp`, which sets the
+ * auth record's [41]&0x01 and nothing else. A library consumer that set
+ * udp could therefore ADVERTISE a datagram session and then run the
+ * ordered data path underneath it. Against this project's own server that
+ * fails closed -- it refuses the mismatch -- but it fails at the PEER, and
+ * Task 1 measured what a GO server does with the same corruption instead:
+ * it reorders rather than drops, and all three byte counts come back
+ * identical. A case that asserted sizes would be green on exactly that.
+ *
+ * So this case asserts CONTENT, through a DATAGRAM socket:
+ *
+ *  - The local endpoint is a UDP socket. A TCP connect to it is refused,
+ *    which is what fails if `udp` reaches the auth record and not the
+ *    listener.
+ *  - A datagram sent into it comes back XORed with 0xFF, byte for byte.
+ *    Only the upstream can produce that transformation (this file's
+ *    construction 1), so the reply is proof the datagram crossed a real
+ *    session, was proxied, and came back -- and the comparison is of the
+ *    bytes and not of their number.
+ *  - The far end is the real merged server, so the session it built
+ *    agreed with the bit that was on the wire. A client that set the bit
+ *    and built an ORDERED session gets no reply at all: the two ends
+ *    disagree about what a frame means.
+ *
+ * The upstream is the same TCP one every other case uses, deliberately:
+ * cloak/proxy.h is explicit that an unordered session against a "tcp"
+ * ProxyBook entry loses datagram boundaries at the far end, and ONE
+ * datagram has no boundaries to lose. What this case is about is whether
+ * the near end is a datagram path at all, and adding a second upstream to
+ * this fixture would test the server's dgram relay, which is
+ * test_proxy_udp.c's job and not this file's. */
+
+#define UDP_CASE_LEN 40
+
+typedef struct {
+    int fd;
+    uint8_t in[512];
+    size_t in_len;
+} udp_peer_t;
+
+/* A connected UDP socket toward the client's local port. Connected, so
+ * the reply can be read with a plain recv and a datagram from anywhere
+ * else could not be mistaken for it. */
+static int udp_peer_open(udp_peer_t *up, int port) {
+    memset(up, 0, sizeof(*up));
+    up->fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (up->fd < 0) {
+        return -1;
+    }
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons((uint16_t)port);
+    if (connect(up->fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        close(up->fd);
+        up->fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static void udp_peer_close(udp_peer_t *up) {
+    if (up->fd >= 0) {
+        close(up->fd);
+        up->fd = -1;
+    }
+}
+
+/* Non-blocking: one whole datagram or nothing. Used as a pump_until
+ * predicate, so it must be cheap and must not block. */
+static int udp_peer_has_reply(void *ctx) {
+    udp_peer_t *up = ctx;
+    if (up->in_len > 0) {
+        return 1;
+    }
+    ssize_t n = recv(up->fd, up->in, sizeof(up->in), MSG_DONTWAIT);
+    if (n > 0) {
+        up->in_len = (size_t)n;
+        return 1;
+    }
+    return 0;
+}
+
+static void test_udp_selects_the_unordered_data_path(void) {
+    int fds_before = count_open_fds();
+    ASSERT_TRUE(fds_before > 0);
+
+    struct fixture fx;
+    if (fixture_init(&fx) != 0) {
+        fixture_destroy(&fx);
+        return;
+    }
+
+    client_t cl;
+    cs_config(&cl, &fx, fx.front_port, 0, 2);
+    cl.cfg.udp = 1; /* THE ONE LINE A LIBRARY CONSUMER WRITES. */
+    cloak_client_stack_config_t sc;
+    memset(&sc, 0, sizeof(sc));
+    char err[256] = {0};
+    int rc = cs_open(&cl, &fx, &sc, err, sizeof(err));
+    ASSERT_EQ_INT(0, rc);
+    if (rc != 0) {
+        fprintf(stderr, "client stack: %s: %s\n", cloak_client_stack_strerror(rc), err);
+        fixture_destroy(&fx);
+        return;
+    }
+
+    int local = cloak_client_stack_local_port(cl.st);
+    ASSERT_TRUE(local > 0);
+
+    /* THE LISTENER IS A DATAGRAM SOCKET. A TCP connect to a port with no
+     * TCP listener on loopback is refused immediately, so this needs no
+     * wait of its own -- and it is the assertion that fails if `udp`
+     * reached the auth record and not the local endpoint. */
+    {
+        int probe = socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_TRUE(probe >= 0);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons((uint16_t)local);
+        ASSERT_TRUE(connect(probe, (struct sockaddr *)&a, sizeof(a)) != 0);
+        close(probe);
+    }
+
+    ASSERT_TRUE(pump_until(fx.reactor, cs_session_up, &cl, CS_MAX_TURNS, CS_TURN_MS));
+    /* The server accepted the unordered session it was told about: two
+     * connections, one session, on the far end's own count. */
+    ASSERT_EQ_INT(2, fx.attach_count);
+    ASSERT_EQ_INT(1, fx.created_count);
+
+    /* AND THE SESSION ITSELF IS UNORDERED. Read off the struct, which is
+     * this file's one white-box liberty (see its header) and is used here
+     * for a reason the round trip below cannot cover: the two ordering
+     * modes are OBSERVATIONALLY IDENTICAL for a single small message
+     * delivered in order. An ordered client session behind an unordered
+     * server session carries this case's datagram end to end, byte for
+     * byte, and every count matches -- which is precisely what Task 1
+     * measured against a real Go server, where forcing the bit on left
+     * all three byte counts identical. The externally visible difference
+     * needs reordering or two frames drained in one turn, neither of
+     * which a test can produce on demand over loopback. So the claim
+     * "udp selects the unordered DATA PATH and not just the bit" is
+     * asserted where it is decided, and the round trip below is what says
+     * the path so selected actually carries anything. */
+    {
+        stack_slot_t *sl = cl.st->slots;
+        ASSERT_TRUE(sl != NULL);
+        if (sl != NULL) {
+            ASSERT_EQ_INT(1, sl->session_live);
+            ASSERT_EQ_INT((int)CLOAK_SESSION_ORDERING_UNORDERED, (int)sl->sesh.ordering);
+        }
+    }
+
+    udp_peer_t up;
+    ASSERT_EQ_INT(0, udp_peer_open(&up, local));
+
+    uint8_t payload[UDP_CASE_LEN];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        /* Deliberately not constant and not a run of zeroes: a reply
+         * compared byte for byte against a constant payload would be
+         * satisfied by a single correct byte repeated. */
+        payload[i] = (uint8_t)(0x31u + (i * 7u) % 61u);
+    }
+    ASSERT_EQ_INT((int)sizeof(payload), (int)send(up.fd, payload, sizeof(payload), 0));
+
+    ASSERT_TRUE(pump_until(fx.reactor, udp_peer_has_reply, &up, CS_MAX_TURNS, CS_TURN_MS));
+    ASSERT_EQ_INT((int)sizeof(payload), (int)up.in_len);
+    uint8_t want[UDP_CASE_LEN];
+    xor_fill(want, payload, sizeof(payload));
+    ASSERT_MEM_EQ(up.in, want, sizeof(want));
+
+    /* One peer, one stream -- and one TCP connection at the upstream,
+     * which is what says the datagram was proxied rather than answered
+     * locally. */
+    ASSERT_EQ_INT(1, (int)cloak_client_stack_local_conns(cl.st));
+    ASSERT_EQ_INT(1, (int)cloak_client_stack_local_streams(cl.st));
+    ASSERT_EQ_INT(1, fx.up.accept_count);
+
+    udp_peer_close(&up);
+    cs_close(&cl);
+    fixture_destroy(&fx);
+    ASSERT_EQ_INT(fds_before, count_open_fds());
 }
 
 /* ---- case 2: a dead session is replaced, under a DIFFERENT id ----------- */
@@ -2350,6 +2544,7 @@ test_the_session_id_predicate();
 test_a_replacement_is_seeded_with_the_dead_id();
 test_the_sni_is_drawn_from_the_whole_mock_domain_list();
 test_a_stack_carries_application_bytes_end_to_end();
+test_udp_selects_the_unordered_data_path();
 test_a_dead_session_is_replaced_under_a_different_id();
 test_the_backoff_is_observed_between_rounds();
 test_singleplex_gives_each_connection_its_own_session();

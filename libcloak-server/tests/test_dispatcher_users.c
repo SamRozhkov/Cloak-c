@@ -301,6 +301,13 @@ struct fixture {
 
     uint8_t server_pub[CLOAK_X25519_KEY_LEN];
     uint8_t uid_bypass[CLOAK_UID_LEN];
+    /* The configured AdminUID. Used by exactly one case -- (b), the
+     * prepare_session refusal -- because an admin session is the only
+     * handshake the dispatcher lets reach prepare_session with a proxy
+     * method this server does not offer (step 7 skips its own check for
+     * one; see dispatcher.c). Distinct from every uid any other case
+     * builds, so its presence in the config changes nothing else. */
+    uint8_t uid_admin[CLOAK_UID_LEN];
 
     /* Counts cloak_dispatch_session_aborted_cb firings. PURELY A PROBE,
      * and the evidence that a given test reached conn_teardown's
@@ -396,20 +403,24 @@ static int fixture_init_opts(struct fixture *fx, const fixture_opts_t *o) {
     uint8_t server_priv[CLOAK_X25519_KEY_LEN];
     ASSERT_EQ_INT(0, cloak_x25519_generate_keypair(server_priv, fx->server_pub));
     mk_uid(fx->uid_bypass, 0x10);
+    mk_uid(fx->uid_admin, 0xAD);
 
     char priv_b64[64];
     char uid_b64[32];
+    char admin_b64[32];
     ASSERT_EQ_INT(
         0, cloak_base64_encode(server_priv, CLOAK_X25519_KEY_LEN, priv_b64, sizeof(priv_b64)));
     ASSERT_EQ_INT(0,
                   cloak_base64_encode(fx->uid_bypass, CLOAK_UID_LEN, uid_b64, sizeof(uid_b64)));
+    ASSERT_EQ_INT(
+        0, cloak_base64_encode(fx->uid_admin, CLOAK_UID_LEN, admin_b64, sizeof(admin_b64)));
 
     char json[1024];
     snprintf(json, sizeof(json),
              "{\"ProxyBook\":{\"ss\":[\"tcp\",\"127.0.0.1:%d\"]},"
              "\"BindAddr\":[\"127.0.0.1:0\"],\"RedirAddr\":\"127.0.0.1:%d\","
-             "\"PrivateKey\":\"%s\",\"BypassUID\":[\"%s\"]}",
-             fx->up_port, cover_port, priv_b64, uid_b64);
+             "\"PrivateKey\":\"%s\",\"AdminUID\":\"%s\",\"BypassUID\":[\"%s\"]}",
+             fx->up_port, cover_port, priv_b64, admin_b64, uid_b64);
     err[0] = '\0';
     ASSERT_EQ_INT(0, cloak_server_config_parse_json(json, &fx->cfg, err, sizeof(err)));
 
@@ -583,6 +594,7 @@ static int front_port(struct fixture *fx) {
 
 static void client_config(cloak_session_config_t *ccfg) {
     memset(ccfg, 0, sizeof(*ccfg));
+    ccfg->ordering = CLOAK_SESSION_ORDERING_ORDERED;
     ccfg->max_on_wire_size = 16401;
     ccfg->stream_recv_capacity = 65536;
     ccfg->stream_max_pending_frames = 64;
@@ -1180,24 +1192,42 @@ static void test_cap_zero_refusal_releases_the_user(void) {
     fixture_destroy(&fx);
 }
 
-/* (b) prepare_session REFUSES. cloak_proxy_prepare_session returns -1 for
- * a client that asked for an UNORDERED (datagram) session, which this
- * server has no data path for -- one flag in the client's own
- * authenticated payload, so no server-side seam is needed to provoke it.
- * The user is fully authorised by then; only the session is refused. */
+/* (b) prepare_session REFUSES.
+ *
+ * THE SEAM CHANGED IN MODULE 9 AND THE REASON IS WORTH RECORDING. This
+ * case used to set the client's UNORDERED flag, which
+ * cloak_proxy_prepare_session refused outright (its old obligation 5)
+ * because the server had no datagram data path. It has one now -- an
+ * unordered handshake builds an unordered session and is spliced by
+ * cloak_dgram_relay_t -- so that flag no longer refuses anything and the
+ * case had to find another real refusal or stop being real.
+ *
+ * IT IS STILL A REAL ONE, and a documented production path rather than a
+ * test-only hook: an ADMIN session (AdminUID with session_id 0) is the
+ * one handshake whose proxy method the dispatcher deliberately does NOT
+ * check at step 7 -- Go's admin branch skips its ProxyBook lookup the
+ * same way -- so an owner with no cloak_adminapi_t wired in hands that
+ * connection to cloak_proxy_prepare_session with a method this server may
+ * not offer. proxy.c's own comment at that branch names this as reason 1
+ * of the two ways to reach it. "zz" is not in this fixture's ProxyBook,
+ * so the lookup returns NULL and prepare_session returns -1.
+ *
+ * What is being measured is unchanged: the user is fully authorised by
+ * the time step 8c runs, and only the session is refused, so the panel is
+ * owed the news. */
 static void test_prepare_session_refusal_releases_the_user(void) {
     struct fixture fx;
     ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
 
-    uint8_t uid[CLOAK_UID_LEN];
-    mk_uid(uid, 0x82);
-    put_user(fx.mgr, uid, 4, START_CREDIT, START_CREDIT, T_EXPIRY);
+    const uint8_t *uid = fx.uid_admin;
 
     uint8_t rec[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
     uint8_t shared[CLOAK_AEAD_KEY_LEN];
-    size_t rec_len = build_client_record(fx.server_pub, uid, "ss",
+    /* session_id 0 is what makes the dispatcher treat this as an admin
+     * session at all (step 6a: AdminUID AND session_id == 0). */
+    size_t rec_len = build_client_record(fx.server_pub, uid, "zz",
                                          (uint8_t)CLOAK_AEAD_AES_256_GCM, (int64_t)time(NULL),
-                                         10002, 1 /* unordered */, rec, sizeof(rec), shared);
+                                         0, 0, rec, sizeof(rec), shared);
     ASSERT_TRUE(rec_len > 0);
 
     uint8_t got[128];
@@ -1343,6 +1373,75 @@ static void test_reply_write_failure_releases_the_user(void) {
  * live. It is recorded here as UNCOVERED rather than left looking tested,
  * which is what the rest of this file would otherwise imply. */
 
+/* (c) THE ORDERING-MISMATCH REFUSAL, UNDER A PANEL -- and the finding is
+ * that its release call is a structural NO-OP rather than an untested
+ * one.
+ *
+ * WHAT WAS ASKED FOR AND WHY IT CANNOT BE PINNED. A review mutated
+ * dispatcher.c step 8 to delete dispatcher_release_user from the
+ * ordering-mismatch refusal and found the whole suite still passing,
+ * reading that as the same defect case (b) above exists to prevent. It is
+ * not, and the reason is structural: that refusal is only reachable on
+ * the registry-HIT path, i.e. exactly when cloak_server_registry_find has
+ * just returned a LIVE session for this (uid, session_id). So the user
+ * being refused still has at least one session, and
+ * cloak_userpanel_notify_session_closed is documented as a no-op for a
+ * user that still has sessions. MEASURED, not argued: with that call
+ * deleted this case passes unchanged, and so does the rest of the suite.
+ * The call is kept anyway -- it costs one predicted branch and it keeps
+ * the invariant dispatcher.c states ("steps 7, 8 and 9 each call
+ * dispatcher_release_user") true of the code rather than only of the
+ * comment, which matters if the refusal is ever moved to a path where a
+ * session is NOT guaranteed.
+ *
+ * WHAT THIS CASE DOES PIN, which nothing did before: the refusal is
+ * ACCOUNTING-NEUTRAL for a metered user. The honest session that was
+ * joined keeps its user active and keeps its place in the registry, and
+ * the refusal neither deactivates the user (which would bill and
+ * terminate them mid-session) nor admits a second session. The mutation
+ * it kills is the plausible over-correction -- answering a mismatch by
+ * terminating the user's sessions rather than by turning one connection
+ * away -- which fails the registry count and the panel lookup below. */
+static void test_ordering_mismatch_refusal_leaves_the_metered_user_alone(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx, 1, 0, 0));
+
+    uint8_t uid[CLOAK_UID_LEN];
+    mk_uid(uid, 0x83);
+    put_user(fx.mgr, uid, 4, START_CREDIT, START_CREDIT, T_EXPIRY);
+
+    /* An ORDERED session first (the flag byte is 0 in make_record). */
+    client_session_t cs;
+    ASSERT_EQ_INT(0, open_client(&fx, &cs, uid, 10003));
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count_for_uid(&fx.registry, uid));
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) != NULL);
+    ASSERT_EQ_INT(0, (int)fx.d.ordering_mismatch_refusals);
+
+    /* A second connection to the SAME key with the opposite flag. */
+    uint8_t rec[CLOAK_CLIENTHELLO_MAX_BYTES + 5];
+    uint8_t shared[CLOAK_AEAD_KEY_LEN];
+    size_t rec_len = build_client_record(fx.server_pub, uid, "ss",
+                                         (uint8_t)CLOAK_AEAD_AES_256_GCM, (int64_t)time(NULL),
+                                         10003, 1 /* unordered */, rec, sizeof(rec), shared);
+    ASSERT_TRUE(rec_len > 0);
+
+    uint8_t got[128];
+    size_t n = probe_response(&fx, rec, rec_len, got, sizeof(got));
+    ASSERT_EQ_INT((int)DU_BANNER_LEN, (int)n);
+    ASSERT_MEM_EQ(got, DU_BANNER, DU_BANNER_LEN);
+    ASSERT_EQ_INT(1, (int)fx.d.ordering_mismatch_refusals);
+
+    /* The honest session is untouched: still exactly one, still this
+     * user's, and the user is still active with its rates intact. */
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count_for_uid(&fx.registry, uid));
+    ASSERT_TRUE(cloak_userpanel_find(fx.panel, uid) != NULL);
+    ASSERT_EQ_INT(1, (int)cloak_userpanel_active_count(fx.panel));
+    ASSERT_EQ_INT(0, fx.aborted_calls);
+
+    client_session_close(&cs);
+    fixture_destroy(&fx);
+}
+
 TEST_MAIN_BEGIN()
 test_database_user_authenticates_and_is_metered();
 test_every_refusal_is_the_same_redirect();
@@ -1352,6 +1451,7 @@ test_no_panel_keeps_bypass_only_policy();
 test_terminated_user_stops_its_relays();
 test_cap_zero_refusal_releases_the_user();
 test_prepare_session_refusal_releases_the_user();
+test_ordering_mismatch_refusal_leaves_the_metered_user_alone();
 test_get_or_create_failure_releases_the_user();
 test_reply_write_failure_releases_the_user();
 TEST_MAIN_END()

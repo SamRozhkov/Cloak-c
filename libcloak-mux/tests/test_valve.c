@@ -141,6 +141,7 @@ static void init_pair(cloak_session_t *client, valve_harness_t *client_h, cloak_
     cloak_session_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.obfuscator = *shared_obfuscator;
+    cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = MAX_ON_WIRE;
     cfg.stream_recv_capacity = STREAM_RECV_CAP;
     cfg.stream_max_pending_frames = STREAM_MAX_PENDING;

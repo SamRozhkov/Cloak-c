@@ -338,7 +338,15 @@ typedef struct {
      *   attempt, exactly as in Go.
      *   server_pub_key, uid, proxy_method, encryption_method, browser,
      *   transport, num_conn, singleplex, udp (-> the session's unordered
-     *   flag), remote_host/remote_port (resolved once, here),
+     *   flag AND, since module 9, WHICH LOCAL LISTENER IS BUILT: 1 gives
+     *   a cloak_udp_piper_t -- one datagram socket, one unordered stream
+     *   per source address -- instead of a TCP cloak_listener_t and a
+     *   cloak_client_piper_t. The two are alternatives, never both, and
+     *   the choice is made once here. udp WITH singleplex is REFUSED as
+     *   ERR_CONFIG: Go supports the combination and this build does not,
+     *   and quietly sharing one session where the user asked for one per
+     *   flow would give none of the isolation the mode exists for),
+     *   remote_host/remote_port (resolved once, here),
      *   local_host/local_port (the listener), stream_timeout_sec (-> the
      *   piper's first-byte deadline, which is Go's own use of
      *   StreamTimeout in RouteTCP).
@@ -357,12 +365,14 @@ typedef struct {
      * above; a NON-zero field is used verbatim and is VALIDATED at open
      * (see that function's TEMPLATE paragraph).
      *
-     * obfuscator, valve and the four callbacks are ignored here and are
-     * CLEARED rather than merely documented as ignored: the connector
-     * overwrites the obfuscator with the agreed key, the valve is a
-     * server-side concept, and all four callbacks belong to the piper
-     * (edge E2 -- an on_broken of a caller's own is a use-after-free,
-     * not a customisation). */
+     * obfuscator, ordering, valve and the four callbacks are ignored here
+     * and are CLEARED rather than merely documented as ignored: the
+     * connector overwrites the obfuscator with the agreed key, it
+     * likewise sets the session's ordering mode from `udp` above (the
+     * same bit it puts in the auth record, so the session and its own
+     * handshake cannot disagree), the valve is a server-side concept, and
+     * all four callbacks belong to the piper (edge E2 -- an on_broken of
+     * a caller's own is a use-after-free, not a customisation). */
     cloak_session_config_t session_template;
 
     /* 0 selects the connector's own defaults. dial_timeout_ms bounds one
@@ -580,8 +590,21 @@ void cloak_client_stack_close(cloak_client_stack_t *s);
  * is returned here is a counter or a scalar, and nothing else. */
 
 /* The port the local listener is actually bound to, which is what a
- * LocalPort of "0" makes worth asking. -1 for a NULL stack. */
+ * LocalPort of "0" makes worth asking. In UDP mode this is the datagram
+ * socket's port -- the same question, a different socket. -1 for a NULL
+ * stack. */
 int cloak_client_stack_local_port(const cloak_client_stack_t *s);
+
+/* Whether the local listener holds its port as a datagram socket, asked
+ * of the socket itself (SO_TYPE) rather than inferred from a bind at
+ * that port number succeeding or failing -- a port number can be held by
+ * any concurrent process in another protocol family, so it proves
+ * nothing about THIS socket. Returns 1 in UDP mode with a datagram
+ * socket, 0 in UDP mode if the socket is somehow not one (or once this
+ * stack is not in UDP mode -- its listener is a stream socket by
+ * construction), or -1 for a NULL stack or a UDP-mode stack with no
+ * socket yet. */
+int cloak_client_stack_local_is_datagram(const cloak_client_stack_t *s);
 
 /* SHARED MODE: the id of the session currently live, or 0 when none is.
  * SINGLEPLEX: always 0 -- there is no single session to name.

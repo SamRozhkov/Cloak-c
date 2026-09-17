@@ -1,11 +1,13 @@
 add_library(cloak-mux STATIC
     src/frame.c
     src/stream.c
+    src/msgqueue.c
     src/strmtab.c
     src/conn.c
     src/switchboard.c
     src/session.c
     src/stream_relay.c
+    src/dgram_relay.c
     src/valve.c
     src/ws_frame.c
 )

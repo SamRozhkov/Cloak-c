@@ -8,6 +8,18 @@ target_include_directories(test_stream PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-comm
 target_link_libraries(test_stream PRIVATE cloak-mux)
 add_test(NAME test_stream COMMAND test_stream)
 
+add_executable(test_stream_unordered test_stream_unordered.c)
+target_include_directories(test_stream_unordered PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_stream_unordered PRIVATE cloak-mux)
+add_test(NAME test_stream_unordered COMMAND test_stream_unordered)
+set_tests_properties(test_stream_unordered PROPERTIES TIMEOUT 120)
+
+add_executable(test_msgqueue_property test_msgqueue_property.c)
+target_include_directories(test_msgqueue_property PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_msgqueue_property PRIVATE cloak-mux)
+add_test(NAME test_msgqueue_property COMMAND test_msgqueue_property)
+set_tests_properties(test_msgqueue_property PROPERTIES TIMEOUT 120)
+
 add_executable(test_strmtab test_strmtab.c)
 target_include_directories(test_strmtab PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_strmtab PRIVATE cloak-mux)
@@ -49,6 +61,19 @@ target_link_libraries(test_stream_relay PRIVATE cloak-mux)
 add_test(NAME test_stream_relay COMMAND test_stream_relay)
 set_tests_properties(test_stream_relay PROPERTIES TIMEOUT 60)
 
+# cloak_dgram_relay_t's own unit file, added in the task 6 fix round: the
+# relay shipped with end-to-end coverage only, and four properties its
+# header argues -- the teardown telling the peer, the minimum-over-the-pool
+# bound, notify_writable pulling, and a refused send holding its datagram
+# -- are unreachable from a proxy fixture whose session has one connection
+# and whose socket is loopback UDP. Same shape and same TIMEOUT as its
+# sibling above; forks nothing, so it stays in the fast tier.
+add_executable(test_dgram_relay test_dgram_relay.c)
+target_include_directories(test_dgram_relay PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_dgram_relay PRIVATE cloak-mux)
+add_test(NAME test_dgram_relay COMMAND test_dgram_relay)
+set_tests_properties(test_dgram_relay PROPERTIES TIMEOUT 60)
+
 add_executable(test_valve test_valve.c)
 target_include_directories(test_valve PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_valve PRIVATE cloak-mux)
@@ -78,3 +103,10 @@ target_include_directories(test_conn_ws_framing PRIVATE ${CMAKE_SOURCE_DIR}/libc
 target_link_libraries(test_conn_ws_framing PRIVATE cloak-mux)
 add_test(NAME test_conn_ws_framing COMMAND test_conn_ws_framing)
 set_tests_properties(test_conn_ws_framing PROPERTIES TIMEOUT 120)
+
+# None of this directory's tests fork a process (module 9 task 0's
+# fast/slow split; see the top-level CMakeLists.txt's own comment on
+# cloak_label_fast_tests() for what this call does and why it has to be
+# made from here rather than from that file). Every test above ends up
+# labelled "fast".
+cloak_label_fast_tests()

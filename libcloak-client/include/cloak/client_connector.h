@@ -274,9 +274,12 @@ typedef struct {
     void *now_userdata;
 
     /* The session to build on success. The obfuscator field is IGNORED
-     * and overwritten with the agreed key and encryption_method; every
-     * other field (queue caps, timeouts, stream callbacks) is used as
-     * given. */
+     * and overwritten with the agreed key and encryption_method, and so
+     * is ordering -- it is set from `unordered` above, the same variable
+     * this connector puts in every auth record it sends, so that a
+     * session and its own handshake cannot disagree about the mode (see
+     * cloak/ordering.h). Every other field (queue caps, timeouts, stream
+     * callbacks) is used as given. */
     cloak_session_config_t session_template;
 
     cloak_client_connector_cb on_done;

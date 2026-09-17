@@ -435,15 +435,31 @@ typedef void (*cloak_dispatch_attached_cb)(cloak_dispatcher_t *d, cloak_session_
  *
  * session_config_template is copied by value into every NEWLY created
  * session's config (cloak_server_registry_find found nothing): the
- * dispatcher overwrites exactly three fields of the copy before passing
+ * dispatcher overwrites exactly four fields of the copy before passing
  * it to cloak_server_registry_get_or_create --
  * obfuscator.method (the client's authenticated, wire-validated
  * encryption method), obfuscator.session_key (a fresh
- * cloak_random_bytes key), and valve (the authorised user's own meter,
- * cloak_userpanel_user_valve, which is NULL both for a bypass user and
- * for a dispatcher with no panel at all) -- so whatever this template's
- * own obfuscator and valve fields hold is irrelevant and always
- * replaced. THE VALVE IS OVERWRITTEN RATHER THAN DEFAULTED-TO because a
+ * cloak_random_bytes key), ordering (CLOAK_SESSION_ORDERING_UNORDERED
+ * iff the client set the auth record's unordered flag, ORDERED
+ * otherwise -- see cloak/ordering.h), and valve (the authorised user's
+ * own meter, cloak_userpanel_user_valve, which is NULL both for a bypass
+ * user and for a dispatcher with no panel at all) -- so whatever this
+ * template's own obfuscator, ordering and valve fields hold is
+ * irrelevant and always replaced. THE ORDERING MODE IS OVERWRITTEN FOR
+ * THE SAME REASON THE VALVE IS: it is per-SESSION and chosen by the
+ * client, while this template is per-DISPATCHER, and one server serves
+ * ordered and unordered clients simultaneously. BUT ONLY ON THE CREATE
+ * PATH, and that is a known gap rather than a design: an additional
+ * connection to an EXISTING (uid, session_id) never revisits the mode, so
+ * its own unordered flag is discarded and it joins whatever mode the
+ * session's first connection chose -- the same "first connection wins"
+ * the live-key rule states, which is right for the key and wrong for the
+ * mode. Inert until module 9 makes the modes differ, specified to become
+ * a refusal at join, and pinned meanwhile by
+ * test_dispatcher_auth.c's test_second_connection_cannot_change_the_
+ * ordering_mode; dispatcher.c's step-8 narrative carries the full
+ * reasoning. THE VALVE IS
+ * OVERWRITTEN RATHER THAN DEFAULTED-TO because a
  * valve is per-USER and this template is per-DISPATCHER: a template
  * valve would meter every user on the server into one counter, which is
  * not a weaker version of the right answer but a wrong one. on_broken/
@@ -646,6 +662,55 @@ struct cloak_dispatcher {
      * Always <= conn_count. This is what cloak_dispatcher_accept checks
      * against the cap, NOT conn_count. */
     size_t pending_count;
+
+    /* THE ONE REFUSAL THIS SERVER MAKES THAT GO DOES NOT MAKE, counted
+     * because it is otherwise invisible: connections refused at step 8
+     * because the ordering flag in their own auth record disagreed with
+     * the mode of the live session they asked to join.
+     *
+     * WHY IT IS A COUNTER AND NOT AN ERROR THE PEER CAN SEE. The refusal
+     * IS the cover-site redirect, byte for byte identical to the one an
+     * unauthorised UID, a replayed record or a stale timestamp produces
+     * -- deliberately, because a refusal distinguishable from those would
+     * be an oracle a prober could use to confirm this is a Cloak server
+     * at all (see this file's step-6 comment for the same argument about
+     * the four authorisation failures). So the diagnosis belongs on the
+     * operator's side only: this counter, and a CLOAK_LOGD line beside
+     * the check in dispatcher.c that names the session and both modes.
+     *
+     * DEBUG, NOT WARN, AND THAT IS PART OF THE SAME ARGUMENT RATHER THAN
+     * A STYLE CHOICE. The line shipped at WARN for one round and was
+     * measured to make this refusal 13-18 microseconds slower at p10 than
+     * a bad-UID refusal -- identical bytes, identical teardown,
+     * distinguishable clock. A blocking write from inside a reactor
+     * callback is exactly the kind of side effect that turns "looks the
+     * same" into "measures different"; see the check's own comment in
+     * dispatcher.c for the measurement and for the test that keeps the
+     * refusal path silent.
+     *
+     * WHAT A NON-ZERO VALUE MEANS. Not congestion, not an attack this
+     * server was under, and never something a legitimate client does: all
+     * NumConn connections of one Cloak session carry the same flag,
+     * because it comes from one client's one config. A non-zero count is
+     * therefore either a peer whose two ends disagree (a bug in a client,
+     * or a fork of one) or somebody deliberately probing what happens
+     * when they do. It is monotonic for the life of the dispatcher and is
+     * never reset.
+     *
+     * THE DIVERGENCE ITSELF. Go's ActiveUser.GetSession returns the
+     * existing session and discards the joining connection's own
+     * SessionConfig, so the connection is spliced on and its frames are
+     * interpreted under the SESSION's mode rather than its own -- which,
+     * once the two modes frame differently, is silent corruption with no
+     * error at either end. Refusing costs nothing against an honest peer
+     * and converts that into an immediate, visible failure. Asserted by
+     * test_dispatcher_auth.c's
+     * test_second_connection_with_the_opposite_ordering_is_refused (both
+     * directions) and bounded on the other side by
+     * test_second_connection_with_the_same_ordering_joins, which is what
+     * stops the check degenerating into "refuse every additional
+     * connection". */
+    uint64_t ordering_mismatch_refusals;
 };
 
 /* Zeroes d and validates the rest -- in that order, so that ANY failure

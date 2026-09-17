@@ -740,6 +740,7 @@ static void ep_fill_config(cloak_session_config_t *cfg, struct endpoint *ep,
                            const cloak_obfuscator_t *obfs, cloak_valve_t *valve) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->obfuscator = *obfs;
+    cfg->ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg->max_on_wire_size = 16401;
     cfg->stream_recv_capacity = 262144;
     cfg->stream_max_pending_frames = 256;
@@ -1031,6 +1032,7 @@ static int tx_probe_start(struct tx_probe *p, cloak_reactor_t *r, cloak_valve_t 
     cloak_session_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.obfuscator = obfs;
+    cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = 16401;
     cfg.stream_recv_capacity = 65536;
     cfg.stream_max_pending_frames = 64;

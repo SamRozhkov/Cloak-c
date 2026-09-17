@@ -53,6 +53,22 @@
  * must be added to that same list. */
 typedef struct cloak_stream_relay cloak_stream_relay_t;
 
+/* The worst-case on-wire bytes a single full frame of `stream` can ever
+ * cost: the connection layer's record header, plus the frame header, plus
+ * a full payload, plus the maximum padding and AEAD tag
+ * cloak_frame_obfuscate can add. In other words, the amount of room in a
+ * connection's send queue that guarantees one more frame will fit no
+ * matter what.
+ *
+ * PUBLIC ONLY SO THE TWO RELAYS CANNOT DISAGREE. cloak_dgram_relay_t
+ * (cloak/dgram_relay.h) makes the same start-time rejection and the same
+ * per-read room check against the same quantity, and a second copy of a
+ * wire-format formula that must match this one is exactly the drift this
+ * tree has paid for before. The derivation and an operational note about
+ * what happens when conn_send_queue_cap sits just below it live at the
+ * definition, in libcloak-mux/src/stream_relay.c. */
+size_t cloak_stream_relay_frame_cost(const cloak_stream_t *stream);
+
 /* Fired exactly once, when the relay finishes: the stream ended, the fd
  * ended, or either side errored. The fd is already closed and the stream
  * is already closed (but NOT released) by the time this fires. Never
@@ -248,7 +264,25 @@ struct cloak_stream_relay {
  * the one stream immediately, and giving its descriptor back to the
  * process, is the better trade.
  *
- * On any failure sr is left safe to pass to cloak_stream_relay_stop. */
+ * On any failure sr is left safe to pass to cloak_stream_relay_stop.
+ *
+ * THE -2 IS NAMED, BECAUSE -2 MEANS SOMETHING ELSE TWENTY LINES AWAY.
+ * cloak_stream_read and cloak_stream_write also return -2, and there it
+ * is CLOAK_STREAM_ERR_SHORT_BUFFER: "your buffer is the wrong size for
+ * the datagram in front of you". Here it is "the pool is momentarily
+ * full, come back". The two live in the same subsystem, are reached
+ * through the same relay objects, and are handled by the same files --
+ * libcloak-client/src/client_piper.c compares against BOTH within thirty
+ * lines. They are not the same condition and a reader who assumes they
+ * are will retry a short buffer or drop a stream on congestion.
+ *
+ * They deliberately keep the same numeric value: the -2 convention in
+ * this project means "a second, distinguishable negative on an existing
+ * -1 contract" (see cloak/stream.h), not one global error space, and
+ * renumbering would break every caller for nothing. What was missing was
+ * a NAME for this one, so each site can say which -2 it means. */
+#define CLOAK_STREAM_RELAY_ERR_POOL_FULL (-2)
+
 int cloak_stream_relay_start(cloak_stream_relay_t *sr, cloak_reactor_t *r,
                               cloak_session_t *sesh, cloak_stream_t *stream, int fd,
                               size_t buf_cap, cloak_stream_relay_done_cb on_done,

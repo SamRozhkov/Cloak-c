@@ -94,7 +94,8 @@ static void test_round_trip_in_order(void) {
     wire_init(&w);
 
     cloak_stream_t tx;
-    ASSERT_EQ_INT(cloak_stream_init(&tx, 7, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w), 0);
+    ASSERT_EQ_INT(cloak_stream_init(&tx, 7, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
 
     const char *msg = "the quick brown fox jumps over the lazy dog";
     long n = cloak_stream_write(&tx, (const uint8_t *)msg, strlen(msg));
@@ -102,7 +103,8 @@ static void test_round_trip_in_order(void) {
     ASSERT_EQ_INT(w.frame_count, 1);
 
     cloak_stream_t rx;
-    ASSERT_EQ_INT(cloak_stream_init(&rx, 7, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w), 0);
+    ASSERT_EQ_INT(cloak_stream_init(&rx, 7, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
 
     size_t order[1] = {0};
     deliver_frames(&w, &o, &rx, order, 1);
@@ -126,7 +128,8 @@ static void test_multi_frame_chunking_and_reassembly(void) {
     /* Force small frames so a sizeable payload spans many of them. */
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 10;
     cloak_stream_t tx;
-    ASSERT_EQ_INT(cloak_stream_init(&tx, 3, &o, max_on_wire, RECV_CAP, MAX_PENDING, wire_sink, &w), 0);
+    ASSERT_EQ_INT(cloak_stream_init(&tx, 3, &o, max_on_wire, RECV_CAP, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
 
     uint8_t msg[537];
     for (size_t i = 0; i < sizeof(msg); i++) {
@@ -137,7 +140,8 @@ static void test_multi_frame_chunking_and_reassembly(void) {
     ASSERT_EQ_INT(w.frame_count, (sizeof(msg) + 10 - 1) / 10);
 
     cloak_stream_t rx;
-    ASSERT_EQ_INT(cloak_stream_init(&rx, 3, &o, max_on_wire, RECV_CAP, MAX_PENDING, wire_sink, &w), 0);
+    ASSERT_EQ_INT(cloak_stream_init(&rx, 3, &o, max_on_wire, RECV_CAP, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
     size_t *order = (size_t *)malloc(w.frame_count * sizeof(size_t));
     for (size_t i = 0; i < w.frame_count; i++) order[i] = i;
     deliver_frames(&w, &o, &rx, order, w.frame_count);
@@ -161,14 +165,16 @@ static void test_out_of_order_delivery(void) {
 
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 5;
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 9, &o, max_on_wire, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 9, &o, max_on_wire, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
 
     const char *msg = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"; /* 26 bytes -> multiple 5-byte frames */
     cloak_stream_write(&tx, (const uint8_t *)msg, strlen(msg));
     ASSERT_EQ_INT(w.frame_count, 6);
 
     cloak_stream_t rx;
-    cloak_stream_init(&rx, 9, &o, max_on_wire, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&rx, 9, &o, max_on_wire, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
 
     /* Reverse delivery order: worst case for the reorder heap. */
     size_t order[6] = {5, 4, 3, 2, 1, 0};
@@ -192,7 +198,8 @@ static void test_shuffled_delivery_many_frames(void) {
 
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 3;
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 1, &o, max_on_wire, 1 << 20, 200, wire_sink, &w);
+    cloak_stream_init(&tx, 1, &o, max_on_wire, 1 << 20, 200,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
 
     uint8_t msg[300];
     for (size_t i = 0; i < sizeof(msg); i++) msg[i] = (uint8_t)(i * 13 + 1);
@@ -200,7 +207,8 @@ static void test_shuffled_delivery_many_frames(void) {
     ASSERT_EQ_INT(w.frame_count, 100);
 
     cloak_stream_t rx;
-    cloak_stream_init(&rx, 1, &o, max_on_wire, 1 << 20, 200, wire_sink, &w);
+    cloak_stream_init(&rx, 1, &o, max_on_wire, 1 << 20, 200,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
 
     size_t *order = (size_t *)malloc(w.frame_count * sizeof(size_t));
     for (size_t i = 0; i < w.frame_count; i++) order[i] = i;
@@ -231,7 +239,8 @@ static void test_closing_frame_signals_eof(void) {
     wire_init(&w);
 
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 4, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 4, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     const char *msg = "final message";
     cloak_stream_write(&tx, (const uint8_t *)msg, strlen(msg));
     ASSERT_EQ_INT(cloak_stream_send_closing(&tx, CLOAK_FRAME_CLOSING_STREAM), 0);
@@ -239,7 +248,8 @@ static void test_closing_frame_signals_eof(void) {
     ASSERT_EQ_INT(w.frame_count, 2);
 
     cloak_stream_t rx;
-    cloak_stream_init(&rx, 4, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&rx, 4, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     size_t order[2] = {0, 1};
     int last_rc = deliver_frames(&w, &o, &rx, order, 2);
     ASSERT_EQ_INT(last_rc, 1);
@@ -269,13 +279,15 @@ static void test_closing_frame_out_of_order_stops_drain(void) {
 
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 4;
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 2, &o, max_on_wire, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 2, &o, max_on_wire, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     cloak_stream_write(&tx, (const uint8_t *)"AAAA", 4); /* seq 0 */
     cloak_stream_send_closing(&tx, CLOAK_FRAME_CLOSING_STREAM); /* seq 1 */
     ASSERT_EQ_INT(w.frame_count, 2);
 
     cloak_stream_t rx;
-    cloak_stream_init(&rx, 2, &o, max_on_wire, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&rx, 2, &o, max_on_wire, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
 
     /* Deliver seq 1 (closing) first (buffered, out of order), THEN seq 0. */
     size_t order[2] = {1, 0};
@@ -300,11 +312,13 @@ static void test_duplicate_seq_rejected(void) {
     wire_init(&w);
 
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 5, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 5, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     cloak_stream_write(&tx, (const uint8_t *)"hello", 5);
 
     cloak_stream_t rx;
-    cloak_stream_init(&rx, 5, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&rx, 5, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     uint8_t out[16];
 
     uint8_t *copy1 = (uint8_t *)malloc(w.frame_lens[0]);
@@ -337,14 +351,16 @@ static void test_duplicate_pending_frame_rejected_not_wedged(void) {
 
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 2;
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 11, &o, max_on_wire, 1 << 20, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 11, &o, max_on_wire, 1 << 20, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     uint8_t msg[16];
     for (size_t i = 0; i < sizeof(msg); i++) msg[i] = (uint8_t)('A' + i);
     cloak_stream_write(&tx, msg, sizeof(msg)); /* 8 frames of 2 bytes, seq 0..7 */
     ASSERT_EQ_INT(w.frame_count, 8);
 
     cloak_stream_t rx;
-    cloak_stream_init(&rx, 11, &o, max_on_wire, 1 << 20, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&rx, 11, &o, max_on_wire, 1 << 20, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
 
     size_t *offsets = (size_t *)malloc(w.frame_count * sizeof(size_t));
     size_t off = 0;
@@ -399,7 +415,8 @@ static void test_backpressure_and_resume(void) {
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 4;
     size_t recv_cap = 260; /* == 65 four-byte frames' worth */
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 6, &o, max_on_wire, 1 << 20, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 6, &o, max_on_wire, 1 << 20, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
 
     /* 400 bytes -> 100 frames of 4 bytes; recv_cap only holds the first 65
      * frames' payload (260 bytes), so the remaining 35 must back up on the
@@ -410,7 +427,8 @@ static void test_backpressure_and_resume(void) {
     ASSERT_EQ_INT(w.frame_count, 100);
 
     cloak_stream_t rx;
-    ASSERT_EQ_INT(cloak_stream_init(&rx, 6, &o, max_on_wire, recv_cap, MAX_PENDING, wire_sink, &w), 0);
+    ASSERT_EQ_INT(cloak_stream_init(&rx, 6, &o, max_on_wire, recv_cap, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
 
     size_t order[100];
     for (size_t i = 0; i < 100; i++) order[i] = i;
@@ -447,7 +465,8 @@ static void test_max_pending_frames_cap(void) {
 
     size_t max_on_wire = CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_MAX_EXTRA_LEN + 2;
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 8, &o, max_on_wire, 1 << 20, 1000, wire_sink, &w);
+    cloak_stream_init(&tx, 8, &o, max_on_wire, 1 << 20, 1000,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     uint8_t msg[20];
     for (size_t i = 0; i < sizeof(msg); i++) msg[i] = (uint8_t)i;
     cloak_stream_write(&tx, msg, sizeof(msg)); /* 10 frames of 2 bytes */
@@ -456,7 +475,8 @@ static void test_max_pending_frames_cap(void) {
     cloak_stream_t rx;
     /* max_pending_frames = 3: never deliver seq 0, so frames 1..9 (9 of
      * them) all pile up out-of-order; the cap should reject once exceeded. */
-    ASSERT_EQ_INT(cloak_stream_init(&rx, 8, &o, max_on_wire, 1 << 20, 3, wire_sink, &w), 0);
+    ASSERT_EQ_INT(cloak_stream_init(&rx, 8, &o, max_on_wire, 1 << 20, 3,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
 
     int saw_rejection = 0;
     size_t *offsets = (size_t *)malloc(w.frame_count * sizeof(size_t));
@@ -490,7 +510,8 @@ static void test_sink_failure_propagates(void) {
     w.fail_after_n = 0; /* sink fails immediately */
 
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 10, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 10, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     long n = cloak_stream_write(&tx, (const uint8_t *)"data", 4);
     ASSERT_EQ_INT(n, -1);
 
@@ -507,7 +528,8 @@ static void test_undersized_recv_capacity_rejected(void) {
     /* recv_capacity smaller than what this max_on_wire_size could ever
      * deliver in one frame must be rejected at init, not accepted and
      * silently wedged later. */
-    ASSERT_EQ_INT(cloak_stream_init(&s, 1, &o, MAX_ON_WIRE, 4, MAX_PENDING, wire_sink, &w), -1);
+    ASSERT_EQ_INT(cloak_stream_init(&s, 1, &o, MAX_ON_WIRE, 4, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), -1);
     wire_free(&w);
 }
 
@@ -519,7 +541,8 @@ static void test_write_failure_closes_write_side(void) {
     w.fail_after_n = 0; /* sink fails on the very first frame */
 
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 12, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 12, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     ASSERT_EQ_INT(cloak_stream_write(&tx, (const uint8_t *)"x", 1), -1);
     /* A retry must also fail -- the stream must be closed, not silently
      * skip the sequence number that never actually reached the sink. */
@@ -536,13 +559,15 @@ static void test_read_with_zero_capacity_is_not_spurious_eof(void) {
     wire_init(&w);
 
     cloak_stream_t tx;
-    cloak_stream_init(&tx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&tx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     const char *msg = "still here";
     cloak_stream_write(&tx, (const uint8_t *)msg, strlen(msg));
     cloak_stream_send_closing(&tx, CLOAK_FRAME_CLOSING_STREAM);
 
     cloak_stream_t rx;
-    cloak_stream_init(&rx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, wire_sink, &w);
+    cloak_stream_init(&rx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                      CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w);
     size_t order[2] = {0, 1};
     deliver_frames(&w, &o, &rx, order, 2);
 
@@ -563,6 +588,53 @@ static void test_read_with_zero_capacity_is_not_spurious_eof(void) {
     wire_free(&w);
 }
 
+/* ---- the ordering mode at the stream layer -----------------------------
+ *
+ * cloak_session_config_t carries the trap that matters (see
+ * cloak/ordering.h and test_session.c's own ordering block): a struct
+ * field has a zero value on every memset, a parameter does not. What this
+ * case pins is that the stream layer does not quietly accept the zero
+ * value ANYWAY -- if it did, cloak_session_init would be the single point
+ * holding the invariant up, and a future caller that reached
+ * cloak_stream_init directly (session.c is not the only conceivable one)
+ * would get a stream whose mode is neither of the two real ones.
+ *
+ * Every assertion names CLOAK_SESSION_ERR_INVALID_ORDERING rather than
+ * -1: the pre-existing rejections in this function all return -1, so a
+ * non-zero assertion here would be satisfied by an implementation that
+ * ignored ordering entirely and happened to object to something else. */
+static void test_stream_init_rejects_invalid_ordering(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+
+    const int bad[3] = {(int)CLOAK_SESSION_ORDERING_INVALID, 3, 255};
+    for (int i = 0; i < 3; i++) {
+        cloak_stream_t s;
+        ASSERT_EQ_INT(cloak_stream_init(&s, 1, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                                        (cloak_session_ordering_t)bad[i], wire_sink, &w),
+                      CLOAK_SESSION_ERR_INVALID_ORDERING);
+    }
+
+    /* Both real modes construct, and the mode the caller asked for is the
+     * mode the stream ends up with -- a constructor that validated the
+     * argument and then stored a constant would pass every rejection
+     * above and hand session.c a stream that disagrees with its session. */
+    const cloak_session_ordering_t good[2] = {CLOAK_SESSION_ORDERING_ORDERED,
+                                              CLOAK_SESSION_ORDERING_UNORDERED};
+    for (int i = 0; i < 2; i++) {
+        cloak_stream_t s;
+        ASSERT_EQ_INT(cloak_stream_init(&s, 1, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING, good[i],
+                                        wire_sink, &w),
+                      0);
+        ASSERT_EQ_INT(s.ordering, good[i]);
+        cloak_stream_destroy(&s);
+    }
+
+    wire_free(&w);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_in_order();
     test_multi_frame_chunking_and_reassembly();
@@ -578,4 +650,5 @@ TEST_MAIN_BEGIN()
     test_undersized_recv_capacity_rejected();
     test_write_failure_closes_write_side();
     test_read_with_zero_capacity_is_not_spurious_eof();
+    test_stream_init_rejects_invalid_ordering();
 TEST_MAIN_END()

@@ -368,6 +368,33 @@ static void fx_session_closing(const uint8_t uid[CLOAK_UID_LEN], uint32_t sessio
     cloak_proxy_session_aborted(NULL, uid, session_id, userdata);
 }
 
+/* cloak_proxy_prepare_session, EXCEPT for an unordered client, for which
+ * it does nothing at all and reports success.
+ *
+ * THE REASON THIS SHIM EXISTS CHANGED IN MODULE 9 TASK 6, and it is kept
+ * rather than deleted. It was written because the real
+ * prepare_session REFUSED an unordered client outright (its old
+ * obligation 5: the server had no datagram data path), and this file
+ * needs such a handshake to complete -- the only way to observe what the
+ * CLIENT does with its own unordered flag is to let it finish building a
+ * session. That refusal is gone; the real function would now accept the
+ * handshake and build a proxy context for it. The shim stays because
+ * this file's unordered case never sends a byte through the session it
+ * builds, so a proxy context for it would be state nothing here asks
+ * for or drives -- and the server side of an unordered session is
+ * covered end to end where it belongs, in
+ * libcloak-server/tests/test_proxy_udp.c.
+ *
+ * Every other case in this file is ordered and reaches
+ * cloak_proxy_prepare_session exactly as before. */
+static int fx_prepare_session(cloak_dispatcher_t *d, const cloak_server_clientinfo_t *info,
+                              cloak_session_config_t *config, void *userdata) {
+    if (info->unordered) {
+        return 0;
+    }
+    return cloak_proxy_prepare_session(d, info, config, userdata);
+}
+
 static int fixture_init(struct fixture *fx) {
     memset(fx, 0, sizeof(*fx));
     char err[256] = {0};
@@ -466,7 +493,7 @@ static int fixture_init(struct fixture *fx) {
     dcfg.session_config_template.stream_max_pending_frames = 64;
     dcfg.session_config_template.conn_send_queue_cap = 262144;
     dcfg.session_config_template.inactivity_timeout_ms = 60000;
-    dcfg.prepare_session = cloak_proxy_prepare_session;
+    dcfg.prepare_session = fx_prepare_session;
     dcfg.prepare_session_userdata = &fx->proxy;
     dcfg.attached = fx_attached;
     dcfg.attached_userdata = fx;
@@ -897,6 +924,109 @@ static void test_connector_one_connection(void) {
                       CLOAK_AEAD_KEY_LEN);
     }
     ASSERT_EQ_INT(1, (int)cloak_switchboard_conn_count(&sesh.sb));
+
+    if (res.status == CLOAK_CLIENT_CONNECTOR_DONE) {
+        cloak_session_destroy(&sesh);
+    }
+    cloak_client_connector_destroy(&c);
+    fixture_destroy(&fx);
+}
+
+/* ---- the ordering mode, end to end ------------------------------------- */
+
+#define SID_UNORDERED ((uint32_t)5113)
+
+/* THE ONE BIT THAT CROSSES THE WIRE, ASSERTED ON BOTH SESSIONS IT LANDS
+ * IN. `unordered` has been in this port's auth record since module 3 and
+ * has, until now, changed nothing below the handshake on either side.
+ * This case pins both halves of the mapping that gives it meaning:
+ *
+ *   - the CLIENT's own session gets the mode this connector declared
+ *     (client_connector.c's assemble derives it from the same variable it
+ *     put in the record, so the two cannot drift);
+ *   - the SERVER's session gets the mode the client asked for
+ *     (dispatcher.c step 8b derives it from the decrypted flag, which is
+ *     also the only proof here that the bit survived the wire).
+ *
+ * Neither half can be seen by any ordinary round-trip assertion: a
+ * session pair that is ordered at both ends and one that is unordered at
+ * both ends behave identically today, and will keep doing so until this
+ * module's later tasks give the modes different behaviour. Both halves
+ * were measured against a mutation that replaced the derivation with a
+ * fixed CLOAK_SESSION_ORDERING_ORDERED -- one on each side, separately --
+ * and this case is what fails for each. */
+static void test_connector_unordered_mode_reaches_both_sessions(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    cloak_session_t sesh;
+    conn_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    cloak_client_connector_config_t cfg;
+    connector_config(&cfg, &fx, &sesh, SID_UNORDERED, front_port(&fx), &res);
+    cfg.unordered = 1;
+    /* The template carries no ordering mode of its own -- the connector
+     * supplies it per session. Left as connector_config's memset made it,
+     * deliberately: if the connector ever stopped setting it, this
+     * session would fail to construct rather than quietly come up
+     * ordered. */
+    ASSERT_EQ_INT((int)CLOAK_SESSION_ORDERING_INVALID, (int)cfg.session_template.ordering);
+
+    cloak_client_connector_t c;
+    ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
+    ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+    ASSERT_TRUE(pump_until(fx.reactor, conn_fired, &res, CONN_MAX_TURNS, CONN_TURN_MS));
+
+    ASSERT_EQ_INT(1, res.calls);
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_DONE, (int)res.status);
+    ASSERT_EQ_INT((int)CLOAK_SESSION_ORDERING_UNORDERED, (int)sesh.ordering);
+
+    cloak_session_t *server_sesh = cloak_server_registry_find(&fx.registry, fx.uid, SID_UNORDERED);
+    ASSERT_TRUE(server_sesh != NULL);
+    if (server_sesh != NULL) {
+        ASSERT_EQ_INT((int)CLOAK_SESSION_ORDERING_UNORDERED, (int)server_sesh->ordering);
+    }
+
+    if (res.status == CLOAK_CLIENT_CONNECTOR_DONE) {
+        cloak_session_destroy(&sesh);
+    }
+    cloak_client_connector_destroy(&c);
+    fixture_destroy(&fx);
+}
+
+/* The same mapping for the OTHER value: an ordered client -- every other
+ * case in this file -- must still produce ORDERED sessions on both sides.
+ * Without this half, a derivation inverted on both ends at once would
+ * pass the case above. */
+#define SID_ORDERED_MODE ((uint32_t)5114)
+
+static void test_connector_ordered_mode_reaches_both_sessions(void) {
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    cloak_session_t sesh;
+    conn_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    cloak_client_connector_config_t cfg;
+    connector_config(&cfg, &fx, &sesh, SID_ORDERED_MODE, front_port(&fx), &res);
+    ASSERT_EQ_INT(0, cfg.unordered);
+
+    cloak_client_connector_t c;
+    ASSERT_EQ_INT(0, cloak_client_connector_init(&c, &cfg));
+    ASSERT_EQ_INT(0, cloak_client_connector_start(&c));
+    ASSERT_TRUE(pump_until(fx.reactor, conn_fired, &res, CONN_MAX_TURNS, CONN_TURN_MS));
+
+    ASSERT_EQ_INT((int)CLOAK_CLIENT_CONNECTOR_DONE, (int)res.status);
+    ASSERT_EQ_INT((int)CLOAK_SESSION_ORDERING_ORDERED, (int)sesh.ordering);
+
+    cloak_session_t *server_sesh =
+        cloak_server_registry_find(&fx.registry, fx.uid, SID_ORDERED_MODE);
+    ASSERT_TRUE(server_sesh != NULL);
+    if (server_sesh != NULL) {
+        ASSERT_EQ_INT((int)CLOAK_SESSION_ORDERING_ORDERED, (int)server_sesh->ordering);
+    }
 
     if (res.status == CLOAK_CLIENT_CONNECTOR_DONE) {
         cloak_session_destroy(&sesh);
@@ -2024,6 +2154,8 @@ static void test_the_fallback_is_per_connection(void) {
 
 TEST_MAIN_BEGIN()
 test_connector_one_connection();
+test_connector_unordered_mode_reaches_both_sessions();
+test_connector_ordered_mode_reaches_both_sessions();
 test_connector_four_connections_one_session();
 test_connector_retries_a_refused_connection();
 test_connector_gives_up_after_the_attempt_bound();

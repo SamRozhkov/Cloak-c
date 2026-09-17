@@ -7,13 +7,69 @@
 #include "cloak/common.h"
 #include "cloak/conn.h"
 
-static uint32_t xorshift32(uint32_t *state) {
-    uint32_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    return x;
+/* THE CONNECTION PICK'S RANDOMNESS. See switchboard.h's header comment
+ * for WHY this has to be cryptographic; this is the how.
+ *
+ * A refill of CSPRNG bytes held in the pool, drawn four at a time --
+ * structurally the same thing Go does (rand.Rand over rand.NewChaCha8
+ * refills 32 words of ChaCha8 keystream at a time and hands them out one
+ * per call), and for the same reason: the per-draw cost of going to the
+ * operating system's generator does not belong on a per-frame path.
+ *
+ * MEASURED, 2,000,000 draws each, in this project's dev image:
+ *   the xorshift32 this replaces      2.0 ns/draw
+ *   cloak_random_below(4) directly  644-658 ns/draw   (~320x)
+ *   this buffer                      10.9-11.0 ns/draw (~5.4x)
+ * The direct call is a real cost on a small-datagram flood -- one
+ * RAND_bytes syscall-ish trip per datagram, against a per-datagram cost
+ * of a couple of microseconds -- and 9 ns is not. Both are unbiased; this
+ * one is also cheap, so the choice cost nothing.
+ *
+ * THE BUFFER IS NOT A WEAKENING. Every byte in it is RAND_bytes output
+ * that has not been handed out yet; what a censor sees is the picks, and
+ * those are as unpredictable as the generator that produced them either
+ * way. What it does change is forward secrecy over a 256-byte window --
+ * an attacker with the pool's memory learns up to 64 future picks. The
+ * picks are published on the wire the moment they are used, so that
+ * window buys an attacker who already has our address space nothing. */
+#define SWITCHBOARD_RNG_BUF_LEN 256
+
+static uint32_t switchboard_random_u32(cloak_switchboard_t *sb) {
+    if (sb->rng_pos + 4 > SWITCHBOARD_RNG_BUF_LEN) {
+        sb->rng_pos = SWITCHBOARD_RNG_BUF_LEN;
+    }
+    if (sb->rng_pos == SWITCHBOARD_RNG_BUF_LEN) {
+        cloak_random_bytes(sb->rng_buf, SWITCHBOARD_RNG_BUF_LEN);
+        sb->rng_pos = 0;
+    }
+    uint32_t v = ((uint32_t)sb->rng_buf[sb->rng_pos] << 24) |
+                 ((uint32_t)sb->rng_buf[sb->rng_pos + 1] << 16) |
+                 ((uint32_t)sb->rng_buf[sb->rng_pos + 2] << 8) |
+                 (uint32_t)sb->rng_buf[sb->rng_pos + 3];
+    sb->rng_pos += 4;
+    return v;
+}
+
+/* [0, n), REJECTION-SAMPLED -- the same strategy, and the same arithmetic,
+ * as cloak_random_below (libcloak-common/src/random.c), which is itself
+ * the port of Go's common.RandInt. `% n` on the raw draw is what this
+ * deliberately is not: module 8's fix wave removed exactly that shape
+ * from a one-byte draw in frame.c after it put a 2.009x size bias on the
+ * wire, and this is its 32-bit cousin. The discarded tail here is at most
+ * n-1 values out of 2^32, so for the pool sizes Cloak uses (NumConn is a
+ * handful) the loop's second iteration has probability below 2^-29 and
+ * the cost above is the cost. */
+static uint32_t switchboard_random_below(cloak_switchboard_t *sb, uint32_t n) {
+    if (n <= 1) {
+        return 0;
+    }
+    uint64_t limit = 0x100000000ULL - (0x100000000ULL % (uint64_t)n);
+    for (;;) {
+        uint32_t v = switchboard_random_u32(sb);
+        if ((uint64_t)v < limit) {
+            return v % n;
+        }
+    }
 }
 
 static void switchboard_conn_envelope_adapter(cloak_conn_t *conn, const uint8_t *bytes, size_t len, void *userdata) {
@@ -67,13 +123,13 @@ int cloak_switchboard_init(cloak_switchboard_t *sb, cloak_reactor_t *reactor,
     sb->on_broken = on_broken;
     sb->on_broken_userdata = on_broken_userdata;
 
-    uint8_t seed[4];
-    cloak_random_bytes(seed, sizeof(seed));
-    sb->rng_state = ((uint32_t)seed[0] << 24) | ((uint32_t)seed[1] << 16) |
-                     ((uint32_t)seed[2] << 8) | (uint32_t)seed[3];
-    if (sb->rng_state == 0) {
-        sb->rng_state = 1; /* xorshift32 is fixed at 0 forever -- avoid that one degenerate seed */
-    }
+    /* "Empty", so the first pick refills from RAND_bytes. The memset
+     * above already did this; it is restated because an rng_pos of 0 with
+     * a zeroed buffer would be the one catastrophic state (64 picks of
+     * connection 0), and a reader should be able to see that it cannot
+     * arise without re-deriving the memset's effect on a field declared
+     * thirty lines away in another file. */
+    sb->rng_pos = SWITCHBOARD_RNG_BUF_LEN;
     return 0;
 }
 
@@ -143,7 +199,7 @@ int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, 
     if (sb->broken || sb->conns_len == 0) {
         return -1;
     }
-    size_t idx = xorshift32(&sb->rng_state) % sb->conns_len;
+    size_t idx = (size_t)switchboard_random_below(sb, (uint32_t)sb->conns_len);
     int rc = cloak_conn_send(sb->conns[idx], frame_bytes, frame_len);
     if (rc == 0) {
         /* TX counting point. Go's switchboard.go:106 -- sb.valve.AddTx(int64(n))

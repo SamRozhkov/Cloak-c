@@ -215,8 +215,20 @@ static void fill_template_defaults(cloak_session_config_t *t) {
      * A template carrying any of them would either be silently discarded
      * -- inviting the reader to believe it was honoured -- or, in the
      * valve's case, meter every session on the server into one shared
-     * counter. */
+     * counter.
+     *
+     * THE ORDERING MODE is in this list for the sharpest version of that
+     * reason: it is declared by the CLIENT, once per session, in the flag
+     * byte of its auth record, and the dispatcher sets it from there
+     * (step 8b, beside the obfuscator). One server serves ordered and
+     * unordered clients at the same time, so there is no server-wide
+     * answer for a template to carry. Cleared to
+     * CLOAK_SESSION_ORDERING_INVALID rather than to either real mode: if
+     * anything ever builds a session straight from this template without
+     * asking the handshake, it fails construction instead of quietly
+     * serving every client in one mode. */
     memset(&t->obfuscator, 0, sizeof(t->obfuscator));
+    t->ordering = CLOAK_SESSION_ORDERING_INVALID;
     t->valve = NULL;
     t->on_broken = NULL;
     t->on_broken_userdata = NULL;
@@ -310,8 +322,19 @@ int cloak_server_stack_open(cloak_server_stack_t **out, const cloak_server_stack
      * redirect to the cover site -- every client on the server silently
      * and correctly redirected, forever, with no error emitted anywhere. */
     {
+        /* The ordering mode is the one field the probe supplies itself:
+         * the template deliberately does not carry one (see
+         * fill_template_defaults), because it is the client's per-session
+         * declaration. ORDERED is an arbitrary but sufficient choice
+         * TODAY, when the two modes differ in nothing this validation
+         * touches. A later task that gives unordered mode its own bounds
+         * must probe both -- a second probe added now would be
+         * indistinguishable from its own absence, which is how a check
+         * rots. */
+        cloak_session_config_t probe_cfg = s->cfg.session_config_template;
+        probe_cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
         cloak_session_t probe;
-        if (cloak_session_init(&probe, 0, s->reactor, &s->cfg.session_config_template) != 0) {
+        if (cloak_session_init(&probe, 0, s->reactor, &probe_cfg) != 0) {
             stack_err(err, err_cap,
                       "session template: cloak_session_init rejected it "
                       "(max_on_wire_size=%zu, stream_recv_capacity=%zu, "

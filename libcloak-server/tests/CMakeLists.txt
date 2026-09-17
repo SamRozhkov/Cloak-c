@@ -153,6 +153,31 @@ target_link_libraries(test_proxy_stream PRIVATE cloak-server)
 add_test(NAME test_proxy_stream COMMAND test_proxy_stream)
 set_tests_properties(test_proxy_stream PROPERTIES TIMEOUT 60)
 
+# LABELS "slow" (module 9 task 0's fast/slow split): this file's
+# test_total_cap_is_derived_from_rlimit calls fork(2) to lower
+# RLIMIT_NOFILE in a child without disturbing the parent's own
+# descriptor table. `ctest -L fast` (the edit-loop target) excludes
+# anything carrying this label; the default `ctest` with no arguments
+# still runs it -- the split changes what the QUICK loop runs, never
+# what the full suite runs, exactly as CLOAK_REQUIRE_GO's 67 -> 68
+# stays a build-time choice, not a per-run skip.
+set_tests_properties(test_proxy_stream PROPERTIES LABELS "slow")
+
+# The server's DATAGRAM upstream (module 9 task 6). NOT labelled "slow":
+# it forks nothing -- its "upstream" is one bound AF_INET SOCK_DGRAM
+# socket driven by the same reactor as everything else -- so it belongs in
+# the `ctest -L fast` edit loop, which is where a relay this fiddly most
+# needs to be re-run.
+add_executable(test_proxy_udp test_proxy_udp.c)
+target_include_directories(test_proxy_udp PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_proxy_udp PRIVATE cloak-server)
+add_test(NAME test_proxy_udp COMMAND test_proxy_udp)
+# 60 s matches every other end-to-end file in this directory and is a
+# BACKSTOP, not the mechanism: every wait inside the file is a
+# clock-bounded pump_until of 4 s, so a wholly unresponsive run still
+# reports its own named assertion rather than being truncated by ctest.
+set_tests_properties(test_proxy_udp PROPERTIES TIMEOUT 60)
+
 add_executable(test_proxy_teardown test_proxy_teardown.c)
 target_include_directories(test_proxy_teardown PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_proxy_teardown PRIVATE cloak-server)
@@ -320,6 +345,7 @@ foreach(_cloak_harness_test
         test_dispatcher_auth
         test_dispatcher_limits
         test_proxy_stream
+        test_proxy_udp
         test_proxy_teardown
         test_server_e2e
         test_dispatcher_users
@@ -444,6 +470,16 @@ if(CLOAK_REQUIRE_GO)
     # being truncated as "***Timeout" with the diagnosis cut off. This is a
     # backstop, not the mechanism.
     set_tests_properties(test_ws_interop PROPERTIES TIMEOUT 120)
+
+    # LABELS "slow" (module 9 task 0's fast/slow split): this is "the
+    # first test in this tree whose PEER was not written by this
+    # project" (see above) -- it forks and execs a real ck-server
+    # binary and the Go oracle (github.com/gorilla/websocket) as real
+    # child processes. `ctest -L fast` (the edit-loop target) excludes
+    # it; the default `ctest` still runs it, same as every other label
+    # in this split -- the suite's test COUNT stays untouched, only the
+    # quick loop's SELECTION shrinks.
+    set_tests_properties(test_ws_interop PROPERTIES LABELS "slow")
 else()
     message(WARNING
         "CLOAK_REQUIRE_GO=OFF: test_ws_interop is NOT built. The suite is 67 "
@@ -451,3 +487,163 @@ else()
         "implementation it did not write -- which is how it once shipped a "
         "frame format no Go peer could read. Turn this back on to restore it.")
 endif()
+
+# ---------------------------------------------------------------------------
+# The DIRECT path's interoperability suite (module 9 task 1).
+#
+# test_ws_interop, above, put a foreign implementation in front of the
+# server's WEBSOCKET leg. The direct (TLS-shaped) leg and the whole C
+# CLIENT had never met foreign code at all -- eight modules in, both ends
+# of every one of their tests were our own -- which is exactly the
+# condition under which this port once shipped a frame format no Go peer
+# could read. test_go_interop closes that: it drives Go Cloak's own
+# ck-client and ck-server BINARIES as subprocesses, in both roles.
+#
+# NOT GUARDED BY CLOAK_REQUIRE_GO, deliberately. That option is about a Go
+# TOOLCHAIN, because ws_interop_oracle is Go source this build compiles.
+# This test compiles nothing: it execs two prebuilt binaries that
+# Dockerfile.dev's `gobuild` stage puts in the image, so a machine with no
+# Go toolchain at all can still run it, and tying it to CLOAK_REQUIRE_GO
+# would remove coverage for a dependency it does not have. The suite is
+# therefore 69 tests with a Go toolchain and 68 with -DCLOAK_REQUIRE_GO=OFF.
+#
+# A MISSING BINARY IS A NAMED FAILURE, NOT A CONFIGURE ERROR AND NOT A
+# TIMEOUT. The paths below are resolved here if they exist and defaulted
+# to where Dockerfile.dev puts them if they do not, so the TEST reports
+# the absence in milliseconds, naming the file and the image that builds
+# it. Making this a configure-time FATAL_ERROR would mean a C library
+# cannot be configured without Go binaries present; making it a skip would
+# be invisible in ctest output, which this tree has been burned by.
+find_program(CLOAK_GO_CK_CLIENT NAMES go-ck-client HINTS /usr/local/bin)
+find_program(CLOAK_GO_CK_SERVER NAMES go-ck-server HINTS /usr/local/bin)
+if(NOT CLOAK_GO_CK_CLIENT)
+    set(CLOAK_GO_CK_CLIENT "/usr/local/bin/go-ck-client")
+endif()
+if(NOT CLOAK_GO_CK_SERVER)
+    set(CLOAK_GO_CK_SERVER "/usr/local/bin/go-ck-server")
+endif()
+
+add_executable(test_go_interop test_go_interop.c)
+target_include_directories(test_go_interop PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+# cloak-server for cloak_clienthello_parse (case 4 reads the relayed
+# ClientHello itself); cloak-common for base64, X25519 and the AEAD it
+# then decrypts the authentication payload with.
+target_link_libraries(test_go_interop PRIVATE cloak-server cloak-common)
+target_compile_definitions(test_go_interop PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_go_interop COMMAND test_go_interop)
+
+# The two things this directory cannot give it -- the paths of OUR
+# ck-client and ck-server binaries -- are APPENDED at the end of the
+# top-level CMakeLists.txt, after cmd/ck-client and cmd/ck-server have
+# been added, exactly as test_ws_interop's ck-server path already is.
+
+# TIMEOUT 120, the bound this project uses for anything that forks real
+# binaries, and set from the worst FAILING run rather than the passing
+# one. MEASURED: a passing run is 2.2 s in Debug (four cases, six child
+# processes, 128 KiB each way through two of them).
+#
+# What the number has to accommodate is a run where the two ends cannot
+# read each other's frames -- the exact shape of the defect this file
+# exists to catch, and one this file was actually run against by
+# mutation. Every wait inside the test is bounded by CLOCK_MONOTONIC, and
+# the file's own budget comment works the arithmetic out to ~77 s for the
+# worst failing path (XFER_MS 15 s per stalled transfer, EXIT_MS 5 s per
+# child that ignores SIGTERM, HANDSHAKE_FAIL_MS 15 s for the negative
+# control). That leaves ~40 s of headroom, so even a wholly unresponsive
+# run finishes inside this timeout and prints its own named assertion
+# instead of being truncated as "***Timeout" with the diagnosis cut off.
+#
+# The first draft of those budgets did NOT fit: at XFER_MS 30 s the two
+# positive cases alone burned 60 s of the 120 under the frame-AEAD
+# mutation. They were cut after measuring that, not before.
+set_tests_properties(test_go_interop PROPERTIES TIMEOUT 120)
+
+# LABELS "slow" (module 9 task 0's fast/slow split): this file forks and
+# execs six real Cloak binaries -- two of them Go's -- which is precisely
+# the cost that split exists to keep out of the edit loop, and which turns
+# brutal under ASan's per-child LeakSanitizer exit scan. `ctest -L fast`
+# excludes it; the default `ctest` still runs it.
+set_tests_properties(test_go_interop PROPERTIES LABELS "slow")
+
+# ---------------------------------------------------------------------------
+# UNORDERED MODE, PROVED (module 9 task 8).
+#
+# Five cases in one binary: the Go oracle in UDP mode (both roles), a
+# deliberate-reordering middle box, sequence-number generation read off a
+# captured connection with our own deobfuscator, two distributions, and a
+# frame-replaying middle box. See the file's own header for why three of
+# those are things no oracle can see.
+#
+# The same find_program pair as test_go_interop above resolves the Go
+# binaries, and the same reasoning applies to why a missing one is a named
+# runtime failure rather than a configure error or a skip.
+add_executable(test_unordered_proof test_unordered_proof.c)
+target_include_directories(test_unordered_proof PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+# cloak-server for cloak_clienthello_parse (case 3 recovers the session key
+# from the relayed handshake itself); cloak-mux for the frame, stream,
+# session and switchboard objects cases 2-5 drive directly; cloak-common
+# for base64, X25519 and the AEAD.
+target_link_libraries(test_unordered_proof PRIVATE cloak-server cloak-mux cloak-common)
+target_compile_definitions(test_unordered_proof PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_unordered_proof COMMAND test_unordered_proof)
+
+# TIMEOUT 150, set from the worst FAILING run and not the passing one.
+#
+# MEASURED, idle, on the dev image, AT THIS COMMIT: a passing run is
+# 3.68-3.83 s in Debug (5 consecutive runs) and 7.18-7.40 s under
+# ASan+UBSan (3 consecutive runs). Four child processes, 24 datagram
+# probes, 200000 padded frames and 48000 switchboard picks -- the padded
+# frames went up 8x in this round (see PAD_STREAMS in the test file) and
+# the wall time went DOWN, because case 5 stopped spending two fixed
+# 200 ms budgets and now waits on events.
+#
+# What the number has to cover is a run where the two ends cannot exchange
+# a datagram at all, which is the defect this file exists to catch and
+# which its mutation campaign actually produced. Each oracle role then
+# spends BOOT_MS (15 s, the warm-up retry window, which is where a wholly
+# dead tunnel burns its time) plus three QUIET_MS windows plus two
+# EXIT_MS teardowns -- about 27 s -- so both roles are ~54 s. A run whose
+# LADDER stalls instead costs nine PROBE_MS (2 s each) per role on top,
+# i.e. ~36 s more. The white-box cases fork nothing and every one of their
+# loops is clock-bounded at 1 s or less, and their measured cost is 0.63 s
+# (Debug). The worst failing path is therefore ~95 s,
+# inside this timeout with enough room that even a wholly unresponsive run
+# prints its own named assertion instead of being truncated as
+# "***Timeout".
+#
+# 150 rather than the 120 this directory uses elsewhere, for one reason:
+# that 120 covers ONE stalled transfer, and this file has TWO stalled
+# roles plus a nine-rung ladder in each of them.
+#
+# LABELS "slow": this file forks and execs four real Cloak binaries, two of
+# them Go's. `ctest -L fast` excludes it; the default `ctest` still runs it.
+#
+# THE TWO PROPERTIES ARE SET IN ONE CALL, DELIBERATELY, AND THAT IS A
+# REPAIR RATHER THAN A STYLE CHOICE. They were two calls separated by the
+# comment above, and a later edit that rewrote the comment took the
+# TIMEOUT call with it -- leaving thirty lines deriving 150 from a ~95 s
+# worst failing path, and a generated CTestTestfile.cmake carrying only
+#     set_tests_properties(test_unordered_proof PROPERTIES  LABELS "slow" ...)
+# so the test ran at ctest's DEFAULT 1500 s. A justification for a number
+# that is not in the build is worse than no justification, because it
+# stops the next reader from checking; the two oracle roles this comment
+# reasons about would have hung the suite for 25 minutes instead of
+# failing at 150 s with a named assertion. One call means a future comment
+# rewrite cannot orphan one property without orphaning the other, and the
+# check that matters is on the GENERATED file:
+#     grep test_unordered_proof build/libcloak-server/tests/CTestTestfile.cmake
+set_tests_properties(test_unordered_proof PROPERTIES TIMEOUT 150 LABELS "slow")
+
+# Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's own
+# comment on cloak_label_fast_tests() for what this call does and why it
+# has to be made from here rather than from that file). Placed after the
+# CLOAK_REQUIRE_GO block above, not before it, so that test_ws_interop
+# already carries its "slow" label (or does not exist at all, with
+# CLOAK_REQUIRE_GO=OFF) by the time this runs -- every OTHER test in this
+# directory ends up labelled "fast" except test_proxy_stream, which was
+# labelled "slow" directly at its own set_tests_properties call above.
+cloak_label_fast_tests()
