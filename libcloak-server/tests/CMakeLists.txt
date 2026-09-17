@@ -567,6 +567,59 @@ set_tests_properties(test_go_interop PROPERTIES TIMEOUT 120)
 # excludes it; the default `ctest` still runs it.
 set_tests_properties(test_go_interop PROPERTIES LABELS "slow")
 
+# ---------------------------------------------------------------------------
+# UNORDERED MODE, PROVED (module 9 task 8).
+#
+# Five cases in one binary: the Go oracle in UDP mode (both roles), a
+# deliberate-reordering middle box, sequence-number generation read off a
+# captured connection with our own deobfuscator, two distributions, and a
+# frame-replaying middle box. See the file's own header for why three of
+# those are things no oracle can see.
+#
+# The same find_program pair as test_go_interop above resolves the Go
+# binaries, and the same reasoning applies to why a missing one is a named
+# runtime failure rather than a configure error or a skip.
+add_executable(test_unordered_proof test_unordered_proof.c)
+target_include_directories(test_unordered_proof PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+# cloak-server for cloak_clienthello_parse (case 3 recovers the session key
+# from the relayed handshake itself); cloak-mux for the frame, stream,
+# session and switchboard objects cases 2-5 drive directly; cloak-common
+# for base64, X25519 and the AEAD.
+target_link_libraries(test_unordered_proof PRIVATE cloak-server cloak-mux cloak-common)
+target_compile_definitions(test_unordered_proof PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_unordered_proof COMMAND test_unordered_proof)
+
+# TIMEOUT 150, set from the worst FAILING run and not the passing one.
+#
+# MEASURED, idle, on the dev image: a passing run is 4.0-4.2 s in Debug
+# (10 consecutive runs) and 7.3-8.5 s under ASan+UBSan (8 consecutive
+# runs). Four child processes, 24 datagram probes, 24000 padded frames and
+# 48000 switchboard picks.
+#
+# What the number has to cover is a run where the two ends cannot exchange
+# a datagram at all, which is the defect this file exists to catch and
+# which its mutation campaign actually produced. Each oracle role then
+# spends BOOT_MS (15 s, the warm-up retry window, which is where a wholly
+# dead tunnel burns its time) plus three QUIET_MS windows plus two
+# EXIT_MS teardowns -- about 27 s -- so both roles are ~54 s. A run whose
+# LADDER stalls instead costs nine PROBE_MS (2 s each) per role on top,
+# i.e. ~36 s more. The white-box cases fork nothing and every one of their
+# loops is clock-bounded at 1 s or less, and their measured cost is 1.0 s
+# (Debug) / 1.2 s (ASan). The worst failing path is therefore ~95 s,
+# inside this timeout with enough room that even a wholly unresponsive run
+# prints its own named assertion instead of being truncated as
+# "***Timeout".
+#
+# 150 rather than the 120 this directory uses elsewhere, for one reason:
+# that 120 covers ONE stalled transfer, and this file has TWO stalled
+# roles plus a nine-rung ladder in each of them.
+
+# LABELS "slow": this file forks and execs four real Cloak binaries, two of
+# them Go's. `ctest -L fast` excludes it; the default `ctest` still runs it.
+set_tests_properties(test_unordered_proof PROPERTIES LABELS "slow")
+
 # Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's own
 # comment on cloak_label_fast_tests() for what this call does and why it
 # has to be made from here rather than from that file). Placed after the
