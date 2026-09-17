@@ -54,7 +54,7 @@ as a **field of `cloak_session_config_t`**, with a **distinct error code** so a 
 - **> 16132 bytes outbound**: refuse with the `io.ErrShortBuffer` analogue, matching Go's stream layer. Same as Go.
 - **8193 … 16132 bytes**: carry it. **Go loses it and tears down the stream** (bug #6). We do not.
 - **> 8192 bytes read from the local UDP socket**: read the whole datagram up to 16132. **Go silently truncates to 8192** (bug #7). We do not.
-- **zero-length datagram**: carry it. **Go swallows it** (bug #8). We do not. *(If carrying it turns out to be wire-visible in a way that distinguishes us from Go, reverse this one and say so — it is the only one of the four where fidelity might win.)*
+- **zero-length datagram**: **swallow it, matching Go.** *(Reversed from the original wording after Task 4 measured it. The criterion was whether carrying it is wire-visible; it is, and worse — "carry it" was never reachable in the first place. Go's frame **encoder** refuses an empty payload outright, not just `Stream.Write`'s loop, and our `cloak_frame_obfuscate` refuses identically, so `stream.c` could not have carried one. A Go receiver fed a hand-built zero-length frame accepts it silently, so the peer's reaction does not decide it — the 30-byte record does, against Go's 31-byte floor past seq 4. Bug #8 therefore stands as a Go observation we deliberately reproduce, not a divergence.)*
 
 ## Three more bugs in the Go original, all reproduced at the built `v2.12.0` binaries
 
@@ -188,8 +188,10 @@ Note the interaction that will bite: **`cloak_stream_feed_frame`'s `-1` return r
     the data is the failure this test exists to catch.
 2.  The same two sizes in ORDERED mode: 16133 splits into two frames and
     succeeds. Same fixture, both modes.
-3.  A zero-length write in unordered mode carries a zero-length datagram
-    (D7), and the negative: Go swallows it. Document as a divergence.
+3.  A zero-length write in unordered mode is SWALLOWED, matching Go --
+    see D7, which Task 4 reversed by measurement. Assert that nothing
+    reaches the wire, and say in the test that the frame encoder, not the
+    stream layer, is what refuses it.
 ```
 - [ ] **Step 2: Run to verify they fail**
 - [ ] **Step 3: Implement**
