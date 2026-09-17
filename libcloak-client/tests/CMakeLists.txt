@@ -143,3 +143,10 @@ target_include_directories(test_client_stack PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_client_stack PRIVATE cloak-client cloak-server)
 add_test(NAME test_client_stack COMMAND test_client_stack)
 set_tests_properties(test_client_stack PROPERTIES TIMEOUT 60)
+
+# None of this directory's tests fork a process (module 9 task 0's
+# fast/slow split; see the top-level CMakeLists.txt's own comment on
+# cloak_label_fast_tests() for what this call does and why it has to be
+# made from here rather than from that file). Every test above ends up
+# labelled "fast".
+cloak_label_fast_tests()

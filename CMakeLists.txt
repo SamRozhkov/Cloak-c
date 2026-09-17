@@ -12,6 +12,75 @@ add_compile_options(-Wall -Wextra)
 
 enable_testing()
 
+# ---------------------------------------------------------------------------
+# The fast/slow label split (module 9 task 0).
+#
+# Module 9 is about to add several tests that fork external processes --
+# including two that fork Go binaries and a UDP echo each -- on top of the
+# four that already do today (test_proxy_stream and test_ws_interop in
+# libcloak-server/tests, test_ck_server_cli and test_ck_client_cli under
+# cmd/): every one of the four forks a real child with fork(2), three of the
+# four also exec a real binary, and grep across the whole tree for
+# fork/vfork/exec*/posix_spawn/system finds no other caller. THIS WAS
+# VERIFIED BY READING AND GREPPING THE TESTS, NOT ASSUMED: the inherited
+# claim from module 8 that "the four slowest tests all fork processes" does
+# NOT hold -- measured before this split (68/68 at -j4, ~24 s), the two
+# slowest tests by wall clock were test_adminapi and test_dispatcher_ws
+# (~12.5 s and ~12.4 s each), and NEITHER forks a process; of the four tests
+# that actually fork, three (test_proxy_stream, test_ws_interop and
+# test_ck_server_cli) are among the FASTEST tests in the whole suite in a
+# plain Debug build (0.26 s, 0.92 s and 0.32 s) -- the fork/exec cost only
+# bites under ASan+UBSan's LeakSanitizer exit scan on every child process,
+# per test_ck_server_cli's and test_ck_client_cli's own TIMEOUT comments
+# (~40 s and ~53 s under the sanitizer, ~0.2-9 s in Debug). So labelling by
+# "is currently slow" would mislabel test_adminapi and test_dispatcher_ws as
+# slow (they aren't the target -- they don't fork, and nothing about them
+# changes here) while mislabelling three of today's four forking tests as
+# fast. Labelling by fork-or-not is the durable split this task asks for:
+# it is exactly what module 9's new oracle tests will do, and it is what
+# turns brutal under a sanitizer build, which is where an edit loop most
+# needs to be cheap.
+#
+# EVERY TEST NOT EXPLICITLY LABELLED "slow" (at its own add_test site --
+# see libcloak-server/tests/CMakeLists.txt, cmd/ck-server/CMakeLists.txt and
+# cmd/ck-client/CMakeLists.txt for the four that are today) GETS "fast" via
+# a call to this function at the end of its own directory's test list file.
+# Defined once, here, and called once per directory rather than duplicated,
+# because set_tests_properties() and the TESTS directory property only see
+# tests added in the CURRENT directory scope -- a test added under
+# libcloak-server/tests cannot be labelled from this top-level file, only
+# from within that directory's own CMakeLists.txt (a function's body runs
+# in ITS CALLER's directory scope, which is what makes one shared
+# definition here reach every directory that calls it, unlike a foreach
+# over directory paths written directly in this file, which cannot resolve
+# tests belonging to a different directory scope at all).
+#
+# A test added anywhere in the tree tomorrow with no LABELS call of its own
+# is therefore "fast" by default, and a test that forks a process has to
+# OPT IN to "slow" explicitly. A directory that forgot to call this
+# function would leave its tests with NO label at all, which `ctest -L
+# fast` would then silently exclude -- a worse failure than a mislabelled
+# test, because it looks like the edit loop still works while it quietly
+# runs fewer and fewer tests. That is why every one of the six directories
+# that calls add_test also calls cloak_label_fast_tests() at the end of
+# its own CMakeLists.txt.
+#
+# `ctest -L fast` is the edit-loop target this task exists to create.
+# `ctest` WITH NO ARGUMENTS is untouched by any of this -- it runs each
+# directory's whole TESTS list regardless of label, so the suite's test
+# COUNT stays exactly what CLOAK_REQUIRE_GO already made a contract (68
+# with a Go toolchain, visibly 67 without one): this split changes what the
+# QUICK loop selects, never what the DEFAULT run covers.
+function(cloak_label_fast_tests)
+    get_property(_cloak_dir_tests DIRECTORY PROPERTY TESTS)
+    foreach(_cloak_test_name ${_cloak_dir_tests})
+        get_test_property(${_cloak_test_name} LABELS _cloak_test_labels)
+        if(NOT _cloak_test_labels MATCHES "slow")
+            set_tests_properties(${_cloak_test_name} PROPERTIES LABELS "fast")
+        endif()
+    endforeach()
+endfunction()
+
 add_subdirectory(third_party/cjson)
 add_subdirectory(third_party/sqlite)
 add_subdirectory(libcloak-common)

@@ -78,3 +78,10 @@ target_include_directories(test_conn_ws_framing PRIVATE ${CMAKE_SOURCE_DIR}/libc
 target_link_libraries(test_conn_ws_framing PRIVATE cloak-mux)
 add_test(NAME test_conn_ws_framing COMMAND test_conn_ws_framing)
 set_tests_properties(test_conn_ws_framing PROPERTIES TIMEOUT 120)
+
+# None of this directory's tests fork a process (module 9 task 0's
+# fast/slow split; see the top-level CMakeLists.txt's own comment on
+# cloak_label_fast_tests() for what this call does and why it has to be
+# made from here rather than from that file). Every test above ends up
+# labelled "fast".
+cloak_label_fast_tests()

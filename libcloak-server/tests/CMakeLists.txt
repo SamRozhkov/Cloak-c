@@ -153,6 +153,16 @@ target_link_libraries(test_proxy_stream PRIVATE cloak-server)
 add_test(NAME test_proxy_stream COMMAND test_proxy_stream)
 set_tests_properties(test_proxy_stream PROPERTIES TIMEOUT 60)
 
+# LABELS "slow" (module 9 task 0's fast/slow split): this file's
+# test_total_cap_is_derived_from_rlimit calls fork(2) to lower
+# RLIMIT_NOFILE in a child without disturbing the parent's own
+# descriptor table. `ctest -L fast` (the edit-loop target) excludes
+# anything carrying this label; the default `ctest` with no arguments
+# still runs it -- the split changes what the QUICK loop runs, never
+# what the full suite runs, exactly as CLOAK_REQUIRE_GO's 67 -> 68
+# stays a build-time choice, not a per-run skip.
+set_tests_properties(test_proxy_stream PROPERTIES LABELS "slow")
+
 add_executable(test_proxy_teardown test_proxy_teardown.c)
 target_include_directories(test_proxy_teardown PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_proxy_teardown PRIVATE cloak-server)
@@ -444,6 +454,16 @@ if(CLOAK_REQUIRE_GO)
     # being truncated as "***Timeout" with the diagnosis cut off. This is a
     # backstop, not the mechanism.
     set_tests_properties(test_ws_interop PROPERTIES TIMEOUT 120)
+
+    # LABELS "slow" (module 9 task 0's fast/slow split): this is "the
+    # first test in this tree whose PEER was not written by this
+    # project" (see above) -- it forks and execs a real ck-server
+    # binary and the Go oracle (github.com/gorilla/websocket) as real
+    # child processes. `ctest -L fast` (the edit-loop target) excludes
+    # it; the default `ctest` still runs it, same as every other label
+    # in this split -- the suite's test COUNT stays untouched, only the
+    # quick loop's SELECTION shrinks.
+    set_tests_properties(test_ws_interop PROPERTIES LABELS "slow")
 else()
     message(WARNING
         "CLOAK_REQUIRE_GO=OFF: test_ws_interop is NOT built. The suite is 67 "
@@ -451,3 +471,13 @@ else()
         "implementation it did not write -- which is how it once shipped a "
         "frame format no Go peer could read. Turn this back on to restore it.")
 endif()
+
+# Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's own
+# comment on cloak_label_fast_tests() for what this call does and why it
+# has to be made from here rather than from that file). Placed after the
+# CLOAK_REQUIRE_GO block above, not before it, so that test_ws_interop
+# already carries its "slow" label (or does not exist at all, with
+# CLOAK_REQUIRE_GO=OFF) by the time this runs -- every OTHER test in this
+# directory ends up labelled "fast" except test_proxy_stream, which was
+# labelled "slow" directly at its own set_tests_properties call above.
+cloak_label_fast_tests()

@@ -55,3 +55,19 @@ add_test(NAME test_ck_client_cli COMMAND test_ck_client_cli)
 # ASAN_OPTIONS=detect_leaks=0 on the forked CHILDREN only, which is most
 # of this number and which the parent's own check does not need.
 set_tests_properties(test_ck_client_cli PROPERTIES TIMEOUT 120)
+
+# LABELS "slow" (module 9 task 0's fast/slow split): this file forks
+# and execs both real binaries repeatedly (see above) -- 8.6 s in
+# Debug, 53 s under ASan+UBSan idle, almost all of it process startup
+# and LeakSanitizer's exit scan. `ctest -L fast` excludes it; the
+# default `ctest` with no arguments still runs it.
+set_tests_properties(test_ck_client_cli PROPERTIES LABELS "slow")
+
+# Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's
+# own comment on cloak_label_fast_tests() for what this call does and why
+# it has to be made from here rather than from that file). This directory
+# has exactly one test, already labelled "slow" above, so this call has
+# nothing left to label -- it is here anyway, for the same reason every
+# directory that calls add_test has it: a test added to this file later
+# with no LABELS call of its own must not end up with no label at all.
+cloak_label_fast_tests()
