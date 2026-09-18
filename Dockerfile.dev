@@ -5,8 +5,45 @@
 # left, and the final stage inherits its ENV and its WORKDIR.
 FROM debian:bookworm-slim AS base
 
+# clang and libclang-rt are here for ONE reason: libFuzzer. It is a
+# clang/compiler-rt feature with no GCC equivalent -- this image's gcc
+# (Debian 12.2.0-14+deb12u1) answers `-fsanitize=fuzzer` with
+# "unrecognized argument to '-fsanitize=' option: 'fuzzer'", measured in
+# this image before these packages were added.
+#
+# BOTH packages are required, and this comment exists so nobody trims the
+# second one: Debian ships the compiler-rt runtime archives in a separate
+# package from the compiler, so `clang` ALONE compiles a fuzz target and
+# then fails at link with
+#   cannot find .../lib/linux/libclang_rt.fuzzer-aarch64.a
+# (that link failure was reported by a scout's clang-only build and is
+# recorded here as READ, not re-measured -- what WAS measured here is that
+# libclang_rt.fuzzer-aarch64.a is present in the built image and that a
+# `-fsanitize=fuzzer,address` target links and runs; see below).
+# libclang-rt-14-dev is that file. Measured cost, comparing `docker images`
+# before and after on arm64: 1.01 GB -> 1.36 GB, i.e. +350 MB. That is
+# MORE than the +264 MB a scout estimated, because apt pulls clang-14,
+# libclang-cpp14 (53 MB installed) and llvm-14-linker-tools in as well;
+# 1.36 GB is the number this build actually produced, not an estimate.
+#
+# VERIFIED, not assumed: a throwaway libFuzzer target with a deliberate
+# null dereference behind a "FUZZZZ" prefix, built in this image with
+# `clang -fsanitize=fuzzer,address`, was found and minimised by libFuzzer
+# in under a second -- `SUMMARY: AddressSanitizer: SEGV`, crashing unit
+# `FUZZZZ`, `Base64: RlVaWlpa`. A toolchain that merely links is not a
+# working fuzzer, and on this codebase a green fuzz run is the expected
+# result, so a planted bug is the only evidence the instrument is wired up.
+#
+# gcc stays the project's default compiler and CI still builds with it;
+# clang is an ADDITIONAL compiler here, which is why the tree is required
+# to be warning-free under both -- measured at this commit: full Debug
+# builds of libraries, binaries and all 75 test executables produce ZERO
+# warnings under gcc 12.2.0 and zero under clang 14.0.6, and `ctest` is
+# 75/75 under each.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    clang \
+    libclang-rt-14-dev \
     cmake \
     libssl-dev \
     ca-certificates \
