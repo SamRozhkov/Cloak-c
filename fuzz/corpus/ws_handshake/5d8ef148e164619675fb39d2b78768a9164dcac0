@@ -1,0 +1,11 @@
+GET /ath/x?y=0 HTTP/1.
+Host: origY: 7a1b2c3d45f6789-FRA
+CDN-Loop: cloudflare
+Accept-Ena: 1.1 cl
+Connecti: gzip
+Via: 1.1 ÿÿÿÿoudflare
+Connection: keep-alive, Upgrade
+Upgrade: websocket
+Sec-WebSocket-Version2:7 
+Sec-WebSocket-Key:¾ˆQ=
+HiddenECAwQI

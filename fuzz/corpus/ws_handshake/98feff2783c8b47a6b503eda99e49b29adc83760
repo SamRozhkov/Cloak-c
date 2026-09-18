@@ -1,0 +1,13 @@
+GET /ws HTTP/1.1
+Host: ample.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Version: 13bsocket
+Connection: Upgrade
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Key: AAw
+Sec: -cdnexample.cm
+Upgrade: webso
+Connection: Upgrade
+Sec-WebSocket-Version: 13--------
+

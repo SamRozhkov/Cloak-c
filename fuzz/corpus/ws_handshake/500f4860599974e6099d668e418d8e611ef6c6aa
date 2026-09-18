@@ -1,0 +1,5 @@
+GET /s HTTP/1
+Hst: cdn.ex:
+Upgrade: websocket
+CDA=
+

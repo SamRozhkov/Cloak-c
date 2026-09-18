@@ -1,0 +1,7 @@
+GET /ws HTTP/1.1plm
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Key: AAECAwQFBgcICQoLDA2Ozw==
+Hidden: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ0Njc4OTo7PD0/P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f
+

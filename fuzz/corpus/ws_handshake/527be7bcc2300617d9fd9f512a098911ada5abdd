@@ -1,0 +1,5 @@
+GET /ws HTTP/0.1
+Host: cdncom
+Upgrade: websocket
+Connection: UpDxAREhMUjJCUmJgpKisQ2Njc4OTo7PD0+P0BBQkNWV1hZWltc2XV5f
+

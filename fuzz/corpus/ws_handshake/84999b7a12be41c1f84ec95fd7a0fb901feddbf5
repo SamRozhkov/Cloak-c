@@ -1,0 +1,4 @@
+GET /ws HTTP/q81
+st: 3
+Sec-WebSocket-Key:
+Sec-WebSocket-Key:+^W

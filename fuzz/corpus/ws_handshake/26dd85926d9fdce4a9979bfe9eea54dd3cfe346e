@@ -1,0 +1,8 @@
+GET / HTTP/0.1
+hot: a
+upgrade: websocket
+connection: Upgrade
+sec-websocket-version: 13
+sec-websocket-key: aAECAwQFBgcICLDSOoQ0Dw==
+hidden: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f
+

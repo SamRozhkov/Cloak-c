@@ -23,11 +23,19 @@
 #
 # HOW TO BUILD AND RUN (from the repo root, in the cloak-c-dev image):
 #
-#   cmake -S . -B /tmp/fuzzbuild -DCMAKE_BUILD_TYPE=Debug \
+#   CC=clang cmake -S . -B /tmp/fuzzbuild -DCMAKE_BUILD_TYPE=Debug \
 #         -DCLOAK_FUZZ=ON -DCLOAK_REQUIRE_GO=OFF
 #   cmake --build /tmp/fuzzbuild --target fuzz_session_envelope -j4
 #   /tmp/fuzzbuild/fuzz/fuzz_session_envelope \
 #         fuzz/corpus/session_envelope -max_len=4096 -max_total_time=60
+#
+# CC=clang IS REQUIRED and was missing from this recipe until module 10a
+# task 3 tripped over it: the dev image's default compiler is gcc, which
+# has no libFuzzer, so a plain `cmake -S . -B ...` configures cleanly and
+# then fails every compile in this directory with
+#   cc: error: unrecognized argument to '-fsanitize=' option: 'fuzzer-no-link'
+# A build directory already configured with gcc must be DELETED, not
+# reconfigured: CMake caches the compiler.
 #
 # -DCLOAK_REQUIRE_GO=OFF is not required, only cheap: it skips the Go
 # oracle's configure-time dependency probe and build, neither of which a
@@ -108,3 +116,57 @@ target_include_directories(fuzz_firstpacket PRIVATE ../libcloak-server/include)
 
 cloak_add_fuzz_target(fuzz_clienthello ../libcloak-server/src/clienthello_parse.c)
 target_include_directories(fuzz_clienthello PRIVATE ../libcloak-server/include)
+
+# ---------------------------------------------------------------------------
+# Task 3's four targets. Same convention as everything above: one file per
+# target, one LLVMFuzzerTestOneInput each, no shared harness, nothing
+# add_test()ed.
+#
+# EACH OF THESE NAMES ITS SOURCE FILES rather than linking a library, for
+# exactly the reason targets #2 and #3 do (see the note above them):
+# `cloak-server` drags in an instrumented, ASan-built SQLite amalgamation
+# and cJSON that none of these targets feeds a byte to, and `cloak-common`
+# drags in cJSON, the reactor and the config readers for the same nothing.
+# Naming the .c files keeps each build to the harness plus the code under
+# test, and it keeps the convention's promise that a target can be read
+# top to bottom. If any of these parsers grows a dependency on another
+# translation unit this breaks at link time, loudly, which is the right
+# way for it to be noticed.
+
+# OpenSSL is found again here rather than relied on from libcloak-common:
+# find_package's IMPORTED targets are directory-scoped, and this directory
+# is a sibling of that one, not a child. Two of the targets below need
+# OpenSSL::Crypto by name.
+find_package(OpenSSL REQUIRED)
+
+# Target #4: the CDN front door's WebSocket upgrade. Unauthenticated.
+# ws_handshake.c uses cloak/base64.h (compiled in here) and OpenSSL's
+# EVP_Digest for the SHA-1 in Sec-WebSocket-Accept, which is why this is
+# the one target in this group that links anything at all.
+cloak_add_fuzz_target(fuzz_ws_handshake ../libcloak-server/src/ws_handshake.c
+                                        ../libcloak-common/src/base64.c)
+target_include_directories(fuzz_ws_handshake PRIVATE ../libcloak-server/include
+                                                     ../libcloak-common/include)
+target_link_libraries(fuzz_ws_handshake PRIVATE OpenSSL::Crypto)
+
+# Target #5: the RFC 6455 frame header decoder on the CDN data path.
+# ws_frame.c references cloak_random_bytes (from cloak_ws_frame_mask_key,
+# which this target never calls) so random.c comes along to satisfy the
+# link; it is 34 lines and pulls in only OpenSSL's RAND.
+cloak_add_fuzz_target(fuzz_ws_frame ../libcloak-mux/src/ws_frame.c
+                                    ../libcloak-common/src/random.c)
+target_include_directories(fuzz_ws_frame PRIVATE ../libcloak-mux/include
+                                                 ../libcloak-common/include)
+target_link_libraries(fuzz_ws_frame PRIVATE OpenSSL::Crypto)
+
+# Target #9: base64, both alphabets, both directions. No dependencies at
+# all -- base64.c includes only <string.h>.
+cloak_add_fuzz_target(fuzz_base64 ../libcloak-common/src/base64.c)
+target_include_directories(fuzz_base64 PRIVATE ../libcloak-common/include)
+
+# Target #6: the admin API's HTTP/1.1 request parser. The highest per-bug
+# cost in the tree (cloak/http.h:19-27) and the only target in this group
+# that is stateful and allocates. http.c includes only <stdlib.h> and
+# <string.h>, so nothing is linked.
+cloak_add_fuzz_target(fuzz_http ../libcloak-server/src/http.c)
+target_include_directories(fuzz_http PRIVATE ../libcloak-server/include)

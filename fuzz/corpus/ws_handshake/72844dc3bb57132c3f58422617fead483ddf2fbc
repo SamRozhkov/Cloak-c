@@ -1,0 +1,10 @@
+EP / HTTP/1.1
+host: a
+upgrade: websocket
+connection: Upgra1e
+seb-websocket-version: 13
+sec-websocket-keyECA: AAwQFBgcICQoLDA0ODw==8
+hiddeg: AwQFBgct
+connection: Upgra1e
+sec-websocket-version: 06
+sec-websocket-keyECiddeg: A***S

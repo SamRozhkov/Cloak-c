@@ -1,0 +1,4 @@
+GE /ws HTTP/1.1
+Sec-WebSocket-Version: 0!
+Sec-WebSocket-Version: 1!
+SrLS4

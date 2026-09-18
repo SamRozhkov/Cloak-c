@@ -1,0 +1,2 @@
+DELETE /admin/users/QQ== HTTP/1.1
+

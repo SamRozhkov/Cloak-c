@@ -1,0 +1,8 @@
+GET / HTTP/2.1
+host:$a
+upgrade: websocket
+connection: Upgra1e
+sec-websocket-version: 13
+sec-websocket-keyECA: AAw=9
+hiddeg: gcLDA5f
+

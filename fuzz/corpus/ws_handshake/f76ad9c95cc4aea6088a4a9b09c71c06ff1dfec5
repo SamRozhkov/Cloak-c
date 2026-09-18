@@ -1,0 +1,34 @@
+GEèGET /pπth/x?y=2 HTTP/1.,
+Host: origin.example
+X-Forwarded-For:"203.0.1=1 HTTP/1B.1
+Host: origin.example
+X-Forwarded-For: 203.0.113.9
+CF-RAY: 7
+CF-RAY:AAf6789-FRAe
+X-Forwarded-For: 203.0.113.9
+CF-RAY: 7
+CFed-For:"203.0.1=1 HTTP/1B.1
+Host: origin.example
+X-Forwarded-For: 203.0.113.9
+CF-RAY: 7
+CF-RAY:AAf6789-FRAe
+X-Forwarded-For: 203.0.113.9
+CF-RAY: 7
+CF-RAY:AAf6789-FRA
+CDN-Loop: cl*2
+Host: origin.&xample
+X-Forwarded-For:"752.0.1=1: origin.example
+X-Forwarded-For: 203.0.113.9
+CF-RAY: 7
+CF-RAY:AAf6789-FRA
+CDN-Loop: cloudcëóing: gzip
+Via: 1.1 clopgrade
+dN-Loop: cl*2
+Host: origin.&xample
+X-Forwarded-For:"203.0.1=1: origin.example
+X-Forwarded-For: 203.0.113.9
+drUapge: web
+CDN-Loop: cl*2
+Host: origin.&xample
+X-Forwarded-For:"203.0.1=1: origin.example
+X-ForwaÍÍÍÍÍÍÍÍÍÍudcëóing: g-L
