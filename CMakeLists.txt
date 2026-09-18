@@ -124,13 +124,24 @@ endfunction()
 # THE FUZZ BUILD (module 10a), AND THE GUARD THAT KEEPS IT OUT OF
 # EVERYTHING ELSE.
 #
-# OFF by default and it must stay that way. With CLOAK_FUZZ off, nothing
-# under fuzz/ is configured, compiled, linked or added as a test: the
-# default build is byte-identical to what it was before this option
-# existed, and `ctest` is the same 75 tests. With it ON, the libraries are
-# rebuilt with libFuzzer's coverage instrumentation and AddressSanitizer,
-# which is a DIFFERENT build of the same sources -- so it gets its own
-# build directory and never shares one with a Debug or CI build.
+# OFF by default and it must stay that way. With CLOAK_FUZZ off, no fuzz
+# TARGET is configured, compiled or linked, and none of the
+# instrumentation below is applied: the libraries and the 75 pre-existing
+# test binaries are byte-identical to what they were before this option
+# existed. With it ON, the libraries are rebuilt with libFuzzer's
+# coverage instrumentation and AddressSanitizer, which is a DIFFERENT
+# build of the same sources -- so it gets its own build directory and
+# never shares one with a Debug or CI build.
+#
+# ONE THING UNDER fuzz/ IS CONFIGURED UNCONDITIONALLY, and the count
+# changed with it: test_fuzz_corpus_replay, which makes the committed
+# corpus a regression rather than an archive (module 10a task 5). It is
+# an ordinary C program with a main(), linking the ordinary libraries,
+# and it replays every committed unit once and exits -- no libFuzzer, no
+# mutation, no time budget. `ctest` is 76 tests, not 75. Module 10a
+# settled that shape by measuring the alternative: a 60-second campaign
+# per target is eight minutes against a ~102 s ASan suite, while the
+# replay is seconds. See fuzz/README.md and fuzz/replay_main.c.
 #
 # WHY THE INSTRUMENTATION IS SET HERE AND NOT IN fuzz/CMakeLists.txt.
 # libFuzzer's feedback comes from SanitizerCoverage compiled into the code
@@ -322,11 +333,15 @@ target_compile_definitions(test_unordered_proof PRIVATE
     CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
     CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
 
-# The fuzz targets, added LAST and only when asked for: fuzz/CMakeLists.txt
-# links cloak-mux, so the library has to be declared before it, and the
-# option itself is declared above (next to the instrumentation flags it
-# turns on) so that a reader who finds this line is one scroll from the
-# reason it is guarded.
-if(CLOAK_FUZZ)
-    add_subdirectory(fuzz)
-endif()
+# fuzz/, added LAST because everything in it links libraries and
+# executables declared above -- the four cloak-* libraries for the corpus
+# replay, cloak-mux for the first fuzz target.
+#
+# ADDED UNCONDITIONALLY, unlike every earlier revision of this line. The
+# guard moved INTO fuzz/CMakeLists.txt, which declares the corpus replay
+# (an ordinary test, always) and then returns early unless CLOAK_FUZZ is
+# ON (the eight libFuzzer targets, never in the default build). The
+# option is declared above, next to the instrumentation flags it turns
+# on, so that a reader who finds this line is one scroll from what it
+# does.
+add_subdirectory(fuzz)

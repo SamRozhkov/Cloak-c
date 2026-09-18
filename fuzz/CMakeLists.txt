@@ -16,10 +16,16 @@
 #     is an exception to "one file per target" and it needs the
 #     justification fuzz_session_envelope.c's own generator gives; a
 #     target whose seeds can be typed by hand should not have one.
-#   * NOTHING HERE IS add_test()ED, ever. These are not tests: they have
-#     no expected output, they run for as long as you give them, and the
-#     suite's count is a contract (75). See the root CMakeLists.txt guard
-#     that keeps this whole directory out of the default build.
+#   * NO FUZZ TARGET IS add_test()ED, ever. These are not tests: they
+#     have no expected output and they run for as long as you give them.
+#     EXACTLY ONE TEST LIVES IN THIS DIRECTORY and it is not a fuzz
+#     target: test_fuzz_corpus_replay (module 10a task 5, declared at the
+#     bottom of the always-configured section below) feeds every
+#     committed corpus unit to the harness that produced it, once, in
+#     sorted order, and exits. That test -- and only that test -- is
+#     configured with CLOAK_FUZZ OFF; the eight libFuzzer targets still
+#     are not. The suite's count is a contract and this is the one thing
+#     in module 10a that changes it: 75 -> 76.
 #
 # HOW TO BUILD AND RUN (from the repo root, in the cloak-c-dev image):
 #
@@ -63,6 +69,117 @@
 # libFuzzer starts at a 4096-byte ceiling but with a corpus it silently
 # adopts the longest seed as the limit, so a minimised corpus can shrink
 # the search space without anybody choosing to.
+
+# ---------------------------------------------------------------------------
+# THE ONE TEST IN THIS DIRECTORY, AND THE ONLY THING HERE THAT IS
+# CONFIGURED WITH CLOAK_FUZZ OFF (module 10a task 5).
+#
+# Everything below the `if(NOT CLOAK_FUZZ) return()` further down is the
+# libFuzzer build proper and is unchanged. This section is above it
+# because it is what an ordinary `cmake -S . -B build` sees: one
+# executable, one add_test, no libFuzzer, no -fsanitize=fuzzer, no seed
+# generators. See replay_main.c's own header for what the test is for and
+# why a replay rather than a campaign runs in the suite.
+#
+# WHY THE HARNESSES ARE COMPILED TWICE. Each fuzz_*.c defines exactly one
+# LLVMFuzzerTestOneInput, so all eight cannot be linked into one program
+# as written. Each gets its own OBJECT library here with the entry point
+# renamed by the preprocessor, which means the replay links the SAME
+# SOURCE the campaign fuzzes -- not a copy, not a subset, not a
+# re-implementation of the oracles. A harness edit reaches both or
+# neither. The cost is eight extra object files in the default build,
+# measured at the commit that added this.
+#
+# THESE OBJECT LIBRARIES NAME THEIR INCLUDE DIRECTORIES but link nothing:
+# an OBJECT library is only compiled here, and the executable below
+# resolves every symbol. It links the four libraries rather than naming
+# the ~12 source files the eight harnesses between them drive, which is
+# the opposite of what each fuzz target below does -- and deliberately.
+# A fuzz target names sources to keep an instrumented, ASan-built SQLite
+# out of a build directory that exists to be small and fast to rebuild;
+# this executable is part of the ordinary suite, where cloak-server,
+# cloak-client, cloak-mux and cloak-common are already built for the
+# other 75 tests and linking them costs a link rather than a compile.
+# Naming sources here would instead risk duplicate symbols, since
+# ws_frame.c and clienthello.c are members of libraries two other
+# harnesses pull in whole.
+find_package(OpenSSL REQUIRED)
+
+# Every target with a committed corpus. A name here must match both
+# fuzz_<name>.c and fuzz/corpus/<name>/, and must have a row in
+# replay_main.c's g_targets -- the replay fails on a corpus directory it
+# cannot open, so a name added here and forgotten there is loud.
+set(CLOAK_REPLAY_TARGETS base64 client_reply clienthello firstpacket http
+                         session_envelope ws_frame ws_handshake)
+
+set(_cloak_replay_objects "")
+foreach(_cloak_t IN LISTS CLOAK_REPLAY_TARGETS)
+    add_library(fuzz_replay_${_cloak_t} OBJECT fuzz_${_cloak_t}.c)
+    # LLVMFuzzerInitialize is renamed too, even though only
+    # fuzz_client_reply.c defines one today: the rename has to be
+    # unconditional so that a harness which grows one later is picked up
+    # by adding a single table row in replay_main.c rather than by also
+    # remembering to change this loop.
+    target_compile_definitions(fuzz_replay_${_cloak_t} PRIVATE
+        LLVMFuzzerTestOneInput=cloak_replay_${_cloak_t}
+        LLVMFuzzerInitialize=cloak_replay_init_${_cloak_t})
+    target_include_directories(fuzz_replay_${_cloak_t} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../libcloak-common/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../libcloak-mux/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../libcloak-server/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../libcloak-client/include)
+    list(APPEND _cloak_replay_objects $<TARGET_OBJECTS:fuzz_replay_${_cloak_t}>)
+endforeach()
+
+add_executable(test_fuzz_corpus_replay replay_main.c ${_cloak_replay_objects})
+# The corpus is read from the SOURCE tree, not copied into the build
+# directory: it is the committed artefact, and a test that replays a copy
+# would keep passing after somebody deleted the original.
+target_compile_definitions(test_fuzz_corpus_replay PRIVATE
+    CLOAK_FUZZ_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/corpus")
+target_link_libraries(test_fuzz_corpus_replay PRIVATE
+    cloak-client cloak-server cloak-mux cloak-common OpenSSL::Crypto)
+add_test(NAME test_fuzz_corpus_replay COMMAND test_fuzz_corpus_replay)
+
+# LABELS AND TIMEOUT IN ONE CALL. Module 9 shipped a TIMEOUT 150
+# documented in a thirty-line comment and never actually set, because a
+# comment rewrite swallowed the set_tests_properties call that set it,
+# and the test then ran at ctest's default of 1500 s while its own
+# comment said 150. One call is the fix, here as in
+# cloak_label_fast_tests(), and it is verified by reading the GENERATED
+# fuzz/CTestTestfile.cmake rather than this file.
+#
+# "fast": the split is fork-or-not, not slow-or-not (see the root
+# CMakeLists.txt), and this test forks nothing and execs nothing -- it is
+# one process feeding 1,094 buffers to eight in-process entry points.
+#
+# TIMEOUT 60 is the project default and is not a placeholder: measured at
+# the commit that added this file (Docker cloak-c-dev, arm64, ctest -j4),
+# the replay runs in 0.32 s in a Debug build and 1.33-1.39 s under
+# ASan+UBSan, so 60 is a 43x margin on the slower of the two -- far wider
+# than the 1.89-2.02x the suite's longest test lives at. It is a
+# MEASUREMENT, and `ctest -R test_fuzz_corpus_replay` in a sanitizer
+# build is the command that would fail if it stopped being true.
+set_tests_properties(test_fuzz_corpus_replay PROPERTIES
+    LABELS "fast"
+    TIMEOUT 60)
+
+# Called for the reason every other directory that adds a test calls it
+# (root CMakeLists.txt): a directory that forgets leaves its tests with
+# no label at all, which `ctest -L fast` then silently excludes. It reads
+# the LABELS and TIMEOUT set above back and re-applies them, so the two
+# cannot disagree.
+cloak_label_fast_tests()
+
+# ---------------------------------------------------------------------------
+# EVERYTHING BELOW THIS LINE IS THE libFuzzer BUILD, and is configured
+# only with -DCLOAK_FUZZ=ON. return() at directory scope stops CMake
+# reading the rest of this file, which is why the eight targets below
+# stay byte-identical to what tasks 1-4 wrote rather than being wrapped
+# in an if() that would re-indent all of them.
+if(NOT CLOAK_FUZZ)
+    return()
+endif()
 
 # Every target in this directory is built and sanitized identically; what
 # differs between them is only WHICH code they drive, which is why the
@@ -133,11 +250,12 @@ target_include_directories(fuzz_clienthello PRIVATE ../libcloak-server/include)
 # translation unit this breaks at link time, loudly, which is the right
 # way for it to be noticed.
 
-# OpenSSL is found again here rather than relied on from libcloak-common:
-# find_package's IMPORTED targets are directory-scoped, and this directory
-# is a sibling of that one, not a child. Two of the targets below need
-# OpenSSL::Crypto by name.
-find_package(OpenSSL REQUIRED)
+# OpenSSL::Crypto, which two of the targets below need by name, is
+# already in scope: find_package(OpenSSL REQUIRED) runs at the top of
+# this file, in the replay section. It has to run HERE rather than be
+# relied on from libcloak-common because find_package's IMPORTED targets
+# are directory-scoped and this directory is a sibling of that one, not a
+# child.
 
 # Target #4: the CDN front door's WebSocket upgrade. Unauthenticated.
 # ws_handshake.c uses cloak/base64.h (compiled in here) and OpenSSL's
