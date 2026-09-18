@@ -170,3 +170,49 @@ target_include_directories(fuzz_base64 PRIVATE ../libcloak-common/include)
 # <string.h>, so nothing is linked.
 cloak_add_fuzz_target(fuzz_http ../libcloak-server/src/http.c)
 target_include_directories(fuzz_http PRIVATE ../libcloak-server/include)
+
+# ---------------------------------------------------------------------------
+# Target #7: the CLIENT's handshake-reply reader. The first client-side
+# target in this directory, and the first one whose subject is reached by
+# ANSWERING a connection rather than by opening one -- see the file's own
+# header for why nine modules of fuzz lists missed it.
+#
+# NAMES ITS SOURCES rather than linking cloak-client, for the reason
+# every target above it does: `cloak-client` drags in the connector, both
+# pipers and the whole client stack -- and, through cloak-mux, the
+# session and relay layers -- none of which this target feeds a byte to,
+# all of them built instrumented and under ASan. The seven files below
+# are exactly the transitive closure of what the reply reader needs:
+# client_transport.c itself, client_auth.c for the shared secret the
+# reply is sealed under, and from libcloak-common the four primitives
+# (aead, x25519, random, clienthello) plus the reactor that actually
+# dispatches the reads. If the reader grows a dependency on anything
+# else this breaks at link time, loudly, which is the right way for it to
+# be noticed.
+#
+# OpenSSL::Crypto: aead.c, x25519.c and random.c are all EVP/RAND.
+cloak_add_fuzz_target(fuzz_client_reply ../libcloak-client/src/client_transport.c
+                                        ../libcloak-client/src/client_auth.c
+                                        ../libcloak-common/src/aead.c
+                                        ../libcloak-common/src/x25519.c
+                                        ../libcloak-common/src/random.c
+                                        ../libcloak-common/src/clienthello.c
+                                        ../libcloak-common/src/reactor.c)
+target_include_directories(fuzz_client_reply PRIVATE ../libcloak-client/include
+                                                     ../libcloak-common/include)
+target_link_libraries(fuzz_client_reply PRIVATE OpenSSL::Crypto)
+#
+# RUN IT WITH -max_len=1024, not the 4096 the recipe at the top of this
+# file uses. This target's cost is dominated by SETUP, not by parsing: a
+# fresh ephemeral X25519 key, an ECDH, a ClientHello and a socketpair per
+# execution, which is why it runs at ~490 exec/s where a pure parser
+# target in this directory runs at six figures. Longer inputs buy nothing
+# -- a real reply is ~165-206 bytes and the record-length ceiling is
+# tripped by two header bytes, not by delivering 16640 of body -- and
+# cost linearly, since a chunk size of 1 turns each input byte into its
+# own write and its own reactor turn.
+#
+# WHAT ONE MINUTE LOOKS LIKE, measured on the commit that added it
+# (Docker cloak-c-dev, arm64, clang 14.0.6, -max_len=1024, starting from
+# the committed 65-file corpus): 29,871 executions, 489 exec/s, 33 new
+# units, 388 MB peak RSS, 267 coverage edges, zero findings.
