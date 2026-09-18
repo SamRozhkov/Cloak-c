@@ -182,6 +182,25 @@ static void test_byte_flip_sweep(void) {
         buf[i] = saved;
     }
     free(buf);
+    /* `sink` must be READ somewhere, not only written, or clang 14 reports
+     * `variable 'sink' set but not used` [-Wunused-but-set-variable] and
+     * this project's build is required to be warning-free under BOTH gcc
+     * and clang (module 10a added clang to the dev image for libFuzzer).
+     *
+     * This load is the fix, and it deliberately does not weaken what the
+     * `volatile` is for. The XORs in the loop above are volatile STORES,
+     * which the compiler may not elide, so the reads of out.random /
+     * out.session_id / out.sni / out.x25519_key_share that feed them must
+     * still be performed -- that is the whole point of the sink, and it is
+     * unchanged by this line. Initialising a non-volatile local from a
+     * volatile lvalue is an unambiguous volatile load (unlike `(void)sink;`,
+     * whose access is implementation-defined), so it always executes.
+     *
+     * Nothing can be asserted about the VALUE: which bytes get XORed in
+     * depends on which single-bit mutations happen to still parse, so the
+     * value is data-dependent and carries no expectation. */
+    const uint8_t sink_value = sink;
+    (void)sink_value;
     ASSERT_TRUE(1); /* reaching here without an ASan/UBSan abort is the test */
 }
 

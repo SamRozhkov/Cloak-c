@@ -1,0 +1,8 @@
+GET /ws HTTP/1.1
+Host: cdn.example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Version: 8
+Sec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==
+Hidden: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5f
+

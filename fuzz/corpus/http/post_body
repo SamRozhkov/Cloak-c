@@ -1,0 +1,6 @@
+POST /admin/users HTTP/1.1
+Host: a
+Content-Type: application/json
+Content-Length: 17
+
+{"UID":"QUJDRA=="}

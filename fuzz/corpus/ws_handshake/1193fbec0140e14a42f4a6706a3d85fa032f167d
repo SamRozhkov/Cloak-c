@@ -1,0 +1,18 @@
+GET / HTTP/1.1
+host: a
+upgrade: websocket
+con: Upgra2e
+sec-w-version: 13
+s~ec--keyECA: Upgra1e
+sec-websocket-deg: A***********GET /TDP/1.1
+ho:t: a
+upgrad: websoekct
+coction: U
+sec-websocket-version: 13
+sec-wet-keyECA: AAwQFBgcICQoLDA8
+hiddeg: A***********GET / HTTP/1.1
+host: a
+upgrade: wBB¹QkNebsoet
+connection: UpKgrade
+sec-wef
+

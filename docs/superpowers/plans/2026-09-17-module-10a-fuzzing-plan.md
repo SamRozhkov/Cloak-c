@@ -139,3 +139,144 @@
 - **Every target must be proven by a planted bug.** A fuzz target that has never caught anything is an unproven instrument, and this plan's own baseline says the pure parsers will find nothing real — so the planted bug is the only evidence the target works at all.
 - **The riskiest task is 1**, because it is the only stateful target and the only one where a crash would be a live defect rather than a planted one.
 - **The most consequential task is 4**, because it adds an attack surface nobody in this project had listed — and the adversary this port is built against can reach it without being the server.
+
+---
+
+## What this branch left for the next ones
+
+### Eight targets, zero real findings, and that was the expectation going in
+
+A scouting run measured **11,321,022 executions at 185,590/s against the four most-quoted parsers,
+zero crashes**, before a line of this module was written. So the plan was built around honest
+expectations rather than hope, and the outcome matched: **no target found a live defect.** The value
+delivered is regression insurance on eight parsers, **two attack surfaces nobody in this project had
+ever listed**, and — unexpectedly — a set of measurements about fuzzing itself that are worth more
+than a crash would have been.
+
+### The rule that made every target real: a planted-bug proof
+
+**On this codebase a green fuzz run is the expected outcome and carries no information about whether
+the target works.** So every target had to plant a bug and show libFuzzer finding it. That rule
+earned its keep immediately:
+
+- **Task 2's first ClientHello target had in-range-only oracles, and its planted bug survived
+  25,402,060 executions.** A target running at **438,051 exec/s** was proving nothing. It was the
+  planted bug, not the throughput, that revealed it.
+- **Task 3 recorded a plant that survived 5,885,563 executions** — hoisting a Content-Length cap out
+  of the digit loop, a twenty-digit wrap — and wrote the gap into the source **with its measurement
+  beside it** rather than leaving it for rediscovery.
+
+**A target with no planted-bug proof is an unconnected instrument.**
+
+### The gate question got four different answers, every one measured
+
+Before seeding a corpus, ask whether the mutator can reach the code at all. The answer was different
+every time, and **not once was it guessable**:
+
+| target | answer |
+|---|---|
+| session envelope | a `seq == 0` gate **2^64 wide with no coverage gradient** — the plant was **not found in 623,089 blind executions**, then found **in ~8 s from seeds** |
+| ClientHello | first written up as "unclimbable", then **measured**: libFuzzer passes the equality gate in ~1.4–2.4M executions on **two of three seeds**, not at all on the third. Seeding bought **reliability and 100x, not reachability** |
+| WS handshake / HTTP | corpora **load-bearing**: with the plant in and no corpus, one target was **not reached in 26,567,643 executions** |
+| client reply reader | **no corpus can ever pass the gate** — the shared secret is a fresh ephemeral X25519 key **per execution** — so the harness seals the first record itself at runtime |
+
+### And ask whether the suite already catches your plant
+
+Also different per target, and the answer changes the target's justification:
+- Task 1's two: **caught by the 75 tests**, so its value narrowed honestly to unenumerated
+  *sequences* rather than one-token mutations.
+- Task 2's two: **not caught** — real marginal coverage.
+- Task 3's six: all caught.
+- Task 4's: one caught, **one not — and that one is a denial-of-service that pins a descriptor for
+  the full 15-second deadline, on the only client-side pre-auth parser in the tree.**
+
+### The surface nobody had listed
+
+**Every fuzz list this project ever wrote — the spec's, module 8's, module 9's, the scouting
+report's first six entries — names server-side parsers only.** The client's handshake-reply reader is
+**reachable by any on-path censor who can answer the client's TCP connection.** You do not have to be
+the server to feed it. That asymmetry is why it survived nine modules unlisted, and it is where the
+module's one uniquely-caught defect shape lives.
+
+### What fuzzing here cannot see, and `fuzz/README.md` says so
+
+**Every defect in this project's seventy-nine-item ledger that was about a distribution or a
+divergence is invisible to a fuzzer**: a biased modulo, a predictable connection pick, a
+padding-length distribution, an AAD mismatch with Go. A green fuzz job must not read as coverage of
+those. They are module 10b's.
+
+### Three flakes in one test file, three different mechanisms, none found by reading
+
+`test_udp_piper.c` produced three wall-clock defects, **every one found by running under load**:
+
+1. **Module 9's** — an assertion demanding that a **TCP** bind to the UDP listener's ephemeral port
+   *succeed*, defeatable by any concurrent process because **ephemeral port ranges are shared across
+   protocol families.** It could also have **passed spuriously.** Cure: ask the socket its own type.
+2. **The wedged peer** — `peer_timeout_ms` runs from a peer's last activity, so the 150 ms deadline
+   was **also the budget for the case's own twenty-datagram setup**; the peer it never fed reached
+   the assertion at **120 ms of 150**. Poll-bound; moved by CPU **quota** (7/20 at `--cpus=2`),
+   untouched by spinners. Cure: move the origin — both peers speak once per setup turn, and the
+   deadline is measured from that instant.
+3. **The churn case** — waited on `pump_until(peer_count_is 1000, …)`, **a level that can only recede
+   once the loop stops feeding it**, so the wait watched 662 more peers expire and **turned a
+   338-peer shortfall into `peer_count 0`, destroying the evidence.** CPU-bound; moved by
+   **contention** (14/20 at `--cpus=1` + spinners), untouched by quota alone. Its idle margin was
+   **8x** — better than #2's 1.25x — so **the margin did not predict the failure; the amplifier
+   did.** Cure: wait on `peers_created`, which only rises.
+
+**A wait must be on something that can only move toward you.** And the worst consequence of #3 was
+silent: before the fix, on a slow machine the three-refusal cap assertion **was not testing the cap
+at all.**
+
+**Two rejected fixes with numbers, which are worth more than the accepted ones**: a single post-loop
+keepalive **measured 3/20 still failing** because peers expire *during* the loop; and `getpid()`
+stamping was **provably useless** in an earlier fix because PIDs are namespaced and `$$` is 1 in
+every container.
+
+### The sweep, and its most useful result is negative
+
+**524 wait sites across 78 test files; 74 level-predicate; 11 timeout-then-work. No silent site
+exists outside `test_udp_piper.c`** — because the suite pairs `ASSERT_TRUE(pump_until(...))` with an
+exact restating `ASSERT_EQ_INT` **nearly everywhere**, so a receding predicate fails loudly instead
+of quietly ceasing to check. **Look where that pairing is missing** — a cheaper rule than auditing
+every wait.
+
+And the top suspects were **measured, which retired them**: one has a **1.14x margin — tighter than
+the 1.25x that did fail** — yet 0/20 under both levers. A margin tighter than a known-failing one,
+proven safe. A read-only audit would have got that backwards.
+
+### False results caught, in both directions
+
+- **`mv` preserves mtime**, so a revert without a rebuild gives a **false pass**. Hence `cp`.
+- **`cp` updates mtime**, so a revert without a rebuild gives a **false fail** — which fired twice
+  this session and was caught both times. **The rule is "always rebuild before you trust a number",
+  and `cp`-not-`mv` is only half of it.**
+- A sweep's clang check reported **zero warnings because `python3` does not exist in the image, so
+  nothing compiled.** Caught by someone asking what their own zero meant.
+- An agent's assembly diff reported **"IDENTICAL" on two empty files** because it matched an
+  inlined-away symbol. Caught and redone.
+
+### Costs and budgets for module 10b
+
+- **76 tests.** Debug ~22.5 s at `-j4`; ASan **67–71 s warm**. The ~102 s figure quoted all module
+  was **cold-cache** — every runtime argument made here rested on it.
+- **`test_ck_client_cli` measured 59.5–64.9 s, i.e. 1.85x–2.02x against `TIMEOUT 120`.** The 1.91x
+  floor declared a module ago **has been crossed.** Splitting the two CLI tests into separate
+  binaries remains the only lever.
+- The corpus replay costs **+0.1 s Debug, +1.4 s ASan** — inside the control's own spread.
+- **Corpus caps are asserted, not documented**: 288,427 / 1,048,576 bytes and 1,094 / 2,048 files.
+  **File count is the binding cost**, at ~58 bytes per file for one target.
+- The image is **~1.42 GB** (clang + compiler-rt + llvm-symbolizer, measured at **+350 MB** against a
+  predicted 264, then +55 MB).
+- **`llvm-symbolizer` is not shipped by clang on Debian.** Without `llvm-14` every crash prints raw
+  addresses, and the obvious remedy — putting a path on `PATH` — **looks like it works** while
+  leaving every report unsymbolized.
+- **Recorded, unbounded by any test**: `cloak_reactor_cancel_timer` is a linear heap scan,
+  `peer_find_addr` a linear list walk, and **`registry_find_live` and `panel_find` scan a fixed 256
+  entries regardless of occupancy.** Five more sites share the shape.
+
+### Tally
+
+Seventy-nine coverage defects across nine branches became **eighty-two across ten** — three flakes,
+each with its own mechanism, none shared with another. Plus two named, measured blind spots inside
+the new targets themselves. Every one found by measuring or mutating. **None was found by reading.**

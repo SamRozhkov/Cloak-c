@@ -1,0 +1,18 @@
+GET /p¹th/x?y=2 HTTP/1.1
+Host: origin.example
+P-Forwarded-For:"HTTP/1B.1
+Host: origin.example
+X-Forwarded-For: 203.0
+CF-RAY: 7
+CF-RAY:AAf6789-FRA
+CDN-LoopAY:AAf6789-FRA
+CDN-Loop: cloudc‘—ing: gzip
+Via: 1.1 clopexample
+X-Forwarded-For: 203.0
+CF-RAY: 7
+CF-RAY:AAf6789-FRA
+CDN-Loop: cl*2
+Host: origin.example
+Xarded-For:"203gzip
+Via: 1.1 clopgrade
+UpgrL

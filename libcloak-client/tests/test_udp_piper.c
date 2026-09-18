@@ -637,6 +637,23 @@ static int far_streams_at_least(void *ctx) {
     return c->far->nstreams >= c->want;
 }
 
+/* "Both of these far-end streams have carried at least one more datagram
+ * than they had." The piper refreshes a peer's deadline when it READS that
+ * peer's datagram off the local socket, and the far end's count is the
+ * only externally visible consequence of that read -- so waiting on it is
+ * how a case can KNOW the refresh happened rather than assume it. */
+struct arrived_ctx {
+    struct far_stream *a;
+    int a_want;
+    struct far_stream *b;
+    int b_want;
+};
+
+static int both_streams_arrived(void *ctx) {
+    struct arrived_ctx *c = ctx;
+    return c->a->count >= c->a_want && c->b->count >= c->b_want;
+}
+
 static void test_two_peers_two_streams_no_crossing(void) {
     /* static, not automatic: struct far_end carries a per-stream record
      * for up to FAR_MAX_STREAMS streams, which case 6 needs 1000 of. */
@@ -1098,6 +1115,37 @@ static void test_full_queue_drops_the_newest_and_counts(void) {
 
 /* ============ 3b. a wedged peer is still retired ======================== */
 
+/* BOTH PEERS SPEAK ONCE, and this returns the instant sampled BEFORE they
+ * did -- i.e. a time no later than either peer's own last_activity_ms.
+ *
+ * WHY A CASE WOULD WANT THIS. peer_timeout_ms is measured from a peer's
+ * LAST ACTIVITY, so a case that configures a short deadline is also
+ * putting its own setup on that clock: every reactor turn the setup takes
+ * is spent out of the peer's remaining life. This moves the origin of both
+ * deadlines to a point the case chooses, which is the difference between
+ * "the deadline fires 150 ms after something the case did not control" and
+ * "150 ms after this line".
+ *
+ * The peer->piper direction is the one to use: it is the direction that
+ * still works when a peer's RECEIVE queue is wedged, so this refreshes a
+ * wedged peer without unwedging it. Returns 0 if a peer has already gone,
+ * which every caller asserts against rather than ignores. */
+static uint64_t keepalive_both(struct stalled *sc) {
+    int slow_before = sc->slow_stream->count;
+    int fast_before = sc->fast_stream->count;
+    uint8_t ka[16];
+    fill_pattern(ka, sizeof(ka), 0x6B);
+    uint64_t before = monotonic_ms();
+    if (peer_send(&sc->slow, ka, sizeof(ka)) != 0 || peer_send(&sc->fast, ka, sizeof(ka)) != 0) {
+        return 0;
+    }
+    struct arrived_ctx fed = {sc->slow_stream, slow_before + 1, sc->fast_stream, fast_before + 1};
+    if (!pump_until(sc->fx.r, both_streams_arrived, &fed, PUMP_MAX_TURNS, PUMP_TURN_MS)) {
+        return 0;
+    }
+    return before == 0 ? 1 : before;
+}
+
 /* A peer that can neither receive (its queue is full and sendto refuses)
  * nor send (it has gone quiet) must still hit its deadline.
  *
@@ -1109,23 +1157,67 @@ static void test_full_queue_drops_the_newest_and_counts(void) {
  * a wedged peer's life would never fire: a slot, a stream and a buffer
  * held forever by a local application that stopped reading. */
 static void test_wedged_peer_is_still_retired_by_the_deadline(void) {
+    /* One number, used twice: as the piper's deadline and as the lower
+     * bound asserted at the end. Two literals could drift apart and the
+     * bound would silently stop being the deadline. */
+    static const uint64_t deadline_ms = 150;
+
     static struct stalled sc;
-    ASSERT_EQ_INT(0, stalled_init(&sc, 1024, 4096, 150));
+    ASSERT_EQ_INT(0, stalled_init(&sc, 1024, 4096, deadline_ms));
     if (sc.slow_stream == NULL) {
         stalled_destroy(&sc);
         return;
     }
+
+    /* THE KEEPALIVE IN THIS LOOP IS LOAD-BEARING, AND IT IS NOT A WIDENED
+     * TOLERANCE -- it MOVES THE ORIGIN of the two deadlines.
+     *
+     * MEASURED, on an idle container, without it: each far_send costs
+     * ~6 ms of reactor turns, so the twenty below span ~120 ms -- and the
+     * FAST peer, which this case never feeds and which is therefore never
+     * touched again after its hello inside stalled_init, arrives at the
+     * peer-count assertion 120 ms idle against this 150 ms deadline. That
+     * is 30 ms of margin for setup that a loaded machine spends: the same
+     * window, instrumented under a --cpus=2 container with four CPU
+     * spinners, measured 174-181 ms, the fast peer was retired before the
+     * loop ended, and peer_count read 1 -- the reported flake, reproduced
+     * 7 times in 20 runs. Refreshing both peers each turn takes the setup
+     * off the deadline's clock entirely, so what the deadline measures
+     * below is only the silence this case is about. It does NOT unwedge
+     * the slow peer: this is the peer->piper direction, and every sendto
+     * TOWARDS the slow peer goes on being refused throughout. */
+    uint64_t touched = 0;
     for (int i = 0; i < 20; i++) {
         far_send(&sc, sc.slow_stream, (uint8_t)i, 700);
+        touched = keepalive_both(&sc);
+        ASSERT_TRUE(touched != 0); /* a peer that vanished mid-setup is a failure, not a skip */
+        if (touched == 0) {
+            stalled_destroy(&sc);
+            return;
+        }
     }
     ASSERT_TRUE(cloak_udp_piper_send_stalls(&sc.fx.pp) > 0);
     ASSERT_EQ_INT(2, (int)cloak_udp_piper_peer_count(&sc.fx.pp));
 
-    /* Nobody speaks from here on. Bounded by the clock at ~20x the
-     * deadline so a failure is an assertion, not a ctest timeout. */
+    /* Nobody speaks from here on, and `touched` is when they last did.
+     * Bounded by the clock at ~20x the deadline so a failure is an
+     * assertion, not a ctest timeout. */
     struct peers_ctx gone = {&sc.fx.pp, 0};
     ASSERT_EQ_INT(1, pump_until(sc.fx.r, peer_count_is, &gone, 3000, 1));
     ASSERT_EQ_INT(2, (int)cloak_udp_piper_peers_expired(&sc.fx.pp));
+    /* AND NOT ONE MILLISECOND EARLY. The piper and this file read the same
+     * CLOCK_MONOTONIC through the same truncation, and `touched` was
+     * sampled BEFORE the datagrams that refreshed the peers, so this is an
+     * exact bound and not a tolerance -- which is what lets the assertion
+     * exist at all, the deadline being the thing under test.
+     *
+     * MUTATION-CHECKED, not assumed: peer_on_deadline changed to retire at
+     * a THIRD of peer_timeout_ms (and to re-arm against that third) leaves
+     * every assertion above this one passing -- the peers are still both
+     * there, both still expire, and the pump still reaches zero -- and
+     * fails HERE, at 50 ms where 150 was configured. Without this line the
+     * case cannot tell a deadline from an early retirement. */
+    ASSERT_TRUE(monotonic_ms() - touched >= deadline_ms);
 
     stalled_destroy(&sc);
 }
@@ -1471,18 +1563,84 @@ static void test_the_size_limit_follows_the_session(void) {
 
 #define CHURN_PEERS 1000
 
-static void test_peer_map_evicts_under_churn(void) {
+struct created_ctx {
+    cloak_udp_piper_t *pp;
+    size_t want;
+};
+
+static int peers_created_at_least(void *ctx) {
+    struct created_ctx *c = ctx;
+    return cloak_udp_piper_peers_created(c->pp) >= c->want;
+}
+
+/* ONE WAVE: CHURN_PEERS peers, each a fresh abstract-namespace socket that
+ * sends one datagram and is closed immediately. Returns once the piper has
+ * READ all of them.
+ *
+ * IT WAITS ON peers_created, NOT ON peer_count, AND THAT IS THE WHOLE
+ * DIFFERENCE. peers_created only ever rises, so waiting on it is waiting
+ * for something that will arrive: the tail of datagrams the per-iteration
+ * turn did not get to. peer_count, once this loop stops feeding it, can
+ * only FALL -- every peer here is silent from the instant its socket
+ * closes, so its deadline is the only thing still acting on it.
+ *
+ * MEASURED, with the `pump_until(peer_count_is CHURN_PEERS, 3000, 1)` this
+ * replaced: under a --cpus=1 container with four CPU spinners the loop
+ * below took 607 ms where it takes 49 ms idle, 338 peers had ALREADY
+ * expired by the time it ended, and the wait then spent its full 3000 ms
+ * watching the other 662 expire too -- turning a 338-peer shortfall into
+ * `peer_count` 0 and reporting `1000 != 0` for every count after it. A
+ * wait on a receding condition does not merely fail to help: it destroys
+ * the evidence of what actually happened. Rate under that load: 14 of 20
+ * runs. */
+static void churn_wave(struct fixture *fx, const struct sockaddr_storage *piper_addr,
+                       socklen_t piper_len) {
+    uint8_t msg[32];
+    fill_pattern(msg, sizeof(msg), 0x66);
+    for (int i = 0; i < CHURN_PEERS; i++) {
+        struct peer p;
+        memset(&p, 0, sizeof(p));
+        p.fd = make_unix_dgram(&p.me, &p.me_len, "cp", 0);
+        ASSERT_TRUE(p.fd >= 0);
+        if (p.fd < 0) {
+            return;
+        }
+        p.piper = *piper_addr;
+        p.piper_len = piper_len;
+        ASSERT_EQ_INT(0, peer_send(&p, msg, sizeof(msg)));
+        /* One turn each: the datagram must be consumed before the socket
+         * is closed and its address reused by nobody. */
+        cloak_reactor_run_once(fx->r, 0);
+        close(p.fd);
+    }
+    struct created_ctx made = {&fx->pp, CHURN_PEERS};
+    ASSERT_EQ_INT(1, pump_until(fx->r, peers_created_at_least, &made, 3000, 1));
+}
+
+/* 6a. THE CAP HOLDS: a thousand peers coexist, and the next one is
+ * refused.
+ *
+ * THE DEADLINE HERE IS DELIBERATELY ONE THAT CANNOT FIRE, and that is the
+ * point of splitting this case from 6b rather than a convenience. Every
+ * assertion below needs all thousand peers alive AT THE SAME INSTANT, so
+ * with a short peer_timeout_ms the case would be racing its own setup: the
+ * creation loop's duration would be spent out of the earliest peers'
+ * lives, and on a machine ~12x slower than this one (measured:
+ * --cpus=1 plus four CPU spinners) a third of them are gone before the
+ * loop ends. Moving the ORIGIN is not available here -- these peers' own
+ * sockets are closed by design, so nothing can refresh them -- so the
+ * deadline is removed from this half instead, and 6b keeps it for the half
+ * that is about it. Neither number was widened: 6b still uses 400 ms. */
+static void test_peer_map_holds_its_cap_under_churn(void) {
     int fds_before = count_open_fds();
     ASSERT_TRUE(fds_before > 0);
 
     static struct fixture fx;
     cloak_udp_piper_config_t pcfg;
     memset(&pcfg, 0, sizeof(pcfg));
-    /* Long enough that no peer expires while the 1000 are being created
-     * (so peer_count really does reach 1000 and the cap is really the
-     * thing not refusing them), short enough that the sweep afterwards is
-     * bounded by the clock rather than by patience. */
-    pcfg.peer_timeout_ms = 400;
+    /* Longer than any plausible run of this case, so no peer can expire
+     * while the thousand are being created OR while they are counted. */
+    pcfg.peer_timeout_ms = 60000;
     /* EXACTLY the number about to be created, so the next peer after them
      * must be refused. A cap set comfortably above the load would leave
      * "max_peers is enforced at all" untested, which is the shape of hole
@@ -1504,26 +1662,7 @@ static void test_peer_map_evicts_under_churn(void) {
     ASSERT_EQ_INT(0, cloak_udp_piper_adopt(&fx.pp, piper_fd));
     int fds_idle = count_open_fds();
 
-    uint8_t msg[32];
-    fill_pattern(msg, sizeof(msg), 0x66);
-    for (int i = 0; i < CHURN_PEERS; i++) {
-        struct peer p;
-        memset(&p, 0, sizeof(p));
-        p.fd = make_unix_dgram(&p.me, &p.me_len, "cp", 0);
-        ASSERT_TRUE(p.fd >= 0);
-        if (p.fd < 0) {
-            break;
-        }
-        p.piper = piper_addr;
-        p.piper_len = piper_len;
-        ASSERT_EQ_INT(0, peer_send(&p, msg, sizeof(msg)));
-        /* One turn each: the datagram must be consumed before the socket
-         * is closed and its address reused by nobody. */
-        cloak_reactor_run_once(fx.r, 0);
-        close(p.fd);
-    }
-    struct peers_ctx up = {&fx.pp, CHURN_PEERS};
-    ASSERT_EQ_INT(1, pump_until(fx.r, peer_count_is, &up, 3000, 1));
+    churn_wave(&fx, &piper_addr, piper_len);
 
     /* EVERY ONE OF THEM WAS REAL: created, not refused, and not silently
      * merged into one peer because the addresses compared equal. */
@@ -1531,6 +1670,10 @@ static void test_peer_map_evicts_under_churn(void) {
     ASSERT_EQ_INT(0, (int)cloak_udp_piper_refused_peers(&fx.pp));
     ASSERT_EQ_INT(0, (int)cloak_udp_piper_dropped_datagrams(&fx.pp));
     ASSERT_EQ_INT(CHURN_PEERS, (int)cloak_udp_piper_peer_count(&fx.pp));
+    /* And none of them died on the way: with a deadline that cannot fire,
+     * a non-zero count here would be a retirement this case did not ask
+     * for, not a slow machine. */
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_peers_expired(&fx.pp));
     /* The piper's own count reaching 1000 does not mean the thousandth
      * frame has crossed the socketpair yet -- it was written, not
      * delivered. Measured: without this the far end was at 999. */
@@ -1541,6 +1684,8 @@ static void test_peer_map_evicts_under_churn(void) {
     /* THE CAP IS REAL. Three more peers arrive with the map full: each is
      * refused, counted, and changes nothing about the 1000 already
      * held. */
+    uint8_t msg[32];
+    fill_pattern(msg, sizeof(msg), 0x66);
     for (int i = 0; i < 3; i++) {
         struct peer over;
         memset(&over, 0, sizeof(over));
@@ -1558,11 +1703,59 @@ static void test_peer_map_evicts_under_churn(void) {
     /* 1000 peers, still one descriptor. */
     ASSERT_EQ_INT(fds_idle, count_open_fds());
 
-    /* Now let them all expire. Bounded by the clock at ~10x the
-     * deadline. */
+    fixture_destroy(&fx);
+    ASSERT_EQ_INT(fds_before, count_open_fds());
+}
+
+/* 6b. AND THEY ALL GO AWAY AGAIN: a thousand deadlines, a thousand
+ * retirements, and the descriptor count back where it started.
+ *
+ * NOTHING HERE NEEDS THE THOUSAND ALIVE AT ONCE, which is exactly why the
+ * short deadline belongs in this half and not in 6a. On a slow machine
+ * some of these peers expire while the rest are still being created --
+ * that costs this case nothing, because what it asserts is a TOTAL
+ * (peers_created == peers_expired == CHURN_PEERS), and a total does not
+ * care when each term arrived. */
+static void test_churned_peers_all_expire(void) {
+    int fds_before = count_open_fds();
+    ASSERT_TRUE(fds_before > 0);
+
+    static struct fixture fx;
+    cloak_udp_piper_config_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    /* Short enough that the sweep below is bounded by the clock rather
+     * than by patience. */
+    pcfg.peer_timeout_ms = 400;
+    pcfg.max_peers = CHURN_PEERS;
+    ASSERT_EQ_INT(0, fixture_init(&fx, &pcfg, 1024, 4096));
+    if (!fx.ready) {
+        fixture_destroy(&fx);
+        return;
+    }
+
+    struct sockaddr_storage piper_addr;
+    socklen_t piper_len;
+    int piper_fd = make_unix_dgram(&piper_addr, &piper_len, "sweep", 0);
+    ASSERT_TRUE(piper_fd >= 0);
+    ASSERT_EQ_INT(0, cloak_udp_piper_adopt(&fx.pp, piper_fd));
+    int fds_idle = count_open_fds();
+
+    churn_wave(&fx, &piper_addr, piper_len);
+    ASSERT_EQ_INT(CHURN_PEERS, (int)cloak_udp_piper_peers_created(&fx.pp));
+    ASSERT_EQ_INT(0, (int)cloak_udp_piper_refused_peers(&fx.pp));
+
+    /* Now let them all expire. Bounded by the clock at ~10x the deadline,
+     * and peer_count only falls from here, so this waits on a condition
+     * that is arriving rather than receding. */
     struct peers_ctx down = {&fx.pp, 0};
     ASSERT_EQ_INT(1, pump_until(fx.r, peer_count_is, &down, 4000, 1));
+    /* THE DEADLINE RETIRED EVERY ONE OF THEM. peers_expired counts only
+     * the deadline -- peer_retire's other callers pass 0 -- so a sweep
+     * that lost a peer to a broken stream or a closed session instead
+     * lands here as a shortfall rather than passing as "they all went
+     * away somehow". */
     ASSERT_EQ_INT(CHURN_PEERS, (int)cloak_udp_piper_peers_expired(&fx.pp));
+    ASSERT_EQ_INT(CHURN_PEERS, (int)cloak_udp_piper_peers_created(&fx.pp));
     ASSERT_EQ_INT(fds_idle, count_open_fds());
 
     fixture_destroy(&fx);
@@ -2345,7 +2538,8 @@ test_wedged_peer_is_still_retired_by_the_deadline();
 test_silent_peer_is_retired_after_the_deadline();
 test_sizes_are_carried_whole();
 test_the_size_limit_follows_the_session();
-test_peer_map_evicts_under_churn();
+test_peer_map_holds_its_cap_under_churn();
+test_churned_peers_all_expire();
 test_pool_backpressure_pauses_the_socket_and_resumes();
 test_pool_bound_is_the_minimum_connection_not_the_aggregate();
 test_ipv6_peers_are_distinct_peers();

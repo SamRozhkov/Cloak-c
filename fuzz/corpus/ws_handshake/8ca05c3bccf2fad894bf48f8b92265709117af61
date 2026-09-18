@@ -1,0 +1,17 @@
+GET path~x?y=0 HTTP/1
+Host: origd-Fo: 406.
+CF-RAY:5f67*0-FRA
+CDN-Loop: are
+Accept-Encoding: gzip
+Via: 2.1 cloulare
+Connection: @keep-li.example
+X-Fo:de
+Sec-WebSocket-Version:: 4a1b2c3-FRA
+CDN-Loop: cloudf∆lare
+Accept-Encoding: gzip
+Via: 2.1 cloudflare
+Connade: websokev
+Connectiotioer-Vsn: 
+Hidn: Upgrade
+Sec
+U

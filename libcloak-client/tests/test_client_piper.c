@@ -1554,12 +1554,38 @@ static void test_a_silent_connection_costs_no_stream(void) {
     pcfg.first_byte_timeout_ms = SILENT_DEADLINE_MS;
     ASSERT_EQ_INT(0, client_up(&cl, &fx, SID_SILENT, &pcfg, 262144));
 
+    /* THE DEADLINE'S ORIGIN IS THE PIPER'S ACCEPT, WHICH THIS TEST CANNOT
+     * OBSERVE DIRECTLY, so each side of the boundary is anchored to the
+     * observable instant that brackets the accept in that side's SAFE
+     * direction, and each side is then waited out as an ABSOLUTE target
+     * rather than as a duration stacked on top of whatever the setup
+     * happened to cost.
+     *
+     * t_before is taken before the local peer even dials, so
+     * accept >= t_before and the alive check at t_before + 880 is AT
+     * MOST 880 ms into the 1000 ms deadline however long the two waits
+     * below take. t_seen is taken once the piper has been observed
+     * holding the connection, so accept <= t_seen and the dead check at
+     * t_seen + 1000 + 270 is AT LEAST 270 ms past the deadline.
+     *
+     * WHAT THIS REPLACES, and why it is not a widened tolerance. Both
+     * sides used to be measured from wherever pump_until(piper_conns_are)
+     * happened to return, so the alive side was 880 ms PLUS the whole of
+     * the lp_connected and piper_conns_are waits -- a stated 1.14x margin
+     * (880 of 1000) with the test's own setup billed on top of it and no
+     * bound at all on how much that setup could add. That is the shape
+     * that produced the wedged-peer defect in test_udp_piper.c, where a
+     * 1.25x margin measured 174-181 ms of a 150 ms budget under load.
+     * The numbers 880 and 270 are unchanged; only their origins are. */
+    uint64_t t_before = pump_monotonic_ms();
+
     local_peer_t quiet;
     ASSERT_EQ_INT(0, lp_open(&quiet, fx.reactor, cl.local_port));
     ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &quiet, PIPER_MAX_TURNS, PIPER_TURN_MS));
 
     struct piper_wait pw = {&cl.piper, 1};
     ASSERT_TRUE(pump_until(fx.reactor, piper_conns_are, &pw, PIPER_MAX_TURNS, PIPER_TURN_MS));
+    uint64_t t_seen = pump_monotonic_ms();
     /* Accepted and held, with NO stream: this is D6's window. */
     ASSERT_EQ_INT(1, (int)cloak_client_piper_conn_count(&cl.piper));
     ASSERT_EQ_INT(0, (int)cloak_client_piper_stream_count(&cl.piper));
@@ -1567,8 +1593,16 @@ static void test_a_silent_connection_costs_no_stream(void) {
     /* SIDE ONE OF THE BOUNDARY: still alive at 88% of the deadline, in
      * WALL-CLOCK time (a turn count does not reliably measure any of
      * this). A piper that shortened the deadline for any reason fails
-     * here and nowhere else. */
-    pump_for_ms(fx.reactor, SILENT_ALIVE_AT_MS);
+     * here and nowhere else.
+     *
+     * The setup above must not already have spent the whole alive-side
+     * budget; asserting that is strictly weaker than what the old code
+     * required, because a setup that had spent 880 ms would have put the
+     * old alive check at 1760 ms of a 1000 ms deadline and failed the
+     * assertion below anyway -- it just would not have said why. */
+    uint64_t spent = pump_monotonic_ms() - t_before;
+    ASSERT_TRUE(spent < SILENT_ALIVE_AT_MS);
+    pump_for_ms(fx.reactor, SILENT_ALIVE_AT_MS - spent);
     ASSERT_EQ_INT(1, (int)cloak_client_piper_conn_count(&cl.piper));
     ASSERT_EQ_INT(0, (int)cloak_client_piper_stream_count(&cl.piper));
     ASSERT_EQ_INT(0, quiet.eof);
@@ -1584,8 +1618,16 @@ static void test_a_silent_connection_costs_no_stream(void) {
      * evaluated -- so "dead 270 ms past a 1000 ms deadline" was really
      * "dead by about 3.2 s", and a deadline armed at THREE TIMES the
      * configured value passed both sides. A waiting pump on the dead side
-     * of a boundary is not a wait, it is the boundary silently moving. */
-    pump_for_ms(fx.reactor, SILENT_DEAD_AFTER_MS);
+     * of a boundary is not a wait, it is the boundary silently moving.
+     *
+     * Anchored to t_seen, the LATEST instant the accept can have happened,
+     * so "270 ms past the deadline" is a guarantee rather than a hope: the
+     * old form pumped 270 ms on from the alive check and therefore
+     * guaranteed only 150 ms past the deadline in the worst case, despite
+     * the constant's name and this comment both saying 270. */
+    uint64_t since_seen = pump_monotonic_ms() - t_seen;
+    ASSERT_TRUE(since_seen < SILENT_DEADLINE_MS + SILENT_DEAD_AFTER_MS);
+    pump_for_ms(fx.reactor, (SILENT_DEADLINE_MS + SILENT_DEAD_AFTER_MS) - since_seen);
 
     ASSERT_EQ_INT(0, (int)cloak_client_piper_conn_count(&cl.piper));
     ASSERT_EQ_INT(0, (int)cloak_client_piper_stream_count(&cl.piper));

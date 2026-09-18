@@ -1,0 +1,5 @@
+GET / HTTP/1
+sec-websocket-keyECn: 26
+sec-websocket-keyCA:
+sec-websocket-version: 13****X
+
