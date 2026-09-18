@@ -56,12 +56,14 @@
 # adopts the longest seed as the limit, so a minimised corpus can shrink
 # the search space without anybody choosing to.
 
-# Every target in this directory links the same libraries and the same
-# sanitizer runtime; the differences between targets belong in their .c
-# files, not here.
+# Every target in this directory is built and sanitized identically; what
+# differs between them is only WHICH code they drive, which is why the
+# sanitizer options live in this function and the sources and libraries do
+# not. ARGN is any extra source the target compiles in directly (see the
+# note above targets #2 and #3), and each target names its own libraries
+# below.
 function(cloak_add_fuzz_target name)
-    add_executable(${name} ${name}.c)
-    target_link_libraries(${name} PRIVATE cloak-mux)
+    add_executable(${name} ${name}.c ${ARGN})
     # fuzzer (not fuzzer-no-link) only on the target that defines
     # LLVMFuzzerTestOneInput: this is what pulls in libFuzzer's own main.
     # The instrumentation of the LIBRARIES is set once, in the root
@@ -72,6 +74,7 @@ function(cloak_add_fuzz_target name)
 endfunction()
 
 cloak_add_fuzz_target(fuzz_session_envelope)
+target_link_libraries(fuzz_session_envelope PRIVATE cloak-mux)
 
 # The seed generator for target #1. Not a fuzz target -- an ordinary
 # program with a main() that writes fuzz/corpus/session_envelope/. See
@@ -79,3 +82,29 @@ cloak_add_fuzz_target(fuzz_session_envelope)
 # state from a corpus of random bytes.
 add_executable(gen_seeds_session_envelope gen_seeds_session_envelope.c)
 target_link_libraries(gen_seeds_session_envelope PRIVATE cloak-mux)
+
+# Targets #2 and #3: the server's front door. Both are unauthenticated --
+# anything that can open a TCP connection reaches them -- and both live in
+# libcloak-server.
+#
+# WHY THESE TWO NAME A SOURCE FILE RATHER THAN LINKING cloak-server. Both
+# drive a self-contained parser with no dependency on anything else in
+# that library, while `cloak-server` as a target drags in sqlite3 and
+# cJSON (see libcloak-server/CMakeLists.txt) -- a large, instrumented,
+# ASan-built amalgamation that nothing here feeds a single byte to, paid
+# for in build time and in a fuzz build directory this module has to keep
+# small on a nearly full disk. Naming the one .c file keeps each target's
+# build to its harness plus the code under test, and it keeps the
+# convention's promise intact: you can still read the target top to bottom
+# and know exactly what is being fuzzed. If either parser ever grows a
+# dependency on another translation unit, this breaks at link time, loudly,
+# which is the right way for it to be noticed. The instrumentation is
+# unaffected: the root CMakeLists.txt's CLOAK_FUZZ block sets
+# -fsanitize=fuzzer-no-link,address via add_compile_options before this
+# directory is added, so a source compiled here is instrumented exactly as
+# it would be inside the library.
+cloak_add_fuzz_target(fuzz_firstpacket ../libcloak-server/src/firstpacket.c)
+target_include_directories(fuzz_firstpacket PRIVATE ../libcloak-server/include)
+
+cloak_add_fuzz_target(fuzz_clienthello ../libcloak-server/src/clienthello_parse.c)
+target_include_directories(fuzz_clienthello PRIVATE ../libcloak-server/include)
