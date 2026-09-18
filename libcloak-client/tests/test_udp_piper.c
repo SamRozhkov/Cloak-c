@@ -637,6 +637,23 @@ static int far_streams_at_least(void *ctx) {
     return c->far->nstreams >= c->want;
 }
 
+/* "Both of these far-end streams have carried at least one more datagram
+ * than they had." The piper refreshes a peer's deadline when it READS that
+ * peer's datagram off the local socket, and the far end's count is the
+ * only externally visible consequence of that read -- so waiting on it is
+ * how a case can KNOW the refresh happened rather than assume it. */
+struct arrived_ctx {
+    struct far_stream *a;
+    int a_want;
+    struct far_stream *b;
+    int b_want;
+};
+
+static int both_streams_arrived(void *ctx) {
+    struct arrived_ctx *c = ctx;
+    return c->a->count >= c->a_want && c->b->count >= c->b_want;
+}
+
 static void test_two_peers_two_streams_no_crossing(void) {
     /* static, not automatic: struct far_end carries a per-stream record
      * for up to FAR_MAX_STREAMS streams, which case 6 needs 1000 of. */
@@ -1098,6 +1115,37 @@ static void test_full_queue_drops_the_newest_and_counts(void) {
 
 /* ============ 3b. a wedged peer is still retired ======================== */
 
+/* BOTH PEERS SPEAK ONCE, and this returns the instant sampled BEFORE they
+ * did -- i.e. a time no later than either peer's own last_activity_ms.
+ *
+ * WHY A CASE WOULD WANT THIS. peer_timeout_ms is measured from a peer's
+ * LAST ACTIVITY, so a case that configures a short deadline is also
+ * putting its own setup on that clock: every reactor turn the setup takes
+ * is spent out of the peer's remaining life. This moves the origin of both
+ * deadlines to a point the case chooses, which is the difference between
+ * "the deadline fires 150 ms after something the case did not control" and
+ * "150 ms after this line".
+ *
+ * The peer->piper direction is the one to use: it is the direction that
+ * still works when a peer's RECEIVE queue is wedged, so this refreshes a
+ * wedged peer without unwedging it. Returns 0 if a peer has already gone,
+ * which every caller asserts against rather than ignores. */
+static uint64_t keepalive_both(struct stalled *sc) {
+    int slow_before = sc->slow_stream->count;
+    int fast_before = sc->fast_stream->count;
+    uint8_t ka[16];
+    fill_pattern(ka, sizeof(ka), 0x6B);
+    uint64_t before = monotonic_ms();
+    if (peer_send(&sc->slow, ka, sizeof(ka)) != 0 || peer_send(&sc->fast, ka, sizeof(ka)) != 0) {
+        return 0;
+    }
+    struct arrived_ctx fed = {sc->slow_stream, slow_before + 1, sc->fast_stream, fast_before + 1};
+    if (!pump_until(sc->fx.r, both_streams_arrived, &fed, PUMP_MAX_TURNS, PUMP_TURN_MS)) {
+        return 0;
+    }
+    return before == 0 ? 1 : before;
+}
+
 /* A peer that can neither receive (its queue is full and sendto refuses)
  * nor send (it has gone quiet) must still hit its deadline.
  *
@@ -1109,23 +1157,67 @@ static void test_full_queue_drops_the_newest_and_counts(void) {
  * a wedged peer's life would never fire: a slot, a stream and a buffer
  * held forever by a local application that stopped reading. */
 static void test_wedged_peer_is_still_retired_by_the_deadline(void) {
+    /* One number, used twice: as the piper's deadline and as the lower
+     * bound asserted at the end. Two literals could drift apart and the
+     * bound would silently stop being the deadline. */
+    static const uint64_t deadline_ms = 150;
+
     static struct stalled sc;
-    ASSERT_EQ_INT(0, stalled_init(&sc, 1024, 4096, 150));
+    ASSERT_EQ_INT(0, stalled_init(&sc, 1024, 4096, deadline_ms));
     if (sc.slow_stream == NULL) {
         stalled_destroy(&sc);
         return;
     }
+
+    /* THE KEEPALIVE IN THIS LOOP IS LOAD-BEARING, AND IT IS NOT A WIDENED
+     * TOLERANCE -- it MOVES THE ORIGIN of the two deadlines.
+     *
+     * MEASURED, on an idle container, without it: each far_send costs
+     * ~6 ms of reactor turns, so the twenty below span ~120 ms -- and the
+     * FAST peer, which this case never feeds and which is therefore never
+     * touched again after its hello inside stalled_init, arrives at the
+     * peer-count assertion 120 ms idle against this 150 ms deadline. That
+     * is 30 ms of margin for setup that a loaded machine spends: the same
+     * window, instrumented under a --cpus=2 container with four CPU
+     * spinners, measured 174-181 ms, the fast peer was retired before the
+     * loop ended, and peer_count read 1 -- the reported flake, reproduced
+     * 7 times in 20 runs. Refreshing both peers each turn takes the setup
+     * off the deadline's clock entirely, so what the deadline measures
+     * below is only the silence this case is about. It does NOT unwedge
+     * the slow peer: this is the peer->piper direction, and every sendto
+     * TOWARDS the slow peer goes on being refused throughout. */
+    uint64_t touched = 0;
     for (int i = 0; i < 20; i++) {
         far_send(&sc, sc.slow_stream, (uint8_t)i, 700);
+        touched = keepalive_both(&sc);
+        ASSERT_TRUE(touched != 0); /* a peer that vanished mid-setup is a failure, not a skip */
+        if (touched == 0) {
+            stalled_destroy(&sc);
+            return;
+        }
     }
     ASSERT_TRUE(cloak_udp_piper_send_stalls(&sc.fx.pp) > 0);
     ASSERT_EQ_INT(2, (int)cloak_udp_piper_peer_count(&sc.fx.pp));
 
-    /* Nobody speaks from here on. Bounded by the clock at ~20x the
-     * deadline so a failure is an assertion, not a ctest timeout. */
+    /* Nobody speaks from here on, and `touched` is when they last did.
+     * Bounded by the clock at ~20x the deadline so a failure is an
+     * assertion, not a ctest timeout. */
     struct peers_ctx gone = {&sc.fx.pp, 0};
     ASSERT_EQ_INT(1, pump_until(sc.fx.r, peer_count_is, &gone, 3000, 1));
     ASSERT_EQ_INT(2, (int)cloak_udp_piper_peers_expired(&sc.fx.pp));
+    /* AND NOT ONE MILLISECOND EARLY. The piper and this file read the same
+     * CLOCK_MONOTONIC through the same truncation, and `touched` was
+     * sampled BEFORE the datagrams that refreshed the peers, so this is an
+     * exact bound and not a tolerance -- which is what lets the assertion
+     * exist at all, the deadline being the thing under test.
+     *
+     * MUTATION-CHECKED, not assumed: peer_on_deadline changed to retire at
+     * a THIRD of peer_timeout_ms (and to re-arm against that third) leaves
+     * every assertion above this one passing -- the peers are still both
+     * there, both still expire, and the pump still reaches zero -- and
+     * fails HERE, at 50 ms where 150 was configured. Without this line the
+     * case cannot tell a deadline from an early retirement. */
+    ASSERT_TRUE(monotonic_ms() - touched >= deadline_ms);
 
     stalled_destroy(&sc);
 }
