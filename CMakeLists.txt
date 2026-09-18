@@ -120,6 +120,38 @@ function(cloak_label_fast_tests)
     endforeach()
 endfunction()
 
+# ---------------------------------------------------------------------------
+# THE FUZZ BUILD (module 10a), AND THE GUARD THAT KEEPS IT OUT OF
+# EVERYTHING ELSE.
+#
+# OFF by default and it must stay that way. With CLOAK_FUZZ off, nothing
+# under fuzz/ is configured, compiled, linked or added as a test: the
+# default build is byte-identical to what it was before this option
+# existed, and `ctest` is the same 75 tests. With it ON, the libraries are
+# rebuilt with libFuzzer's coverage instrumentation and AddressSanitizer,
+# which is a DIFFERENT build of the same sources -- so it gets its own
+# build directory and never shares one with a Debug or CI build.
+#
+# WHY THE INSTRUMENTATION IS SET HERE AND NOT IN fuzz/CMakeLists.txt.
+# libFuzzer's feedback comes from SanitizerCoverage compiled into the code
+# under test, not into the harness -- a harness built with
+# -fsanitize=fuzzer against uninstrumented libraries links and runs
+# perfectly and explores nothing, which is exactly the shape of failure
+# this module has to avoid (it looks like a working fuzzer). cloak-mux,
+# cloak-common and their third-party dependencies are all declared in
+# subdirectories added BELOW this point, so add_compile_options here is
+# what reaches them.
+#
+# -fsanitize=fuzzer-no-link, not -fsanitize=fuzzer: the libraries need the
+# coverage instrumentation but must NOT pull in libFuzzer's main(); only
+# the one executable that defines LLVMFuzzerTestOneInput asks for the full
+# -fsanitize=fuzzer, in fuzz/CMakeLists.txt.
+option(CLOAK_FUZZ "Build the libFuzzer targets under fuzz/ (never part of the default build or the test suite)" OFF)
+if(CLOAK_FUZZ)
+    add_compile_options(-fsanitize=fuzzer-no-link,address -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address)
+endif()
+
 add_subdirectory(third_party/cjson)
 add_subdirectory(third_party/sqlite)
 add_subdirectory(libcloak-common)
@@ -289,3 +321,12 @@ add_dependencies(test_unordered_proof ck-server ck-client)
 target_compile_definitions(test_unordered_proof PRIVATE
     CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
     CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
+
+# The fuzz targets, added LAST and only when asked for: fuzz/CMakeLists.txt
+# links cloak-mux, so the library has to be declared before it, and the
+# option itself is declared above (next to the instrumentation flags it
+# turns on) so that a reader who finds this line is one scroll from the
+# reason it is guarded.
+if(CLOAK_FUZZ)
+    add_subdirectory(fuzz)
+endif()

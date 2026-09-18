@@ -40,15 +40,79 @@ FROM debian:bookworm-slim AS base
 # builds of libraries, binaries and all 75 test executables produce ZERO
 # warnings under gcc 12.2.0 and zero under clang 14.0.6, and `ctest` is
 # 75/75 under each.
+
+# AND llvm-14, FOR ONE FILE: /usr/lib/llvm-14/bin/llvm-symbolizer. Without
+# it every sanitizer report in this image is a list of raw addresses --
+# `SUMMARY: AddressSanitizer: SEGV (/w/probe+0x10b808)` and nothing else --
+# which is the difference between a fuzz finding you can act on and one you
+# cannot.
+#
+# TASK 0 REPORTED THIS FILE WAS ALREADY IN THE IMAGE, AT
+# /usr/lib/llvm-14/bin/, NEEDING ONLY A PATH ENTRY. IT WAS NOT, AND THIS
+# COMMENT EXISTS SO THAT CLAIM IS NOT ACTED ON AGAIN: measured in the image
+# BEFORE this line was added, `find / -name "llvm-symbolizer*"` returned
+# NOTHING, and /usr/lib/llvm-14/bin contained exactly four files (clang,
+# clang++, clang-14, clang-cpp). A PATH entry alone would have left every
+# crash unsymbolized while looking like a fix.
+#
+# llvm-14 AND NOT SOMETHING SMALLER, measured not guessed: llvm-14-runtime
+# (1.4 MB installed) ships only lli and lli-child-target -- `dpkg -L` after
+# installing it found no llvm-symbolizer -- and llvm-14-tools ships neither.
+# llvm-14 is the package that has it. Measured cost in this image, where
+# libllvm14 and llvm-14-linker-tools are already present as clang's
+# dependencies: 8 new packages (libnspr4, libsqlite3-0, libnss3,
+# nss-plugin-pem, libcurl3-nss, libpfm4, llvm-14-runtime, llvm-14),
+# "Need to get 13.0 MB of archives", "After this operation, 55.0 MB of
+# additional disk space will be used".
+#
+# WHY NOT addr2line, WHICH IS ALREADY HERE AND COSTS ZERO. It was tried,
+# and it is the trap, not the bargain. compiler-rt accepts any
+# ASAN_SYMBOLIZER_PATH and falls back to an addr2line pool for a binary
+# whose name is not llvm-symbolizer, so `ASAN_SYMBOLIZER_PATH=
+# /usr/bin/addr2line` DOES produce file:line output and DOES look like it
+# works. On the same planted crash (a null read in a `static` helper the
+# compiler inlined into its one caller) the two disagree:
+#
+#   addr2line:        #0 ... in LLVMFuzzerTestOneInput /w/probe.c:6
+#   llvm-symbolizer:  #0 ... in boom /w/probe.c:6:24
+#                     #1 ... in LLVMFuzzerTestOneInput /w/probe.c:12:16
+#
+# addr2line DROPPED the inlined frame and then attributed the callee's line
+# number to the caller's name -- a report naming the wrong function. This
+# tree is full of `static` helpers that inline (heap_push, heap_pop,
+# try_drain, ring_put, ring_peek in libcloak-mux alone), so that is the
+# normal case here, not the corner case. 55 MB buys frames that name the
+# function the bug is actually in.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     clang \
     libclang-rt-14-dev \
+    llvm-14 \
     cmake \
     libssl-dev \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
+
+# The symbolizer, wired up where every sanitizer run in this image sees it
+# rather than in each fuzz invocation's own command line -- ASan, LSan,
+# UBSan and libFuzzer all read this one variable. The versioned real path,
+# not /usr/bin/llvm-symbolizer-14, which is only a symlink to it.
+#
+# VERIFIED, not assumed, at the commit that added it. A one-character
+# off-by-one planted in libcloak-mux/src/msgqueue.c (a dropped
+# `% q->cap`) was found by fuzz/fuzz_session_envelope.c and reported as:
+#
+#   #1 ... in ring_put .../libcloak-mux/src/msgqueue.c:25:9
+#   #2 ... in cloak_msgqueue_write .../libcloak-mux/src/msgqueue.c:76:9
+#   #3 ... in feed_frame_unordered .../libcloak-mux/src/stream.c:354:14
+#   #5 ... in session_on_envelope .../libcloak-mux/src/session.c:320:18
+#
+# Function, file, line and column -- including `ring_put`, which is
+# `static` and inlined, and `session_on_envelope`, which is `static` and
+# is the code under test. An unproven symbolizer is indistinguishable
+# from a missing one until the day you need it.
+ENV ASAN_SYMBOLIZER_PATH=/usr/lib/llvm-14/bin/llvm-symbolizer
 
 # A Go toolchain, for one reason: module 8's tests need an implementation
 # nobody here wrote. Every test in the first seven modules had our code on
