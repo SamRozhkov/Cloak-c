@@ -98,13 +98,57 @@ typedef void (*cloak_reactor_timer_cb)(cloak_reactor_t *r, void *userdata);
 
 /* Schedules cb to run once, delay_ms from now (CLOCK_MONOTONIC). Returns a
  * timer id usable with cloak_reactor_cancel_timer, or CLOAK_TIMER_INVALID
- * on failure (cb is NULL, or an allocation failure growing the timer
- * heap). */
+ * on failure (cb is NULL, an allocation failure growing the timer heap,
+ * or more than 1048575 timers pending on one reactor at the same time --
+ * see reactor.c's handle layout for where that number comes from).
+ *
+ * The returned id is OPAQUE. It used to be a plain monotonically
+ * increasing counter and it no longer is: it now encodes which slot the
+ * timer occupies, so that cancelling is a lookup rather than a search.
+ * Ids are still unique within a reactor for as long as any caller could
+ * hold one, but they are NOT ordered, NOT dense, and nothing may infer a
+ * creation order from comparing two of them. */
 cloak_timer_id_t cloak_reactor_add_timer(cloak_reactor_t *r, uint64_t delay_ms,
                                           cloak_reactor_timer_cb cb, void *userdata);
 
 /* Cancels a pending timer. A no-op if id is CLOAK_TIMER_INVALID, already
- * fired, or already cancelled. */
+ * fired, already cancelled, or was never issued by this reactor.
+ *
+ * CONSTANT IN THE NUMBER OF PENDING TIMERS, and that is a contract
+ * rather than an implementation note: this is on the path of every
+ * session teardown (twice -- the inactivity timer and the deferred
+ * teardown timer), every UDP peer expiry, every connect retry and every
+ * handshake deadline, on BOTH the client and the server, which share
+ * this file. A mass teardown at the server's 1024-session cap is two
+ * thousand of them back to back. It was a linear scan of the timer heap
+ * until module 10b, MEASURED at 1221 ns per cancel at 1024 pending
+ * timers against 42 ns at one.
+ * libcloak-common/tests/test_reactor_timer_scale.c asserts the cost
+ * bracket at 1 / 64 / 256 / 1024 timers and fails against a scan. The
+ * worst case for one call is a handle lookup plus O(log n) heap moves to
+ * close the hole; the MEASURED mean over a full drain is flat at three
+ * steps from 64 timers to 1024.
+ *
+ * Safe to call from inside a timer or fd callback, including on the
+ * currently-firing timer's own id (a no-op: it has already fired). */
 void cloak_reactor_cancel_timer(cloak_reactor_t *r, cloak_timer_id_t id);
+
+/* INSTRUMENTATION, public for one reason: the cost of a cancel is part of
+ * this reactor's contract (see above) and a test cannot assert a cost it
+ * cannot see. Counts the elements of the timer structure that
+ * cloak_reactor_cancel_timer has examined or moved since the reactor was
+ * created -- machine-independent, unlike a wall clock, which is what
+ * makes it assertable in a suite that runs under ASan at -j4. */
+uint64_t cloak_reactor_cancel_probe_steps(const cloak_reactor_t *r);
+
+/* The number of timers that have neither fired nor been cancelled.
+ * Cancelling REMOVES a timer rather than flagging it, so this falls as
+ * soon as cancel returns. The version this replaced only set a flag and
+ * left the entry in the heap until its ORIGINAL deadline reached the
+ * root -- so a cancelled 60-second inactivity timer went on being
+ * scanned for up to 60 seconds after the session that owned it was gone,
+ * making every other cancel in that window more expensive. Nothing could
+ * observe that without this accessor, which is why it is here. */
+size_t cloak_reactor_pending_timers(const cloak_reactor_t *r);
 
 #endif

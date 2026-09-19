@@ -97,6 +97,26 @@ target_link_libraries(test_signals PRIVATE cloak-common)
 add_test(NAME test_signals COMMAND test_signals)
 set_tests_properties(test_signals PROPERTIES TIMEOUT 60)
 
+# The cost of cloak_reactor_cancel_timer as a function of occupancy
+# (module 10b, the timer half of task 4's leftovers). Forks nothing, so
+# cloak_label_fast_tests() below correctly puts it in the "fast" half --
+# and the same sweep re-applies the TIMEOUT set here, in the ONE
+# set_tests_properties call the generated CTestTestfile.cmake ends up
+# with. Verified there: LABELS "fast" TIMEOUT "120".
+#
+# 120 RATHER THAN THE 60 THE SWEEP WOULD DEFAULT TO, and not because the
+# test is slow: MEASURED at 0.07 s in Debug. It is because the test's own
+# internal deadlines -- every wait in it is bounded by the clock, never by
+# an iteration count -- sum to 12 s in the worst case where nothing ever
+# fires, and 60 leaves only 5x on that. This suite's whole point of pain
+# is a loaded -j4 ASan run, which is exactly where a 5x margin is not a
+# margin; 10x is. (Measured under ASan+UBSan at -j4: 1.03 s.)
+add_executable(test_reactor_timer_scale test_reactor_timer_scale.c)
+target_include_directories(test_reactor_timer_scale PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_reactor_timer_scale PRIVATE cloak-common)
+add_test(NAME test_reactor_timer_scale COMMAND test_reactor_timer_scale)
+set_tests_properties(test_reactor_timer_scale PROPERTIES TIMEOUT 120)
+
 # None of this directory's tests fork a process (module 9 task 0's
 # fast/slow split; see the top-level CMakeLists.txt's own comment on
 # cloak_label_fast_tests() for what this call does and why it has to be
