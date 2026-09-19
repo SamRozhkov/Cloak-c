@@ -2532,6 +2532,130 @@ static void test_keepalive_is_warned_about(void) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* ONE FILE, TWO BINARIES (module 10b task 8)                           */
+/* ------------------------------------------------------------------ */
+
+/* NOTHING ABOVE THIS LINE CHANGED. Every case function, every helper and
+ * every assertion is byte-for-byte what the single binary ran; the ONLY
+ * change is which PROCESS runs which case, and that is decided by the
+ * table below and by -DCK_CLI_PART on the two executables the build
+ * makes from this one source file.
+ *
+ * WHY. The single test_ck_client_cli measured 63.1 s warm at -j4 under
+ * ASan+UBSan against its own TIMEOUT 120 -- a 1.90x margin, under the
+ * 1.91x floor module 9 declared. The per-case measurement that chose this
+ * split is in the ms comments on each row, taken from one serial
+ * ASan+UBSan run (cmd/ck-client/CMakeLists.txt records the totals). They
+ * say something more useful than any single case does. A COUNTER ON THE
+ * fork() SITE was added for the measurement (temporary instrumentation,
+ * not shipped) and the two columns line up almost exactly:
+ *
+ *   children   1     2     3     5     6     8
+ *   ms       ~900 ~1800 ~2750 ~4500 ~5400 ~7220
+ *
+ * THE UNIT OF COST IS A FORKED CHILD, ~0.92 s EACH under LeakSanitizer's
+ * exit scan -- not an assertion, not a transfer. Across this file's 56
+ * children and the server file's 42, the figure is 918 ms and 919 ms
+ * respectively. Size a new case by counting its fork/exec calls and
+ * multiplying.
+ *
+ * WITH ONE MEASURED EXCEPTION, which is the most expensive case in either
+ * file and is expensive for a reason the rule does not predict:
+ * test_proxy_flag_overrides_json forks TWO children and costs 9503 ms.
+ * The other ~8.6 s is the client's RETRY BACKOFF -- the case waits for
+ * "round failed" from a server that refuses the flag's proxy method, and
+ * that wait is the stack's, not the sanitizer's. A case that waits on a
+ * real protocol event has to be costed by measuring it, not by counting
+ * forks. (918 ms/child above is this file's 54 OTHER children over its
+ * 49.6 s; including this case's backoff it reads 1056 ms.)
+ *
+ * HOW A NEW CASE PICKS ITS HALF. Both halves print their own per-case
+ * costs and their own total on every run, so the rule is mechanical: add
+ * the row to the half whose printed total is smaller, then read the two
+ * totals back off the next run. The halves are near-equal today under
+ * ASan+UBSan -- 29.4 s and 29.5 s serially, 31-32 s each warm at -j4 --
+ * and are meant to stay that way. UNDER ASAN, and deliberately so: in a
+ * plain Debug build the same halves are 7.15 s and 0.60 s, because with
+ * no LeakSanitizer a fork is nearly free and the Debug cost is almost all
+ * test_proxy_flag_overrides_json's retry backoff. The sanitizer build is
+ * the one with a TIMEOUT to protect and a suite that is 3x longer, so it
+ * is the one the balance is struck against. They are NOT a
+ * theme with a cost as an afterthought, though they do read as one --
+ * CONFIG is the command line and the configuration document, RUNTIME is
+ * what the started process then does and logs.
+ *
+ * WHY THE TABLE AND NOT #if AROUND THE CALL LIST. A case function that is
+ * compiled but never reached would be a static function nobody calls, and
+ * this tree is required to build with zero warnings under both gcc and
+ * clang: -Wunused-function would fire on every case the other half owns.
+ * Referencing all of them from one table compiles both halves whole and
+ * runs half of each. THAT IS ALSO THE GUARD AGAINST LOSING A CASE: a case
+ * function left OUT of this table is referenced by nothing and becomes a
+ * -Wunused-function warning, which this tree treats as a failure. A split
+ * that silently drops a case cannot get past the compiler. */
+
+#define CK_CLI_CONFIG 1
+#define CK_CLI_RUNTIME 2
+
+#ifndef CK_CLI_PART
+#error "CK_CLI_PART must be defined by the build (1 = config, 2 = runtime)"
+#endif
+#if CK_CLI_PART != CK_CLI_CONFIG && CK_CLI_PART != CK_CLI_RUNTIME
+#error "CK_CLI_PART must be 1 (config) or 2 (runtime)"
+#endif
+
+typedef struct {
+    const char *name;
+    void (*fn)(void);
+    int part;
+} cli_case_t;
+
+/* The ms figures are the measurement this split was chosen from, and they
+ * are a READING of one serial ASan+UBSan run on one machine -- no test
+ * fails if they drift. What the run prints is the live number; these are
+ * here so the next reader can see what the halves were balanced against. */
+static const cli_case_t k_cases[] = {
+    {"version_and_help_exit_before_config",
+     test_version_and_help_exit_before_config, CK_CLI_CONFIG},  /*  1796 ms */
+    {"flags_override_json",
+     test_flags_override_json, CK_CLI_CONFIG},  /*  1828 ms */
+    {"local_host_flag_overrides_json",
+     test_local_host_flag_overrides_json, CK_CLI_CONFIG},  /*   904 ms */
+    {"proxy_flag_overrides_json",
+     test_proxy_flag_overrides_json, CK_CLI_CONFIG},  /*  9889 ms */
+    {"missing_remote_host_is_a_config_error",
+     test_missing_remote_host_is_a_config_error, CK_CLI_CONFIG},  /*  1787 ms */
+    {"plugin_mode_takes_an_ssv_string",
+     test_plugin_mode_takes_an_ssv_string, CK_CLI_CONFIG},  /*  4524 ms */
+    {"exit_codes_are_distinct",
+     test_exit_codes_are_distinct, CK_CLI_CONFIG},  /*  4499 ms */
+    {"config_from_a_file_and_from_ssv",
+     test_config_from_a_file_and_from_ssv, CK_CLI_CONFIG},  /*  3680 ms */
+    {"defaults_fill_in_the_omitted_fields",
+     test_defaults_fill_in_the_omitted_fields, CK_CLI_CONFIG},  /*   899 ms */
+    {"udp_is_honoured",
+     test_udp_is_honoured, CK_CLI_RUNTIME},  /*  5444 ms */
+    {"udp_without_numconn_names_numconn",
+     test_udp_without_numconn_names_numconn, CK_CLI_RUNTIME},  /*  1806 ms */
+    {"the_unordered_bit_is_on_the_wire",
+     test_the_unordered_bit_is_on_the_wire, CK_CLI_RUNTIME},  /*  1819 ms */
+    {"end_to_end_through_both_binaries",
+     test_end_to_end_through_both_binaries, CK_CLI_RUNTIME},  /*  1902 ms */
+    {"sigterm_is_clean_and_leaks_no_descriptor",
+     test_sigterm_is_clean_and_leaks_no_descriptor, CK_CLI_RUNTIME},  /*  2296 ms */
+    {"admin_flag_reaches_the_admin_api",
+     test_admin_flag_reaches_the_admin_api, CK_CLI_RUNTIME},  /*  2774 ms */
+    {"shutdown_bills_the_last_interval",
+     test_shutdown_bills_the_last_interval, CK_CLI_RUNTIME},  /*  1910 ms */
+    {"runtime_exit_code_and_the_descriptor_budget",
+     test_runtime_exit_code_and_the_descriptor_budget, CK_CLI_RUNTIME},  /*  7223 ms */
+    {"verbosity_is_validated_and_takes_effect",
+     test_verbosity_is_validated_and_takes_effect, CK_CLI_RUNTIME},  /*  2691 ms */
+    {"keepalive_is_warned_about",
+     test_keepalive_is_warned_about, CK_CLI_RUNTIME},  /*  1823 ms */
+};
+
 TEST_MAIN_BEGIN()
     /* LINE-BUFFERED, DELIBERATELY. stdout here is a pipe, so libc would
      * block-buffer it and a ctest TIMEOUT would arrive with
@@ -2542,23 +2666,24 @@ TEST_MAIN_BEGIN()
      * reached. */
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
-    test_version_and_help_exit_before_config();
-    test_flags_override_json();
-    test_local_host_flag_overrides_json();
-    test_proxy_flag_overrides_json();
-    test_missing_remote_host_is_a_config_error();
-    test_udp_is_honoured();
-    test_udp_without_numconn_names_numconn();
-    test_the_unordered_bit_is_on_the_wire();
-    test_end_to_end_through_both_binaries();
-    test_sigterm_is_clean_and_leaks_no_descriptor();
-    test_admin_flag_reaches_the_admin_api();
-    test_shutdown_bills_the_last_interval();
-    test_plugin_mode_takes_an_ssv_string();
-    test_exit_codes_are_distinct();
-    test_config_from_a_file_and_from_ssv();
-    test_defaults_fill_in_the_omitted_fields();
-    test_runtime_exit_code_and_the_descriptor_budget();
-    test_verbosity_is_validated_and_takes_effect();
-    test_keepalive_is_warned_about();
+
+    unsigned ran = 0;
+    uint64_t total_ms = 0;
+    for (size_t i = 0; i < sizeof(k_cases) / sizeof(k_cases[0]); i++) {
+        if (k_cases[i].part != CK_CLI_PART) {
+            continue;
+        }
+        uint64_t t0 = now_ms();
+        k_cases[i].fn();
+        uint64_t took = now_ms() - t0;
+        total_ms += took;
+        ran++;
+        printf("[case] %-46s %6llu ms\n", k_cases[i].name,
+               (unsigned long long)took);
+    }
+    /* A half that ran NOTHING is a build that mis-set CK_CLI_PART, and it
+     * would otherwise print "All tests passed" and go green. */
+    ASSERT_TRUE(ran > 0);
+    printf("[part %d] %u case(s), %llu ms total\n", CK_CLI_PART, ran,
+           (unsigned long long)total_ms);
 TEST_MAIN_END()
