@@ -35,6 +35,32 @@ target_include_directories(test_replay_cache PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_replay_cache PRIVATE cloak-server)
 add_test(NAME test_replay_cache COMMAND test_replay_cache)
 
+# The adversarial half of the replay cache's coverage, in its own binary
+# rather than appended to test_replay_cache.c: that file is the
+# functional suite and every one of its assertions passed on the code
+# this one's case 1 breaks. Keeping them apart is what makes "the
+# functional suite is green and the cache is still broken" a statement
+# you can read off the test list.
+#
+# In-process, no fork, so it stays "fast" by default (see the top-level
+# CMakeLists.txt on the fast/slow split). It is not free, though: case 2
+# runs 32 floods of ln(2)*524288 inserts each, about 11.6 million keyed
+# hashes, and case 3 allocates two more tables and fills them. MEASURED
+# at 2.53 s through ctest in a Debug build at the commit that added it
+# (`ctest -R ^test_replay_cache_keyed$`); for scale, the same run's
+# slowest tests are test_adminapi at 12.20 s and test_dispatcher_ws at
+# 11.99 s, and neither of those forks either. TIMEOUT 120 is roughly a 47x
+# margin on that; THE SANITIZER BUILD WAS NOT MEASURED -- the disk had
+# no room for a second build directory on the machine this was written
+# on, and 120 was chosen to leave room for the order-of-magnitude
+# slowdown the other TIMEOUT comments in this file report under
+# ASan+UBSan rather than from a number anyone here observed.
+add_executable(test_replay_cache_keyed test_replay_cache_keyed.c)
+target_include_directories(test_replay_cache_keyed PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_replay_cache_keyed PRIVATE cloak-server)
+add_test(NAME test_replay_cache_keyed COMMAND test_replay_cache_keyed)
+set_tests_properties(test_replay_cache_keyed PROPERTIES TIMEOUT 120)
+
 add_executable(test_firstpacket test_firstpacket.c)
 target_include_directories(test_firstpacket PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_firstpacket PRIVATE cloak-server)
