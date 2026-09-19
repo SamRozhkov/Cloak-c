@@ -10,10 +10,14 @@ add_executable(ck-client main.c)
 target_link_libraries(ck-client PRIVATE cloak-client cloak-common cjson)
 
 # ---------------------------------------------------------------------------
-# ONE SOURCE FILE, TWO TEST BINARIES (module 10b task 8).
+# ONE SOURCE FILE, THREE TEST BINARIES (module 10b tasks 8 and 6).
 #
-# tests/test_ck_client_cli.c is compiled twice, with -DCK_CLI_PART=1 and
-# -DCK_CLI_PART=2. Both objects contain EVERY case; the table at the
+# tests/test_ck_client_cli.c is compiled once per part, with
+# -DCK_CLI_PART=1 (config), 2 (runtime) and 3 (restart). Parts 1 and 2 are
+# task 8's balanced split of the original file; part 3 is task 6's single
+# restart case, which is a binary of its own because its cost is a WAIT
+# and not a fork -- see the timeout derivation in the loop below. All
+# three objects contain EVERY case; the table at the
 # bottom of that file decides which half each process RUNS. See that
 # file's own comment for why it is a table and not an #if -- the short
 # version is that a case left out of the table is a static function
@@ -97,7 +101,7 @@ target_link_libraries(ck-client PRIVATE cloak-client cloak-common cjson)
 #     case that adds a relative-path file has to keep that property or
 #     name the file after its half.
 #
-# TIMEOUT STAYS 120 on both halves, deliberately, and the value is NOT
+# TIMEOUT STAYS 120 on the two halves below, deliberately, and is NOT
 # re-derived here: it is the bound the single binary carried, for the
 # reasons module 9 measured and wrote down -- a run in which the shutdown
 # path is broken pays every case's bounded wait, and at TIMEOUT 60 such a
@@ -105,11 +109,61 @@ target_link_libraries(ck-client PRIVATE cloak-client cloak-common cjson)
 # Halving the work halves that failing run too, so 120 is now a MEASURED
 # margin of 3.7x on the worse half instead of 1.90x. Lowering it would
 # spend the room this task exists to create.
-foreach(_part config runtime)
+foreach(_part config runtime restart)
     if(_part STREQUAL "config")
         set(_part_id 1)
-    else()
+        set(_part_timeout 120)
+    elseif(_part STREQUAL "runtime")
         set(_part_id 2)
+        set(_part_timeout 120)
+    else()
+        set(_part_id 3)
+        # ---------------------------------------------------------------
+        # THE THIRD BINARY (module 10b task 6) AND WHY ITS TIMEOUT IS NOT
+        # 120.
+        #
+        # test_retries_across_a_server_restart is the one case in either
+        # CLI file whose cost is DELIBERATE WAITING rather than process
+        # startup: it kills a real ck-server, waits out the client's
+        # reconnect ladder to prove the client is still trying, and only
+        # then brings the server back. ~30 s of which ~26 s is waiting,
+        # and NONE of it is shortenable from the test -- ck-client
+        # hard-codes max_rounds to ROUNDS_UNBOUNDED and leaves
+        # reconnect_base_ms at its 500 ms default, with no flag and no
+        # config key for either. So it is a binary of its own: added to
+        # either half above it would have more than doubled that half's
+        # Debug runtime and taken its measured TIMEOUT margin with it.
+        # MEASURED: 17.1 s in Debug (16.8 s of it waiting), 18.3 s alone
+        # under ASan+UBSan and 19.8 s at -j4. The suite's ASan wall clock
+        # went 83.27 s -> 93.66 s at -j4 when it was added, and its Debug
+        # wall clock 33.36 s -> 33.82 s: Debug is NOT work-bound at -j4
+        # and absorbed it, the sanitizer build is and did not.
+        #
+        # TIMEOUT 220, DERIVED, not copied. The value the other two halves
+        # carry is the one module 9 measured for a run in which the
+        # shutdown path is broken and every case pays every bounded wait.
+        # This binary runs ONE case, so that worst case is just the sum of
+        # its own waits:
+        #
+        #   ck-server ready                    BOOT_MS      10 s
+        #   ck-client "session up"             BOOT_MS      10 s
+        #   the first transfer                 XFER          8 s
+        #   the outage bracket                 N + window   20 s
+        #   ck-server ready again              BOOT_MS      10 s
+        #   the client reconnecting            RESUME       15 s
+        #   the second transfer                XFER          8 s
+        #   stopping two children              2 x EXIT_MS  20 s
+        #                                                  ------
+        #                                                   101 s
+        #
+        # 200 / 101 = 1.98x, above the 1.91x floor module 9 declared. It
+        # is also 11.7x a HEALTHY run (17.1 s), and that ratio is the
+        # price of the other one: this binary's pathological run is 6x its
+        # healthy run because almost all of its healthy cost is a wait
+        # that SUCCEEDS early, and a timeout below 101 s would cut the
+        # named assertions off a failing run exactly as TIMEOUT 60 did the
+        # last time this project tried it.
+        set(_part_timeout 200)
     endif()
     set(_tgt test_ck_client_cli_${_part})
 
@@ -136,7 +190,7 @@ foreach(_part config runtime)
     add_dependencies(${_tgt} ck-client ck-server)
     add_test(NAME ${_tgt} COMMAND ${_tgt})
 
-    # LABELS "slow" (module 9 task 0's fast/slow split): both halves fork
+    # LABELS "slow" (module 9 task 0's fast/slow split): every part forks
     # and exec both real binaries repeatedly -- config forks 24 children
     # and runtime 32 -- so both are ~31-32 s under ASan+UBSan, almost all
     # of it process startup and LeakSanitizer's exit scan. IN DEBUG THE
@@ -154,9 +208,10 @@ foreach(_part config runtime)
     # a test set none -- and 120 is what this pair needs, so it is set
     # here and read back there. See the top-level CMakeLists.txt for why
     # the two properties travel together and never apart.
-    set_tests_properties(${_tgt} PROPERTIES TIMEOUT 120 LABELS "slow")
+    set_tests_properties(${_tgt} PROPERTIES TIMEOUT ${_part_timeout} LABELS "slow")
 endforeach()
 unset(_part_id)
+unset(_part_timeout)
 unset(_tgt)
 
 # Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's

@@ -1365,6 +1365,35 @@ static int read_one_tls_record(int fd, uint8_t *buf, size_t cap, int timeout_ms)
     }
 }
 
+/* Runs the SERVER'S OWN authentication decrypter over one captured
+ * ClientHello record and hands back everything it recovered. Returns 0, or
+ * -1 if the record did not parse or did not authenticate.
+ *
+ * Factored out of wire_unordered_flag below because case 12
+ * (test_retries_across_a_server_restart) needs a DIFFERENT field of the
+ * same struct -- the session id -- off the same wire, and a second
+ * hand-written copy of this sequence would be a second copy of the layout,
+ * free to agree with a mutated builder. */
+static int wire_clientinfo(const uint8_t *rec, size_t n, cloak_server_clientinfo_t *info) {
+    cloak_clienthello_parsed_t parsed;
+    if (cloak_clienthello_parse(rec, n, &parsed) != 0) {
+        return -1;
+    }
+    uint8_t priv[CLOAK_X25519_KEY_LEN];
+    size_t priv_len = 0;
+    if (cloak_base64_decode(PRIV_B64, priv, sizeof(priv), &priv_len) != 0 ||
+        priv_len != CLOAK_X25519_KEY_LEN) {
+        return -1;
+    }
+    uint8_t secret[CLOAK_AEAD_KEY_LEN];
+    if (cloak_server_auth_decrypt(parsed.random, parsed.session_id, parsed.session_id_len,
+                                  parsed.x25519_key_share, priv, (int64_t)time(NULL), info,
+                                  secret) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /* Accepts one connection on `listen_fd`, reads its ClientHello, and
  * returns the unordered flag the server would have read out of it: 0, 1,
  * or -1 if anything went wrong. */
@@ -1383,21 +1412,8 @@ static int wire_unordered_flag(int listen_fd) {
     if (n <= 0) {
         return -1;
     }
-    cloak_clienthello_parsed_t parsed;
-    if (cloak_clienthello_parse(rec, (size_t)n, &parsed) != 0) {
-        return -1;
-    }
-    uint8_t priv[CLOAK_X25519_KEY_LEN];
-    size_t priv_len = 0;
-    if (cloak_base64_decode(PRIV_B64, priv, sizeof(priv), &priv_len) != 0 ||
-        priv_len != CLOAK_X25519_KEY_LEN) {
-        return -1;
-    }
     cloak_server_clientinfo_t info;
-    uint8_t secret[CLOAK_AEAD_KEY_LEN];
-    if (cloak_server_auth_decrypt(parsed.random, parsed.session_id, parsed.session_id_len,
-                                  parsed.x25519_key_share, priv, (int64_t)time(NULL), &info,
-                                  secret) != 0) {
+    if (wire_clientinfo(rec, (size_t)n, &info) != 0) {
         return -1;
     }
     return info.unordered ? 1 : 0;
@@ -2793,6 +2809,684 @@ static void test_keepalive_is_warned_about(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Case 12: the client retries across a server restart                   */
+/* ------------------------------------------------------------------ */
+
+/* THE DEBT THIS DISCHARGES IS A JUSTIFICATION, NOT A FEATURE.
+ * cmd/ck-client/main.c's EXIT CODES block argues there is no SIXTH exit
+ * code -- no distinct "could not connect" -- ON THE GROUND THAT a client
+ * that cannot bring a session up does not fail, it retries forever. Five
+ * codes stand or fall on that premise, and an operator's supervisor
+ * policy is written against them. Module 7 wrote the obligation down:
+ * whoever argues five suffice owes this test. Nothing in the tree proved
+ * it through the BINARIES -- every `restart` in this file is about
+ * supervisor policy or billing, and the reconnect ladder is covered at
+ * LIBRARY level only (libcloak-client/tests/test_client_stack.c case 2).
+ *
+ * ---------------------------------------------------------------------
+ * WHAT THIS READS, AND WHY IT IS NOT THE CLIENT'S OWN LOG.
+ *
+ * The assertion that decides whether this case is worth anything is not
+ * "bytes flow again" -- a client that silently reattached to the DEAD
+ * session id would pass that, and reattaching under a dead id is the
+ * precise failure cloak/client_stack.h's RECONNECT LOOP section says a
+ * retry above the connector must not commit (the server's registry is
+ * keyed by (uid, session id) and holds a half-dead session for its own
+ * inactivity timeout). So the id is read WHERE THE SERVER READS IT: out
+ * of the ClientHello on the wire, through cloak_server_auth_decrypt --
+ * the server's own decrypter, the same code path a real ck-server runs --
+ * and not out of ck-client's narration, which is the client's own opinion
+ * of what it sent. (The two are cross-checked below: the id the decrypter
+ * recovers must appear in the client's log line for that round. That is
+ * what makes the log's ids usable as evidence ANYWHERE ELSE in this file,
+ * and it is an assertion rather than an assumption.)
+ *
+ * A CONFIG FIELD CANNOT SATISFY THIS. There is no knob, no flag and no
+ * JSON key for the session id: stack_pick_session_id draws it at random
+ * per bring-up. The only way to state "the id changed" is to observe two
+ * different ids, and the only place both are visible from outside the
+ * process is the wire.
+ *
+ * ---------------------------------------------------------------------
+ * THE RELAY, AND WHY THERE IS ONE.
+ *
+ * Reading the wire and carrying real traffic are the same requirement
+ * here, so a sniffer that swallows the handshake (which is what case 4b
+ * does, deliberately) is not enough. A forked child sits between the two
+ * binaries: ck-client dials the RELAY's port, the relay dials the real
+ * ck-server's port and splices. It parses the first TLS record of every
+ * connection and reports the session id it decrypts down a pipe, one line
+ * per event, so the parent sees EVERY handshake -- the one that carries
+ * traffic, and every one the client attempts while the server is dead.
+ *
+ * While the server is dead the relay's own dial is refused, so it reads
+ * the ClientHello and then CLOSES -- which is what makes each failed
+ * attempt cost a round trip rather than a handshake timeout, and is also
+ * why the outage produces evidence at all instead of silence.
+ *
+ * WHAT THE RELAY IS NOT ALLOWED TO HIDE: the ck-server process is really
+ * SIGKILLed and a new one is really exec'd, ON THE SAME PORT. The relay
+ * does not move, so the client's view of "the far end went away and came
+ * back at the same address" is the real one; SO_REUSEADDR on the server's
+ * listener (cloak/net.h says it is always set) is what makes the rebind
+ * work, and a regression there fails this case at the restart.
+ *
+ * ---------------------------------------------------------------------
+ * N, AND WHERE IT COMES FROM. Case 3 of the brief wants a bracket: the
+ * client must STILL BE TRYING after N seconds, with N derived rather than
+ * round. N is derived from the ladders the binary actually runs, both of
+ * which it hard-codes -- ck-client leaves reconnect_base_ms at 0
+ * (CLOAK_CLIENT_STACK_DEFAULT_RECONNECT_BASE_MS, 500 ms) and sets
+ * max_rounds to ROUNDS_UNBOUNDED, and neither is reachable from a flag or
+ * from the config, so this case CANNOT shorten the wait it is about to
+ * pay:
+ *
+ *   one round's cost   the connector's D2 ladder, 5 attempts with
+ *                      nominal delays 500 + 1000 + 2000 + 4000 ms
+ *                      (cloak/client_connector.h) = 7500 ms, jittered
+ *                      +/-25%  ->  at most 9375 ms. Each attempt itself
+ *                      is a loopback connect and one record, ~1 ms.
+ *   the first round    starts one reconnect base interval after the
+ *                      break: 500 ms +/-25%  ->  at most 625 ms.
+ *
+ * So a client bounded at ONE round makes its LAST connection attempt no
+ * later than 625 + 9375 = 10000 ms after the break. N = 12000 ms sits
+ * above that with 2 s of margin for scheduling and process startup, and
+ * is the smallest bar that distinguishes "retries forever" from "retried
+ * once and stopped". It is also reachable from the other side: round 2
+ * starts at the latest 625 + 9375 + 625 = 10625 ms after the break, so an
+ * attempt at or after 12 s is one the ladder was always going to make.
+ *
+ * THE WINDOW AFTER THE BAR is 8 s, from the same schedule: once past 12 s
+ * the largest gap between consecutive attempts is either the connector's
+ * own last step (4000 ms +25% = 5000 ms) or the ladder delay before round
+ * 3 or 4 (1000 or 2000 ms, +25%), whichever the run is in -- 5 s at
+ * worst, and 8 s is that with margin.
+ *
+ * WHAT IT COSTS, SAID RATHER THAN ABSORBED AND MEASURED RATHER THAN
+ * ESTIMATED. 17.1 s in Debug, of which 16.8 s -- 98% -- is DELIBERATE
+ * WAITING on a ladder this binary does not let a test shorten: 12.5 s out
+ * to the bar and 4.2 s for the replacement session. 18.3 s under
+ * ASan+UBSan run alone, 15.9 s of it waiting (87%) -- the extra 1.2 s
+ * over Debug is the THREE exec'd children, because the fourth, the relay,
+ * _exit()s and so never pays LeakSanitizer's scan. That ratio is the
+ * point: this is the one case in either CLI file whose cost the file's
+ * ~0.92 s-per-child rule does NOT predict, and it is why it is a THIRD
+ * binary rather than a row in either existing half -- it would have more
+ * than doubled the half it joined and taken that half's TIMEOUT margin
+ * with it.
+ *
+ * EVERY WAIT HERE IS BOUNDED BY THE CLOCK AND MONOTONE. The predicates
+ * are "a hello has arrived at or after the bar" and "the client's log
+ * contains a second `session up`" -- both of which can only become true,
+ * never stop being true, because the id list and the log only ever grow.
+ * The bar is anchored to t_break, an instant this test takes itself right
+ * after reaping the server, and nothing before it is charged to it. */
+
+#define RELAY_PAIRS 12
+#define RELAY_BUF   16384
+#define RELAY_HEAD  4096
+
+/* The payload. Small ON PURPOSE: 4 KiB fits inside one relay buffer in
+ * each direction, so the relay can never be the thing that blocks, and
+ * the framing and reassembly this size does NOT exercise are case 5's
+ * job (256 KiB, >= 16 records) and not this case's. */
+#define RESTART_PAYLOAD 4096
+#define RESTART_XFER_MS 8000
+/* Derived above. */
+#define RESTART_N_MS      12000
+#define RESTART_WINDOW_MS 8000
+/* The client is mid-ladder when the server comes back, so it owes at most
+ * one inter-attempt gap (<= 5 s, above) plus at worst a ladder delay and a
+ * handshake -- call it 8.5 s. MEASURED: 1.2 s and 4.2 s in Debug, 1.2 s
+ * under ASan+UBSan. 15 s is the 8.5 s bound with room for a loaded -j4
+ * sanitizer run, and most of it is a wait a healthy run does not pay. */
+#define RESTART_RESUME_MS 15000
+
+typedef struct {
+    int used;
+    int cfd; /* to ck-client */
+    int sfd; /* to ck-server, -1 when the dial was refused */
+    uint64_t opened_ms;
+    uint8_t c2s[RELAY_BUF];
+    size_t c2s_len, c2s_off;
+    uint8_t s2c[RELAY_BUF];
+    size_t s2c_len, s2c_off;
+    uint8_t head[RELAY_HEAD];
+    size_t head_len;
+    int parsed;
+} relay_pair_t;
+
+static void relay_pair_close(relay_pair_t *q) {
+    if (q->cfd >= 0) {
+        close(q->cfd);
+    }
+    if (q->sfd >= 0) {
+        close(q->sfd);
+    }
+    memset(q, 0, sizeof(*q));
+    q->cfd = -1;
+    q->sfd = -1;
+}
+
+/* Parses the first TLS record of a connection, once, and reports what the
+ * SERVER would have authenticated out of it. */
+static void relay_capture(relay_pair_t *q, int evt_fd) {
+    if (q->parsed || q->head_len < 5) {
+        return;
+    }
+    size_t want = 5 + (((size_t)q->head[3] << 8) | (size_t)q->head[4]);
+    if (want > RELAY_HEAD) {
+        q->parsed = 1;
+        dprintf(evt_fd, "X %llu\n", (unsigned long long)now_ms());
+        return;
+    }
+    if (q->head_len < want) {
+        return;
+    }
+    q->parsed = 1;
+    cloak_server_clientinfo_t info;
+    if (wire_clientinfo(q->head, want, &info) == 0) {
+        dprintf(evt_fd, "H %u %llu\n", info.session_id, (unsigned long long)now_ms());
+    } else {
+        dprintf(evt_fd, "X %llu\n", (unsigned long long)now_ms());
+    }
+}
+
+/* The relay child. Never returns. */
+static void relay_child_run(int listen_fd, int target_port, int evt_fd) {
+    /* A write to a socket whose peer has gone must not kill this child --
+     * it happens on every attempt made while the server is dead. */
+    signal(SIGPIPE, SIG_IGN);
+    static relay_pair_t pr[RELAY_PAIRS];
+    for (int i = 0; i < RELAY_PAIRS; i++) {
+        pr[i].cfd = -1;
+        pr[i].sfd = -1;
+    }
+    set_nonblock(listen_fd);
+
+    for (;;) {
+        struct pollfd p[1 + 2 * RELAY_PAIRS];
+        int ci[RELAY_PAIRS], si[RELAY_PAIRS];
+        nfds_t n = 0;
+        p[n].fd = listen_fd;
+        p[n].events = POLLIN;
+        p[n].revents = 0;
+        n++;
+        for (int i = 0; i < RELAY_PAIRS; i++) {
+            ci[i] = -1;
+            si[i] = -1;
+            if (!pr[i].used) {
+                continue;
+            }
+            if (pr[i].cfd >= 0) {
+                short ev = 0;
+                if (pr[i].c2s_len < RELAY_BUF) {
+                    ev = (short)(ev | POLLIN);
+                }
+                if (pr[i].s2c_off < pr[i].s2c_len) {
+                    ev = (short)(ev | POLLOUT);
+                }
+                ci[i] = (int)n;
+                p[n].fd = pr[i].cfd;
+                p[n].events = ev;
+                p[n].revents = 0;
+                n++;
+            }
+            if (pr[i].sfd >= 0) {
+                short ev = 0;
+                if (pr[i].s2c_len < RELAY_BUF) {
+                    ev = (short)(ev | POLLIN);
+                }
+                if (pr[i].c2s_off < pr[i].c2s_len) {
+                    ev = (short)(ev | POLLOUT);
+                }
+                si[i] = (int)n;
+                p[n].fd = pr[i].sfd;
+                p[n].events = ev;
+                p[n].revents = 0;
+                n++;
+            }
+        }
+        if (poll(p, n, 20) < 0 && errno != EINTR) {
+            _exit(0);
+        }
+
+        if ((p[0].revents & POLLIN) != 0) {
+            int cfd = accept(listen_fd, NULL, NULL);
+            if (cfd >= 0) {
+                dprintf(evt_fd, "A %llu\n", (unsigned long long)now_ms());
+                int slot = -1;
+                for (int i = 0; i < RELAY_PAIRS; i++) {
+                    if (!pr[i].used) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot < 0) {
+                    close(cfd);
+                } else {
+                    int sfd = dial(target_port);
+                    set_nonblock(cfd);
+                    if (sfd >= 0) {
+                        set_nonblock(sfd);
+                    } else {
+                        dprintf(evt_fd, "D %llu\n", (unsigned long long)now_ms());
+                    }
+                    memset(&pr[slot], 0, sizeof(pr[slot]));
+                    pr[slot].used = 1;
+                    pr[slot].cfd = cfd;
+                    pr[slot].sfd = sfd;
+                    pr[slot].opened_ms = now_ms();
+                }
+            }
+        }
+
+        for (int i = 0; i < RELAY_PAIRS; i++) {
+            if (!pr[i].used) {
+                continue;
+            }
+            relay_pair_t *q = &pr[i];
+            int dead = 0;
+            /* Only when POLLIN was ASKED FOR: with no room left in the
+             * buffer the events mask is 0, and reading anyway would be a
+             * zero-length read that reads as EOF. */
+            if (ci[i] >= 0 && (p[ci[i]].events & POLLIN) != 0 &&
+                (p[ci[i]].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+                ssize_t r = read(q->cfd, q->c2s + q->c2s_len, RELAY_BUF - q->c2s_len);
+                if (r > 0) {
+                    size_t room = RELAY_HEAD - q->head_len;
+                    size_t take = (size_t)r < room ? (size_t)r : room;
+                    memcpy(q->head + q->head_len, q->c2s + q->c2s_len, take);
+                    q->head_len += take;
+                    q->c2s_len += (size_t)r;
+                    relay_capture(q, evt_fd);
+                } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    dead = 1;
+                }
+            }
+            if (!dead && si[i] >= 0 && (p[si[i]].events & POLLIN) != 0 &&
+                (p[si[i]].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+                ssize_t r = read(q->sfd, q->s2c + q->s2c_len, RELAY_BUF - q->s2c_len);
+                if (r > 0) {
+                    q->s2c_len += (size_t)r;
+                } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    dead = 1;
+                }
+            }
+            if (!dead && si[i] >= 0 && q->c2s_off < q->c2s_len) {
+                ssize_t w = write(q->sfd, q->c2s + q->c2s_off, q->c2s_len - q->c2s_off);
+                if (w > 0) {
+                    q->c2s_off += (size_t)w;
+                    if (q->c2s_off == q->c2s_len) {
+                        q->c2s_off = 0;
+                        q->c2s_len = 0;
+                    }
+                } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    dead = 1;
+                }
+            }
+            if (!dead && ci[i] >= 0 && q->s2c_off < q->s2c_len) {
+                ssize_t w = write(q->cfd, q->s2c + q->s2c_off, q->s2c_len - q->s2c_off);
+                if (w > 0) {
+                    q->s2c_off += (size_t)w;
+                    if (q->s2c_off == q->s2c_len) {
+                        q->s2c_off = 0;
+                        q->s2c_len = 0;
+                    }
+                } else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    dead = 1;
+                }
+            }
+            /* THE DIAL WAS REFUSED: read the hello, report it, then close
+             * at once, so the attempt fails on an EOF rather than on the
+             * connector's handshake timeout. The 2 s floor is only for a
+             * connection that never says anything. */
+            if (!dead && q->sfd < 0 && (q->parsed || now_ms() - q->opened_ms > 2000)) {
+                dead = 1;
+            }
+            if (dead) {
+                relay_pair_close(q);
+            }
+        }
+    }
+}
+
+/* The parent's handle on that child: a monotone event log. */
+typedef struct {
+    pid_t pid;
+    int evt_fd;
+    char line[256];
+    size_t line_len;
+    unsigned accepts;
+    uint64_t last_accept_ms;
+    unsigned refused;
+    unsigned undecryptable;
+    uint32_t ids[512];
+    uint64_t id_ms[512];
+    unsigned n_ids;
+} relay_t;
+
+static int relay_start(relay_t *r, int listen_fd, int target_port) {
+    memset(r, 0, sizeof(*r));
+    r->evt_fd = -1;
+    int pf[2];
+    if (pipe(pf) != 0) {
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pf[0]);
+        close(pf[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(pf[0]);
+        relay_child_run(listen_fd, target_port, pf[1]);
+        /* _exit, NOT exit: this child is a fork of the test binary, and
+         * exit() would run LeakSanitizer's scan over an address space it
+         * inherited rather than built. It also makes this child the one
+         * fork in the case that costs nothing. */
+        _exit(0);
+    }
+    close(pf[1]);
+    r->pid = pid;
+    r->evt_fd = pf[0];
+    set_nonblock(r->evt_fd);
+    return 0;
+}
+
+static void relay_feed_line(relay_t *r, const char *s) {
+    unsigned long long at = 0;
+    unsigned id = 0;
+    if (sscanf(s, "A %llu", &at) == 1) {
+        r->accepts++;
+        r->last_accept_ms = (uint64_t)at;
+    } else if (sscanf(s, "H %u %llu", &id, &at) == 2) {
+        if (r->n_ids < sizeof(r->ids) / sizeof(r->ids[0])) {
+            r->ids[r->n_ids] = (uint32_t)id;
+            r->id_ms[r->n_ids] = (uint64_t)at;
+            r->n_ids++;
+        }
+    } else if (sscanf(s, "D %llu", &at) == 1) {
+        r->refused++;
+    } else if (sscanf(s, "X %llu", &at) == 1) {
+        r->undecryptable++;
+    }
+}
+
+/* Pulls whatever the relay has said, waiting at most wait_ms for the
+ * first byte. Purely additive: nothing this function records is ever
+ * unrecorded, which is what lets every predicate below be monotone. */
+static void relay_drain(relay_t *r, int wait_ms) {
+    for (;;) {
+        struct pollfd p = {r->evt_fd, POLLIN, 0};
+        if (poll(&p, 1, wait_ms) <= 0) {
+            return;
+        }
+        char buf[1024];
+        ssize_t n = read(r->evt_fd, buf, sizeof(buf));
+        if (n <= 0) {
+            return;
+        }
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == '\n') {
+                r->line[r->line_len] = '\0';
+                relay_feed_line(r, r->line);
+                r->line_len = 0;
+            } else if (r->line_len + 1 < sizeof(r->line)) {
+                r->line[r->line_len++] = buf[i];
+            }
+        }
+        wait_ms = 0;
+    }
+}
+
+static void relay_stop(relay_t *r) {
+    if (r->pid > 0) {
+        kill(r->pid, SIGKILL);
+        int st = 0;
+        waitpid(r->pid, &st, 0);
+        r->pid = 0;
+    }
+    if (r->evt_fd >= 0) {
+        close(r->evt_fd);
+        r->evt_fd = -1;
+    }
+}
+
+/* 1 while the child is still running. If it has exited it is reaped here
+ * and *status_out gets the wait status, so the assertion that fails can
+ * print what it died of. */
+static int child_still_running(child_t *c, int *status_out) {
+    if (c->pid <= 0) {
+        return 0;
+    }
+    int st = 0;
+    pid_t r = waitpid(c->pid, &st, WNOHANG);
+    if (r == c->pid) {
+        c->pid = 0;
+        if (status_out != NULL) {
+            *status_out = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static unsigned count_substr(const char *hay, const char *needle) {
+    unsigned n = 0;
+    size_t len = strlen(needle);
+    for (const char *p = strstr(hay, needle); p != NULL; p = strstr(p + len, needle)) {
+        n++;
+    }
+    return n;
+}
+
+/* ck-server on a GIVEN port, so the restart can reuse the one the client
+ * is already pointed at through the relay. */
+static int restart_start_server(child_t *c, int bind_port, int upstream_port) {
+    char upstream[64];
+    snprintf(upstream, sizeof(upstream), "127.0.0.1:%d", upstream_port);
+    char cfg[2048];
+    make_server_config_bypass(cfg, sizeof(cfg), bind_port, upstream, "\"" UID_B64 "\"", "");
+    char *const argv[] = {(char *)"ck-server", (char *)"-c", cfg, NULL};
+    if (child_spawn(c, CK_SERVER_PATH, argv, NULL) != 0) {
+        return -1;
+    }
+    return child_wait_for(c, "ck-server ready", BOOT_MS);
+}
+
+static void test_retries_across_a_server_restart(void) {
+    char pub[64];
+    derive_pub_b64(pub, sizeof(pub));
+
+    int front_port = 0;
+    int front_fd = listen_on(&front_port);
+    ASSERT_TRUE(front_fd >= 0);
+    int server_port = free_port();
+    ASSERT_TRUE(server_port > 0);
+
+    relay_t relay;
+    ASSERT_EQ_INT(0, relay_start(&relay, front_fd, server_port));
+    /* The child owns the listener now; the parent must not answer on it. */
+    close(front_fd);
+
+    int upstream_port = 0;
+    int upstream_fd = listen_on(&upstream_port);
+    ASSERT_TRUE(upstream_fd >= 0);
+
+    child_t server;
+    ASSERT_EQ_INT(0, restart_start_server(&server, server_port, upstream_port));
+
+    int local_port = free_port();
+    ASSERT_TRUE(local_port > 0);
+    char extra[512];
+    snprintf(extra, sizeof(extra),
+             "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"%d\","
+             "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"%d\",",
+             front_port, local_port);
+    char ccfg[2048];
+    make_client_config(ccfg, sizeof(ccfg), pub, extra);
+    char *const cargv[] = {(char *)"ck-client", (char *)"-c", ccfg, NULL};
+    child_t client;
+    ASSERT_EQ_INT(0, child_spawn(&client, CK_CLIENT_PATH, cargv, NULL));
+    ASSERT_EQ_INT(0, child_wait_for(&client, "session up", BOOT_MS));
+
+    /* ---- 1a. TRAFFIC, before anything is killed. --------------------- */
+    /* The reply buffer is EXACTLY the payload size, not one byte more:
+     * exchange() returns as soon as it is full, and a larger one would
+     * make every transfer here sit out its whole RESTART_XFER_MS budget.
+     * Measured before the fix: 8 s per transfer, 16 s on the case. */
+    static uint8_t sent1[RESTART_PAYLOAD];
+    static uint8_t got1[RESTART_PAYLOAD];
+    fill_payload(sent1, sizeof(sent1), 0xA11CEu);
+    int app = dial(local_port);
+    ASSERT_TRUE(app >= 0);
+    size_t up_seen = 0;
+    size_t n1 = exchange(app, upstream_fd, sent1, sizeof(sent1), 0x5Au, got1, sizeof(got1),
+                         &up_seen, RESTART_XFER_MS);
+    ASSERT_EQ_INT((long long)sizeof(sent1), (long long)n1);
+    ASSERT_EQ_INT((long long)sizeof(sent1), (long long)up_seen);
+    for (size_t i = 0; i < sizeof(sent1) && i < n1; i++) {
+        got1[i] = (uint8_t)(got1[i] ^ 0x5Au);
+    }
+    ASSERT_MEM_EQ(sent1, got1, n1 < sizeof(sent1) ? n1 : sizeof(sent1));
+    close(app);
+
+    /* The id THE SERVER AUTHENTICATED, off the wire. NumConn is 2, so the
+     * live session opened two connections and BOTH must carry the same
+     * id -- two ids here would mean two sessions on the server's registry
+     * for one client. */
+    relay_drain(&relay, 200);
+    ASSERT_TRUE(relay.n_ids >= 2);
+    uint32_t id0 = relay.n_ids > 0 ? relay.ids[0] : 0;
+    unsigned same = 0;
+    for (unsigned i = 0; i < relay.n_ids; i++) {
+        same += (relay.ids[i] == id0) ? 1u : 0u;
+    }
+    ASSERT_EQ_INT((long long)relay.n_ids, (long long)same);
+    ASSERT_EQ_INT(0, (long long)relay.undecryptable);
+    ASSERT_TRUE(id0 != 0);
+
+    /* AND THE CROSS-CHECK that makes every OTHER use of ck-client's log in
+     * this file evidence rather than assumption: the id the server's
+     * decrypter recovered is the id the client says it used. */
+    {
+        char hex[16];
+        snprintf(hex, sizeof(hex), "%08x", id0);
+        child_drain(&client, 50);
+        ASSERT_TRUE(strstr(client.out, hex) != NULL);
+    }
+
+    /* ---- 1b/3. KILL IT, and watch the client keep knocking. ---------- */
+    unsigned ids_before = relay.n_ids;
+    unsigned accepts_before = relay.accepts;
+    kill(server.pid, SIGKILL);
+    (void)child_reap(&server, EXIT_MS);
+    uint64_t t_break = now_ms();
+
+    uint64_t bar = t_break + RESTART_N_MS;
+    uint64_t hard = bar + RESTART_WINDOW_MS;
+    uint64_t late_hello_ms = 0;
+    int client_died_as = -1;
+    while (now_ms() < hard) {
+        relay_drain(&relay, 50);
+        child_drain(&client, 0);
+        if (!child_still_running(&client, &client_died_as)) {
+            break;
+        }
+        if (relay.n_ids > ids_before && relay.id_ms[relay.n_ids - 1] >= bar) {
+            late_hello_ms = relay.id_ms[relay.n_ids - 1];
+            break;
+        }
+    }
+
+    /* THE PREMISE cmd/ck-client/main.c:41-47 RESTS ON. */
+    ASSERT_EQ_INT(-1, client_died_as);
+    ASSERT_TRUE(child_still_running(&client, &client_died_as));
+    /* Still TRYING, not merely still alive -- a client that gave up would
+     * also still be running, because ck-client's on_event only logs. */
+    ASSERT_TRUE(late_hello_ms != 0);
+    ASSERT_TRUE(late_hello_ms - t_break >= RESTART_N_MS);
+    ASSERT_TRUE(strstr(client.out, "gave up") == NULL);
+    fprintf(stderr, "restart: %u attempts and %u handshakes in the %llu ms after the break\n",
+            relay.accepts - accepts_before, relay.n_ids - ids_before,
+            (unsigned long long)(now_ms() - t_break));
+
+    /* ---- 2. EVERY id it offered while the server was dead is FRESH. --- */
+    unsigned distinct = 0;
+    for (unsigned i = ids_before; i < relay.n_ids; i++) {
+        ASSERT_TRUE(relay.ids[i] != id0);
+        int seen_before = 0;
+        for (unsigned j = ids_before; j < i; j++) {
+            seen_before |= (relay.ids[j] == relay.ids[i]);
+        }
+        distinct += seen_before ? 0u : 1u;
+    }
+    /* At least two rounds: the schedule above puts round 2's start at
+     * 10625 ms after the break at the very latest, and the bar is 12000. */
+    ASSERT_TRUE(distinct >= 2);
+
+    /* ---- 1c. BRING IT BACK, on the same port. ----------------------- */
+    unsigned ids_at_restart = relay.n_ids;
+    ASSERT_EQ_INT(0, restart_start_server(&server, server_port, upstream_port));
+    uint64_t t_back = now_ms();
+
+    uint64_t resume_deadline = now_ms() + RESTART_RESUME_MS;
+    int resumed = 0;
+    while (now_ms() < resume_deadline) {
+        relay_drain(&relay, 50);
+        child_drain(&client, 0);
+        if (count_substr(client.out, "session up") >= 2) {
+            resumed = 1;
+            break;
+        }
+        if (!child_still_running(&client, &client_died_as)) {
+            break;
+        }
+    }
+    ASSERT_EQ_INT(1, resumed);
+    uint64_t t_up = now_ms();
+    relay_drain(&relay, 200);
+    ASSERT_TRUE(relay.n_ids > ids_at_restart);
+    uint32_t id1 = relay.ids[relay.n_ids - 1];
+    /* Case 2, stated against the session that is about to carry bytes. */
+    ASSERT_TRUE(id1 != id0);
+
+    /* ---- 1d. AND TRAFFIC CARRIES AGAIN. ----------------------------- */
+    static uint8_t sent2[RESTART_PAYLOAD];
+    static uint8_t got2[RESTART_PAYLOAD];
+    fill_payload(sent2, sizeof(sent2), 0xB0B1Eu);
+    int app2 = dial(local_port);
+    ASSERT_TRUE(app2 >= 0);
+    up_seen = 0;
+    size_t n2 = exchange(app2, upstream_fd, sent2, sizeof(sent2), 0x33u, got2, sizeof(got2),
+                         &up_seen, RESTART_XFER_MS);
+    ASSERT_EQ_INT((long long)sizeof(sent2), (long long)n2);
+    ASSERT_EQ_INT((long long)sizeof(sent2), (long long)up_seen);
+    for (size_t i = 0; i < sizeof(sent2) && i < n2; i++) {
+        got2[i] = (uint8_t)(got2[i] ^ 0x33u);
+    }
+    ASSERT_MEM_EQ(sent2, got2, n2 < sizeof(sent2) ? n2 : sizeof(sent2));
+    /* The second payload is a DIFFERENT one, so a relay that replayed the
+     * first transfer's bytes cannot pass this. */
+    ASSERT_MEM_NE(sent1, sent2, sizeof(sent1));
+    close(app2);
+
+    fprintf(stderr,
+            "restart: id %08x -> %08x, %u distinct ids while down, %u attempts total; "
+            "server back at +%llu ms, session up again at +%llu ms, %zu bytes of client log\n",
+            id0, id1, distinct, relay.accepts, (unsigned long long)(t_back - t_break),
+            (unsigned long long)(t_up - t_break), client.out_len);
+
+    ASSERT_EQ_INT(0, child_stop(&client));
+    ASSERT_EQ_INT(0, child_stop(&server));
+    relay_stop(&relay);
+    close(upstream_fd);
+}
+
+/* ------------------------------------------------------------------ */
 /* ONE FILE, TWO BINARIES (module 10b task 8)                           */
 /* ------------------------------------------------------------------ */
 
@@ -2857,12 +3551,14 @@ static void test_keepalive_is_warned_about(void) {
 
 #define CK_CLI_CONFIG 1
 #define CK_CLI_RUNTIME 2
+#define CK_CLI_RESTART 3
 
 #ifndef CK_CLI_PART
 #error "CK_CLI_PART must be defined by the build (1 = config, 2 = runtime)"
 #endif
-#if CK_CLI_PART != CK_CLI_CONFIG && CK_CLI_PART != CK_CLI_RUNTIME
-#error "CK_CLI_PART must be 1 (config) or 2 (runtime)"
+#if CK_CLI_PART != CK_CLI_CONFIG && CK_CLI_PART != CK_CLI_RUNTIME && \
+    CK_CLI_PART != CK_CLI_RESTART
+#error "CK_CLI_PART must be 1 (config), 2 (runtime) or 3 (restart)"
 #endif
 
 typedef struct {
@@ -2916,6 +3612,12 @@ static const cli_case_t k_cases[] = {
      test_verbosity_is_validated_and_takes_effect, CK_CLI_RUNTIME},  /*  2691 ms */
     {"keepalive_is_warned_about",
      test_keepalive_is_warned_about, CK_CLI_RUNTIME},  /*  1823 ms */
+    /* A HALF OF ITS OWN, and the ms figure is the only one in this table
+     * that is not process startup: see the case's own comment. It waits
+     * out a reconnect ladder it cannot shorten, so putting it in either
+     * half above would have doubled that half. */
+    {"retries_across_a_server_restart",
+     test_retries_across_a_server_restart, CK_CLI_RESTART},  /* 30000 ms */
 };
 
 TEST_MAIN_BEGIN()
