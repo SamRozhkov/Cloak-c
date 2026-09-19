@@ -170,8 +170,8 @@ const char *cloak_server_stack_strerror(int code);
 /* Slots in the replay cache. Go's server keeps its replay window in a
  * map it never bounds; this port bounds it, so the number has to come
  * from somewhere, AND THE FIRST ANSWER WAS WRONG IN A WAY WORTH
- * RECORDING. It was CLOAK_REGISTRY_MAX_SESSIONS (256) sessions times the
- * four connections a multi-connection client opens, i.e. 1024, and it
+ * RECORDING. It was CLOAK_REGISTRY_MAX_SESSIONS (256 at the time) sessions
+ * times the four connections a multi-connection client opens, i.e. 1024, and it
  * described itself as "the number of distinct handshakes a fully loaded
  * server sees inside one replay window". It is not. 256 * 4 is the
  * server's CONCURRENT CONNECTION CEILING. The replay window is a
@@ -185,11 +185,17 @@ const char *cloak_server_stack_strerror(int code);
  * THE ARITHMETIC, with every input named.
  *
  *   Concurrency ceiling   C_conn = CLOAK_REGISTRY_MAX_SESSIONS * 4
- *                                = 256 * 4 = 1024 connections
- *     (cloak/registry.h:60 for the 256; 4 is the NumConn a
+ *                                = 1024 * 4 = 4096 connections
+ *     (cloak/registry.h's CLOAK_REGISTRY_MAX_SESSIONS for the 1024 and
+ *      the whole argument for that number; 4 is the NumConn a
  *      multi-connection client opens per session, which is what the
  *      previous sizing comment used and what upstream's example config
- *      ships.)
+ *      ships. THIS TERM MOVED: the session cap was raised from 256 to
+ *      1024 in the commit that lifted it, and everything below moved
+ *      with it -- a cap four times higher is a sized handshake rate four
+ *      times higher, and a replay cache that did not follow would have
+ *      quietly gone back to overwriting itself under load, which is the
+ *      exact defect recorded two paragraphs up.)
  *
  *   Turnover assumption   T = 120 s for a complete turnover of those
  *                             connections -- a mobile/NAT reconnect
@@ -199,7 +205,7 @@ const char *cloak_server_stack_strerror(int code);
  *                             with. Nothing measures a real deployment's
  *                             reconnect rate here.
  *
- *   Sized handshake rate  R = 1024 / 120 s = 8.53 handshakes/s
+ *   Sized handshake rate  R = 4096 / 120 s = 34.13 handshakes/s
  *
  *   Retention window      W = 2 * CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS
  *                           = 360 s
@@ -210,22 +216,23 @@ const char *cloak_server_stack_strerror(int code);
  *      timestamp whatever this cache says, so W -- not the 12-hour age
  *      limit -- is the window over which retention has any effect.)
  *
- *   Inserts to survive    N = R * W = 8.53 * 360 = 3072
+ *   Inserts to survive    N = R * W = 34.13 * 360 = 12,288
  *
  *   Direct-mapped survival of one entry against N later inserts is
  *   (1 - 1/C)^N ~ e^(-N/C). Requiring 99 %:
  *
- *       C >= N / ln(1/0.99) = 3072 / 0.01005 = 305,671
+ *       C >= N / ln(1/0.99) = 12,288 / 0.01005 = 1,222,686
  *
- *   Next power of two: 524,288 = 2^19, giving e^(-3072/524288) = 99.42 %.
+ *   Next power of two: 2,097,152 = 2^21, giving
+ *   e^(-12288/2097152) = 99.42 %.
  *
  * CROSS-CHECK AT THE 12-HOUR HORIZON, because that is the figure the
  * plan asked for: R * CLOAK_SERVER_AUTH_REPLAY_CACHE_AGE_LIMIT_SECONDS =
- * 8.53 * 43,200 = 368,640 inserts over a full age window, which is 0.70
- * of 524,288 -- FEWER INSERTS THAN SLOTS. The old 1024 took 360 times
- * its own size over the same period.
+ * 34.13 * 43,200 = 1,474,560 inserts over a full age window, which is
+ * 0.70 of 2,097,152 -- FEWER INSERTS THAN SLOTS. The original 1024 took
+ * 360 times its own size over the same period.
  *
- * COST: 524,288 * sizeof(cloak_replay_slot_t) (40 bytes) = 20 MiB, in
+ * COST: 2,097,152 * sizeof(cloak_replay_slot_t) (40 bytes) = 80 MiB, in
  * one calloc at cloak_server_init. On glibc an allocation that size is
  * an mmap of untouched zero pages, so a lightly loaded server's resident
  * cost is the slots it actually touches rather than the whole table.
@@ -237,7 +244,7 @@ const char *cloak_server_stack_strerror(int code);
  * N from the same constants and asserts the inequality: a change to the
  * tolerance, to CLOAK_REGISTRY_MAX_SESSIONS or to this number that
  * breaks the sizing fails there rather than being discovered in prose. */
-#define CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY  ((size_t)524288)
+#define CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY  ((size_t)2097152)
 
 /* ------------------------------------------------------------------ */
 /* Configuration                                                       */

@@ -44,22 +44,41 @@ add_test(NAME test_replay_cache COMMAND test_replay_cache)
 #
 # In-process, no fork, so it stays "fast" by default (see the top-level
 # CMakeLists.txt on the fast/slow split). It is not free, though: case 2
-# runs 32 floods of ln(2)*524288 inserts each, about 11.6 million keyed
-# hashes, and case 3 allocates two more tables and fills them. MEASURED
-# at 2.53 s through ctest in a Debug build at the commit that added it
-# (`ctest -R ^test_replay_cache_keyed$`); for scale, the same run's
-# slowest tests are test_adminapi at 12.20 s and test_dispatcher_ws at
-# 11.99 s, and neither of those forks either. TIMEOUT 120 is roughly a 47x
-# margin on that; THE SANITIZER BUILD WAS NOT MEASURED -- the disk had
-# no room for a second build directory on the machine this was written
-# on, and 120 was chosen to leave room for the order-of-magnitude
-# slowdown the other TIMEOUT comments in this file report under
-# ASan+UBSan rather than from a number anyone here observed.
+# runs 32 floods of ln(2)*C inserts each and case 3 allocates two more
+# tables and fills them, so its whole cost is proportional to
+# CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY.
+#
+# THE TIMEOUT MOVED WITH THE SESSION CAP, and this is the record of why.
+# When this test was added the capacity was 2^19, case 2 was about 11.6
+# million keyed hashes, and it MEASURED at 2.53 s through ctest in a
+# Debug build -- TIMEOUT 120, roughly a 47x margin, chosen to leave room
+# for the order-of-magnitude ASan+UBSan slowdown the other TIMEOUT
+# comments in this file report rather than from a sanitizer number anyone
+# had observed. Raising CLOAK_REGISTRY_MAX_SESSIONS from 256 to 1024
+# raised the sized handshake rate fourfold and the capacity with it, to
+# 2^21; case 2 is now about 46.5 million keyed hashes. MEASURED at
+# 14.66 s in a Debug build at that commit, same command.
+#
+# AND THE SANITIZER BUILD WAS MEASURED THIS TIME, which is worth recording
+# because the number the earlier comment reasoned its way to was wrong:
+# an ASan+UBSan build of the whole suite ran this test in 23.75 s, a
+# slowdown of 1.6x rather than the order of magnitude the other TIMEOUT
+# comments in this file assume. The prediction from that assumption was
+# ~147 s. TIMEOUT 600 is a 41x margin on the Debug measurement and a 25x
+# margin on the sanitizer one; the old 120 would in fact have survived,
+# and is being raised anyway because a 5x margin under -j4 on a loaded
+# machine is not one.
+#
+# NOTHING IN THE TEST ITSELF CHANGED SHAPE: every number in it is derived
+# from SHIPPED_CAPACITY and REPLAY_WINDOW_SECONDS, and the two literals
+# that are not (the insert count the sizing comment quotes, and the
+# capacity floor that stops the constant moving DOWN) moved to the values
+# the same two constants now produce.
 add_executable(test_replay_cache_keyed test_replay_cache_keyed.c)
 target_include_directories(test_replay_cache_keyed PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_replay_cache_keyed PRIVATE cloak-server)
 add_test(NAME test_replay_cache_keyed COMMAND test_replay_cache_keyed)
-set_tests_properties(test_replay_cache_keyed PROPERTIES TIMEOUT 120)
+set_tests_properties(test_replay_cache_keyed PROPERTIES TIMEOUT 600)
 
 add_executable(test_firstpacket test_firstpacket.c)
 target_include_directories(test_firstpacket PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
@@ -72,6 +91,27 @@ target_include_directories(test_server_state PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_server_state PRIVATE cloak-server)
 add_test(NAME test_server_state COMMAND test_server_state)
 set_tests_properties(test_server_state PROPERTIES TIMEOUT 60)
+
+# The session cap at its own scale (module 10b task 4): 1024 sessions
+# established, the cost of finding one measured at four occupancies, and
+# the refusal at the cap held against the cover-site redirect.
+#
+# NOT labelled "slow": it forks nothing (the fast/slow split in the
+# top-level CMakeLists.txt is by fork-or-not, not by duration). It is not
+# free either -- case 1 builds 1024 real cloak_session_t's, case 2 builds
+# 1345 more across its four measurement points and runs 100k lookups, and
+# case 3 drives 242 real TCP probes through a dispatcher at a full
+# registry. MEASURED at 0.26 s through ctest in a Debug build at the
+# commit that added it (`ctest -R ^test_registry_scale$`), of which case 3
+# is most of it, and MEASURED at 1.47 s in an ASan+UBSan build of the same
+# tree -- a slowdown of 5.7x, not the order of magnitude the older TIMEOUT
+# comments in this file assume. TIMEOUT 300 is a 1150x margin on the first
+# number and a 204x margin on the second.
+add_executable(test_registry_scale test_registry_scale.c)
+target_include_directories(test_registry_scale PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_registry_scale PRIVATE cloak-server cloak-client)
+add_test(NAME test_registry_scale COMMAND test_registry_scale)
+set_tests_properties(test_registry_scale PROPERTIES TIMEOUT 300)
 
 add_executable(test_registry test_registry.c)
 target_include_directories(test_registry PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)

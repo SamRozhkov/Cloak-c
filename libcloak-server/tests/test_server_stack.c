@@ -1822,16 +1822,22 @@ static void test_replay_cache_capacity(void) {
     stack_config(&e, &sc);
     cloak_server_stack_t *st = NULL;
     ASSERT_EQ_INT(0, cloak_server_stack_open(&st, &sc, err, sizeof(err)));
-    /* 524288, and it was 1024 until the replay cache was keyed and
-     * resized (see cloak/server_stack.h for the arithmetic and
-     * cloak/replay_cache.h for why). THE ONLY THING THAT CHANGED HERE IS
-     * THE LITERAL: the assertion still spells the number out rather than
-     * deriving it from CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY,
-     * for the reason above, and still reads it back through the accessor
-     * that reports what cloak_server_init really allocated. A
-     * substitution that never reached the allocation is still visible,
-     * and so is a future change to the constant that nobody meant. */
-    ASSERT_EQ_INT(524288, (int)cloak_server_stack_replay_cache_capacity(st));
+    /* 2097152. It was 1024 until the replay cache was keyed and resized,
+     * and 524288 until the SESSION CAP was lifted from 256 to 1024 --
+     * cloak/server_stack.h derives this capacity from
+     * CLOAK_REGISTRY_MAX_SESSIONS * 4 connections turning over every
+     * 120 s, so a fourfold cap is a fourfold sized handshake rate and a
+     * fourfold capacity. THE ONLY THING THAT CHANGED HERE, BOTH TIMES,
+     * IS THE LITERAL: the assertion still spells the number out rather
+     * than deriving it from
+     * CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY, for the reason
+     * above, and still reads it back through the accessor that reports
+     * what cloak_server_init really allocated. A substitution that never
+     * reached the allocation is still visible, and so is a future change
+     * to the constant that nobody meant -- INCLUDING THIS ONE: this
+     * assertion is what failed when the cap was raised, which is the
+     * whole point of spelling it out. */
+    ASSERT_EQ_INT(2097152, (int)cloak_server_stack_replay_cache_capacity(st));
     cloak_server_stack_close(st);
 
     /* An explicit value is honoured verbatim, which is what makes the

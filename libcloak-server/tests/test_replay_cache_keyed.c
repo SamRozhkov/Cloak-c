@@ -121,7 +121,7 @@ static size_t sole_occupied_slot(const cloak_replay_cache_t *cache) {
  * constant be divided by 512 without failing. Everything below derives
  * its arithmetic from the symbol so the numbers move with it; this one
  * line is what stops it moving DOWN. */
-#define SHIPPED_CAPACITY_FLOOR ((size_t)524288)
+#define SHIPPED_CAPACITY_FLOOR ((size_t)2097152)
 
 #define SHIPPED_CAPACITY CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY
 #define OLD_CAPACITY ((size_t)1024)
@@ -140,13 +140,17 @@ static size_t sole_occupied_slot(const cloak_replay_cache_t *cache) {
 /* The handshake rate the table is sized for, and where it comes from.
  * CLOAK_REGISTRY_MAX_SESSIONS sessions, each with the four connections
  * a multi-connection client opens, is the server's CONCURRENT
- * connection ceiling -- and that product, 1024, was the old capacity,
- * which is the defect in one line: it counted concurrency and forgot
- * time. Sizing assumption on top of it: complete turnover of those
- * connections every 120 s, a mobile/NAT reconnect interval, i.e. 8.53
- * new handshakes per second. server_stack.h carries the same
+ * connection ceiling -- and that product, back when the cap was 256,
+ * was 1024, which WAS the old capacity: the defect in one line, a
+ * number that counted concurrency and forgot time. Sizing assumption on
+ * top of it: complete turnover of those connections every 120 s, a
+ * mobile/NAT reconnect interval. server_stack.h carries the same
  * derivation; both are written out so that a change to one shows up as
- * a failure of the other. */
+ * a failure of the other -- WHICH IS WHAT HAPPENED. Raising
+ * CLOAK_REGISTRY_MAX_SESSIONS from 256 to 1024 quadrupled this rate and
+ * broke the assertion below against the old 2^19 capacity; the shipped
+ * capacity moved to 2^21 in the same commit, and the two literals in
+ * this file moved with the two constants they are derived from. */
 #define SIZED_CONCURRENT_CONNECTIONS ((size_t)CLOAK_REGISTRY_MAX_SESSIONS * 4)
 #define SIZED_TURNOVER_SECONDS ((size_t)120)
 #define SIZED_INSERTS_PER_REPLAY_WINDOW \
@@ -159,9 +163,9 @@ static void test_shipped_capacity_meets_its_floor(void) {
      * so that this stops being a whole number, the sizing comment in
      * server_stack.h is stale and this is where it shows. */
     ASSERT_EQ_INT(360, (int)REPLAY_WINDOW_SECONDS);
-    ASSERT_EQ_INT(3072, (int)SIZED_INSERTS_PER_REPLAY_WINDOW);
-    /* 1 - (1 - 1/C)^N >= 99 % survival needs C >= N / 0.01005 = 305,671.
-     * 2^19 = 524,288 clears it; the check is written as the integer
+    ASSERT_EQ_INT(12288, (int)SIZED_INSERTS_PER_REPLAY_WINDOW);
+    /* 1 - (1 - 1/C)^N >= 99 % survival needs C >= N / 0.01005 =
+     * 1,222,686. 2^21 = 2,097,152 clears it; the check is written as the integer
      * inequality C * 1005 >= N * 100000 so it has no floating point in
      * it. */
     ASSERT_TRUE(SHIPPED_CAPACITY * 1005ULL >= (unsigned long long)SIZED_INSERTS_PER_REPLAY_WINDOW * 100000ULL);
@@ -250,16 +254,20 @@ static void test_case1_targeted_eviction(void) {
  * Blind flooding is the only eviction left once the hash is keyed. A
  * flood of N random inserts evicts a chosen victim with probability
  * 1 - (1 - 1/C)^N, so the N that reaches even a COIN FLIP is
- * ln(2) * C = 0.693 * 524,288 = 363,409 handshakes -- and every one of
- * them must arrive inside REPLAY_WINDOW_SECONDS, because outside it the
+ * ln(2) * C = 0.693 * 2,097,152 = 1,453,635 handshakes -- and every one
+ * of them must arrive inside REPLAY_WINDOW_SECONDS, because outside it the
  * captured ciphertext is refused on its timestamp whatever this cache
- * says. That is 1009 full handshakes per second, sustained, against one
+ * says. That is 4037 full handshakes per second, sustained, against one
  * server, to reach a 50 % chance -- versus ONE packet before the fix.
+ * (These three numbers are 4x what they were when this case was written,
+ * for the reason SIZED_CONCURRENT_CONNECTIONS above now gives: the
+ * session cap moved and the capacity moved with it. The case itself is
+ * unchanged -- it derives everything from SHIPPED_CAPACITY.)
  *
- * HONEST ABOUT WHAT THIS IS NOT. 1009 handshakes/s is not beyond a
+ * HONEST ABOUT WHAT THIS IS NOT. 4037 handshakes/s is not beyond a
  * state-level adversary's bandwidth; the brief's word for the result
  * was "infeasible" and that is not what was measured. What IS measured
- * is a cost ratio of 3.6e5, and a change of KIND: the pre-fix attack
+ * is a cost ratio of 1.5e6, and a change of KIND: the pre-fix attack
  * was one silent packet indistinguishable from a client connecting, and
  * the post-fix attack is a sustained flood that is a denial of service
  * in its own right and looks like one. The claim here is the ratio and

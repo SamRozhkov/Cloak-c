@@ -6,7 +6,17 @@
 #include <time.h>
 
 #include "cloak/base64.h"
+#include "cloak/common.h" /* cloak_random_bytes, for this panel's hash key */
 #include "cloak/log.h"
+
+#include "hash_internal.h"
+
+/* Buckets for the active-user chains. A power of two, so the reduction is
+ * a mask; 256 against CLOAK_USERPANEL_MAX_ACTIVE_USERS (1024) is a load
+ * factor of 4, deliberately looser than the registry's 0.5 -- what lands
+ * here is one entry per ACTIVE USER rather than one per session, and
+ * 2 KiB of heads is the whole cost. */
+#define PANEL_UID_BUCKETS 256
 
 /* One UID's accumulated usage between two uploads. Separate from
  * cloak_userpanel_user_t on purpose -- see cloak_userpanel_upload_now's
@@ -23,6 +33,29 @@ struct cloak_userpanel {
      * their embedded valve's address is handed to every session that user
      * holds. See cloak_userpanel_user_t's own comment. */
     cloak_userpanel_user_t *active[CLOAK_USERPANEL_MAX_ACTIVE_USERS];
+
+    /* THE LOOKUP INDEX over exactly the same entries, described at
+     * cloak_userpanel_user_t::hash_next in cloak/userpanel.h. panel_find
+     * runs once per handshake and this is what stops it costing a scan of
+     * `active` -- 1024 slots since the session cap moved. Maintained in
+     * exactly two functions, panel_index_add and panel_index_del, each
+     * called from exactly the one place that fills or clears a slot in
+     * `active` above. */
+    cloak_userpanel_user_t *uid_buckets[PANEL_UID_BUCKETS];
+
+    /* Keyed, per panel, from cloak_random_bytes -- see hash_internal.h.
+     * A UID reaching panel_find has been named by a client but not
+     * necessarily authenticated (cloak_userpanel_get_user is what
+     * authenticates it), so the bucket function is not something a prober
+     * gets to evaluate offline. */
+    uint8_t hash_key[16];
+
+    /* The number of non-NULL slots in `active`, maintained alongside the
+     * index so that the room check on the handshake path and
+     * cloak_userpanel_active_count are both O(1). Counts terminating
+     * entries, exactly as the scan it replaced did -- such an entry still
+     * holds its slot until cloak_userpanel_terminate frees it. */
+    size_t n_active;
 
     /* Compacted: queue_n entries at the front, no holes. */
     struct panel_queue_entry queue[CLOAK_USERPANEL_MAX_QUEUED_USERS];
@@ -116,20 +149,62 @@ static int64_t panel_add_sat(int64_t a, int64_t b) {
 /* The active-user table                                               */
 /* ------------------------------------------------------------------ */
 
-/* Linear over a fixed table, like cloak_server_registry_find and
- * cloak_proxy_t's own scans, and for the same reason: the table is small
- * and a second index keyed on UID could disagree with it.
+/* One walk of one hash chain -- see cloak_userpanel_t::uid_buckets. This
+ * was a linear scan of the whole `active` array, justified by "the table
+ * is small and a second index keyed on UID could disagree with it", until
+ * CLOAK_USERPANEL_MAX_ACTIVE_USERS followed CLOAK_REGISTRY_MAX_SESSIONS
+ * up to 1024 and "small" stopped being true of something on the
+ * per-handshake path. The disagreement risk is real and is answered by a
+ * test rather than by an argument: test_registry_scale.c case 7.
+ *
+ * A UID CAN LEGITIMATELY APPEAR TWICE in one chain -- a reentrant
+ * get_user during cloak_userpanel_terminate's step 2 can install a second
+ * entry for a UID whose first entry is still terminating -- so this walks
+ * the chain for a non-terminating match rather than stopping at the first
+ * UID hit.
  *
  * Entries marked terminating are skipped -- from the outside such a user
  * has already stopped being active, and handing back an entry whose valve
  * is about to be freed is exactly the use-after-free this rule prevents.
  * It is also what makes a reentrant cloak_userpanel_notify_session_closed
  * a no-op without needing a second flag. */
+static size_t panel_uid_bucket(const cloak_userpanel_t *p, const uint8_t uid[CLOAK_UID_LEN]) {
+    return (size_t)(cloak_siphash24(p->hash_key, uid, CLOAK_UID_LEN) &
+                    (uint64_t)(PANEL_UID_BUCKETS - 1));
+}
+
+/* The only two functions that change an entry's chain membership or
+ * p->n_active, each called from the one place that fills or clears its
+ * slot in p->active. */
+static void panel_index_add(cloak_userpanel_t *p, cloak_userpanel_user_t *u) {
+    cloak_userpanel_user_t **head = &p->uid_buckets[panel_uid_bucket(p, u->uid)];
+    u->hash_next = *head;
+    if (*head != NULL) {
+        (*head)->hash_pprev = &u->hash_next;
+    }
+    *head = u;
+    u->hash_pprev = head;
+    p->n_active++;
+}
+
+static void panel_index_del(cloak_userpanel_t *p, cloak_userpanel_user_t *u) {
+    if (u->hash_pprev == NULL) {
+        return;
+    }
+    if (u->hash_next != NULL) {
+        u->hash_next->hash_pprev = u->hash_pprev;
+    }
+    *u->hash_pprev = u->hash_next;
+    u->hash_next = NULL;
+    u->hash_pprev = NULL;
+    p->n_active--;
+}
+
 static cloak_userpanel_user_t *panel_find(const cloak_userpanel_t *p,
                                           const uint8_t uid[CLOAK_UID_LEN]) {
-    for (size_t i = 0; i < CLOAK_USERPANEL_MAX_ACTIVE_USERS; i++) {
-        cloak_userpanel_user_t *u = p->active[i];
-        if (u != NULL && !u->terminating && memcmp(u->uid, uid, CLOAK_UID_LEN) == 0) {
+    for (cloak_userpanel_user_t *u = p->uid_buckets[panel_uid_bucket(p, uid)]; u != NULL;
+         u = u->hash_next) {
+        if (!u->terminating && memcmp(u->uid, uid, CLOAK_UID_LEN) == 0) {
             return u;
         }
     }
@@ -137,7 +212,16 @@ static cloak_userpanel_user_t *panel_find(const cloak_userpanel_t *p,
 }
 
 /* Allocates and installs a new active user. Returns NULL and writes the
- * reason through *out_err (CLOAK_USERPANEL_ERR_FULL or _ALLOC). */
+ * reason through *out_err (CLOAK_USERPANEL_ERR_FULL or _ALLOC).
+ *
+ * THE FREE-SLOT SEARCH IS STILL LINEAR, deliberately rather than by
+ * oversight: it runs once per user ACTIVATION, not once per handshake (a
+ * handshake for an already-active user is answered by panel_find above
+ * and never reaches here), and the slot array is what the periodic upload
+ * and reap enumerate. Making it O(1) would mean a free-list -- a fourth
+ * thing to keep in step -- to save at most CLOAK_USERPANEL_MAX_ACTIVE_USERS
+ * pointer tests on an event that also performs a synchronous SQLite
+ * read. */
 static cloak_userpanel_user_t *panel_new_user(cloak_userpanel_t *p,
                                               const uint8_t uid[CLOAK_UID_LEN], int bypass,
                                               int *out_err) {
@@ -163,6 +247,7 @@ static cloak_userpanel_user_t *panel_new_user(cloak_userpanel_t *p,
     u->bypass = bypass;
 
     p->active[slot] = u;
+    panel_index_add(p, u);
     *out_err = 0;
     return u;
 }
@@ -317,6 +402,12 @@ int cloak_userpanel_open(cloak_userpanel_t **out, const cloak_userpanel_config_t
         return CLOAK_USERPANEL_ERR_ALLOC;
     }
     p->cfg = *cfg;
+    /* Drawn here, per panel, and never anywhere else -- the same
+     * discipline cloak_replay_cache_init and cloak_server_registry_init
+     * follow, for the reason hash_internal.h gives. Before any entry can
+     * exist, since the bucket an entry lands in is computed from this key
+     * and nothing rehashes. */
+    cloak_random_bytes(p->hash_key, sizeof(p->hash_key));
     if (p->cfg.upload_interval_ms == 0) {
         p->cfg.upload_interval_ms = CLOAK_USERPANEL_DEFAULT_UPLOAD_INTERVAL_MS;
     }
@@ -348,6 +439,12 @@ void cloak_userpanel_close(cloak_userpanel_t *p) {
         free(p->active[i]);
         p->active[i] = NULL;
     }
+    /* The chains pointed into what was just freed. Nothing reads them
+     * again -- p itself goes next -- but leaving dangling heads in a
+     * struct about to be passed to free() is the kind of thing that
+     * survives a refactor, so they go with their entries. */
+    memset(p->uid_buckets, 0, sizeof(p->uid_buckets));
+    p->n_active = 0;
     free(p);
 }
 
@@ -382,11 +479,7 @@ int cloak_userpanel_get_user(cloak_userpanel_t *p, const uint8_t uid[CLOAK_UID_L
      * (cloak/usermanager.h), and a full table would otherwise let anyone
      * who can reach the handshake force one per connection attempt for a
      * user that can never be admitted anyway. */
-    int has_room = 0;
-    for (size_t i = 0; i < CLOAK_USERPANEL_MAX_ACTIVE_USERS && !has_room; i++) {
-        has_room = p->active[i] == NULL;
-    }
-    if (!has_room) {
+    if (p->n_active >= CLOAK_USERPANEL_MAX_ACTIVE_USERS) {
         return CLOAK_USERPANEL_ERR_FULL;
     }
 
@@ -482,13 +575,10 @@ size_t cloak_userpanel_active_count(const cloak_userpanel_t *p) {
     if (p == NULL) {
         return 0;
     }
-    size_t n = 0;
-    for (size_t i = 0; i < CLOAK_USERPANEL_MAX_ACTIVE_USERS; i++) {
-        if (p->active[i] != NULL) {
-            n++;
-        }
-    }
-    return n;
+    /* Maintained, not recomputed -- see cloak_userpanel_t::n_active. It
+     * counts exactly what the scan it replaced counted: every non-NULL
+     * slot, terminating entries included. */
+    return p->n_active;
 }
 
 /* A cloak_registry_closing_cb: forwards each session about to be closed
@@ -574,6 +664,7 @@ void cloak_userpanel_terminate(cloak_userpanel_t *p, cloak_userpanel_user_t *use
             break;
         }
     }
+    panel_index_del(p, user);
     free(user);
 }
 

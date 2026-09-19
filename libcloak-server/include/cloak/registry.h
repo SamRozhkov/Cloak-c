@@ -46,7 +46,9 @@
  * userdata for as long as that session lives. Storing entries by value in
  * a growable array would be a use-after-free the moment such an array
  * reallocs out from under a live session's callback userdata -- so this
- * table is a fixed-size array of pointers instead.
+ * table is a fixed-size, open-chained hash OF POINTERS to them instead;
+ * see CLOAK_REGISTRY_KEY_BUCKETS below for the structure and for what it
+ * replaced.
  *
  * The table is capped at CLOAK_REGISTRY_MAX_SESSIONS. A get_or_create
  * that would exceed the cap returns NULL -- this is a RESOURCE LIMIT, not
@@ -54,10 +56,158 @@
  * sessions cannot exhaust memory through this path. */
 typedef struct cloak_server_registry cloak_server_registry_t;
 
-/* CLOAK_REGISTRY_MAX_SESSIONS is ample for this stage: there is no user
- * manager yet to spread sessions across, so this is the entire server's
- * session budget, not a per-user one. */
-#define CLOAK_REGISTRY_MAX_SESSIONS 256
+/* THE SESSION CAP, and where the number comes from.
+ *
+ * WHAT IT WAS, AND WHY IT WAS WRONG. This was 256, defended by a comment
+ * reading "ample for this stage: there is no user manager yet to spread
+ * sessions across, so this is the entire server's session budget, not a
+ * per-user one". There has been a user manager since module 4
+ * (libcloak-server/src/usermanager.c, SQLite-backed), so the premise
+ * expired three modules before the number was revisited -- and the
+ * second half of that sentence is the defect stated in the header's own
+ * words: 256 was the WHOLE SERVER'S budget, not one user's. One Cloak
+ * session per client instance (cloak/session.h) means it was a ceiling
+ * of 256 simultaneous clients, server-wide, and a deployment with 300
+ * users met a hard refusal delivered as a cover-site redirect -- i.e. at
+ * the least visible moment this protocol has.
+ *
+ * WHY THERE IS A CAP AT ALL: A DELIBERATE DIVERGENCE FROM GO. Go has no
+ * equivalent. /Users/sam/Cloak/internal/server/activeuser.go:21 is
+ * `sessions map[uint32]*mux.Session`, an unbounded map, one per
+ * ActiveUser, hanging off userpanel.go:22's equally unbounded
+ * `activeUsers map[[16]byte]*ActiveUser`. Go can afford that: its map
+ * grows, its runtime collects, and the worst case is pressure. This port
+ * allocates one never-moved entry per session and frees it only on
+ * teardown, so an unbounded table's failure mode is the OOM killer
+ * taking the process down for every user at once. A refusal for one
+ * client is a strictly smaller failure than that. The cap therefore
+ * stays and the number is CHOSEN, which means it has to be justified.
+ *
+ * THE ARITHMETIC, with every input named.
+ *
+ *   Connections per session   K = 4
+ *     (the NumConn a multi-connection client opens -- the same 4
+ *      cloak/server_stack.h's replay-cache sizing uses, and what
+ *      upstream's example config ships.)
+ *
+ *   Send-queue bytes per connection
+ *     Q = CLOAK_SERVER_STACK_DEFAULT_CONN_SEND_QUEUE_CAP = 262144
+ *
+ *   Worst-case buffered bytes per session = K * Q = 1 MiB. Send queues
+ *     only: per-stream receive buffers sit on top of this and scale with
+ *     STREAMS, not sessions, so they are not what a session cap can
+ *     bound and are deliberately left out of the term.
+ *
+ *   Backlog budget   B = 1 GiB at full occupancy. THIS IS THE ONE INPUT
+ *     NOT READ OFF ANOTHER CONSTANT IN THIS TREE. It is a deployment
+ *     assumption -- a server with a couple of gigabytes to its name --
+ *     and it is written down so it can be argued with rather than
+ *     inferred from the answer.
+ *
+ *   Cap = B / (K * Q) = 1 GiB / 1 MiB = 1024 sessions.
+ *
+ * WHAT IT IS SIZED FOR: 1024 simultaneously connected client instances,
+ * server-wide. Four times the old ceiling, and the first version of this
+ * number with a term in it for the resource the cap exists to protect.
+ *
+ * TWO CONSEQUENCES A DEPLOYMENT HAS TO KNOW ABOUT.
+ *
+ *  - DESCRIPTORS. 1024 * 4 = 4096 client-side descriptors at full
+ *    occupancy, plus one upstream socket per proxied stream. A server at
+ *    this cap needs RLIMIT_NOFILE well above the common 1024 default.
+ *    The old cap already needed 1024 for its connections alone, so this
+ *    is a bigger number rather than a new kind of requirement. NOT
+ *    MEASURED: nothing in this tree opens 4096 descriptors at once.
+ *
+ *  - THE REPLAY CACHE MOVES WITH THIS NUMBER, and that coupling is not
+ *    optional. cloak/server_stack.h sizes
+ *    CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY from
+ *    CLOAK_REGISTRY_MAX_SESSIONS * 4 connections turning over every
+ *    120 s; quadrupling this quadruples that sized handshake rate, so
+ *    the capacity went from 2^19 to 2^21 in the same commit.
+ *    libcloak-server/tests/test_replay_cache_keyed.c derives the same
+ *    inequality from the same two symbols and fails if they drift apart.
+ *
+ * RAISING IT FURTHER means raising B and raising the replay capacity by
+ * the same factor. What it no longer means is making every lookup on the
+ * handshake path proportionally slower -- see CLOAK_REGISTRY_KEY_BUCKETS
+ * below, which is the other half of this commit and the reason it is one
+ * commit rather than a constant bump. */
+#define CLOAK_REGISTRY_MAX_SESSIONS 1024
+
+/* THE LOOKUP STRUCTURE, and why raising the cap required replacing it.
+ *
+ * Until this commit the table was `entries[CLOAK_REGISTRY_MAX_SESSIONS]`
+ * and EVERY operation on it was a linear scan of the whole array, at full
+ * price whether the server held one session or all of them. Two of those
+ * scans are on the per-connection handshake path:
+ * cloak_server_registry_get_or_create's existence check, and
+ * cloak_server_registry_count_for_uid, which
+ * libcloak-server/src/dispatcher.c calls once per new session to apply
+ * the per-user cap. Raising the session cap alone would have multiplied
+ * both by four, per connection -- the scan would have become the defect.
+ *
+ * The table is now an OPEN-CHAINED HASH. Entries are still individually
+ * heap-allocated and never moved (the reason is unchanged; it is in the
+ * top-of-file comment above). What changed is how they are found: three
+ * chains run through every entry, all of them maintained in exactly one
+ * pair of functions in registry.c, registry_entry_link and
+ * registry_entry_unlink.
+ *
+ *   - BY (uid, session_id): cloak_server_registry_find,
+ *     cloak_server_registry_close, and get_or_create's existence check.
+ *     O(1) expected, independent of how many sessions the server holds.
+ *   - BY uid ALONE: cloak_server_registry_count_for_uid and
+ *     cloak_server_registry_close_all_for_uid, which now cost one step
+ *     per session THAT UID holds instead of one per slot in the table.
+ *   - THE DEAD CHAIN: entries whose session has broken and whose
+ *     deferred sweep has not yet run, so the sweep costs one step per
+ *     dead entry rather than a scan of everything.
+ *
+ * THE OBJECTION THIS ANSWERS, because this header used to make it.
+ * cloak_server_registry_count_for_uid carried "an index keyed on UID
+ * would be a second structure that could disagree with the table --
+ * which is the failure this module is least able to afford, since the
+ * table is the only record of what is still alive." That was right about
+ * an index added BESIDE the array. There is no array any more: the
+ * chains ARE the table, an entry is linked in one place and unlinked in
+ * one place, and there is nothing left for them to disagree with.
+ * libcloak-server/tests/test_registry_scale.c case 5 cross-checks the
+ * uid chains against the key chains at full occupancy regardless.
+ *
+ * BUCKET COUNTS, AND THE SHAPE THEY BUY. Powers of two, so the reduction
+ * is a mask, and both are sized FROM THE CAP -- which is what makes the
+ * cost of a lookup a constant of this table rather than a function of how
+ * many sessions the server happens to be holding.
+ *
+ *   2048 key buckets against a 1024-entry cap is a load factor of 0.5.
+ *   A successful lookup walks 1 + (n-1)/2m steps, i.e. 1.000 at one
+ *   session and 1.25 at the cap. MEASURED at 1.000 / 1.015 / 1.058 /
+ *   1.229 for n = 1 / 64 / 256 / 1024 by test_registry_scale.c case 2,
+ *   which asserts the ratio across that whole range stays under 3.
+ *
+ *   1024 uid buckets, one per possible session, because
+ *   cloak_server_registry_count_for_uid does not stop at its first hit --
+ *   it walks its whole bucket -- so its cost is 1 + (n-1)/m rather than
+ *   1 + (n-1)/2m. MEASURED at 4.988 steps at the cap when this array was
+ *   256 entries long, and 2.0 at 1024, against the 1024 the scan it
+ *   replaced cost unconditionally. That measurement is why this number is
+ *   1024 and not 256: it is the one place in this table where halving the
+ *   memory doubled the work on the handshake path.
+ *
+ * Together they cost (2048 + 1024) * sizeof(void *) = 24 KiB per
+ * registry, of which there is one per server.
+ *
+ * THE HASH IS KEYED, for exactly the reason cloak/replay_cache.h gives
+ * for its own: half of this key -- the session id -- is chosen by the
+ * client and arrives off the wire. SipHash-2-4 under 16 bytes drawn from
+ * cloak_random_bytes per registry at cloak_server_registry_init means an
+ * attacker who cannot read that key cannot compute the colliding session
+ * ids that would collapse one bucket back into the linear scan this
+ * commit removed. That is not a hypothetical failure shape in this tree:
+ * replay_cache.h records the same bug found, unkeyed, by measurement. */
+#define CLOAK_REGISTRY_KEY_BUCKETS 2048
+#define CLOAK_REGISTRY_UID_BUCKETS 1024
 
 /* Fired exactly once per session, the moment that session becomes broken
  * for any reason cloak_session_broken_cb itself fires for. sesh is still
@@ -117,12 +267,56 @@ struct cloak_server_registry {
     cloak_registry_broken_cb on_broken;
     void *on_broken_userdata;
 
-    /* NULL slots are free. cloak_server_registry_count recomputes its
-     * answer by scanning this array rather than maintaining a running
-     * total -- CLOAK_REGISTRY_MAX_SESSIONS is small enough that this
-     * costs nothing and there is then exactly one place that can ever
-     * disagree with reality. */
-    struct cloak_registry_entry *entries[CLOAK_REGISTRY_MAX_SESSIONS];
+    /* Chain heads only; everything behind them is an individually
+     * heap-allocated struct cloak_registry_entry that never moves. See
+     * CLOAK_REGISTRY_KEY_BUCKETS above for the whole structure. */
+    struct cloak_registry_entry *key_buckets[CLOAK_REGISTRY_KEY_BUCKETS];
+    struct cloak_registry_entry *uid_buckets[CLOAK_REGISTRY_UID_BUCKETS];
+
+    /* Entries marked dead -- their session's on_broken has fired and the
+     * deferred sweep has not yet reached them. A dead entry stays in BOTH
+     * hash chains above: it is invisible to find and to count, but NOT to
+     * cloak_server_registry_close_all_for_uid, which must still reach it
+     * (see that function's doc comment for why that divergence exists). */
+    struct cloak_registry_entry *dead_head;
+
+    /* n_entries counts EVERY entry, live or dead, and is what the cap is
+     * applied to -- a dead entry still owns its session, its connections
+     * and its memory until the sweep runs, so it still spends budget.
+     * n_dead is the length of the dead chain, and
+     * cloak_server_registry_count is their difference.
+     *
+     * MAINTAINED RATHER THAN RECOMPUTED, which reverses what this header
+     * used to say: that count "recomputes its answer by scanning this
+     * array rather than maintaining a running total --
+     * CLOAK_REGISTRY_MAX_SESSIONS is small enough that this costs
+     * nothing and there is then exactly one place that can ever disagree
+     * with reality". The first half stopped being true when the cap
+     * moved: a scan is now 1024 slots and the cap check runs once per
+     * handshake. The second half is preserved by construction rather
+     * than given up -- these two fields are written in exactly three
+     * functions, all in registry.c and all within ten lines of each
+     * other: registry_entry_link, registry_entry_unlink and
+     * registry_mark_dead. */
+    size_t n_entries;
+    size_t n_dead;
+
+    /* SipHash-2-4's 128-bit key, drawn per registry from
+     * cloak_random_bytes by cloak_server_registry_init. See the keying
+     * paragraph at CLOAK_REGISTRY_KEY_BUCKETS. */
+    uint8_t hash_key[16];
+
+    /* DIAGNOSTIC COUNTERS, and the only reason they exist:
+     * libcloak-server/tests/test_registry_scale.c case 2 divides one by
+     * the other to measure what a lookup COSTS at one session and at the
+     * full cap, and asserts the ratio. That measurement is the point of
+     * this commit -- a test asserting only that lookups still return the
+     * right session would pass just as happily against the linear scan
+     * this replaced. Incremented by registry_find_live and by
+     * cloak_server_registry_count_for_uid, the two lookups the dispatcher
+     * performs per handshake. Never read by shipping code. */
+    uint64_t lookup_probe_steps;
+    uint64_t lookup_calls;
 
     /* Non-CLOAK_TIMER_INVALID while a zero-delay sweep of dead entries is
      * pending -- at most one at a time, matching every other deferred
@@ -327,12 +521,13 @@ size_t cloak_server_registry_count(const cloak_server_registry_t *reg);
  * besides the one that just broke?", since the breaking entry is marked
  * dead before that callback runs).
  *
- * A LINEAR SCAN over the whole table, like every other lookup in this
- * file and like cloak_proxy_t's own scans: CLOAK_REGISTRY_MAX_SESSIONS is
- * small, the scan costs nothing at that size, and an index keyed on UID
- * would be a second structure that could disagree with the table -- which
- * is the failure this module is least able to afford, since the table is
- * the only record of what is still alive.
+ * ONE STEP PER SESSION THIS UID HOLDS, not one per slot in the table:
+ * this walks the uid chain described at CLOAK_REGISTRY_KEY_BUCKETS, which
+ * also answers the objection this comment used to raise against a
+ * uid-keyed index (there is no separate table left for it to disagree
+ * with). It matters because libcloak-server/src/dispatcher.c calls this
+ * once per new session, on the handshake path, to apply the per-user cap
+ * -- it was a full scan of the table there until this commit.
  *
  * NULL arguments: reg == NULL or uid == NULL returns 0. */
 size_t cloak_server_registry_count_for_uid(const cloak_server_registry_t *reg,
@@ -406,10 +601,16 @@ typedef void (*cloak_registry_closing_cb)(cloak_server_registry_t *reg, cloak_se
  *    cloak_server_registry_destroy (which destroys every session in the
  *    table) is already documented as permitted.
  *
- * A LINEAR SCAN, for the reason given on
- * cloak_server_registry_count_for_uid. The scan reads each slot once and
- * unlinks the entry BEFORE invoking on_closing, so an on_closing that
- * reenters this module cannot see, close, or free the same entry twice.
+ * ONE STEP PER SESSION THIS UID HOLDS, over the uid chain described at
+ * CLOAK_REGISTRY_KEY_BUCKETS. Each iteration RE-READS the chain from its
+ * head rather than carrying a saved `next` pointer across the callback,
+ * and unlinks the entry BEFORE invoking on_closing -- so an on_closing
+ * that reenters this module and closes or frees other entries of this
+ * same uid cannot leave this loop holding a pointer to something it
+ * freed, and cannot see, close or free the same entry twice. Re-reading
+ * the head is not a second scan: every session of one uid hashes to one
+ * bucket by construction, so the head of that bucket is a matching entry
+ * except for the handful of foreign uids that collided into it.
  *
  * NULL arguments: reg == NULL or uid == NULL returns 0. */
 size_t cloak_server_registry_close_all_for_uid(cloak_server_registry_t *reg,
