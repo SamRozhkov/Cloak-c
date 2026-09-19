@@ -38,16 +38,30 @@
 
 **D4 — `admin && udp` is an unrecorded divergence either way, and this module records it.** Go accepts it and produces something broken: `ck-client.go:165` forces `NumConn = 1` in the admin branch but **leaves `authInfo.Unordered` alone**, and `:191` routes the admin API over `RouteUDP`. The C client refuses `admin && (num_conn != 1 || singleplex)` but **has no opinion on `admin && udp`.** Decide — refuse it, or test it — and write the decision down with its Go citation.
 
+**DECIDED BY TASK 5: ACCEPT AND TEST.** Go's citation re-read in the reference tree — the admin branch is `ck-client.go:159-167` and the `if authInfo.Unordered` that picks `RouteUDP` over `RouteTCP` is `:191-200`, outside it. Refusing would be a divergence with nothing behind it, and the combination **already worked**: `test_ck_client_cli.c` case 7a (`admin_over_udp_is_served`) now drives `-a` with `-u` through both real binaries and gets a real `200` with a JSON body back, 123 bytes in **one** datagram. What is *not* claimed: a response longer than one frame's payload still leaves as several datagrams that nothing joins up — the local endpoint is a UDP socket and this port does not pretend otherwise.
+
 **D5 — the restart test discharges a written debt and is not optional.** `cmd/ck-client/main.c:41-47` justifies there being no sixth exit code **on the grounds that** a client that cannot connect retries forever. Nothing proves it does, through the binaries, across a real restart. Module 7 said whoever argues five codes suffice owes this test. **This module owes it.**
 
 **D6 — what this module does NOT do.** `-u` × CDN stays unreachable (module 8b's; it needs a real TLS stack and a fingerprint decision). `singleplex + udp` stays unimplemented and refused by name. `read_whole_file`/`ck_err` stay duplicated in the two binaries — module 7 said a third binary makes sharing worth it, and there is no third binary. **Say so; do not re-litigate.**
 
-## Two more candidate bugs in the reference, both read and neither reproduced
+## Two more candidate bugs in the reference
 
 - **#10 — a duplicate of a *pending* seq wedges Go's stream permanently and grows its heap without bound.** Found by checking `stream.h:266`'s justification for our ordered-duplicate divergence, which claims *"Go … has no error path there at all"* — **that is false** (`streamBuffer.go:79-81`). The false comment is what hid the candidate.
+
+  **PROMOTED TO A FINDING BY TASK 5 — REPRODUCED, NOT READ.** Measured against the reference tree at `cbeuw/Cloak` `c3d5470` (a copy of it, with one added `_test.go`; the reference checkout itself was not modified), `go1.25.6`, driving `NewStreamBuffer` directly in-package:
+
+  ```
+  frames seq 1, 1, 0  ->  nextRecvSeq = 2, heap = [seq 1]   (the stale copy)
+  + 1000 in-order frames (seq 2..1001)
+                      ->  nextRecvSeq = 2 STILL, heap = 1001 entries
+  reader             ->  "AB" once, then deadline exceeded, forever
+  ```
+
+  The mechanism: `streamBuffer.go:79-81` only rejects `f.Seq < nextRecvSeq`, so a second copy of a seq still **pending** in the sorter heap is pushed again at `:86`; the drain loop at `:88` stops as soon as `sh[0].Seq != nextRecvSeq`, and by then `nextRecvSeq` has moved **past** the stale copy, which therefore sits at the head of the heap where it can never match again. **Reachable from a peer:** `Session.recvDataFromRemote` → `Stream.recvFrame` (`stream.go:72`) hands every deobfuscated frame straight to `streamBuffer.Write`, so an authenticated peer that repeats one pending frame wedges that stream and grows the process heap for as long as it keeps sending. **This port is immune** — `stream.c`'s check is `frame->seq < s->next_recv_seq || heap_contains_seq(s, frame->seq)` — and `cloak/stream.h`'s `ORDERED` paragraph now carries the corrected citation.
+
 - **#12 — Go's replay-cache cleaner sleeps `replayCacheAgeLimit` = 12 hours between passes** (`state.go:214-225`), so an unauthenticated flood grows `UsedRandom` unboundedly for up to twelve hours: a memory DoS from packets that never authenticate.
 
-**Both are read, not measured.** A task that reproduces either promotes it to a finding; a task that cannot must say so.
+**#12 is still read, not measured.** A task that reproduces it promotes it to a finding; a task that cannot must say so.
 
 ---
 

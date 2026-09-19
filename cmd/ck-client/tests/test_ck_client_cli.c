@@ -57,6 +57,17 @@
  *      case points at an echo upstream on purpose, so a client whose
  *      session was dispatched to the PROXY instead of the admin API gets
  *      its own request text back and fails visibly rather than hanging.
+ *   7a. -a TOGETHER WITH -u: the admin API served over a DATAGRAM local
+ *      endpoint, which is Go's shape (the RouteUDP/RouteTCP choice at
+ *      ck-client.go:191-200 sits outside the adminUID branch at :159-167,
+ *      which never touches authInfo.Unordered) and which module 7
+ *      documented, called untested, and left that way. Same misrouting
+ *      echo as case 7, plus case 4's TCP probe against the local port so
+ *      an admin branch that silently repaired the configuration to TCP
+ *      fails immediately instead of hanging, and case 4b's wire probe
+ *      against the admin branch's own ClientHello -- which is the only
+ *      assertion in the case that a client with a datagram socket and an
+ *      ORDERED session flag fails.
  *
  * EVERY WAIT IS BOUNDED BY THE CLOCK, never by an iteration count: a
  * child that misses its deadline is a failed assertion, not a hung suite,
@@ -1796,6 +1807,255 @@ static void test_admin_flag_reaches_the_admin_api(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Case 7a: -a TOGETHER WITH -u serves the admin API over datagrams     */
+/* ------------------------------------------------------------------ */
+
+/* THE COMBINATION MODULE 7 DOCUMENTED AND DID NOT RUN, and D4 of module
+ * 10b's plan asked to be decided rather than left as "accepted and
+ * untested". The decision is ACCEPT, and this case is the second half of
+ * it: a decision to accept a combination nobody exercises is
+ * indistinguishable from not having decided.
+ *
+ * GO'S CITATION, checked in the reference tree rather than remembered.
+ * cmd/ck-client/ck-client.go:159-167 is the whole admin branch: it sets
+ * authInfo.UID, authInfo.SessionId = 0 and remoteConfig.NumConn = 1, and
+ * it does NOT touch authInfo.Unordered. The `if authInfo.Unordered`
+ * that chooses between client.RouteUDP and client.RouteTCP is at :191-200
+ * and sits OUTSIDE that branch, so Go serves the admin API over a UDP
+ * local endpoint whenever the configuration says UDP. Refusing here would
+ * therefore be a divergence; accepting is Go's shape.
+ *
+ * WHAT GO PRODUCES ON THAT PATH IS BROKEN IN A WAY THIS PORT IS NOT, and
+ * that is worth one sentence because it is why "faithful" is not the only
+ * argument. Go's ordinary (non-admin) branch draws a fresh SessionId per
+ * session; the admin branch pins it to 0, which is exactly what the
+ * server requires of an admin session -- but only if NumConn > 0 was
+ * written in the config, because internal/client/state.go:212-217 turns
+ * NumConn <= 0 into "NumConn 1, Singleplex true" and RouteUDP with
+ * singleplex calls newSeshFunc() per peer (internal/client/piper.go:40-42),
+ * giving every local peer its own session at id 0 -- duplicate
+ * (uid, session id) keys on the server. This port refuses that
+ * configuration outright (admin + singleplex, client_stack.c) and refuses
+ * udp + singleplex separately, so the reachable admin+udp configurations
+ * here are exactly the ones that work.
+ *
+ * WHAT WOULD HAVE TO BREAK FOR THIS TO FAIL:
+ *
+ *  - `-u` IGNORED IN THE ADMIN BRANCH. main.c's admin block rewrites
+ *    NumConn; a block that also cleared udp (or an admin path that simply
+ *    never consulted it) would open a TCP listener. The can_connect and
+ *    tcp_port_is_free pair below is case 4's own probe, run here against
+ *    a client that reached UDP THROUGH the admin branch -- so an admin
+ *    branch that quietly repairs the configuration fails in milliseconds
+ *    instead of hanging on a sendto nobody is listening for.
+ *  - `-a` IGNORED IN THE UDP BRANCH -- the mirror. The server's admin
+ *    decision is `cloak_server_is_admin(uid) && session_id == 0`; a
+ *    session missing either half is dispatched to the PROXY, whose
+ *    ProxyBook here points at an upstream this test owns and echoes. So
+ *    a misroute comes back as the request text, and the loop stops the
+ *    moment what came back is not an HTTP response.
+ *  - THE UNORDERED BIT ITSELF. Everything above is satisfied by a client
+ *    whose local socket is a datagram socket and whose ClientHello says
+ *    ORDERED -- measured, not supposed: that mutation passed all 83
+ *    tests before the last leg of this case existed. The last leg takes
+ *    the admin client's ClientHello off a fake front and decrypts it, as
+ *    case 4b does for -u alone.
+ *  - THE ADMIN API'S UNORDERED ARMS. adminapi_write_budget clamps the
+ *    response chunk to one frame's payload in unordered mode and
+ *    cloak_stream_read returns a whole datagram or nothing; neither arm
+ *    had ever been reached from a real ck-client, only from
+ *    test_adminapi.c's in-process fixture.
+ *
+ * AND WHAT IT DELIBERATELY DOES NOT ASSERT: a datagram COUNT. The
+ * response here is one frame and therefore one datagram, and the loop
+ * below concatenates anyway and prints how many arrived, because the
+ * property that matters to an operator is that a reply over one frame's
+ * payload would arrive as SEVERAL datagrams that no reassembly joins up
+ * -- the local endpoint is a UDP socket and this port does not pretend
+ * otherwise. Pinning "exactly one" would pin the size of the response
+ * body, which is the user table's business and not this case's. */
+static void test_admin_over_udp_is_served(void) {
+    pair_t p;
+    pair_init(&p);
+
+    char extra[256];
+    snprintf(extra, sizeof(extra), "\"AdminUID\":\"%s\",\"DatabasePath\":\"%s\",",
+             ADMIN_UID_B64, "ck_client_test_admin_udp.db");
+    ASSERT_EQ_INT(0, pair_start_server(&p, extra));
+
+    /* -a AND -u together, on the command line, which is the road an
+     * operator actually reaches this by: a config file with "UDP": true
+     * that they then run with -a. (The config-key road is case 4's; what
+     * is new here is the pair, not either flag.) */
+    char *const cargv[] = {(char *)"-a", (char *)ADMIN_UID_B64, (char *)"-u", NULL};
+    ASSERT_EQ_INT(0, pair_start_client(&p, "", cargv));
+    ASSERT_EQ_INT(0, child_wait_for(&p.client, "session up", BOOT_MS));
+
+    /* Both halves said so, in the client's own log. */
+    ASSERT_TRUE(strstr(p.client.out, "admin mode") != NULL);
+    char line[128];
+    snprintf(line, sizeof(line), "listening on UDP 127.0.0.1:%d", p.local_port);
+    ASSERT_TRUE(strstr(p.client.out, line) != NULL);
+    /* ...and the socket agrees with the log: nothing accepts TCP there. */
+    ASSERT_EQ_INT(-1, can_connect(p.local_port));
+    ASSERT_EQ_INT(1, tcp_port_is_free(p.local_port));
+
+    int app = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_TRUE(app >= 0);
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port = htons((uint16_t)p.local_port);
+    /* CONNECTED, so a reply from anywhere else is not read as the answer
+     * and an ICMP port-unreachable surfaces as an error on the next
+     * operation rather than as silence. */
+    ASSERT_EQ_INT(0, connect(app, (struct sockaddr *)&to, sizeof(to)));
+    set_nonblock(app);
+
+    static const char req[] = "GET /admin/users HTTP/1.1\r\n"
+                              "Host: cloak-admin\r\n"
+                              "\r\n";
+    /* ONE DATAGRAM, which is the whole request: an unordered stream
+     * carries message boundaries and the admin parser on the far side
+     * reads one of them at a time. */
+    ASSERT_EQ_INT((long long)(sizeof(req) - 1),
+                  (long long)send(app, req, sizeof(req) - 1, 0));
+
+    char resp[8192];
+    size_t got = 0;
+    int datagrams = 0;
+    int up_fd = -1;
+    set_nonblock(p.upstream_fd);
+    uint64_t deadline = now_ms() + XFER_MS;
+    while (got + 1 < sizeof(resp) && now_ms() < deadline) {
+        struct pollfd pf[2];
+        int n = 0;
+        int app_i = n;
+        pf[n].fd = app;
+        pf[n].events = POLLIN;
+        pf[n].revents = 0;
+        n++;
+        int lst_i = -1, up_i = -1;
+        if (up_fd < 0) {
+            lst_i = n;
+            pf[n].fd = p.upstream_fd;
+            pf[n].events = POLLIN;
+            pf[n].revents = 0;
+            n++;
+        } else {
+            up_i = n;
+            pf[n].fd = up_fd;
+            pf[n].events = POLLIN;
+            pf[n].revents = 0;
+            n++;
+        }
+        if (poll(pf, (nfds_t)n, 50) <= 0) {
+            continue;
+        }
+        if (lst_i >= 0 && (pf[lst_i].revents & POLLIN) != 0) {
+            /* THE MISROUTE PATH, exactly as case 7: the request reached
+             * the proxy rather than the admin API. Accept and echo, so
+             * the wrong answer arrives instead of nothing at all. */
+            up_fd = accept(p.upstream_fd, NULL, NULL);
+            if (up_fd >= 0) {
+                set_nonblock(up_fd);
+            }
+        }
+        if (up_i >= 0 && (pf[up_i].revents & POLLIN) != 0) {
+            char buf[2048];
+            ssize_t r = read(up_fd, buf, sizeof(buf));
+            if (r > 0) {
+                ssize_t w = write(up_fd, buf, (size_t)r);
+                (void)w;
+            } else if (r == 0) {
+                close(up_fd);
+                up_fd = -1;
+            }
+        }
+        if ((pf[app_i].revents & POLLIN) == 0) {
+            continue;
+        }
+        ssize_t r = recv(app, resp + got, sizeof(resp) - 1 - got, 0);
+        if (r > 0) {
+            got += (size_t)r;
+            resp[got] = '\0';
+            datagrams++;
+            if (got >= 5 && memcmp(resp, "HTTP/", 5) != 0) {
+                break; /* not an HTTP response: stop and report it */
+            }
+            const char *hdr_end = strstr(resp, "\r\n\r\n");
+            if (hdr_end != NULL && strchr(hdr_end + 4, ']') != NULL) {
+                break;
+            }
+        } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            break;
+        }
+    }
+    if (up_fd >= 0) {
+        close(up_fd);
+    }
+    close(app);
+    resp[got] = '\0';
+    printf("  [case 7a] %zu bytes in %d datagram(s): %.60s\n", got, datagrams, resp);
+
+    /* A REAL HTTP RESPONSE FROM THE ADMIN ROUTER, over a datagram
+     * endpoint. An echoed request (the proxy path) matches none of it. */
+    ASSERT_TRUE(strstr(resp, "HTTP/1.1 200") != NULL);
+    ASSERT_TRUE(strstr(resp, "application/json") != NULL);
+    const char *body = strstr(resp, "\r\n\r\n");
+    ASSERT_TRUE(body != NULL);
+    if (body != NULL) {
+        ASSERT_EQ_INT('[', (long long)body[4]);
+    }
+    ASSERT_TRUE(strstr(resp, "GET /admin/users") == NULL);
+
+    pair_teardown(&p);
+    unlink("ck_client_test_admin_udp.db");
+
+    /* AND THE BIT THE SERVER ACTUALLY ACTS ON, because everything above
+     * this line is satisfied by a client whose local socket is a datagram
+     * socket and whose ClientHello says ORDERED.
+     *
+     * THAT COMBINATION WAS MEASURED TO SURVIVE THE WHOLE SUITE. Making
+     * client_stack.c's `cc.unordered = c->udp` read
+     * `s->cfg.admin_session ? 0 : c->udp` passed all 83 tests, this
+     * case's every assertion included: on loopback the piper writes one
+     * frame per datagram and an ORDERED stream hands those bytes back in
+     * order, so a 200 with a JSON body still arrives. What changes is
+     * only visible on the wire and at the far end -- the server builds an
+     * ordered session, message boundaries stop being a guarantee, and a
+     * Go server would see a different session shape than the one the
+     * operator asked for. Case 4b asserts this bit for -u alone; the
+     * admin branch is a SEPARATE road to it, and this is the leg that
+     * says so.
+     *
+     * One child, no server: wire_unordered_flag takes the ClientHello off
+     * a fake front and decrypts it with the server's private key, which
+     * is all this question needs. */
+    {
+        int front = 0;
+        int listen_fd = listen_on(&front);
+        ASSERT_TRUE(listen_fd >= 0);
+        char wextra[512];
+        snprintf(wextra, sizeof(wextra),
+                 "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"%d\","
+                 "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"0\",",
+                 front);
+        char wcfg[2048];
+        make_client_config(wcfg, sizeof(wcfg), p.pub_b64, wextra);
+        char *const wargv[] = {(char *)"ck-client", (char *)"-c", wcfg,
+                               (char *)"-a",        (char *)ADMIN_UID_B64,
+                               (char *)"-u",        NULL};
+        child_t c;
+        ASSERT_EQ_INT(0, child_spawn(&c, CK_CLIENT_PATH, wargv, NULL));
+        ASSERT_EQ_INT(1, wire_unordered_flag(listen_fd));
+        ASSERT_EQ_INT(0, child_stop(&c));
+        close(listen_fd);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Case 7b: ck-server BILLS THE LAST INTERVAL before it exits           */
 /* ------------------------------------------------------------------ */
 
@@ -2646,6 +2906,8 @@ static const cli_case_t k_cases[] = {
      test_sigterm_is_clean_and_leaks_no_descriptor, CK_CLI_RUNTIME},  /*  2296 ms */
     {"admin_flag_reaches_the_admin_api",
      test_admin_flag_reaches_the_admin_api, CK_CLI_RUNTIME},  /*  2774 ms */
+    {"admin_over_udp_is_served",
+     test_admin_over_udp_is_served, CK_CLI_RUNTIME},  /*  2924 ms */
     {"shutdown_bills_the_last_interval",
      test_shutdown_bills_the_last_interval, CK_CLI_RUNTIME},  /*  1910 ms */
     {"runtime_exit_code_and_the_descriptor_budget",

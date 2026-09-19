@@ -414,8 +414,39 @@ static cloak_client_browser_t stack_browser(cloak_browser_t b) {
 }
 
 /* ONE SNI FOR THIS SESSION, drawn uniformly from ServerName together
- * with every MockDomainList entry -- Go's randomServerName selection
- * over its own list.
+ * with every MockDomainList entry -- the same candidate set Go draws
+ * from, by a different draw.
+ *
+ * GO'S SET: internal/client/state.go:158-169 builds MockDomainList as
+ * the (deduplicated, non-empty) AlternativeNames with ServerName
+ * appended, which is exactly `server_name` plus `alt_names` here. GO'S
+ * DRAW: cmd/ck-client/ck-client.go:178-181, inside seshMaker --
+ *
+ *     randByte := make([]byte, 1)
+ *     common.RandRead(authInfo.WorldState.Rand, randByte)
+ *     authInfo.MockDomain = localConfig.MockDomainList[
+ *             int(randByte[0])%len(localConfig.MockDomainList)]
+ *
+ * -- ONE BYTE, TAKEN MODULO THE LIST LENGTH. (Not to be confused with
+ * Go's randomServerName(), internal/client/TLS.go:35, which is a
+ * different thing entirely: it invents a random gibberish hostname, and
+ * only when the chosen MockDomain is the literal string "random"
+ * (TLS.go:125-127). An earlier version of this comment attributed the
+ * list selection to randomServerName; that was the wrong symbol.)
+ *
+ * SO THIS IS AN UNRECORDED, WIRE-VISIBLE DIVERGENCE, AND THIS IS THE
+ * RECORD. 256 is not a multiple of any list length but 1, 2, 4, 8, 16
+ * and 256, so for every other size Go's modulo is biased toward the low
+ * indices -- at the 17 this port's CLOAK_MAX_ALT_NAMES allows, 256 =
+ * 15*17 + 1, so index 0 is drawn 16 times in 256 and the other sixteen
+ * 15 times each: the FIRST candidate appears 6.7 % more often than its
+ * neighbours, forever, on every ClientHello this client sends. Go's list
+ * puts ServerName LAST and ours puts it first, so the over-drawn entry
+ * is not even the same one -- which changes nothing about the argument
+ * and is worth knowing before comparing two captures. This port draws
+ * with cloak_random_below instead (rejection sampling, uniform for every
+ * length), which is a DELIBERATE departure from the reference on a
+ * quantity a censor can aggregate, not an accident of porting.
  *
  * THE GRANULARITY IS PER SESSION, AND THAT IS GO'S. A
  * cloak_client_connector_t copies server_name at init, this module calls
@@ -432,9 +463,10 @@ static cloak_client_browser_t stack_browser(cloak_browser_t b) {
  *
  * cloak_random_below, i.e. REJECTION-SAMPLED. This used to draw one byte
  * and take it modulo a list of at most CLOAK_MAX_ALT_NAMES + 1 == 17
- * entries, with a comment conceding "at most one part in fifteen between
- * the first and last candidates" on the grounds that the quantity must
- * merely not be constant. That was the wrong standard for this one,
+ * entries -- Go's draw, ported faithfully -- with a comment conceding
+ * "at most one part in fifteen between the first and last candidates"
+ * on the grounds that the quantity must merely not be constant. That
+ * was the wrong standard for this one,
  * because unlike a retry delay THE CHOSEN NAME GOES ON THE WIRE, in the
  * SNI of every ClientHello -- and a name that appears 6.7 % more often
  * than its neighbours is a property of THIS implementation that a censor

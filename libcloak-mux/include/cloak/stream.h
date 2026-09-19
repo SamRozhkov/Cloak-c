@@ -264,8 +264,46 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type);
  *              space), the max_pending_frames cap being exceeded, or an
  *              allocation failure. Unchanged by module 9; the
  *              duplicate-kills-the-stream behaviour is a deliberate,
- *              documented improvement over Go (which has no error path
- *              there at all) and test_stream.c pins it.
+ *              documented improvement over Go, and test_stream.c pins it
+ *              (verified by mutation: deleting the heap_contains_seq
+ *              half of stream.c's check fails test_stream).
+ *
+ *              WHAT GO ACTUALLY DOES, corrected. An earlier version of
+ *              this paragraph said Go "has no error path there at all".
+ *              THAT WAS FALSE. streamBuffer.Write
+ *              (internal/multiplex/streamBuffer.go:65-97) has exactly
+ *              one, at :79-81 -- `if f.Seq < sb.nextRecvSeq { return
+ *              false, fmt.Errorf("seq %v is smaller than nextRecvSeq
+ *              %v", ...) }` -- so an ALREADY-DELIVERED seq is an error
+ *              in Go too, and the real divergence is narrower than the
+ *              comment claimed: it is the PENDING duplicate, a seq at or
+ *              above nextRecvSeq that is already sitting in Go's sorter
+ *              heap. Go has no check for that one, and this port does
+ *              (stream.c: `frame->seq < s->next_recv_seq ||
+ *              heap_contains_seq(s, frame->seq)`).
+ *
+ *              AND THAT GAP IS GO BUG #10, REPRODUCED, NOT READ.
+ *              streamBuffer.go:86 pushes the second copy onto the heap
+ *              and the drain loop at :88 stops the moment
+ *              sh[0].Seq != nextRecvSeq -- but nextRecvSeq has by then
+ *              moved PAST the stale copy, so the head of the heap can
+ *              never match again. The stream wedges permanently and the
+ *              heap grows without bound. Measured against the reference
+ *              tree at cbeuw/Cloak c3d5470 with a Go test driving
+ *              NewStreamBuffer directly: frames seq 1, 1, 0 leave
+ *              nextRecvSeq at 2 with a stale seq 1 at the heap's head;
+ *              1000 further in-order frames then leave nextRecvSeq STILL
+ *              2 and the heap at 1001 entries, and the reader sees only
+ *              the two bytes that drained before the wedge and then a
+ *              read deadline. It is reachable from a peer:
+ *              Session.recvDataFromRemote -> Stream.recvFrame
+ *              (stream.go:72) hands every deobfuscated frame straight to
+ *              streamBuffer.Write, so an authenticated peer that repeats
+ *              one pending frame wedges that stream and grows the
+ *              process heap for as long as it keeps sending. Retiring
+ *              the stream, as this port does, is the strictly safer
+ *              answer and costs nothing our own sender can trip: it
+ *              never duplicates a frame.
  *   UNORDERED  -1 ONLY for a frame->payload_len that exceeds the datagram
  *              queue's total capacity. Nothing else: a duplicate seq, a
  *              late seq, a seq that skips ahead, a full queue -- all

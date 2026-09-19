@@ -2247,8 +2247,14 @@ static void test_unordered_request_larger_than_one_read_chunk(void) {
  *
  * IT IS REACHABLE, not theoretical: dispatcher.c builds an UNORDERED admin
  * session whenever the client sets the flag, and says so in its own
- * comment. Our ck-client cannot ask for it today (it refuses -u), but a
- * Go or crafted client with an admin UID can.
+ * comment. (This used to add "our ck-client cannot ask for it today (it
+ * refuses -u)". THAT IS NO LONGER TRUE and was not re-checked when it
+ * stopped being true: cmd/ck-client accepts -a with -u, which is Go's
+ * shape -- the RouteUDP/RouteTCP choice at ck-client.go:191-200 sits
+ * outside the adminUID branch at :159-167 -- and module 10b task 5
+ * decided to keep it and pinned it end to end through both binaries in
+ * test_ck_client_cli.c case 7a. So the caller this case was written for
+ * hypothetically is now a real one.)
  *
  * It is the same hazard module 9 task 5 fixed for cloak_stream_relay_t's
  * read budget, in the third and last of the three places that hand a
