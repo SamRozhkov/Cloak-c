@@ -323,6 +323,18 @@ target_compile_definitions(test_go_interop PRIVATE
     CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
     CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
 
+# test_go_clienthello_matrix's two in-tree dependencies (module 10b task
+# 1), appended here for exactly the reason test_go_interop's are: it is
+# declared in libcloak-server/tests, which is added BEFORE cmd/ck-server
+# and cmd/ck-client. It never runs OUR ck-server -- the far end is always
+# Go's -- but it includes the same go_oracle_harness.h, whose four *_PATH
+# macros are a #error if any of them is missing, so both are defined here
+# and the dependency edge is kept on both.
+add_dependencies(test_go_clienthello_matrix ck-server ck-client)
+target_compile_definitions(test_go_clienthello_matrix PRIVATE
+    CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
+    CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
+
 # test_unordered_proof's two in-tree dependencies (module 9 task 8),
 # appended here for exactly the reason test_go_interop's are: the test is
 # declared in libcloak-server/tests, which is added BEFORE cmd/ck-server

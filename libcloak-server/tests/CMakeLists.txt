@@ -568,6 +568,65 @@ set_tests_properties(test_go_interop PROPERTIES TIMEOUT 120)
 set_tests_properties(test_go_interop PROPERTIES LABELS "slow")
 
 # ---------------------------------------------------------------------------
+# THE CLIENTHELLO MATRIX (module 10b task 1).
+#
+# A SECOND binary rather than more cases in test_go_interop, for two
+# reasons and neither is tidiness. test_go_interop's TIMEOUT 120 is
+# already sized for a worst FAILING run of roughly 90 s (its own budget
+# comment does the arithmetic); six more forking scenarios would not fit,
+# and a bound that cannot cover its own failure mode reports "***Timeout"
+# instead of the assertion that diagnoses it. And the two files ask
+# different questions -- one asks whether the direct path interoperates at
+# all, this one asks whether all three ClientHello templates do -- so a
+# failure in one should not hide the other behind a single ctest row.
+#
+# The harness both share is go_oracle_harness.h, extracted verbatim from
+# test_go_interop.c when this file was written; see its own header.
+#
+# cloak-server for cloak_clienthello_parse (the relay locates the X25519
+# key share it corrupts by parsing the record that arrived, not by
+# reading a template table); cloak-common for base64, X25519 and the AEAD
+# the shared harness uses.
+add_executable(test_go_clienthello_matrix test_go_clienthello_matrix.c)
+target_include_directories(test_go_clienthello_matrix PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_go_clienthello_matrix PRIVATE cloak-server cloak-common)
+target_compile_definitions(test_go_clienthello_matrix PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_go_clienthello_matrix COMMAND test_go_clienthello_matrix)
+
+# The paths of OUR ck-client and ck-server are APPENDED at the end of the
+# top-level CMakeLists.txt, after cmd/ck-client and cmd/ck-server have
+# been added, exactly as test_go_interop's are.
+
+# TIMEOUT AND LABELS IN ONE CALL, AT THE SOURCE SITE. Task 8 of this
+# module found that "every test carries both" was true of the GENERATED
+# CTestTestfile.cmake and not of the source -- cloak_label_fast_tests()
+# was merging two adjacent calls after the fact, so the discipline was
+# the sweep's and not the file's. This is one call. (The older tests in
+# this file, test_go_interop and test_unordered_proof among them, still
+# use two adjacent calls; that is recorded rather than quietly fixed,
+# because changing them is not this task's work.)
+#
+# LABELS "slow": six scenarios, twelve forked children, four of them Go's
+# own binaries. That is exactly the cost module 9 task 0's split exists to
+# keep out of the `ctest -L fast` edit loop; the default `ctest` still
+# runs it.
+#
+# TIMEOUT 150, set from the worst FAILING run and not the passing one.
+# MEASURED in Debug: a passing run is ~14 s (twelve children, 128 KiB
+# each way through six of them). The bound has to cover a run where the
+# two ends cannot read each other's frames -- the shape of defect this
+# file exists to catch -- which is the shared harness's own arithmetic:
+# three positive scenarios stalling for XFER_MS (15 s) each, plus three
+# negative ones at HANDSHAKE_FAIL_MS + QUIET_MS (10 s) each, i.e. 75 s
+# before any child that also ignores SIGTERM adds EXIT_MS. 150 leaves
+# room for that and still fails loudly rather than being truncated.
+set_tests_properties(test_go_clienthello_matrix PROPERTIES
+    TIMEOUT 150
+    LABELS "slow")
+
+# ---------------------------------------------------------------------------
 # UNORDERED MODE, PROVED (module 9 task 8).
 #
 # Five cases in one binary: the Go oracle in UDP mode (both roles), a
