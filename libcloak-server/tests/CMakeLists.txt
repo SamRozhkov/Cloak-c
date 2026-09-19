@@ -627,6 +627,69 @@ set_tests_properties(test_go_clienthello_matrix PROPERTIES
     LABELS "slow")
 
 # ---------------------------------------------------------------------------
+# THE ENCRYPTION MATRIX (module 10b task 2).
+#
+# A THIRD binary rather than more cases in either of the two above, for
+# the same reason task 1 gave for splitting off the second and one more.
+# test_go_clienthello_matrix's TIMEOUT 150 is sized for a worst FAILING
+# run of six scenarios; twelve more would not fit under it, and a bound
+# that cannot cover its own failure mode reports "***Timeout" instead of
+# the assertion that diagnoses it. The three files also ask three
+# different questions -- does the direct path interoperate at all, do all
+# three ClientHello templates, do all four encryption methods -- so a
+# failure in one should not hide the others behind a single ctest row.
+# And at -j4 three rows run beside each other where one long row cannot.
+#
+# The harness all three share is go_oracle_harness.h. This task added the
+# post-handshake wire capture and the numbered-record corruption to it;
+# every existing scenario in the other two files is unchanged, because
+# both are opt-in fields that default to off.
+#
+# cloak-server for cloak_clienthello_parse (the ClientHello is parsed to
+# find the client's ephemeral key, which is what the session key is
+# recovered through); cloak-mux for nothing linked but CLOAK_FRAME_* and
+# CLOAK_CONN_MAX_FRAME_LEN, which are header constants -- the frame layer
+# is re-implemented in the test rather than called, deliberately, so the
+# assertion does not inherit the code it is judging; cloak-common for
+# base64, X25519, Salsa20 and the AEAD.
+add_executable(test_go_encryption_matrix test_go_encryption_matrix.c)
+target_include_directories(test_go_encryption_matrix PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_go_encryption_matrix PRIVATE cloak-server cloak-mux cloak-common)
+target_compile_definitions(test_go_encryption_matrix PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_go_encryption_matrix COMMAND test_go_encryption_matrix)
+
+# The paths of OUR ck-client and ck-server are APPENDED at the end of the
+# top-level CMakeLists.txt, after cmd/ck-client and cmd/ck-server have
+# been added, exactly as test_go_interop's are.
+
+# TIMEOUT AND LABELS IN ONE CALL, AT THE SOURCE SITE -- the discipline
+# task 8 of this module established and task 1 kept. (The older tests in
+# this file, test_go_interop and test_unordered_proof among them, still
+# use two adjacent calls merged after the fact by cloak_label_fast_tests();
+# that is recorded rather than quietly fixed, because changing them is
+# not this task's work either.)
+#
+# LABELS "slow": twelve scenarios, twenty-four forked children, twelve of
+# them Go's own binaries.
+#
+# TIMEOUT 300, set from the worst FAILING run and not the passing one.
+# MEASURED in Debug: a passing run is 6.9 s -- cheaper than its twelve
+# scenarios suggest, because three of the four corrupting ones end on
+# STALL_QUIET_MS (2 s of silence) rather than on XFER_MS. The bound has to
+# cover a run where the two ends cannot read each other's frames -- the shape of defect this file exists to catch -- which is the
+# shared harness's own arithmetic: eight positive scenarios stalling for
+# XFER_MS (15 s) each is 120 s, and four frame-corrupting scenarios that
+# never see their flipped bit land would also run to XFER_MS, 60 s more.
+# 180 s of stalling plus twenty-four child spawns and teardowns; 300
+# leaves room for that and still fails loudly rather than being
+# truncated.
+set_tests_properties(test_go_encryption_matrix PROPERTIES
+    TIMEOUT 300
+    LABELS "slow")
+
+# ---------------------------------------------------------------------------
 # UNORDERED MODE, PROVED (module 9 task 8).
 #
 # Five cases in one binary: the Go oracle in UDP mode (both roles), a

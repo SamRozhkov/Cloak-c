@@ -102,6 +102,20 @@
 #define HANDSHAKE_FAIL_MS 8000
 #define QUIET_MS 2000
 
+/* How long a frame-corrupting run waits, AFTER its flipped bit has been
+ * forwarded, for the transfer to prove it has stopped. See run_scenario's
+ * transfer loop for why a stall is timed out this way rather than by
+ * sitting on XFER_MS.
+ *
+ * 2000 ms, the same figure QUIET_MS above was set at and for the same
+ * reason: on loopback the two ends exchange the whole 128 KiB in tens of
+ * milliseconds, so two seconds of complete silence is three orders of
+ * magnitude past any scheduling hiccup, while costing a control about
+ * a sixth of what waiting out XFER_MS would. A run that is merely SLOW
+ * rather than stalled is not mis-scored, because any progress at all
+ * restarts the window. */
+#define STALL_QUIET_MS 2000
+
 /* 128 KiB. Go's client caps one on-wire message at appDataMaxLength =
  * 16401 bytes (internal/client/TLS.go), so a payload this size CANNOT fit
  * in fewer than eight frames in either direction. That number is read off
@@ -337,6 +351,60 @@ static inline void set_nonblock(int fd) {
 #define QCAP 65536
 #define HELLO_CAP 8192
 
+/* ------------------------------------------------------------------ */
+/* THE POST-HANDSHAKE WIRE, kept so a case can decrypt it itself         */
+/* ------------------------------------------------------------------ */
+
+/* WHY THIS EXISTS AND WHAT IT IS FOR. Every assertion this harness made
+ * before it was about whether bytes ARRIVED. That cannot say which
+ * ENCRYPTION METHOD produced them: a client that silently used
+ * aes-256-gcm when asked for chacha20-poly1305 would move 128 KiB just
+ * as happily, because the method it announced in its ClientHello is the
+ * one the server would then use. The only thing that can tell them apart
+ * is the ciphertext itself -- and an AEAD tag is the strongest
+ * discriminator there is, since a frame sealed under one method does not
+ * open under another.
+ *
+ * So the relay keeps, verbatim, the bytes of ONE connection: every
+ * server -> client byte (the ServerHello is the first 127 of them, and
+ * carries the session key sealed to the shared secret), and every
+ * client -> server byte AFTER the ClientHello record (which on the
+ * direct path is a sequence of TLS application-data records, one
+ * obfuscated mux frame apiece). A case holding the server private key --
+ * every case here writes the configuration, so every case does -- can
+ * recover the session key from the first and open the second.
+ *
+ * ONE CONNECTION, not all of them, and it is the FIRST ACCEPTED one:
+ * 64 KiB a direction is already 128 KiB, the pair table is compacted
+ * when a connection closes so a per-pair buffer would move under the
+ * case, and a scenario that wants every frame on one connection sets
+ * NumConn 1 anyway.
+ *
+ * The bytes captured are the CLEAN ones -- what the peer composed, before
+ * any corruption this relay applies -- for the same reason relay_pair_t
+ * keeps a clean `hello`: a negative run must still be able to say what
+ * was corrupted. */
+#define WIRE_CAP 65536
+
+typedef struct {
+    /* Client -> server, from the first byte after the ClientHello record. */
+    uint8_t c2s[WIRE_CAP];
+    size_t c2s_len;
+    /* Server -> client, from the first byte of the ServerHello. */
+    uint8_t s2c[WIRE_CAP];
+    size_t s2c_len;
+    /* Whole TLS records completed in the client -> server direction after
+     * the ClientHello, counted by the relay's own walk rather than by a
+     * case re-parsing the buffer -- so a case can tell "the capture
+     * buffer filled" from "the client sent that many records". */
+    size_t c2s_records;
+    /* Truncation flags: set when a direction produced more than WIRE_CAP
+     * bytes. A case that walks a truncated buffer must say so rather than
+     * report a short frame list as a finding. */
+    int c2s_truncated;
+    int s2c_truncated;
+} wire_capture_t;
+
 /* A one-read-deep queue. The flow-control rule below (never read from a
  * socket whose outbound queue still has bytes in it) is what bounds it to
  * one read, so there is no growth path and no allocation anywhere in this
@@ -383,6 +451,21 @@ typedef struct {
      * it is done on every scenario rather than only the corrupting
      * ones. */
     int hello_done;
+
+    /* THE CLIENT -> SERVER RECORD WALK, live, so that a corruption can be
+     * aimed at a numbered record rather than at a byte offset. Offsets do
+     * not survive across runs here: cloak_frame_obfuscate pads the first
+     * CLOAK_FRAME_PAD_FIRST_N_FRAMES frames of every stream by a random
+     * amount, so record N begins at a different offset on every run. A
+     * record INDEX is stable. */
+    uint8_t rec_hdr[5];
+    size_t rec_pos;   /* bytes of the current record consumed, header included */
+    size_t rec_len;   /* its total length, header included; 0 while unknown */
+    size_t rec_index; /* how many post-ClientHello records have COMPLETED */
+
+    /* Set on the first connection this relay ever accepts: the one whose
+     * bytes wire_capture_t keeps. */
+    int capture;
 } relay_pair_t;
 
 typedef struct {
@@ -442,6 +525,27 @@ typedef struct {
      * argument (in HELLO_CAP's comment) that a Cloak client cannot send
      * 8 KiB before it has seen a ServerHello. */
     size_t hello_overflows;
+
+    /* WHERE THE BYTES OF ONE CONNECTION GO. Non-NULL only when a
+     * scenario asked for them (scenario_t::wire_out); the buffer belongs
+     * to the case, not to this struct, because it is 128 KiB and
+     * relay_t is already a stack object inside run_scenario. */
+    wire_capture_t *wire;
+
+    /* ONE FLIPPED BIT INSIDE A NUMBERED CLIENT -> SERVER RECORD, which is
+     * the frame layer's mirror of corrupt_at and corrupt_keyshare.
+     *
+     * corrupt_c2s_rec is an index into the records that follow the
+     * ClientHello (0 is the first one), -1 disables. corrupt_c2s_off is a
+     * byte offset into that record's BODY, i.e. past its 5-byte TLS
+     * header, so offset 0 is the first byte of the obfuscated frame.
+     * Applied to every connection, which with NumConn 1 is the only one.
+     *
+     * An index and not an absolute offset because absolute offsets are
+     * not reproducible: see relay_pair_t's record-walk comment. */
+    long corrupt_c2s_rec;
+    size_t corrupt_c2s_off;
+    size_t c2s_corruptions; /* how many bytes were actually flipped */
 } relay_t;
 
 /* What a case gets back: every ClientHello one run put on the wire. 64 KiB,
@@ -490,6 +594,60 @@ static inline long keyshare_offset_in(const uint8_t *rec, size_t len) {
     return (long)(p.x25519_key_share - rec);
 }
 
+/* Walks a chunk of one connection's post-ClientHello client -> server
+ * bytes: captures them (clean) if this is the captured connection,
+ * counts whole TLS records, and flips one bit if this chunk contains the
+ * byte a negative run asked for.
+ *
+ * The walk is INCREMENTAL because the relay reads whatever the kernel
+ * gives it -- a record is routinely split across reads and several
+ * records routinely arrive in one -- so the record boundary state lives
+ * on the pair, not in this function. */
+static inline void wire_scan_c2s(relay_t *r, relay_pair_t *p, uint8_t *buf, size_t len) {
+    if (r->wire != NULL && p->capture) {
+        size_t room = WIRE_CAP - r->wire->c2s_len;
+        size_t take = len < room ? len : room;
+        memcpy(r->wire->c2s + r->wire->c2s_len, buf, take);
+        r->wire->c2s_len += take;
+        if (take != len) {
+            r->wire->c2s_truncated = 1;
+        }
+    }
+    size_t i = 0;
+    while (i < len) {
+        if (p->rec_len == 0) {
+            p->rec_hdr[p->rec_pos] = buf[i];
+            p->rec_pos++;
+            i++;
+            if (p->rec_pos == 5) {
+                p->rec_len = 5 + (((size_t)p->rec_hdr[3] << 8) | (size_t)p->rec_hdr[4]);
+            }
+            continue;
+        }
+        size_t remain = p->rec_len - p->rec_pos;
+        size_t avail = len - i;
+        size_t take = remain < avail ? remain : avail;
+        if (r->corrupt_c2s_rec >= 0 && p->rec_index == (size_t)r->corrupt_c2s_rec) {
+            size_t target = 5 + r->corrupt_c2s_off;
+            if (target >= p->rec_pos && target < p->rec_pos + take &&
+                target < p->rec_len) {
+                buf[i + (target - p->rec_pos)] ^= 0x01;
+                r->c2s_corruptions++;
+            }
+        }
+        p->rec_pos += take;
+        i += take;
+        if (p->rec_pos == p->rec_len) {
+            p->rec_index++;
+            if (r->wire != NULL && p->capture) {
+                r->wire->c2s_records++;
+            }
+            p->rec_pos = 0;
+            p->rec_len = 0;
+        }
+    }
+}
+
 typedef struct {
     relay_t relay;
 
@@ -520,6 +678,7 @@ static inline void harness_init(harness_t *h) {
     memset(h, 0, sizeof(*h));
     h->relay.listen_fd = -1;
     h->relay.corrupt_at = -1;
+    h->relay.corrupt_c2s_rec = -1;
     for (size_t i = 0; i < MAX_PAIRS; i++) {
         h->relay.pairs[i].cfd = -1;
         h->relay.pairs[i].sfd = -1;
@@ -695,6 +854,7 @@ static inline void harness_pump(harness_t *h, int timeout_ms) {
             memset(p, 0, sizeof(*p));
             p->cfd = c;
             p->sfd = s;
+            p->capture = (r->accepted == 0); /* the first connection ever accepted */
             r->npairs++;
             r->accepted++;
             break;
@@ -738,6 +898,12 @@ static inline void harness_pump(harness_t *h, int timeout_ms) {
                      * key, so nothing is delayed behind this but the
                      * microseconds it takes the rest of one ~2 KiB record
                      * to arrive on loopback. */
+                    /* Where the POST-ClientHello stream begins inside
+                     * the buffer about to be forwarded. Zero on every
+                     * read but the one that completes the hello -- by
+                     * then the hold is over and the whole read is
+                     * post-hello bytes. */
+                    size_t post_hello_from = 0;
                     if (!p->hello_done) {
                         long tot = first_record_total(p->hello, p->hello_len);
                         if (tot == 0 || (tot > 0 && p->hello_len < (size_t)tot)) {
@@ -746,6 +912,7 @@ static inline void harness_pump(harness_t *h, int timeout_ms) {
                             break; /* hold; read again next turn */
                         }
                         p->hello_done = 1;
+                        post_hello_from = (tot > 0) ? (size_t)tot : 0;
                         if (tot > 0 && r->nhellos < MAX_PAIRS) {
                             memcpy(r->hellos[r->nhellos], p->hello, (size_t)tot);
                             r->hello_lens[r->nhellos] = (size_t)tot;
@@ -765,6 +932,17 @@ static inline void harness_pump(harness_t *h, int timeout_ms) {
                                 r->keyshare_corruptions++;
                             }
                         }
+                    }
+                    /* THE FRAME LAYER. Everything after the ClientHello
+                     * record is walked here: captured for the case that
+                     * will decrypt it, counted, and -- on a negative run
+                     * -- corrupted in one numbered record. Done on the
+                     * bytes about to be forwarded, so a corruption lands
+                     * on what the far end reads and the capture keeps
+                     * what the near end composed. */
+                    if (post_hello_from <= p->c2s.len) {
+                        wire_scan_c2s(r, p, p->c2s.buf + post_hello_from,
+                                      p->c2s.len - post_hello_from);
                     }
                     if (q_flush(&p->c2s, p->sfd) != 0) {
                         pair_drop(r, (size_t)idx[k]);
@@ -788,11 +966,22 @@ static inline void harness_pump(harness_t *h, int timeout_ms) {
                 q_pending(&p->s2c) == 0) {
                 ssize_t got = read(p->sfd, p->s2c.buf, QCAP);
                 if (got > 0) {
-                    /* THE ONE FLIPPED BIT (case 3). corrupt_at is an
-                     * offset into this connection's server -> client
-                     * stream, so it lands on the same byte of the
-                     * ServerHello no matter how the server's write was
-                     * split across reads. */
+                    /* The clean bytes, kept before anything below can
+                     * alter them -- see wire_capture_t. */
+                    if (r->wire != NULL && p->capture) {
+                        size_t room = WIRE_CAP - r->wire->s2c_len;
+                        size_t take = ((size_t)got < room) ? (size_t)got : room;
+                        memcpy(r->wire->s2c + r->wire->s2c_len, p->s2c.buf, take);
+                        r->wire->s2c_len += take;
+                        if (take != (size_t)got) {
+                            r->wire->s2c_truncated = 1;
+                        }
+                    }
+                    /* THE ONE FLIPPED BIT (test_go_interop's case 3).
+                     * corrupt_at is an offset into this connection's
+                     * server -> client stream, so it lands on the same
+                     * byte of the ServerHello no matter how the server's
+                     * write was split across reads. */
                     if (r->corrupt_at >= 0) {
                         uint64_t lo = p->s2c_total;
                         uint64_t hi = lo + (uint64_t)got;
@@ -1026,14 +1215,14 @@ static inline void write_server_config(char *path_out, size_t cap, const char *n
 
 static inline void write_client_config(char *path_out, size_t cap, const char *name,
                                 const char *pub_b64, int remote_port, int local_port,
-                                int num_conn, const char *browser) {
+                                int num_conn, const char *browser, const char *encryption) {
     char cfg[1024];
     snprintf(cfg, sizeof(cfg),
              "{"
              "\"Transport\":\"direct\","
              "\"ServerName\":\"www.bing.com\","
              "\"ProxyMethod\":\"shadowsocks\","
-             "\"EncryptionMethod\":\"aes-gcm\","
+             "\"EncryptionMethod\":\"%s\","
              "\"UID\":\"%s\","
              "\"PublicKey\":\"%s\","
              "\"NumConn\":%d,"
@@ -1041,7 +1230,7 @@ static inline void write_client_config(char *path_out, size_t cap, const char *n
              "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"%d\","
              "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"%d\""
              "}",
-             UID_B64, pub_b64, num_conn, browser, remote_port, local_port);
+             encryption, UID_B64, pub_b64, num_conn, browser, remote_port, local_port);
     ASSERT_EQ_INT(0, write_temp_unique(path_out, cap, name, cfg));
 }
 
@@ -1187,7 +1376,72 @@ typedef struct {
      * flip one bit inside the X25519 key share of every ClientHello.
      * See relay_t::corrupt_keyshare. */
     int corrupt_keyshare;
+
+    /* EncryptionMethod for the client's configuration: "plain",
+     * "aes-gcm"/"aes-256-gcm", "aes-128-gcm" or "chacha20-poly1305".
+     * NULL means "aes-gcm", so every scenario written before the
+     * encryption matrix existed keeps the fixture it was measured with.
+     * The SERVER is not configured with a method by either
+     * implementation -- it takes byte 28 of the authentication payload --
+     * so there is no server-side counterpart to set.
+     *
+     * SETTING THIS PROVES NOTHING ON ITS OWN, exactly as `browser` above
+     * does not: it is what the client was ASKED for. Which method
+     * actually sealed the frames is a separate question, answered only by
+     * opening the captured ciphertext in `wire_out` under each candidate
+     * method and seeing which one the tag accepts. */
+    const char *encryption;
+
+    /* Non-NULL asks the relay to keep one connection's post-handshake
+     * bytes here -- see wire_capture_t. The case owns the storage; the
+     * relay only writes into it. */
+    wire_capture_t *wire_out;
+
+    /* THE FRAME-LAYER NEGATIVE CONTROL. corrupt_c2s is the enable --
+     * a SEPARATE FLAG and not "-1 disables" on the index, because record
+     * 0 is a real target and zero-initialised designated initialisers
+     * would otherwise arm this on every scenario in this tree that
+     * predates it. corrupt_c2s_rec is the index of a post-ClientHello
+     * client -> server TLS record (0 is the first); corrupt_c2s_off is a
+     * byte offset into that record's body, past its 5-byte header. One
+     * bit is flipped there.
+     *
+     * Unlike corrupt_at and corrupt_keyshare, this does NOT make the
+     * handshake fail -- the handshake is already over. What happens
+     * instead depends on `expect`. */
+    int corrupt_c2s;
+    size_t corrupt_c2s_rec;
+    size_t corrupt_c2s_off;
+
+    /* HOW A FRAME-CORRUPTING RUN IS SCORED, and it is neither of the two
+     * modes that existed before.
+     *
+     * CLOAK_EXPECT_ALL (0, the default) is the positive run: all
+     * PAYLOAD_LEN bytes out, all of them seen upstream, all of them back
+     * transformed, byte for byte.
+     *
+     * CLOAK_EXPECT_STALL is what an AEAD method must do when one bit of
+     * a data frame is flipped: the receiving mux drops the frame (Go's
+     * switchboard deplex logs and continues; ours returns from
+     * session_on_envelope, libcloak-mux/src/session.c), the stream's
+     * sequence number never arrives, and the transfer stops. Asserted as
+     * "SOME bytes reached the upstream and NOT ALL of them" -- the lower
+     * bound is what separates a genuine mid-stream stall from a session
+     * that never carried anything.
+     *
+     * CLOAK_EXPECT_ONE_BYTE_OFF is what `plain` must do under the SAME
+     * corruption at the SAME place: nothing authenticates the payload, so
+     * the whole transfer completes and exactly one delivered byte differs
+     * from what was sent. That is this file's proof that the stall above
+     * is caused by the AEAD tag rather than by corruption in general --
+     * the same role "corrupt a byte outside the authenticated span and
+     * watch it be accepted" plays for the ClientHello controls. */
+    int expect;
 } scenario_t;
+
+#define CLOAK_EXPECT_ALL 0
+#define CLOAK_EXPECT_STALL 1
+#define CLOAK_EXPECT_ONE_BYTE_OFF 2
 
 /* WHICH IMPLEMENTATION IS ACTUALLY AT THAT END. The readiness markers
  * alone cannot answer this: our ck-client logs "listening on TCP
@@ -1249,6 +1503,12 @@ static inline void run_scenario(const scenario_t *sc, captured_hellos_t *caps) {
     h.relay.server_port = server_port;
     h.relay.corrupt_at = sc->corrupt_at;
     h.relay.corrupt_keyshare = sc->corrupt_keyshare;
+    h.relay.wire = sc->wire_out;
+    if (sc->wire_out != NULL) {
+        memset(sc->wire_out, 0, sizeof(*sc->wire_out));
+    }
+    h.relay.corrupt_c2s_rec = sc->corrupt_c2s ? (long)sc->corrupt_c2s_rec : -1;
+    h.relay.corrupt_c2s_off = sc->corrupt_c2s_off;
 
     int local_port = free_port();
     ASSERT_TRUE(local_port > 0);
@@ -1262,7 +1522,8 @@ static inline void run_scenario(const scenario_t *sc, captured_hellos_t *caps) {
     snprintf(cname, sizeof(cname), "%s_client", sc->name);
     write_server_config(scfg, sizeof(scfg), sname, server_port, h.up_port);
     write_client_config(ccfg, sizeof(ccfg), cname, pub_b64, h.relay.port, local_port,
-                        sc->num_conn, sc->browser != NULL ? sc->browser : "chrome");
+                        sc->num_conn, sc->browser != NULL ? sc->browser : "chrome",
+                        sc->encryption != NULL ? sc->encryption : "aes-gcm");
 
     child_t server;
     child_t client;
@@ -1355,26 +1616,128 @@ static inline void run_scenario(const scenario_t *sc, captured_hellos_t *caps) {
     if (sc->corrupt_at < 0 && !sc->corrupt_keyshare) {
         uint64_t start = now_ms();
         uint64_t deadline = start + XFER_MS;
-        while (h.got < h.reply_cap && now_ms() < deadline) {
+        /* A STALL IS DETECTED BY THE CLOCK, NOT BY WAITING OUT XFER_MS.
+         * A dropped frame leaves a permanent gap in the stream's sequence
+         * numbers -- neither implementation retransmits -- so the
+         * transfer never resumes, and sitting on it for the full 15 s
+         * would cost three of this module's negative controls 45 s of
+         * serial work for nothing. Instead: once the flipped bit has
+         * actually been forwarded, a window of STALL_QUIET_MS with no
+         * progress in EITHER direction ends the run. Both halves are
+         * necessary -- "no progress" alone would fire during the
+         * milliseconds before the client's first frame, and "the bit
+         * landed" alone says nothing about whether anything stopped. */
+        uint64_t last_progress = start;
+        size_t last_up = h.up_seen;
+        size_t last_got = h.got;
+        while (now_ms() < deadline) {
             harness_pump(&h, 20);
+            if (h.up_seen != last_up || h.got != last_got) {
+                last_up = h.up_seen;
+                last_got = h.got;
+                last_progress = now_ms();
+            }
+            if (h.got >= h.reply_cap) {
+                break;
+            }
+            if (sc->expect != CLOAK_EXPECT_ALL && h.relay.c2s_corruptions > 0 &&
+                now_ms() - last_progress >= (uint64_t)STALL_QUIET_MS) {
+                break;
+            }
         }
         uint64_t took = now_ms() - start;
 
-        ASSERT_EQ_INT((long long)sizeof(send_buf), (long long)h.sent);
-        ASSERT_EQ_INT((long long)sizeof(send_buf), (long long)h.up_seen);
-        ASSERT_EQ_INT((long long)sizeof(reply_buf), (long long)h.got);
-        ASSERT_MEM_EQ(want_buf, reply_buf, sizeof(want_buf));
-        /* The reply must NOT be the request: an upstream that echoed, or a
-         * near end that looped the application's own bytes back without
-         * ever crossing the tunnel, would satisfy every length assertion
-         * above. */
-        ASSERT_MEM_NE(send_buf, reply_buf, sizeof(send_buf));
-        /* h.sent and h.got, NOT the buffer size: a stalled transfer must
-         * print what actually crossed, or the line reads like a success
-         * next to the assertions that just failed. */
-        printf("   %zu bytes out, %zu back, %zu seen upstream, in %llu ms, "
-               "%zu relayed connection(s)\n",
-               h.sent, h.got, h.up_seen, (unsigned long long)took, h.relay.accepted);
+        /* THE FLIPPED BIT MUST HAVE LANDED. A control whose corruption
+         * never reached the wire asserts a stall and may well get one --
+         * from a run that never reached the thing under test. */
+        if (sc->corrupt_c2s && h.relay.c2s_corruptions == 0) {
+            fprintf(stderr,
+                    "FAIL %s:%d: %s: not one byte was flipped (record %zu offset %zu was "
+                    "never seen; the relay walked %zu record(s)), so this run says nothing "
+                    "about the encryption method\n",
+                    __FILE__, __LINE__, sc->name, sc->corrupt_c2s_rec, sc->corrupt_c2s_off,
+                    sc->wire_out != NULL ? sc->wire_out->c2s_records : (size_t)0);
+            cloak_test_failures++;
+        }
+
+        if (sc->expect == CLOAK_EXPECT_STALL) {
+            /* SOME bytes, and NOT ALL of them. The upper bound is the
+             * refusal: the receiving mux dropped the frame whose bit was
+             * flipped and the stream can never be completed. The LOWER
+             * bound is what makes it mean anything -- without it, a
+             * session that never came up at all would pass. */
+            if (h.up_seen == 0) {
+                fprintf(stderr,
+                        "FAIL %s:%d: %s: not one byte reached the upstream, so the stall "
+                        "proves nothing about the frame that was corrupted -- this run "
+                        "never carried traffic at all\n",
+                        __FILE__, __LINE__, sc->name);
+                cloak_test_failures++;
+            }
+            if (h.up_seen >= sizeof(send_buf)) {
+                fprintf(stderr,
+                        "FAIL %s:%d: %s: all %zu bytes reached the upstream even though one "
+                        "bit inside an authenticated frame was flipped -- the receiving end "
+                        "is not checking the AEAD tag\n",
+                        __FILE__, __LINE__, sc->name, h.up_seen);
+                cloak_test_failures++;
+            }
+            if (h.got >= h.reply_cap) {
+                fprintf(stderr,
+                        "FAIL %s:%d: %s: the whole reply came back despite a flipped bit\n",
+                        __FILE__, __LINE__, sc->name);
+                cloak_test_failures++;
+            }
+            printf("   STALLED as required: %zu of %zu bytes upstream, %zu back, "
+                   "%zu byte(s) flipped, in %llu ms\n",
+                   h.up_seen, sizeof(send_buf), h.got, h.relay.c2s_corruptions,
+                   (unsigned long long)took);
+        } else {
+            ASSERT_EQ_INT((long long)sizeof(send_buf), (long long)h.sent);
+            ASSERT_EQ_INT((long long)sizeof(send_buf), (long long)h.up_seen);
+            ASSERT_EQ_INT((long long)sizeof(reply_buf), (long long)h.got);
+            if (sc->expect == CLOAK_EXPECT_ONE_BYTE_OFF) {
+                /* EXACTLY ONE. Not "it differs" -- a count is the whole
+                 * assertion: it says the flipped bit was delivered to the
+                 * application verbatim and that nothing else moved, which
+                 * is what "this method does not authenticate" means and
+                 * what an AEAD method cannot do. */
+                size_t diffs = 0;
+                size_t first_diff = 0;
+                for (size_t i = 0; i < sizeof(want_buf); i++) {
+                    if (reply_buf[i] != want_buf[i]) {
+                        if (diffs == 0) {
+                            first_diff = i;
+                        }
+                        diffs++;
+                    }
+                }
+                if (diffs != 1) {
+                    fprintf(stderr,
+                            "FAIL %s:%d: %s: %zu delivered byte(s) differ from what was "
+                            "sent; exactly 1 was required (one flipped wire bit, carried "
+                            "through an unauthenticated payload)\n",
+                            __FILE__, __LINE__, sc->name, diffs);
+                    cloak_test_failures++;
+                } else {
+                    printf("   exactly 1 delivered byte differs (offset %zu), as required\n",
+                           first_diff);
+                }
+            } else {
+                ASSERT_MEM_EQ(want_buf, reply_buf, sizeof(want_buf));
+            }
+            /* The reply must NOT be the request: an upstream that echoed, or a
+             * near end that looped the application's own bytes back without
+             * ever crossing the tunnel, would satisfy every length assertion
+             * above. */
+            ASSERT_MEM_NE(send_buf, reply_buf, sizeof(send_buf));
+            /* h.sent and h.got, NOT the buffer size: a stalled transfer must
+             * print what actually crossed, or the line reads like a success
+             * next to the assertions that just failed. */
+            printf("   %zu bytes out, %zu back, %zu seen upstream, in %llu ms, "
+                   "%zu relayed connection(s)\n",
+                   h.sent, h.got, h.up_seen, (unsigned long long)took, h.relay.accepted);
+        }
 
     } else {
         /* THE NEGATIVE CONTROL. The client must say it refused, and no

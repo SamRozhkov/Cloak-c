@@ -335,6 +335,17 @@ target_compile_definitions(test_go_clienthello_matrix PRIVATE
     CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
     CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
 
+# test_go_encryption_matrix's two in-tree dependencies (module 10b task
+# 2), appended here for exactly the reason test_go_interop's are. Unlike
+# test_go_clienthello_matrix it really does run BOTH of ours -- half its
+# matrix is Go's ck-client against our ck-server -- so both edges are
+# load-bearing here and not merely present to satisfy the harness's
+# #error.
+add_dependencies(test_go_encryption_matrix ck-server ck-client)
+target_compile_definitions(test_go_encryption_matrix PRIVATE
+    CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
+    CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
+
 # test_unordered_proof's two in-tree dependencies (module 9 task 8),
 # appended here for exactly the reason test_go_interop's are: the test is
 # declared in libcloak-server/tests, which is added BEFORE cmd/ck-server
