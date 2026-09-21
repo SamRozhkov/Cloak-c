@@ -196,12 +196,27 @@ static void test_sessions_to_the_cap_all_establish(void) {
 /* 2. THE COST BRACKET                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Fills a fresh registry with `n` sessions under distinct uids, performs
- * `lookups` successful lookups spread evenly over them, and returns the
- * mean number of chain steps per lookup in units of 1/1000 of a step.
- * *out_ns, when non-NULL, gets the mean wall-clock nanoseconds per
- * lookup, which is reported but never asserted on. */
-static unsigned long lookup_cost_milli_steps(unsigned n, unsigned lookups, unsigned long *out_ns) {
+/* Fills a fresh registry with `n` sessions spread over `uid_count`
+ * distinct uids (uid_count == 0 means one uid per session, the
+ * 1024-users-with-one-session-each shape), performs `lookups` successful
+ * lookups spread evenly over them, and returns the mean number of chain
+ * steps per lookup in units of 1/1000 of a step. *out_ns, when non-NULL,
+ * gets the mean wall-clock nanoseconds per lookup, which is reported but
+ * never asserted on.
+ *
+ * WHY uid_count EXISTS, because it is the whole point of the second
+ * bracket below. The key bucket is hashed from the PAIR (uid,
+ * session_id). Under one uid per session the uid half alone already
+ * separates every key, so with 1024 sessions over 2048 key buckets every
+ * chain holds exactly one entry NO MATTER WHAT THE HASH DOES -- a hash
+ * that ignored session_id entirely would measure identically. That was
+ * measured, not reasoned: zeroing session_id out of registry.c's
+ * registry_key_bucket input left the whole 85-binary suite passing. With
+ * uid_count small the sessions of one uid all collide unless the
+ * session_id half is really hashed, and the same mutation takes the mean
+ * chain length from ~1.0 to ~65 at the cap. */
+static unsigned long lookup_cost_milli_steps(unsigned n, unsigned uid_count, unsigned lookups,
+                                             unsigned long *out_ns) {
     cloak_reactor_t *r = cloak_reactor_create();
     ASSERT_TRUE(r != NULL);
     cloak_server_registry_t reg;
@@ -214,7 +229,7 @@ static unsigned long lookup_cost_milli_steps(unsigned n, unsigned lookups, unsig
 
     for (unsigned i = 0; i < n; i++) {
         uint8_t uid[CLOAK_UID_LEN];
-        scale_uid(uid, i);
+        scale_uid(uid, uid_count == 0 ? i : (i % uid_count));
         int created = 0;
         ASSERT_TRUE(cloak_server_registry_get_or_create(&reg, uid, 7000u + i, &cfg, &created) !=
                     NULL);
@@ -230,7 +245,7 @@ static unsigned long lookup_cost_milli_steps(unsigned n, unsigned lookups, unsig
     for (unsigned k = 0; k < lookups; k++) {
         unsigned i = k % n;
         uint8_t uid[CLOAK_UID_LEN];
-        scale_uid(uid, i);
+        scale_uid(uid, uid_count == 0 ? i : (i % uid_count));
         cloak_session_t *s = cloak_server_registry_find(&reg, uid, 7000u + i);
         ASSERT_TRUE(s != NULL);
     }
@@ -310,14 +325,25 @@ static unsigned long count_for_uid_cost_milli_steps(unsigned n, unsigned lookups
  * be satisfied by an implementation that was uniformly terrible.
  *
  * Wall-clock nanoseconds are printed alongside for the report and are
- * deliberately NOT asserted on. */
+ * deliberately NOT asserted on.
+ *
+ * WHAT THIS CASE CANNOT SEE, stated here so the next reader does not
+ * trust it further than it goes: it fills ONE UID PER SESSION, and under
+ * that occupancy the uid half of the key already separates all 1024
+ * entries, so every chain holds one entry whatever the hash does. A key
+ * hash that dropped session_id entirely passes this case unchanged --
+ * measured, by zeroing session_id out of registry.c's
+ * registry_key_bucket input and watching all 85 test binaries still
+ * pass. That is what
+ * test_lookup_cost_is_bounded_when_one_user_holds_many_sessions below is
+ * for; the two are a pair and neither is sufficient alone. */
 static void test_lookup_cost_is_bounded_at_the_cap(void) {
     const unsigned points[4] = {1, 64, 256, CLOAK_REGISTRY_MAX_SESSIONS};
     unsigned long milli[4];
     unsigned long ns[4];
 
     for (int i = 0; i < 4; i++) {
-        milli[i] = lookup_cost_milli_steps(points[i], 20000, &ns[i]);
+        milli[i] = lookup_cost_milli_steps(points[i], 0u, 20000, &ns[i]);
         printf("case 2: find at n=%4u -> %lu.%03lu chain steps/lookup, %lu ns/lookup\n", points[i],
                milli[i] / 1000, milli[i] % 1000, ns[i]);
     }
@@ -356,6 +382,68 @@ static void test_lookup_cost_is_bounded_at_the_cap(void) {
      * table, not the other way round. 1024 is what the scan it replaced
      * cost unconditionally. */
     ASSERT_TRUE(ccap < 3000);
+}
+
+/* THE SAME BRACKET, UNDER THE OCCUPANCY THE SERVER ACTUALLY HAS -- and
+ * the reason the one above is not sufficient on its own.
+ *
+ * Cloak's uid IS A USER. cloak_server_registry_count_for_uid exists
+ * precisely because one user legitimately holds many concurrent
+ * sessions, and the per-user cap the dispatcher applies is a cap on that
+ * number. So "1024 users holding one session each" is not the workload;
+ * it is the ONE workload under which a (uid, session_id) key hash cannot
+ * be told apart from a uid-only hash, because the uid half alone already
+ * separates all 1024 keys.
+ *
+ * MEASURED, not argued. Zeroing session_id's four bytes out of
+ * registry.c's registry_key_bucket input -- so the key bucket depends on
+ * the uid alone -- leaves lookups CORRECT (the chain walk still compares
+ * both halves of the key) and therefore leaves the whole 85-binary suite
+ * passing 85/85, INCLUDING the bracket above. It is caught here, and
+ * only here: at 8 uids the same mutation reads
+ *
+ *     n=   1 -> 1.000 chain steps    n=  64 ->  4.503
+ *     n= 256 -> 16.522               n=1024 -> 65.316
+ *
+ * against the unmutated 1.000 / 1.062 / 1.046 / 1.239 this case asserts.
+ * 65x, not a subtle margin. The control matters: the workload change
+ * ALONE proves nothing, since the unmutated numbers are flat either way;
+ * it is the mutation that shows the bracket can now fail.
+ *
+ * 8 is chosen so that at the cap one uid holds 128 sessions -- well above
+ * any plausible per-user concurrency, which is the point: the bracket
+ * should hold at a uid:session ratio far worse than deployment's. The
+ * assertions are deliberately the SAME two as the case above, so the two
+ * differ in workload and in nothing else. */
+static void test_lookup_cost_is_bounded_when_one_user_holds_many_sessions(void) {
+    const unsigned points[4] = {1, 64, 256, CLOAK_REGISTRY_MAX_SESSIONS};
+    const unsigned uid_count = 8u;
+    unsigned long milli[4];
+    unsigned long ns[4];
+
+    for (int i = 0; i < 4; i++) {
+        milli[i] = lookup_cost_milli_steps(points[i], uid_count, 20000, &ns[i]);
+        printf("case 2b: find at n=%4u over %u uids -> %lu.%03lu chain steps/lookup, %lu "
+               "ns/lookup\n",
+               points[i], uid_count, milli[i] / 1000, milli[i] % 1000, ns[i]);
+    }
+
+    unsigned long lo = milli[0], hi = milli[0];
+    for (int i = 1; i < 4; i++) {
+        if (milli[i] < lo) {
+            lo = milli[i];
+        }
+        if (milli[i] > hi) {
+            hi = milli[i];
+        }
+    }
+    ASSERT_TRUE(lo > 0);
+    printf("case 2b: find cost ratio across a 1024-fold range in n at %u uids = %lu.%03lu\n",
+           uid_count, hi / lo, ((hi * 1000) / lo) % 1000);
+
+    /* THE BRACKET, identical to case 2's. */
+    ASSERT_TRUE(hi < 3 * lo);
+    ASSERT_TRUE(milli[3] < 4000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1011,6 +1099,7 @@ static void test_panel_index_agrees_with_the_panel(void) {
 TEST_MAIN_BEGIN()
     test_sessions_to_the_cap_all_establish();
     test_lookup_cost_is_bounded_at_the_cap();
+    test_lookup_cost_is_bounded_when_one_user_holds_many_sessions();
     test_refusal_at_the_cap_is_indistinguishable();
     test_the_cap_still_means_what_it_says();
     test_uid_and_key_chains_agree();
