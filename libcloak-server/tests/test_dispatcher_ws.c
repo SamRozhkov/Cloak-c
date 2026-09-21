@@ -1155,21 +1155,23 @@ static void test_replayed_cdn_request_is_refused(void) {
  *       the successful upgrade in case 1, whose first byte already
  *       differs, so the assertion demonstrably can fail.
  *
- *   (b) A MEASURED TIMING BRACKET. The spread between the four step-1
- *       medians over WS_TIMING_RUNS samples -- and the same spread over
- *       the four MINIMA -- is below WS_TIMING_BOUND_US, a literal
- *       justified by the measurement recorded beside it rather than by
- *       taste.
+ *   (b) THE VALIDATION ORDER, WITHOUT A CLOCK. After every one of the
+ *       WS_TIMING_RUNS x ARM_COUNT probes, the session_aborted counter,
+ *       the panel's active count and the panel's own lookup for uid_ok
+ *       are all unmoved -- so no arm authorised the UID its Hidden
+ *       decrypts to before refusing the upgrade it should have refused
+ *       on first. Two of the arms carry a valid Hidden for an
+ *       authorised UID precisely so that this can fail.
  *
- * WHAT (b) IS NOT, and this is worth being exact about because an
- * earlier revision of this file over-claimed it: the bracket is a bound
- * on how different these refusals may look, not the detector for a
- * wrongly ordered validation. It cannot see a same-bytes branch costing
- * under about 600 us (measured, by this commit's reviewer, with a
- * deliberately delayed arm), and the ratio that COULD see one flaked on
- * an unmutated tree -- see WS_TIMING_BOUND_US. The ordering is caught by
- * two clock-free assertions instead: the session_aborted counter in
- * case 4 and the replay-cache check in case 4b.
+ * WHAT (b) USED TO BE, and why it is not that any more: a bracket on the
+ * spread between the four step-1 medians and between their four minima,
+ * against a 1000 us literal. It was never the detector for a wrongly
+ * ordered validation -- it could not see a same-bytes branch costing
+ * under about 600 us (measured, by that commit's reviewer, with a
+ * deliberately delayed arm) -- and under Go's ordering, ported into this
+ * tree as a mutation, it PASSED while the counters above failed on the
+ * first probe. The clock is still measured and printed on every run; see
+ * the comment above WS_TIMING_RUNS.
  *
  * EVERY ARM IS THE SAME LENGTH, to the byte. That is load-bearing: the
  * WebSocket first-packet path reads one byte at a time, so a shorter
@@ -1346,52 +1348,68 @@ static int cmp_u64(const void *a, const void *b) {
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
-/* THE TWO BOUNDS, AND THE MEASUREMENTS THAT JUSTIFY THEM. Everything
- * below was measured in this project's dev image over 24 runs of this
- * test (Debug and ASan+UBSan, 31 samples per arm per run), on a busy
- * machine deliberately -- the noisy runs are the ones that set the
- * numbers, not the clean ones:
+/* THE CLOCK IS A DIAGNOSTIC HERE, NOT A DETECTOR, AND IT USED TO BE
+ * BOTH. This file printed five medians, five minima and a step-6 ratio,
+ * and it ALSO asserted that the spread between the four step-1 medians,
+ * and the spread between their four minima, were each below a literal
+ * WS_TIMING_BOUND_US of 1000 microseconds. Those two assertions are
+ * gone. The numbers are not.
+ *
+ * WHY THEY ARE GONE, MEASURED RATHER THAN ARGUED. The comment they
+ * carried already conceded that a clock-based detector here is
+ * redundant, that the bracket "is a bound on how different these
+ * refusals may look, not the detector for a wrongly ordered validation",
+ * and that "this project treats a flaky test as a bug rather than as
+ * noise to be re-run" -- and then asserted the bracket anyway. Both
+ * halves of that concession were checked before the assertions were
+ * removed, by porting Go's ordering into this tree: cloak_ws_handshake_
+ * parse committing the Hidden before its upgrade checks, and
+ * dispatcher.c deferring the refusal past step 6, so a BAD_UPGRADE arm
+ * carrying a valid Hidden for an authorised UID gets that UID
+ * authorised, a session created, and the session then thrown away.
+ *
+ *   - With that defect in place, the two timing brackets PASSED, twice
+ *     over: median spread 686 us then 663 us, fastest-sample spread
+ *     313 us then 394 us, all four comfortably inside the 1000 us bound.
+ *     They did not detect the one defect this whole case exists to
+ *     detect. (The step-6 ratio, which is only printed, did move as its
+ *     own comment predicts: 1107/1000 and 1122/1000, over 1.0.)
+ *   - With that defect in place, the clock-free assertion added below
+ *     FAILED in the first run of the matrix, at the BAD_UPGRADE arm --
+ *     "arm 1, run 0, created and then unwound a session" -- unstarved
+ *     and on both attempts.
+ *
+ * So the bracket cost a schedule-sensitive failure mode and bought no
+ * detection. What replaces it is not a looser bound -- there is no bound
+ * -- it is the session_aborted counter and the panel, checked after
+ * EVERY one of the 155 probes rather than once per arm in case 4. An arm
+ * that authorised a UID before refusing the upgrade cannot hide behind
+ * the dispatcher's clean unwind: the counter is the one trace that
+ * survives it (see test_panel_is_untouched_by_a_malformed_upgrade).
+ *
+ * WHAT THE NUMBERS ARE STILL FOR, and why they are still printed on
+ * every run. They are how a reader sees that the step-6 refusal really
+ * does cost more, and by how much, which is the measurement the
+ * side-channel note in dispatcher.c's step 6 depends on. The figures
+ * this file measured over 24 runs in this project's dev image (Debug and
+ * ASan+UBSan, 31 samples per arm per run, on a deliberately busy
+ * machine) are kept here as the baseline a future reader compares
+ * against:
  *
  *   spread between the four step-1 refusals' medians:   6..256 us
+ *   spread between their four minima:                   2..110 us
  *   median of the step-6 refusal, as a fraction of the
  *   BAD_UPGRADE arm's median:                     1.54x..1.79x
  *
- * WS_TIMING_BOUND_US is an ABSOLUTE literal, because "no refusal is
- * grossly slower than another" is an absolute claim: a regression that
- * doubled every arm's cost equally would keep a ratio happy and should
- * not keep this happy. 1000 us is about 4x the worst spread ever
- * observed here, which is the margin this measurement needs -- the
- * absolute latency of the whole probe (connect, one-byte-at-a-time read,
- * dial to the cover site, relay, banner) swings by a factor of four with
- * machine load, and the spread swings with it.
- *
- * THE STEP-6 RATIO BELOW IS MEASURED, PRINTED, AND NOT ASSERTED. It was
- * an assertion (BAD_UPGRADE's median against 0.8x UNAUTHORISED's), and
- * on paper it is the sharpest detector in the file: it would read >= 1.0
- * the moment the upgrade were validated after the UID. In practice it
- * FLAKED ON THE UNMUTATED TREE -- 1 failure in 50 isolated Debug runs
- * here (0.807 against the 0.8 bound), 3 in 50 for this commit's reviewer
- * (0.831, 0.933, 0.954). The reason is structural rather than fixable by
- * widening: the step-6 path's extra work is ~100-130 us, while the
- * probe's own cost -- connect, a 512-byte request read one byte at a
- * time, a TCP dial to the cover site, a relay, a banner -- swings from
- * ~190 us to ~800 us with machine load. The denominator is mostly probe,
- * not path, so a loaded run can eat the whole margin. Widening the bound
- * to cover that would put it past the signal it is meant to detect.
- *
- * SO IT IS A DIAGNOSTIC, AND THAT IS THE RIGHT SHAPE HERE rather than a
- * retreat, for one specific reason: it is REDUNDANT AS A DETECTOR. Go's
- * ordering is caught deterministically, twice over and without a clock,
- * by the session_aborted counter across all five malformed-upgrade arms
- * and by test_refused_upgrade_does_not_burn_the_ephemeral_key. A
- * non-deterministic assertion that adds no detection only adds a way for
- * a green tree to go red, and this project treats a flaky test as a bug
- * rather than as noise to be re-run. The number is still worth having on
- * every run: it is how a future reader sees that the step-6 refusal
- * really does cost more, and by how much, which is the measurement the
- * side-channel note in dispatcher.c's step 6 depends on. */
+ * A run far outside those is worth looking at by eye. It is not worth
+ * failing a suite on, for the same structural reason the step-6 ratio
+ * was demoted to a print before it: the probe's own cost -- connect, a
+ * 512-byte request read one byte at a time, a TCP dial to the cover
+ * site, a relay, a banner -- swings from ~190 us to ~800 us with machine
+ * load, and the signal being looked for is ~100-130 us. The denominator
+ * is mostly probe, not path. There is no bound that is both stable under
+ * load and tighter than the effect. */
 #define WS_TIMING_RUNS 31
-#define WS_TIMING_BOUND_US 1000
 
 static void test_three_refusals_are_indistinguishable(void) {
     struct fixture fx;
@@ -1401,11 +1419,61 @@ static void test_three_refusals_are_indistinguishable(void) {
     probe_result_t first[ARM_COUNT];
     memset(first, 0, sizeof(first));
 
-    for (int run = 0; run < WS_TIMING_RUNS; run++) {
+    /* The clock-free baseline for (b) below, taken once: every arm in
+     * this matrix is a REFUSAL, so nothing in the loop may move any of
+     * these three. */
+    int aborted_before = fx.aborted_calls;
+    size_t active_before = cloak_userpanel_active_count(fx.panel);
+    const char *order_broken = NULL;
+    int broken_arm = -1;
+    int broken_run = -1;
+
+    for (int run = 0; run < WS_TIMING_RUNS && order_broken == NULL; run++) {
         for (int a = 0; a < ARM_COUNT; a++) {
             probe_result_t pr;
             run_arm(&fx, (arm_t)a, &pr);
             samples[a][run] = pr.elapsed_us;
+
+            /* (b) THE VALIDATION ORDER, WITHOUT A CLOCK, AFTER EVERY ONE
+             * OF THE WS_TIMING_RUNS x ARM_COUNT PROBES. Two of these arms
+             * -- BAD_UPGRADE and BARE_LF -- carry a Hidden that decrypts
+             * to uid_ok, an authorised, metered, in-database UID, which
+             * is what makes this a test of ORDER and not merely of
+             * rejection: if the upgrade were validated after step 6, as
+             * Go's is, either of them would authorise that UID and create
+             * a session before reaching the header it should have been
+             * refused on.
+             *
+             * aborted_calls is the check that survives the unwind, and it
+             * is why the other two are not enough on their own. The
+             * dispatcher's cleanup is clean: a session created at step 8
+             * and abandoned later leaves the panel and the registry
+             * looking exactly as they do here, so the active count and
+             * the lookup would both pass against precisely the defect
+             * being looked for. cloak_dispatch_session_aborted_cb fires
+             * only when a session THIS handshake created is thrown away,
+             * so it cannot be tidied away -- the same argument
+             * test_panel_is_untouched_by_a_malformed_upgrade makes, run
+             * here on every sample of the timing matrix rather than once
+             * per arm.
+             *
+             * This is the assertion the removed timing bracket could not
+             * make. See the comment above WS_TIMING_RUNS for the
+             * mutation in which the bracket passed and this failed on the
+             * first probe. */
+            if (fx.aborted_calls != aborted_before) {
+                order_broken = "created and then unwound a session";
+            } else if (cloak_userpanel_active_count(fx.panel) != active_before) {
+                order_broken = "changed the panel's active count";
+            } else if (cloak_userpanel_find(fx.panel, fx.uid_ok) != NULL) {
+                order_broken = "made uid_ok active";
+            }
+            if (order_broken != NULL) {
+                broken_arm = a;
+                broken_run = run;
+                break;
+            }
+
             if (run == 0) {
                 first[a] = pr;
             } else {
@@ -1416,6 +1484,15 @@ static void test_three_refusals_are_indistinguishable(void) {
                 ASSERT_MEM_EQ(first[a].got, pr.got, pr.len);
             }
         }
+    }
+
+    if (order_broken != NULL) {
+        fprintf(stderr, "FAIL: arm %d, run %d, %s -- a UID was authorised before the upgrade was "
+                        "refused\n",
+                broken_arm, broken_run, order_broken);
+        ASSERT_TRUE(0);
+        fixture_destroy(&fx);
+        return;
     }
 
     /* (a), across the arms. */
@@ -1453,11 +1530,10 @@ static void test_three_refusals_are_indistinguishable(void) {
     }
     fprintf(stderr,
             "[timing] medians us: bad_hidden=%llu bad_upgrade=%llu not_cloak=%llu bare_lf=%llu "
-            "unauthorised=%llu spread=%llu bound=%d\n",
+            "unauthorised=%llu spread=%llu\n",
             (unsigned long long)med[ARM_BAD_HIDDEN], (unsigned long long)med[ARM_BAD_UPGRADE],
             (unsigned long long)med[ARM_NOT_CLOAK], (unsigned long long)med[ARM_BARE_LF],
-            (unsigned long long)med[ARM_UNAUTHORISED], (unsigned long long)(hi - lo),
-            WS_TIMING_BOUND_US);
+            (unsigned long long)med[ARM_UNAUTHORISED], (unsigned long long)(hi - lo));
     uint64_t flo = fastest[0], fhi = fastest[0];
     for (int a = 1; a < ARM_STEP1_COUNT; a++) {
         if (fastest[a] < flo) {
@@ -1473,26 +1549,27 @@ static void test_three_refusals_are_indistinguishable(void) {
             (unsigned long long)fastest[4], (unsigned long long)(fhi - flo));
     fprintf(stderr, "[timing] step6 gap us: %lld\n",
             (long long)((int64_t)med[ARM_UNAUTHORISED] - (int64_t)hi));
-    ASSERT_TRUE(hi - lo < WS_TIMING_BOUND_US);
 
-    /* THE SAME BRACKET ON THE FASTEST SAMPLE OF EACH ARM, which is both
-     * a much sharper instrument and the statistic a prober would
-     * actually use -- nobody distinguishes two servers on one probe;
-     * they take the best of many. It is also far less sensitive to the
-     * machine this test runs on, because a scheduling delay can only
-     * ever push a sample UP: measured spread 2..110 us across two dozen
-     * runs, Debug and ASan, against the same 1000 us bound. */
-    ASSERT_TRUE(fhi - flo < WS_TIMING_BOUND_US);
+    /* The spread over each arm's FASTEST sample is printed above for the
+     * same reason: it is the sharper instrument and the statistic a
+     * prober would actually use -- nobody distinguishes two servers on
+     * one probe, they take the best of many -- and a scheduling delay
+     * can only ever push a sample UP. It is still a measurement, not a
+     * detector, and it is still not asserted. */
 
     /* The bare-LF arm carries the other half of that argument: it is
      * the one input that reaches the parser with MALFORMED rather than
-     * BAD_HIDDEN, and its median sits inside the same bracket, so the
-     * dispatcher demonstrably does not branch on the failure code. */
+     * BAD_HIDDEN, and its bytes are identical to the others' and its
+     * median sits with theirs, so the dispatcher demonstrably does not
+     * branch on the failure code. */
 
-    /* The step-6 ratio: recorded, never asserted. See WS_TIMING_BOUND_US's
-     * own comment for why a number this informative is still the wrong
-     * thing to fail a build on, and which two clock-free assertions do
-     * the detecting instead. Typical quiet-run value is 550-650; a run
+    /* The step-6 ratio: recorded, never asserted, and the first of these
+     * numbers to be demoted from an assertion to a print -- it flaked on
+     * an unmutated tree, 1 failure in 50 isolated Debug runs here and 3
+     * in 50 for that commit's reviewer, against a 0.8x bound. See the
+     * comment above WS_TIMING_RUNS for why a number this informative is
+     * still the wrong thing to fail a build on, and what does the
+     * detecting instead. Typical quiet-run value is 550-650; a run
      * reading 1000 or more would mean BAD_UPGRADE had started paying
      * everything UNAUTHORISED pays, which is Go's ordering -- worth
      * looking at by eye, not worth failing a suite on. */
