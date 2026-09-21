@@ -604,9 +604,11 @@ void cloak_proxy_destroy(cloak_proxy_t *p);
  *
  *  AND ITS OLD JUSTIFICATION IS NOW FALSE IN A WAY THAT MATTERED. It
  *  claimed a check on the CREATE path was the COMPLETE check, because Go
- *  treats Unordered as a session-level property fixed at creation and an
- *  additional connection joining an existing session never reaches this
- *  callback. The first half is true and still is; the conclusion was
+ *  treats Unordered as a session-level property fixed at creation
+ *  (internal/multiplex/session.go:48-63 reads it once, in makeStream,
+ *  from the session) and an additional connection joining an existing
+ *  session never reaches this callback (internal/server/activeuser.go:46-47
+ *  returns early with the existing session). The first half is true and still is; the conclusion was
  *  only true while every unordered client was refused outright. Once
  *  they are not, a second connection whose flag DISAGREES with the live
  *  session would be spliced onto it silently -- its frames interpreted
@@ -631,7 +633,10 @@ void cloak_proxy_destroy(cloak_proxy_t *p);
  * how the client's application framed what it sent; the upstream's
  * socket type says what the far end can receive. All four combinations
  * are legal and all four are what Go does -- Go chooses nothing, it
- * dials whatever the ProxyBook names and runs one copy loop over it. An
+ * dials whatever the ProxyBook names
+ * (internal/server/dispatcher.go:289-290, `ProxyDialer.Dial(
+ * proxyAddr.Network(), proxyAddr.String())`) and runs one copy loop
+ * over it (common.Copy, internal/common/copy.go). An
  * unordered session against a "tcp" upstream loses its boundaries at the
  * TCP socket, in this port exactly as in Go, because there is nowhere
  * else they could survive. */

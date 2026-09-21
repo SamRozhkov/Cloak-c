@@ -846,7 +846,9 @@ static void test_delete(void) {
     finish(&fx, &cs, st2, &r2);
 
     /* A second DELETE is 404 too, not 200 and not 500: Go answers 500
-     * here (and then writes 200 over it, which is its own bug). */
+     * here (and then writes 200 over it, which is its own bug) --
+     * internal/server/usermanager/api_router.go:123-128, where the
+     * http.Error(500) arm has no `return` before w.WriteHeader(200). */
     snprintf(reqbuf, sizeof(reqbuf), "DELETE /admin/users/%s HTTP/1.1\r\nHost: admin\r\n\r\n", up);
     resp_t r3;
     cloak_stream_t *st3 = request(&fx, &cs, reqbuf, &r3);
@@ -1823,7 +1825,8 @@ static void test_post_with_empty_body(void) {
 
 /* ---- 12f. A query string is stripped before routing ----------------------
  *
- * Go's gorilla/mux matches on r.URL.Path, which excludes the query, so a
+ * Go's gorilla/mux matches on r.URL.Path, which excludes the query
+ * (gorilla/mux@v1.8.1 mux.go:177, `path := req.URL.Path`), so a
  * router that matched the raw target would answer 404 for
  * /admin/users?x=1 and 400 for /admin/users/<uid>?x=1 -- two divergences
  * from upstream, neither visible to any other case here. */
@@ -2247,8 +2250,14 @@ static void test_unordered_request_larger_than_one_read_chunk(void) {
  *
  * IT IS REACHABLE, not theoretical: dispatcher.c builds an UNORDERED admin
  * session whenever the client sets the flag, and says so in its own
- * comment. Our ck-client cannot ask for it today (it refuses -u), but a
- * Go or crafted client with an admin UID can.
+ * comment. (This used to add "our ck-client cannot ask for it today (it
+ * refuses -u)". THAT IS NO LONGER TRUE and was not re-checked when it
+ * stopped being true: cmd/ck-client accepts -a with -u, which is Go's
+ * shape -- the RouteUDP/RouteTCP choice at ck-client.go:191-200 sits
+ * outside the adminUID branch at :159-167 -- and module 10b task 5
+ * decided to keep it and pinned it end to end through both binaries in
+ * test_ck_client_cli.c case 7a. So the caller this case was written for
+ * hypothetically is now a real one.)
  *
  * It is the same hazard module 9 task 5 fixed for cloak_stream_relay_t's
  * read budget, in the third and last of the three places that hand a

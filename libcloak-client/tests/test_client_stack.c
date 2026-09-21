@@ -1084,7 +1084,8 @@ static void test_a_replacement_is_seeded_with_the_dead_id(void) {
 /* alt_names is parsed everywhere in this tree and, until this round, was
  * consumed nowhere: every session of every client presented one fixed
  * SNI, which is more distinguishable than one that varies. The selection
- * is per SESSION, which is Go's own granularity.
+ * is per SESSION, which is Go's own granularity: the pick lives inside
+ * seshMaker, at cmd/ck-client/ck-client.go:178-181.
  *
  * Asserted here rather than end to end because no server in this project
  * validates SNI, so an integration test could not tell a fixed name from

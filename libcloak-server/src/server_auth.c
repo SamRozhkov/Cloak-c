@@ -30,7 +30,7 @@ static void store_be16(uint8_t *p, uint16_t v) {
 }
 
 /* Trims leading and trailing NUL bytes, matching Go's bytes.Trim(s, "\x00")
- * exactly. Writes a NUL-terminated result to out (capacity out_cap, which
+ * exactly (internal/server/auth.go:47, on plaintext[16:28]). Writes a NUL-terminated result to out (capacity out_cap, which
  * must be > in_len). */
 static void trim_nul_copy(const uint8_t *in, size_t in_len, char *out, size_t out_cap) {
     size_t start = 0;

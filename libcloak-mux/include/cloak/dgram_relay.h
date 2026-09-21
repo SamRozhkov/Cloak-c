@@ -49,8 +49,10 @@
  *   A DATAGRAM UP TO max_payload_per_frame IS CARRIED WHOLE, in both
  *   directions. At the max_on_wire_size both ends of a Cloak tunnel use
  *   (16401) that is 16132 bytes. Go loses every one of 8193..16132: its
- *   client reads replies into an 8192-byte buffer, gets io.ErrShortBuffer
- *   from the datagram pipe, and breaks out of the loop -- tearing the
+ *   client reads replies into an 8192-byte buffer
+ *   (internal/client/piper.go:60), gets io.ErrShortBuffer from the
+ *   datagram pipe (internal/multiplex/datagramBufferedPipe.go:59-60),
+ *   and breaks out of the loop (piper.go:63-66) -- tearing the
  *   peer's whole stream down rather than dropping one message (bug 6).
  *
  *   A LARGER DATAGRAM FROM THE SOCKET IS DROPPED WHOLE, and the relay
@@ -58,14 +60,22 @@
  *   cloak_stream_write refuses to split -- the far end does no
  *   reassembly), so the only choices are drop it or deliver part of it.
  *   Go delivers part of it: its read buffer silently truncates and the
- *   fragment is forwarded as though it were the message (bug 7), which a
- *   UDP application cannot distinguish from a genuinely short reply.
+ *   fragment is forwarded as though it were the message (bug 7), which
+ *   a UDP application cannot distinguish from a genuinely short reply.
+ *   THE BUFFER DIFFERS BY SIDE, and commit 1f8c3e8 cited only the
+ *   client's here, which is the wrong one for this object: this relay is
+ *   the SERVER's upstream socket (proxy.c), whose Go analogue is
+ *   Stream.ReadFrom reading maxStreamUnitWrite bytes -- 16132 at
+ *   appDataMaxLength 16401 (internal/multiplex/stream.go:163,
+ *   session.go:111). The client's local socket truncates at 8192
+ *   instead (internal/client/piper.go:25-26). Same bug, two sizes.
  *   Dropping is what the network itself would have done with a datagram
  *   too large for a hop.
  *
  *   A ZERO-LENGTH DATAGRAM IS SWALLOWED, matching Go and forced anyway:
  *   cloak_stream_write sends nothing for an empty payload because Go's
- *   frame encoder refuses one outright, so there is no frame in which an
+ *   frame encoder refuses one outright
+ *   (internal/multiplex/obfs.go:64-67, "payload cannot be empty"), so there is no frame in which an
  *   empty datagram could cross. Swallowing is not the same as ignoring --
  *   see point 2 above for what must NOT happen when one arrives.
  *

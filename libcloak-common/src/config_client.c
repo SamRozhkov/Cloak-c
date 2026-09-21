@@ -21,7 +21,8 @@ static int parse_encryption_method(const char *name, cloak_aead_method_t *out) {
     return 0;
 }
 
-/* Unknown browser names fall back to chrome, matching Go's switch default. */
+/* Unknown browser names fall back to chrome, matching Go's switch default
+ * (internal/client/state.go:240-250: "chrome" falls through into it). */
 static cloak_browser_t parse_browser(const char *name) {
     if (strcasecmp(name, "firefox") == 0) {
         return CLOAK_BROWSER_FIREFOX;

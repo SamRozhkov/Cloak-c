@@ -1242,6 +1242,42 @@ static size_t cs_block_len(const uint8_t *at) {
     return 2 + (((size_t)at[0] << 8) | (size_t)at[1]);
 }
 
+static int cs_is_grease(uint16_t v) {
+    return (v & 0x0f0fu) == 0x0a0au && (uint8_t)(v >> 8) == (uint8_t)(v & 0xffu);
+}
+
+/* Copies a cipher_suites block, replacing every entry that the TEMPLATE
+ * holds a GREASE codepoint in with a single canonical value, and
+ * asserting the WIRE held a GREASE codepoint in the same slot.
+ *
+ * This is here because cloak_clienthello_build now re-draws GREASE per
+ * connection, the way real Chrome, real Safari and Go's uTLS do
+ * (internal/client/TLS.go:66-80), so the GREASE slot of a captured hello
+ * cannot equal the template's frozen capture byte and must not be
+ * required to. This test runs a real handshake over a real socket, so
+ * there is no seed to pin -- unlike test_clienthello.c, which uses
+ * cloak_clienthello_build_with_grease_seed and keeps its literals exact.
+ *
+ * Nothing is weakened by this: the slot still has to be a legal GREASE
+ * value (which a zeroed or truncated block is not), and every OTHER byte
+ * of the block is still compared exactly. What is dropped is only the
+ * requirement that the value be one specific frozen constant -- which
+ * was the defect. */
+static void cs_normalize_grease(uint8_t *dst, const uint8_t *wire, const uint8_t *tmpl,
+                                size_t len) {
+    memcpy(dst, wire, len);
+    for (size_t i = 2; i + 1 < len; i += 2) {
+        uint16_t t = (uint16_t)(((uint16_t)tmpl[i] << 8) | tmpl[i + 1]);
+        if (!cs_is_grease(t)) {
+            continue;
+        }
+        uint16_t w = (uint16_t)(((uint16_t)wire[i] << 8) | wire[i + 1]);
+        ASSERT_TRUE(cs_is_grease(w));
+        dst[i] = 0x0a;
+        dst[i + 1] = 0x0a;
+    }
+}
+
 static void test_browser_templates_are_distinct(void) {
     const cloak_client_browser_t browsers[3] = {CLOAK_CLIENT_BROWSER_CHROME,
                                                 CLOAK_CLIENT_BROWSER_FIREFOX,
@@ -1283,9 +1319,14 @@ static void test_browser_templates_are_distinct(void) {
         ASSERT_TRUE(len <= sizeof(captured[0]));
         ASSERT_TRUE(fs.in_len > CS_BLOCK_OFF_IN_RECORD + len);
         if (len <= sizeof(captured[0]) && fs.in_len > CS_BLOCK_OFF_IN_RECORD + len) {
-            /* What went on the wire IS this browser's template. */
-            ASSERT_MEM_EQ(fs.in + CS_BLOCK_OFF_IN_RECORD, tmpl_cs, len);
-            memcpy(captured[b], fs.in + CS_BLOCK_OFF_IN_RECORD, len);
+            /* What went on the wire IS this browser's template, modulo
+             * the per-connection GREASE draw. */
+            uint8_t norm_wire[512];
+            uint8_t norm_tmpl[512];
+            cs_normalize_grease(norm_wire, fs.in + CS_BLOCK_OFF_IN_RECORD, tmpl_cs, len);
+            cs_normalize_grease(norm_tmpl, tmpl_cs, tmpl_cs, len);
+            ASSERT_MEM_EQ(norm_wire, norm_tmpl, len);
+            memcpy(captured[b], norm_wire, len);
             captured_len[b] = len;
         }
 

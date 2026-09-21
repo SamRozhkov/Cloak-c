@@ -323,6 +323,29 @@ target_compile_definitions(test_go_interop PRIVATE
     CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
     CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
 
+# test_go_clienthello_matrix's two in-tree dependencies (module 10b task
+# 1), appended here for exactly the reason test_go_interop's are: it is
+# declared in libcloak-server/tests, which is added BEFORE cmd/ck-server
+# and cmd/ck-client. It never runs OUR ck-server -- the far end is always
+# Go's -- but it includes the same go_oracle_harness.h, whose four *_PATH
+# macros are a #error if any of them is missing, so both are defined here
+# and the dependency edge is kept on both.
+add_dependencies(test_go_clienthello_matrix ck-server ck-client)
+target_compile_definitions(test_go_clienthello_matrix PRIVATE
+    CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
+    CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
+
+# test_go_encryption_matrix's two in-tree dependencies (module 10b task
+# 2), appended here for exactly the reason test_go_interop's are. Unlike
+# test_go_clienthello_matrix it really does run BOTH of ours -- half its
+# matrix is Go's ck-client against our ck-server -- so both edges are
+# load-bearing here and not merely present to satisfy the harness's
+# #error.
+add_dependencies(test_go_encryption_matrix ck-server ck-client)
+target_compile_definitions(test_go_encryption_matrix PRIVATE
+    CK_SERVER_PATH="$<TARGET_FILE:ck-server>"
+    CK_CLIENT_PATH="$<TARGET_FILE:ck-client>")
+
 # test_unordered_proof's two in-tree dependencies (module 9 task 8),
 # appended here for exactly the reason test_go_interop's are: the test is
 # declared in libcloak-server/tests, which is added BEFORE cmd/ck-server
@@ -345,3 +368,15 @@ target_compile_definitions(test_unordered_proof PRIVATE
 # on, so that a reader who finds this line is one scroll from what it
 # does.
 add_subdirectory(fuzz)
+
+# The out-of-band growth harness (module 10b task 9). NOT a test and not
+# in the default build: tools/soak/CMakeLists.txt is only entered when
+# CLOAK_BUILD_SOAK is ON, so `ctest` still runs exactly the tests it ran
+# before this line existed, and a default `cmake --build` compiles
+# exactly the same objects. The option is declared here rather than in
+# that file so it is visible to `cmake -LH` without configuring the
+# subdirectory first. See docs/runbooks/soak-growth.md.
+option(CLOAK_BUILD_SOAK "Build the long-running growth harness (tools/soak)" OFF)
+if(CLOAK_BUILD_SOAK)
+    add_subdirectory(tools/soak)
+endif()

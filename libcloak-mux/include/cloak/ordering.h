@@ -20,8 +20,8 @@
  *
  * WHAT THE TWO MODES ACTUALLY MEAN, since nothing in this module's task 2
  * implements the difference yet and a name alone is not a specification.
- * In Go, makeStream (stream.go) picks the receive buffer from this one
- * bit:
+ * In Go, makeStream (internal/multiplex/stream.go:48-66) picks the
+ * receive buffer from this one bit:
  *
  *   ORDERED    a streamBuffer: frames are reassembled by sequence number
  *              into a gap-free byte stream, out-of-order arrivals wait in
@@ -35,10 +35,11 @@
  *              a frame that arrives late is simply late, not buffered
  *              until its predecessors show up. Go correspondingly refuses
  *              to split a write that does not fit in one frame
- *              (io.ErrShortBuffer) rather than silently fragmenting a
- *              datagram, and stops pinning a stream to one underlying
- *              connection (Stream.assignedConn is documented as "not used
- *              in unordered connection mode").
+ *              (io.ErrShortBuffer -- stream.go:132-135) rather than
+ *              silently fragmenting a datagram, and stops pinning a
+ *              stream to one underlying connection (Stream.assignedConn
+ *              is documented as "not used in unordered connection mode"
+ *              at stream.go:38-43).
  *
  * ZERO IS DELIBERATELY INVALID, AND THE MODE IS A FIELD OF
  * cloak_session_config_t RATHER THAN A PARAMETER FOR THAT REASON. This is
@@ -82,7 +83,9 @@
  * two halves the wrong way round. */
 typedef enum {
     CLOAK_SESSION_ORDERING_INVALID   = 0, /* deliberate: an un-updated call site FAILS construction */
-    CLOAK_SESSION_ORDERING_ORDERED   = 1, /* Go's Unordered == false: reassembled byte stream */
+    /* Go's Unordered == false: reassembled byte stream
+     * (internal/multiplex/stream.go:59-63 picks NewStreamBuffer). */
+    CLOAK_SESSION_ORDERING_ORDERED   = 1,
     CLOAK_SESSION_ORDERING_UNORDERED = 2  /* Go's Unordered == true: datagrams, no reassembly */
 } cloak_session_ordering_t;
 

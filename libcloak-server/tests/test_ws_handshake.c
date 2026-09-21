@@ -197,7 +197,8 @@ static cloak_ws_hs_result_t parse_str(const char *req, cloak_ws_hs_t *out) {
  * Every false "measured" claim this file has carried -- four of them,
  * found across three review rounds -- was a claim about a request literal
  * with NO Host header. Go answers `400 Bad Request: missing required Host
- * header` to ANY HTTP/1.1 request that omits it (RFC 9112 3.2), before
+ * header` to ANY HTTP/1.1 request that omits it (RFC 9112 3.2;
+ * re-measured in module 10b task 10 on go1.25.6, verbatim), before
  * the handler runs and for a reason that has nothing to do with the
  * property under test. So a Go measurement taken against such a literal
  * measures the Host check and nothing else, and it will agree with
@@ -857,7 +858,10 @@ static void test_high_bytes_in_a_header_value_are_accepted(void) {
      * in test_malformed_requests).
      *
      * MEASURED ON THESE EXACT BYTES: 101, with the hidden payload
-     * decoding to the same 96 bytes. An earlier version of this literal
+     * decoding to the same 96 bytes. Re-measured in module 10b task 10
+     * on go1.25.6 + gorilla/websocket v1.5.3: 0x80/0xff/0xc3 in a header
+     * value with a Host present is 101, and the same request with the
+     * Host line deleted is the 400 described below. An earlier version of this literal
      * had no Host header, and the 101 claimed here did not reproduce on
      * it -- Go answered `400 Bad Request: missing required Host header`,
      * for a reason with nothing to do with high bytes at all. The Host
@@ -1248,7 +1252,9 @@ static void test_malformed_requests(void) {
     }
 
     /* Control bytes in a header value. Go rejects any byte below 0x20
-     * that is not HTAB, and DEL; high bytes it allows (the acceptance
+     * that is not HTAB, and DEL; high bytes it allows (re-measured in
+     * module 10b task 10 on go1.25.6 + gorilla/websocket v1.5.3: NUL,
+     * 0x01, bare CR and DEL are each 400, while HTAB is 101) (the acceptance
      * side is test_high_bytes_in_a_header_value_are_accepted). All four
      * below were measured as 400 with the Host line these literals now
      * carry -- NUL, 0x01, a bare CR and DEL -- so none of the four is
@@ -1272,7 +1278,10 @@ static void test_malformed_requests(void) {
 static void test_bare_lf_line_endings_are_refused(void) {
     /* A DELIBERATE, MEASURED DIVERGENCE. Go's net/http accepts bare LF as
      * a line terminator: the request below was measured as 101 against
-     * live gorilla. This parser requires CRLF everywhere, for the reason
+     * live gorilla, and RE-MEASURED as 101 in module 10b task 10 by
+     * feeding these exact bytes through net/http + websocket.Upgrader on
+     * go1.25.6 with gorilla/websocket v1.5.3 (the same pair the oracle
+     * binaries are built from). This parser requires CRLF everywhere, for the reason
      * http.h states for the admin API -- accidental leniency about line
      * endings is the classic request-smuggling differential -- plus one
      * specific to this path: cloak_firstpacket_t frames the request on

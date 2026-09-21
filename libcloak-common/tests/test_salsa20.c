@@ -92,7 +92,9 @@ static void test_deterministic_for_same_inputs(void) {
 }
 
 /* Known-answer vectors. Both were verified twice: once against
- * golang.org/x/crypto/salsa20 (the exact library Go Cloak depends on) via
+ * golang.org/x/crypto/salsa20 (the exact library Go Cloak depends on --
+ * imported at internal/multiplex/obfs.go:12 and called at :108 and
+ * :123) via
  * `go run`, and once by compiling and running this exact cloak_salsa20_xor
  * implementation standalone against the same inputs. Both runs produced
  * byte-identical output to what's below. */

@@ -264,7 +264,9 @@ int cloak_clienthello_parse(const uint8_t *data, size_t len, cloak_clienthello_p
      * divergence from Go Cloak's parseClientHello, which passes
      * peeled[pointer:] -- every remaining byte in the message -- to
      * parseExtensions and never checks that extensions actually stop at the
-     * declared extensionsLen boundary. A ClientHello with an X25519
+     * declared extensionsLen boundary (internal/server/TLSAux.go:143-146:
+     * extensionsLen is read, stored in the struct, and never used to bound
+     * anything). A ClientHello with an X25519
      * key_share placed after the declared end of the extensions block will
      * not have that key_share found by this parser, where Go's would find
      * it. Not an oversight -- see the header's top-level doc comment. */

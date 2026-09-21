@@ -988,25 +988,44 @@ int main(int argc, char **argv) {
      * is written down.
      *
      * -a WITH -u SERVES THE ADMIN API OVER DATAGRAMS, and this paragraph
-     * exists because the combination is reachable, untested, and easy to
-     * reach by accident -- an operator who put "UDP": true in the file
-     * their proxy uses and then ran the same file with -a gets it.
+     * exists because the combination is reachable and easy to reach by
+     * accident -- an operator who put "UDP": true in the file their proxy
+     * uses and then ran the same file with -a gets it.
      *
-     * IT IS NOT REFUSED, and that is Go's shape: RouteUDP sits OUTSIDE
-     * the adminUID branch (ck-client.go:188-196), so Go serves admin over
-     * a datagram endpoint too. It starts here and it works, in the sense
-     * that cloak_adminapi_t's read and write paths both carry their own
-     * unordered arms (its own header's WIRE section, and the write budget
-     * clamped to one frame in unordered mode) -- but the local endpoint
-     * is then a UDP socket with no reassembly at either end, so a
-     * response over one frame's payload arrives as SEVERAL DATAGRAMS that
-     * nothing joins up, and no admin client in this tree speaks that.
+     * IT IS NOT REFUSED, AND THAT IS THE DECISION (module 10b, D4).
+     * It is Go's shape, checked in the reference tree rather than
+     * remembered: the adminUID branch at ck-client.go:159-167 sets
+     * authInfo.UID, authInfo.SessionId = 0 and remoteConfig.NumConn = 1
+     * and NEVER TOUCHES authInfo.Unordered, while the `if
+     * authInfo.Unordered` that chooses client.RouteUDP over
+     * client.RouteTCP is at :191-200, OUTSIDE that branch. So Go serves
+     * the admin API over a UDP local endpoint whenever the configuration
+     * says UDP, and refusing here would be a divergence with nothing
+     * behind it.
      *
-     * NOT TESTED, said plainly rather than implied: no case in this tree
-     * drives -a and -u together, and module 9 task 8 owns the
-     * binary-to-binary datagram path. What is written down here is the
-     * intent -- accept it, because Go does, and do not pretend the
-     * response framing is a byte stream -- not a measurement. */
+     * IT IS TESTED NOW, which is the half module 7 owed and did not pay.
+     * tests/test_ck_client_cli.c case 7a
+     * (test_admin_over_udp_is_served) runs -a and -u together through
+     * both real binaries: the local endpoint is asserted to be a
+     * datagram socket (a TCP connect to it is refused and the TCP port
+     * is still free -- so an admin branch that silently repaired the
+     * configuration to TCP fails immediately), the ClientHello this
+     * branch sends is decrypted and its UNORDERED BIT asserted (an admin
+     * branch that opened a datagram socket while advertising an ordered
+     * session passed all 83 tests until that leg existed), one request
+     * goes out as one datagram, and a real 200 with a JSON body comes
+     * back. Measured in Debug at 123 response bytes in ONE datagram.
+     *
+     * WHAT STILL IS NOT A BYTE STREAM, said plainly. The local endpoint
+     * is a UDP socket with no reassembly at either end. cloak_adminapi_t
+     * carries unordered arms on both paths (its own header's WIRE
+     * section; adminapi_write_budget clamps a chunk to ONE frame's
+     * payload in unordered mode), so nothing is truncated or refused --
+     * but a response longer than one frame's payload leaves as SEVERAL
+     * datagrams, and joining them up is the admin client's problem, not
+     * this binary's. Case 7a concatenates and prints the count for
+     * exactly that reason; it does not pin the count, because the count
+     * is the size of the user table. */
     int admin_session = 0;
     if (args.admin_uid != NULL && args.admin_uid[0] != '\0') {
         uint8_t uid[CLOAK_UID_LEN];

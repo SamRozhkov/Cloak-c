@@ -228,7 +228,9 @@ static const char *adminapi_reason(int status) {
  * lines. body may be NULL only when body_len is 0.
  *
  * ACCESS-CONTROL-ALLOW-ORIGIN IS ON EVERY RESPONSE because Go's
- * corsMiddleware puts it on every response. IT IS VESTIGIAL HERE: this
+ * corsMiddleware puts it on every response
+ * (internal/server/usermanager/api_router.go:25-30, installed for the
+ * whole router by ar.Use at :41). IT IS VESTIGIAL HERE: this
  * API is reachable only over an authenticated Cloak session, where there
  * is no browser and no origin, so it grants nothing and protects nothing.
  * It is ported for fidelity with the real admin client's expectations and

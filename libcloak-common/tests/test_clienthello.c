@@ -169,6 +169,35 @@ static size_t count_out_of_range_mlkem_coeffs(const uint8_t *data) {
     return count;
 }
 
+/* The GREASE seeds that reproduce each template's CAPTURED codepoints,
+ * so the byte-exact assertions in this file stay byte-exact now that
+ * cloak_clienthello_build re-draws GREASE per call. Only the high nibble
+ * of each byte is used; the order is CLOAK_CH_GREASE_{CIPHER, GROUP,
+ * EXT1, EXT2, VERSION}.
+ *
+ * These are NOT the shipping behaviour and no test may use them to
+ * assert what a real handshake looks like -- they exist so that a test
+ * about the ECH resize, or about a fingerprint's cipher list, is not
+ * also a test about GREASE. The GREASE behaviour itself is asserted by
+ * test_grease_* below, which never pins a seed. */
+static const uint8_t chrome_capture_grease_seed[CLOAK_CLIENTHELLO_GREASE_ROLES] = {
+    0xf0, /* CIPHER  -> 0xfafa */
+    0xa0, /* GROUP   -> 0xaaaa */
+    0xf0, /* EXT1    -> 0xfafa */
+    0x20, /* EXT2    -> 0x2a2a */
+    0xf0, /* VERSION -> 0xfafa */
+};
+static const uint8_t safari_capture_grease_seed[CLOAK_CLIENTHELLO_GREASE_ROLES] = {
+    0x20, /* CIPHER  -> 0x2a2a */
+    0x70, /* GROUP   -> 0x7a7a */
+    0x20, /* EXT1    -> 0x2a2a */
+    0x10, /* EXT2    -> 0x1a1a */
+    0x30, /* VERSION -> 0x3a3a */
+};
+/* Firefox has no GREASE positions at all, so any seed produces the same
+ * bytes; this one is passed for uniformity. */
+static const uint8_t firefox_capture_grease_seed[CLOAK_CLIENTHELLO_GREASE_ROLES] = {0, 0, 0, 0, 0};
+
 static long build_with_sni_len(const cloak_clienthello_template_t *tmpl, int sni_len,
                                uint8_t *out, size_t out_cap, long *sni_delta_out) {
     uint8_t random[32];
@@ -188,6 +217,32 @@ static long build_with_sni_len(const cloak_clienthello_template_t *tmpl, int sni
         *sni_delta_out = (long)sni_len - (long)tmpl->sni_host_len;
     }
     return cloak_clienthello_build(tmpl, random, session_id, key_share, sni, out, out_cap);
+}
+
+/* build_with_sni_len with GREASE pinned to the template's captured
+ * values -- see chrome_capture_grease_seed above for why that is allowed
+ * here and where it is not. */
+static long build_with_sni_len_pinned_grease(const cloak_clienthello_template_t *tmpl, int sni_len,
+                                             uint8_t *out, size_t out_cap, long *sni_delta_out,
+                                             const uint8_t *grease_seed) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    char sni[254];
+    for (int i = 0; i < sni_len; i++) {
+        sni[i] = (char)('a' + (i % 26));
+    }
+    sni[sni_len] = '\0';
+
+    if (sni_delta_out != NULL) {
+        *sni_delta_out = (long)sni_len - (long)tmpl->sni_host_len;
+    }
+    return cloak_clienthello_build_with_grease_seed(tmpl, random, session_id, key_share, sni,
+                                                    grease_seed, out, out_cap);
 }
 
 static int is_valid_secp256r1_point(const uint8_t point[65]) {
@@ -795,7 +850,13 @@ static void test_chrome_ech_payload_length_varies_and_stays_consistent(void) {
     for (int iter = 0; iter < 120; iter++) {
         int sni_len = sni_len_cases[(size_t)iter % SNI_LEN_CASE_COUNT];
         long sni_delta = 0;
-        long n = build_with_sni_len(&cloak_clienthello_chrome, sni_len, out, sizeof(out), &sni_delta);
+        /* GREASE pinned to the capture so chrome_tail stays byte-exact:
+         * the tail's last five bytes ARE a GREASE extension header, and
+         * this case is about the ECH resize shifting it intact, not
+         * about what value it carries. */
+        long n = build_with_sni_len_pinned_grease(&cloak_clienthello_chrome, sni_len, out,
+                                                  sizeof(out), &sni_delta,
+                                                  chrome_capture_grease_seed);
         ASSERT_TRUE(n > 0);
 
         /* walk_and_verify itself checks handshake_length == n - 4, that
@@ -911,11 +972,16 @@ static void test_exact_size_output_buffer_stress(void) {
  * measured what that oracle CANNOT see, and this was the headline:
  * replacing the Chrome template's three TLS 1.3 cipher suites
  * (0x1301/0x1302/0x1303) with TLS_RSA_WITH_3DES_EDE_CBC_SHA (0x000a) left
- * the ENTIRE 69-test suite green. Go's server reads the record header,
- * the `random`, the session id and the key share, and looks at nothing
- * else in the ClientHello -- so no interoperability test, against any Go
- * peer, present or future, can ever notice that these templates stopped
- * looking like a browser.
+ * the ENTIRE 69-test suite green (69 was the count in module 9; the
+ * suite is larger now, and the measurement has not been re-run since).
+ * Go's server reads the record header, the `random`, the session id and
+ * the key share, and ACTS on nothing else in the ClientHello
+ * (internal/server/TLS.go:73-99 consumes ch.random, ch.sessionId and
+ * extension 0x0033 and nothing more; internal/server/TLSAux.go:133-141
+ * walks past the cipher-suite and compression lists for their LENGTHS
+ * without ever examining their contents) -- so no interoperability
+ * test, against any Go peer, present or future, can ever notice that
+ * these templates stopped looking like a browser.
  *
  * But the one reader that is not in this repository -- a censor's
  * fingerprinter -- reads all of it. Offering 3DES where Chrome offers
@@ -1047,6 +1113,7 @@ static fingerprint_t read_fingerprint(const uint8_t *buf, size_t len) {
  * case can assert on it. */
 static int assert_fingerprint_reported(const char *who,
                                        const cloak_clienthello_template_t *tmpl,
+                                       const uint8_t *grease_seed,
                                        const uint16_t *want_suites, size_t want_suite_count,
                                        const uint16_t *want_exts, size_t want_ext_count,
                                        int report) {
@@ -1059,8 +1126,9 @@ static int assert_fingerprint_reported(const char *who,
     fill_marker(keyshare, 0x70);
 
     uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
-    long n = cloak_clienthello_build(tmpl, random, session_id, keyshare, "www.bing.com", out,
-                                     sizeof(out));
+    long n = cloak_clienthello_build_with_grease_seed(tmpl, random, session_id, keyshare,
+                                                      "www.bing.com", grease_seed, out,
+                                                      sizeof(out));
     ASSERT_TRUE(n > 0);
     if (n <= 0) {
         return mismatches;
@@ -1124,10 +1192,11 @@ static int assert_fingerprint_reported(const char *who,
 }
 
 static void assert_fingerprint(const char *who, const cloak_clienthello_template_t *tmpl,
+                               const uint8_t *grease_seed,
                                const uint16_t *want_suites, size_t want_suite_count,
                                const uint16_t *want_exts, size_t want_ext_count) {
-    (void)assert_fingerprint_reported(who, tmpl, want_suites, want_suite_count, want_exts,
-                                      want_ext_count, 1);
+    (void)assert_fingerprint_reported(who, tmpl, grease_seed, want_suites, want_suite_count,
+                                      want_exts, want_ext_count, 1);
 }
 
 /* Chrome, as uTLS's HelloChrome_Auto offers them: one GREASE value, the
@@ -1194,19 +1263,22 @@ static const uint16_t safari_exts[] = {
 };
 
 static void test_chrome_fingerprint_is_pinned(void) {
-    assert_fingerprint("chrome", &cloak_clienthello_chrome, chrome_suites,
+    assert_fingerprint("chrome", &cloak_clienthello_chrome, chrome_capture_grease_seed,
+                       chrome_suites,
                        sizeof(chrome_suites) / sizeof(chrome_suites[0]), chrome_exts,
                        sizeof(chrome_exts) / sizeof(chrome_exts[0]));
 }
 
 static void test_firefox_fingerprint_is_pinned(void) {
-    assert_fingerprint("firefox", &cloak_clienthello_firefox, firefox_suites,
+    assert_fingerprint("firefox", &cloak_clienthello_firefox, firefox_capture_grease_seed,
+                       firefox_suites,
                        sizeof(firefox_suites) / sizeof(firefox_suites[0]), firefox_exts,
                        sizeof(firefox_exts) / sizeof(firefox_exts[0]));
 }
 
 static void test_safari_fingerprint_is_pinned(void) {
-    assert_fingerprint("safari", &cloak_clienthello_safari, safari_suites,
+    assert_fingerprint("safari", &cloak_clienthello_safari, safari_capture_grease_seed,
+                       safari_suites,
                        sizeof(safari_suites) / sizeof(safari_suites[0]), safari_exts,
                        sizeof(safari_exts) / sizeof(safari_exts[0]));
 }
@@ -1235,8 +1307,15 @@ static void test_the_fingerprint_pin_can_fail(void) {
     fill_marker(keyshare, 0x71);
 
     uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
-    long n = cloak_clienthello_build(&cloak_clienthello_chrome, random, session_id, keyshare,
-                                     "www.bing.com", out, sizeof(out));
+    /* Pinned GREASE in BOTH builds -- this one and the one
+     * assert_fingerprint_reported does below -- so the only differences
+     * between them are the two bits deliberately flipped. With GREASE
+     * re-drawn per call the two hellos would differ in up to four more
+     * places and this case would count the wrong number of mismatches. */
+    long n = cloak_clienthello_build_with_grease_seed(&cloak_clienthello_chrome, random,
+                                                      session_id, keyshare, "www.bing.com",
+                                                      chrome_capture_grease_seed, out,
+                                                      sizeof(out));
     ASSERT_TRUE(n > 0);
     if (n <= 0) {
         return;
@@ -1255,9 +1334,654 @@ static void test_the_fingerprint_pin_can_fail(void) {
     bad_exts[1] = (uint16_t)(f.ext_types[1] ^ 0x0001u);
 
     int mismatches = assert_fingerprint_reported("chrome(deliberately wrong)",
-                                                 &cloak_clienthello_chrome, bad_suites,
+                                                 &cloak_clienthello_chrome,
+                                                 chrome_capture_grease_seed, bad_suites,
                                                  f.suite_count, bad_exts, f.ext_count, 0);
     ASSERT_EQ_INT(2, mismatches);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* GREASE is drawn per connection                                       */
+/* ------------------------------------------------------------------ */
+
+/* WHY THIS EXISTS. Until this change the templates carried ONE frozen
+ * GREASE draw each -- 0xfafa/0xaaaa/0x2a2a for Chrome,
+ * 0x2a2a/0x7a7a/0x3a3a/0x1a1a for Safari -- baked into the captured byte
+ * arrays. A frozen GREASE codepoint is not a missing randomisation, it
+ * is a STATIC PER-BUILD DISTINGUISHER: every Cloak-C client in the world
+ * shipped the same bytes, so every Chrome-profile connection anywhere
+ * offered cipher suite 0xfafa, in the one field of a ClientHello whose
+ * entire purpose is to be meaningless and unstable. Real Chrome, real
+ * Safari and Go Cloak (via utls.UClient, internal/client/TLS.go:66-80)
+ * all draw fresh values every handshake.
+ *
+ * WHAT IS ASSERTED, and each of these can fail on its own:
+ *  1. two successive handshakes do not carry the same GREASE values;
+ *  2. every drawn value has the RFC 8701 0x?A?A form, over the whole
+ *     seed space, not just the seeds a few random builds happen to hit;
+ *  3. the two positions that share the GROUP role (supported_groups and
+ *     key_share) always agree -- a key_share naming a group that is not
+ *     offered is an illegal hello and a distinguisher in itself;
+ *  4. the two GREASE extension types always differ, which is BoringSSL's
+ *     and uTLS's rule (measured: 0 collisions in 200 uTLS builds);
+ *  5. over many builds each GREASE position really does take many
+ *     distinct values, which is what a frozen template would fail. */
+
+/* Where a TEMPLATE offset ends up in a built hello, given that build's
+ * SNI and ECH-payload deltas. Shared with
+ * grease_positions_are_complete_for below, which needs the same mapping
+ * to compare the declared positions against the offsets a structural
+ * walk of the same hello finds. */
+static size_t grease_wire_off(const cloak_clienthello_template_t *tmpl, size_t off,
+                              long sni_delta, long ech_delta) {
+    if (off > tmpl->sni_host_off) {
+        off = (size_t)((long)off + sni_delta);
+    }
+    /* Chrome's trailing GREASE extension lies past the ECH payload, so
+     * the payload resize moves it too. */
+    if (tmpl->ech_payload_candidate_count > 0) {
+        size_t tail_start = (size_t)((long)tmpl->ech_payload_off + sni_delta)
+                            + tmpl->ech_payload_candidate_lens[0];
+        if (off >= tail_start) {
+            off = (size_t)((long)off + ech_delta);
+        }
+    }
+    return off;
+}
+
+static uint16_t read_grease_at(const uint8_t *out, long n, const cloak_clienthello_template_t *tmpl,
+                               size_t i, long sni_delta, long ech_delta) {
+    size_t off = grease_wire_off(tmpl, tmpl->grease_positions[i].off, sni_delta, ech_delta);
+    ASSERT_TRUE((long)off + 2 <= n);
+    if ((long)off + 2 > n) {
+        return 0;
+    }
+    return read_be16(out + off);
+}
+
+static int is_grease_codepoint(uint16_t v) {
+    return (v & 0x0f0fu) == 0x0a0au && (uint8_t)(v >> 8) == (uint8_t)(v & 0xffu);
+}
+
+/* 2 and 3 and 4, over the WHOLE seed space rather than over whatever a
+ * handful of builds drew: 256 values for the role's own seed byte,
+ * crossed with 256 for EXT1's, which is every input the EXT2 correction
+ * can see. */
+static void test_grease_values_have_the_rfc8701_form(void) {
+    for (int role = 0; role < CLOAK_CLIENTHELLO_GREASE_ROLES; role++) {
+        int seen[16] = {0};
+        int distinct = 0;
+        for (int b = 0; b < 256; b++) {
+            for (int e1 = 0; e1 < 256; e1 += 17) { /* 17 is coprime with 16: hits every nibble */
+                uint8_t seed[CLOAK_CLIENTHELLO_GREASE_ROLES] = {0, 0, 0, 0, 0};
+                seed[role] = (uint8_t)b;
+                seed[CLOAK_CH_GREASE_EXT1] = (uint8_t)e1;
+                if (role == CLOAK_CH_GREASE_EXT1) {
+                    seed[role] = (uint8_t)b;
+                }
+                uint16_t v = cloak_clienthello_grease_value(
+                    seed, (cloak_clienthello_grease_role_t)role);
+                ASSERT_TRUE(is_grease_codepoint(v));
+                if (role == CLOAK_CH_GREASE_EXT2) {
+                    uint16_t e = cloak_clienthello_grease_value(seed, CLOAK_CH_GREASE_EXT1);
+                    ASSERT_TRUE(v != e); /* BoringSSL's rule, and uTLS's */
+                }
+                if (!seen[(v >> 12) & 0xf]) {
+                    seen[(v >> 12) & 0xf] = 1;
+                    distinct++;
+                }
+            }
+        }
+        /* All sixteen legal GREASE values reachable for every role --
+         * except EXT2, which is pushed off one of them whenever it would
+         * collide with EXT1. */
+        ASSERT_TRUE(distinct >= 15);
+    }
+    printf("clienthello: GREASE derivation checked over the whole seed space, all five roles\n");
+}
+
+/* 1 and 5: the SHIPPING entry point, with no seed pinned anywhere. */
+static void grease_varies_for(const char *who, const cloak_clienthello_template_t *tmpl) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    ASSERT_TRUE(tmpl->grease_position_count > 0);
+
+    uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
+    uint16_t first[CLOAK_CLIENTHELLO_MAX_GREASE_POSITIONS];
+    uint16_t distinct_seen[CLOAK_CLIENTHELLO_MAX_GREASE_POSITIONS][16];
+    size_t distinct_count[CLOAK_CLIENTHELLO_MAX_GREASE_POSITIONS] = {0};
+    int any_differs_from_first = 0;
+    int consecutive_pairs_all_equal = 1;
+    uint16_t prev[CLOAK_CLIENTHELLO_MAX_GREASE_POSITIONS];
+
+    for (int iter = 0; iter < 200; iter++) {
+        long n = cloak_clienthello_build(tmpl, random, session_id, key_share, "www.bing.com", out,
+                                         sizeof(out));
+        ASSERT_TRUE(n > 0);
+        if (n <= 0) {
+            return;
+        }
+        long sni_delta = (long)strlen("www.bing.com") - (long)tmpl->sni_host_len;
+        long ech_delta = 0;
+        if (tmpl->ech_payload_candidate_count > 0) {
+            /* n = template + sni_delta + (chosen - candidate[0]). */
+            ech_delta = n - (long)tmpl->len - sni_delta;
+        }
+
+        uint16_t v[CLOAK_CLIENTHELLO_MAX_GREASE_POSITIONS];
+        uint16_t group_value = 0;
+        int group_seen = 0;
+        uint16_t ext1 = 0, ext2 = 0;
+        for (size_t i = 0; i < tmpl->grease_position_count; i++) {
+            v[i] = read_grease_at(out, n, tmpl, i, sni_delta, ech_delta);
+            /* 2, on the wire this time. */
+            ASSERT_TRUE(is_grease_codepoint(v[i]));
+            switch (tmpl->grease_positions[i].role) {
+            case CLOAK_CH_GREASE_GROUP:
+                /* 3: every position sharing the GROUP role carries the
+                 * same value in one hello. */
+                if (group_seen) {
+                    ASSERT_EQ_INT(group_value, v[i]);
+                } else {
+                    group_value = v[i];
+                    group_seen = 1;
+                }
+                break;
+            case CLOAK_CH_GREASE_EXT1:
+                ext1 = v[i];
+                break;
+            case CLOAK_CH_GREASE_EXT2:
+                ext2 = v[i];
+                break;
+            default:
+                break;
+            }
+            int known = 0;
+            for (size_t k = 0; k < distinct_count[i]; k++) {
+                if (distinct_seen[i][k] == v[i]) {
+                    known = 1;
+                }
+            }
+            if (!known && distinct_count[i] < 16) {
+                distinct_seen[i][distinct_count[i]++] = v[i];
+            }
+        }
+        ASSERT_TRUE(group_seen);
+        /* 4, on the wire. */
+        ASSERT_TRUE(ext1 != ext2);
+
+        if (iter == 0) {
+            memcpy(first, v, sizeof(v));
+        } else {
+            if (memcmp(first, v, sizeof(uint16_t) * tmpl->grease_position_count) != 0) {
+                any_differs_from_first = 1;
+            }
+            if (memcmp(prev, v, sizeof(uint16_t) * tmpl->grease_position_count) != 0) {
+                consecutive_pairs_all_equal = 0;
+            }
+        }
+        memcpy(prev, v, sizeof(v));
+    }
+
+    /* 1. Not "some build somewhere differed" -- two SUCCESSIVE builds
+     * must differ, which is what an eavesdropper on one client sees. The
+     * chance of a false failure is the chance that all 199 consecutive
+     * pairs collide, which for five independent 1-in-16 draws is
+     * (1/16^4)^199 -- there is no flake here. (Four, not five: EXT2 is
+     * constrained by EXT1.) */
+    ASSERT_TRUE(!consecutive_pairs_all_equal);
+    ASSERT_TRUE(any_differs_from_first);
+
+    /* 5. A frozen template gives exactly 1 here for every position. */
+    for (size_t i = 0; i < tmpl->grease_position_count; i++) {
+        ASSERT_TRUE(distinct_count[i] >= 8);
+    }
+    printf("clienthello: %s GREASE over 200 builds, distinct values per position:", who);
+    for (size_t i = 0; i < tmpl->grease_position_count; i++) {
+        printf(" %zu", distinct_count[i]);
+    }
+    printf("\n");
+}
+
+static void test_chrome_grease_varies_between_handshakes(void) {
+    grease_varies_for("chrome", &cloak_clienthello_chrome);
+}
+
+static void test_safari_grease_varies_between_handshakes(void) {
+    grease_varies_for("safari", &cloak_clienthello_safari);
+}
+
+/* ------------------------------------------------------------------ */
+/* What the hello SAYS, not what the template DECLARES                 */
+/* ------------------------------------------------------------------ */
+
+/* A third structural walk, and the only one that opens extension
+ * BODIES: walk_and_verify checks internal consistency, read_fingerprint
+ * extracts the JA3-bearing lists, and this one enumerates every 2-byte
+ * slot of a ClientHello that can legally carry a codepoint -- cipher
+ * suites, extension types, the supported_groups list, the key_share
+ * client_shares' group ids, and the supported_versions list -- recording
+ * each slot's OFFSET and VALUE.
+ *
+ * WHY IT EXISTS. The two properties asserted below cannot be read off
+ * tmpl->grease_positions, because a check that asks the template where
+ * its GREASE is and then compares those bytes to each other can only
+ * confirm that the template agrees with itself. Both were measured to be
+ * blind that way, by mutation. That the PRE-FIX tree passed all 85
+ * binaries under each of them is the re-review's measurement, read here
+ * rather than re-taken; what was measured here is the other half, below:
+ *
+ *   MUT-E: re-tag chrome offset 1478 and safari offset 162 (the
+ *   supported_groups GREASE) as CLOAK_CH_GREASE_CIPHER. 15 of every 16
+ *   hellos then offer a key_share naming a GREASE group that
+ *   supported_groups does not list -- an illegal ClientHello, and the
+ *   property clienthello.h calls load-bearing. Caught only by
+ *   key_share_groups_are_offered_for below.
+ *
+ *   MUT-D: chrome grease_position_count 6 -> 5. The trailing GREASE
+ *   extension type refreezes at 0x2a2a for every client in the world --
+ *   the original defect, narrowed to one codepoint -- and nothing
+ *   notices, because the dropped position is simply never read. Caught
+ *   only by grease_positions_are_complete_for below.
+ *
+ * Both mutations were applied to libcloak-common/src/clienthello.c,
+ * rebuilt, and run through the WHOLE suite with these cases in place:
+ * each fails test_clienthello and no other binary -- 84 of 85 pass --
+ * so each gap is closed by exactly the case named above it and by
+ * nothing that already existed. Both were then reverted. Nothing in this
+ * section consults tmpl->grease_positions to decide WHERE to look. */
+
+#define MAX_CH_SLOTS 64
+
+typedef struct {
+    size_t off[MAX_CH_SLOTS];
+    uint16_t val[MAX_CH_SLOTS];
+    size_t count;
+} ch_slots_t;
+
+typedef struct {
+    int ok;
+    ch_slots_t suites;
+    ch_slots_t ext_types;
+    ch_slots_t groups;    /* supported_groups (0x000a) body */
+    ch_slots_t ks_groups; /* key_share (0x0033) client_shares' group ids */
+    ch_slots_t versions;  /* supported_versions (0x002b) body */
+} ch_codepoints_t;
+
+static int slots_push(ch_slots_t *s, size_t off, uint16_t v) {
+    if (s->count >= MAX_CH_SLOTS) {
+        return 0;
+    }
+    s->off[s->count] = off;
+    s->val[s->count] = v;
+    s->count++;
+    return 1;
+}
+
+static int slots_hold_value(const ch_slots_t *s, uint16_t v) {
+    for (size_t i = 0; i < s->count; i++) {
+        if (s->val[i] == v) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static ch_codepoints_t read_codepoints(const uint8_t *buf, size_t len) {
+    ch_codepoints_t c;
+    memset(&c, 0, sizeof(c));
+    if (len < 4 + 2 + 32 + 1) {
+        return c;
+    }
+    size_t off = 4 + 2 + 32; /* header | client_version | random */
+    size_t sid_len = buf[off];
+    off += 1 + sid_len;
+    if (off + 2 > len) {
+        return c;
+    }
+    size_t cs_len = read_be16(buf + off);
+    off += 2;
+    /* The cipher-list LENGTH field is deliberately NOT a slot. Safari's
+     * is 0x002a, so a byte-wise hunt for 0x?A?A finds a phantom GREASE
+     * straddling its low byte and the first byte of the real GREASE
+     * suite that follows it (template offset 72, where the suite is at
+     * 73). Walking the structure cannot make that mistake; that is the
+     * whole reason this walk exists rather than a scan. */
+    if (off + cs_len > len || (cs_len % 2) != 0) {
+        return c;
+    }
+    for (size_t i = 0; i + 1 < cs_len; i += 2) {
+        if (!slots_push(&c.suites, off + i, read_be16(buf + off + i))) {
+            return c;
+        }
+    }
+    off += cs_len;
+    if (off >= len) {
+        return c;
+    }
+    size_t cm_len = buf[off];
+    off += 1 + cm_len;
+    if (off + 2 > len) {
+        return c;
+    }
+    size_t ext_len = read_be16(buf + off);
+    off += 2;
+    size_t ext_end = off + ext_len;
+    if (ext_end != len) {
+        return c;
+    }
+    while (off < ext_end) {
+        if (off + 4 > ext_end) {
+            return c;
+        }
+        uint16_t ext_type = read_be16(buf + off);
+        size_t dlen = read_be16(buf + off + 2);
+        if (off + 4 + dlen > ext_end) {
+            return c;
+        }
+        if (!slots_push(&c.ext_types, off, ext_type)) {
+            return c;
+        }
+        size_t d = off + 4;
+        if (ext_type == 0x000a) { /* supported_groups */
+            if (dlen < 2) {
+                return c;
+            }
+            size_t list_len = read_be16(buf + d);
+            if (list_len + 2 != dlen || (list_len % 2) != 0) {
+                return c;
+            }
+            for (size_t i = 0; i + 1 < list_len; i += 2) {
+                if (!slots_push(&c.groups, d + 2 + i, read_be16(buf + d + 2 + i))) {
+                    return c;
+                }
+            }
+        } else if (ext_type == 0x0033) { /* key_share */
+            if (dlen < 2) {
+                return c;
+            }
+            size_t list_len = read_be16(buf + d);
+            if (list_len + 2 != dlen) {
+                return c;
+            }
+            size_t p = d + 2;
+            size_t list_end = p + list_len;
+            while (p < list_end) {
+                if (p + 4 > list_end) {
+                    return c;
+                }
+                if (!slots_push(&c.ks_groups, p, read_be16(buf + p))) {
+                    return c;
+                }
+                size_t kx_len = read_be16(buf + p + 2);
+                if (p + 4 + kx_len > list_end) {
+                    return c;
+                }
+                p += 4 + kx_len;
+            }
+        } else if (ext_type == 0x002b) { /* supported_versions */
+            if (dlen < 1) {
+                return c;
+            }
+            size_t list_len = buf[d];
+            if (list_len + 1 != dlen || (list_len % 2) != 0) {
+                return c;
+            }
+            for (size_t i = 0; i + 1 < list_len; i += 2) {
+                if (!slots_push(&c.versions, d + 1 + i, read_be16(buf + d + 1 + i))) {
+                    return c;
+                }
+            }
+        }
+        off += 4 + dlen;
+    }
+    c.ok = 1;
+    return c;
+}
+
+/* Every group the key_share extension carries a share for must also
+ * appear in the supported_groups list -- RFC 8446 4.2.8, and a hello
+ * that breaks it is both illegal and a distinguisher in itself.
+ *
+ * The comparison is against the supported_groups list PARSED OUT OF THE
+ * EMITTED BYTES. grease_varies_for's clause 3 compares the positions the
+ * template TAGS CLOAK_CH_GREASE_GROUP against each other, which is true
+ * by construction (one role yields one value) and stayed true under
+ * MUT-E while the emitted hellos went illegal. */
+static void key_share_groups_are_offered_for(const char *who,
+                                             const cloak_clienthello_template_t *tmpl) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
+    ch_codepoints_t c;
+    memset(&c, 0, sizeof(c));
+    int builds_with_a_grease_share = 0;
+
+    for (int iter = 0; iter < 200; iter++) {
+        long n = cloak_clienthello_build(tmpl, random, session_id, key_share, "www.bing.com", out,
+                                         sizeof(out));
+        ASSERT_TRUE(n > 0);
+        if (n <= 0) {
+            return;
+        }
+        c = read_codepoints(out, (size_t)n);
+        ASSERT_TRUE(c.ok);
+        if (!c.ok) {
+            return;
+        }
+        ASSERT_TRUE(c.ks_groups.count > 0);
+        ASSERT_TRUE(c.groups.count > 0);
+
+        int grease_share_here = 0;
+        for (size_t i = 0; i < c.ks_groups.count; i++) {
+            if (!slots_hold_value(&c.groups, c.ks_groups.val[i])) {
+                /* Reported once, not 200 times: a wall of identical FAIL
+                 * lines teaches a reader to skim past real ones. */
+                fprintf(stderr,
+                        "FAIL %s:%d: %s key_share offers group 0x%04x, absent from "
+                        "supported_groups (build %d)\n",
+                        __FILE__, __LINE__, who, c.ks_groups.val[i], iter);
+                cloak_test_failures++;
+                return;
+            }
+            if (is_grease_codepoint(c.ks_groups.val[i])) {
+                grease_share_here = 1;
+            }
+        }
+        builds_with_a_grease_share += grease_share_here;
+    }
+
+    /* Non-vacuity: for a GREASE-bearing template the subset check must
+     * actually be exercised on the group that is RE-DRAWN per
+     * connection, not only on the fixed ones. Both templates put a
+     * GREASE group in key_share on every build. */
+    ASSERT_EQ_INT(200, builds_with_a_grease_share);
+    printf("clienthello: %s key_share groups all present in the emitted supported_groups over "
+           "200 builds (%zu shares, %zu groups offered)\n",
+           who, c.ks_groups.count, c.groups.count);
+}
+
+static void test_chrome_key_share_group_is_actually_offered(void) {
+    key_share_groups_are_offered_for("chrome", &cloak_clienthello_chrome);
+}
+
+static void test_safari_key_share_group_is_actually_offered(void) {
+    key_share_groups_are_offered_for("safari", &cloak_clienthello_safari);
+}
+
+/* The mirror of test_firefox_offers_no_grease, for the templates that DO
+ * carry GREASE: every 0x?A?A the emitted hello actually contains must be
+ * a position the template declares, and must vary across builds.
+ *
+ * grease_varies_for iterates tmpl->grease_positions, so a codepoint the
+ * table forgets is never looked at -- which is exactly how MUT-D refroze
+ * Chrome's trailing GREASE extension type with the suite green. This
+ * case never iterates the table to find bytes; it finds the bytes
+ * structurally and then requires the table to account for all of them.
+ * The offsets in clienthello.c are hand-written constants against
+ * templates the headers expect to be REGENERATED, so this is the check
+ * that survives a regeneration: it compares against the wire, and a
+ * regenerated template that moves or adds a GREASE codepoint without
+ * updating the table fails here. */
+static void grease_positions_are_complete_for(const char *who,
+                                              const cloak_clienthello_template_t *tmpl) {
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+
+    ASSERT_TRUE(tmpl->grease_position_count > 0);
+
+    uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
+    uint16_t distinct_seen[MAX_CH_SLOTS][16];
+    size_t distinct_count[MAX_CH_SLOTS];
+    size_t found_count = 0;
+    memset(distinct_count, 0, sizeof(distinct_count));
+
+    for (int iter = 0; iter < 200; iter++) {
+        long n = cloak_clienthello_build(tmpl, random, session_id, key_share, "www.bing.com", out,
+                                         sizeof(out));
+        ASSERT_TRUE(n > 0);
+        if (n <= 0) {
+            return;
+        }
+        ch_codepoints_t c = read_codepoints(out, (size_t)n);
+        ASSERT_TRUE(c.ok);
+        if (!c.ok) {
+            return;
+        }
+
+        /* Every GREASE codepoint the hello carries, in a fixed
+         * enumeration order, so index j means the same slot on every
+         * build (guaranteed by the set equality asserted just below). */
+        const ch_slots_t *kinds[5] = {&c.suites, &c.ext_types, &c.groups, &c.ks_groups,
+                                      &c.versions};
+        size_t found_off[MAX_CH_SLOTS];
+        uint16_t found_val[MAX_CH_SLOTS];
+        size_t fc = 0;
+        for (size_t k = 0; k < 5; k++) {
+            for (size_t i = 0; i < kinds[k]->count; i++) {
+                if (is_grease_codepoint(kinds[k]->val[i]) && fc < MAX_CH_SLOTS) {
+                    found_off[fc] = kinds[k]->off[i];
+                    found_val[fc] = kinds[k]->val[i];
+                    fc++;
+                }
+            }
+        }
+
+        /* COMPLETENESS: the table's count is the hello's count. This is
+         * the assertion MUT-D fails. */
+        ASSERT_EQ_INT((long long)tmpl->grease_position_count, (long long)fc);
+        if (fc != tmpl->grease_position_count) {
+            fprintf(stderr, "       (%s build %d carries %zu GREASE codepoints, table declares %zu)\n",
+                    who, iter, fc, tmpl->grease_position_count);
+            return;
+        }
+
+        /* SOUNDNESS: every declared position lands on one of them. With
+         * the counts equal and slot offsets distinct, this is set
+         * equality -- no declared offset points at a byte pair the wire
+         * structure does not treat as a codepoint. */
+        long sni_delta = (long)strlen("www.bing.com") - (long)tmpl->sni_host_len;
+        long ech_delta = 0;
+        if (tmpl->ech_payload_candidate_count > 0) {
+            ech_delta = n - (long)tmpl->len - sni_delta;
+        }
+        for (size_t i = 0; i < tmpl->grease_position_count; i++) {
+            size_t want = grease_wire_off(tmpl, tmpl->grease_positions[i].off, sni_delta,
+                                          ech_delta);
+            int seen = 0;
+            for (size_t j = 0; j < fc; j++) {
+                if (found_off[j] == want) {
+                    seen = 1;
+                }
+            }
+            ASSERT_TRUE(seen);
+            if (!seen) {
+                fprintf(stderr, "       (%s declares GREASE at template offset %zu, wire offset "
+                                "%zu, which is not a codepoint slot)\n",
+                        who, tmpl->grease_positions[i].off, want);
+                return;
+            }
+        }
+
+        for (size_t j = 0; j < fc; j++) {
+            int known = 0;
+            for (size_t k = 0; k < distinct_count[j]; k++) {
+                if (distinct_seen[j][k] == found_val[j]) {
+                    known = 1;
+                }
+            }
+            if (!known && distinct_count[j] < 16) {
+                distinct_seen[j][distinct_count[j]++] = found_val[j];
+            }
+        }
+        found_count = fc;
+    }
+
+    /* And none of them is frozen. A refrozen codepoint gives exactly 1;
+     * 200 builds of a real 1-in-16 draw give 16 with overwhelming
+     * probability, so 8 is far below anything reachable by chance. */
+    for (size_t j = 0; j < found_count; j++) {
+        ASSERT_TRUE(distinct_count[j] >= 8);
+    }
+    printf("clienthello: %s hello carries %zu GREASE codepoints, all declared, distinct values "
+           "per wire slot over 200 builds:",
+           who, found_count);
+    for (size_t j = 0; j < found_count; j++) {
+        printf(" %zu", distinct_count[j]);
+    }
+    printf("\n");
+}
+
+static void test_chrome_grease_position_table_is_complete(void) {
+    grease_positions_are_complete_for("chrome", &cloak_clienthello_chrome);
+}
+
+static void test_safari_grease_position_table_is_complete(void) {
+    grease_positions_are_complete_for("safari", &cloak_clienthello_safari);
+}
+
+/* Real Firefox offers NO GREASE -- measured over 200 utls.HelloFirefox_Auto
+ * builds, zero 0x?A?A codepoints anywhere. Adding some would be the
+ * distinguisher, so this pins the absence. */
+static void test_firefox_offers_no_grease(void) {
+    ASSERT_EQ_INT(0, (int)cloak_clienthello_firefox.grease_position_count);
+
+    uint8_t random[32];
+    uint8_t session_id[32];
+    uint8_t key_share[32];
+    fill_marker(random, 0x10);
+    fill_marker(session_id, 0x30);
+    fill_marker(key_share, 0x50);
+    uint8_t out[CLOAK_CLIENTHELLO_MAX_BYTES];
+    long n = cloak_clienthello_build(&cloak_clienthello_firefox, random, session_id, key_share,
+                                     "www.bing.com", out, sizeof(out));
+    ASSERT_TRUE(n > 0);
+    if (n <= 0) {
+        return;
+    }
+    fingerprint_t f = read_fingerprint(out, (size_t)n);
+    ASSERT_TRUE(f.ok);
+    for (size_t i = 0; i < f.suite_count; i++) {
+        ASSERT_TRUE(!is_grease_codepoint(f.suites[i]));
+    }
+    for (size_t i = 0; i < f.ext_count; i++) {
+        ASSERT_TRUE(!is_grease_codepoint(f.ext_types[i]));
+    }
 }
 
 TEST_MAIN_BEGIN()
@@ -1287,4 +2011,12 @@ TEST_MAIN_BEGIN()
     test_firefox_fingerprint_is_pinned();
     test_safari_fingerprint_is_pinned();
     test_the_fingerprint_pin_can_fail();
+    test_grease_values_have_the_rfc8701_form();
+    test_chrome_grease_varies_between_handshakes();
+    test_safari_grease_varies_between_handshakes();
+    test_chrome_key_share_group_is_actually_offered();
+    test_safari_key_share_group_is_actually_offered();
+    test_chrome_grease_position_table_is_complete();
+    test_safari_grease_position_table_is_complete();
+    test_firefox_offers_no_grease();
 TEST_MAIN_END()

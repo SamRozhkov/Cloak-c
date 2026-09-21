@@ -357,12 +357,35 @@ static void peer_drain(cloak_udp_piper_peer_t *peer) {
         if (n < 0) {
             /* End of stream: the far end closed it, or the session
              * retired it. Go's reader goroutine does exactly this --
-             * break, delete its own key, close the stream. */
+             * break, delete its own key, close the stream
+             * (internal/client/piper.go:61-79).
+             *
+             * IT IS GO'S MODEL, NOT GO'S CODE, AND THE DIFFERENCE IS A
+             * BUG WE DO NOT INHERIT. Go deletes BY KEY --
+             * `delete(streams, addr.String())` at piper.go:76 -- from a
+             * goroutine that has just finished with ITS stream, while
+             * the accept loop at :38-53 is free to have replaced that
+             * map entry with a NEW stream for the SAME peer address in
+             * the meantime (the loop creates one whenever the lookup
+             * misses, and :89 deletes on a write error too). The dying
+             * goroutine's delete then evicts the LIVE stream: it is
+             * never read from again, never closed, and the next datagram
+             * from that peer opens yet another one. This port removes
+             * the PEER OBJECT -- peer_unlink(pp, peer) below, by
+             * pointer, not by address string -- from a single-threaded
+             * reactor in which no second peer for the same address can
+             * exist while this one is being retired, so neither half of
+             * that race is reachable here. Read from piper.go, not
+             * reproduced: this port has no way to construct Go's
+             * interleaving from outside. */
             peer_retire(peer, 0);
             return;
         }
         peer->out_len = (size_t)n;
-        peer_touch(peer); /* Go refreshes the deadline on every read too */
+        /* Go refreshes the deadline on every read too:
+         * internal/client/piper.go:67, immediately after each successful
+         * stream.Read in the same direction. */
+        peer_touch(peer);
         if (peer_flush(peer) != 0) {
             return;
         }

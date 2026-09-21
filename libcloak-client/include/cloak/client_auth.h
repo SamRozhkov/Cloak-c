@@ -46,7 +46,9 @@ typedef struct {
      * key_share_field (bytes [32:64)) -- exactly the two fields
      * cloak_clienthello_parse extracts and cloak_server_auth_decrypt
      * expects, split at the 32-byte boundary matching Go's `len(ctxTag) !=
-     * 64` check split across the two constituent fields. */
+     * 64` check (internal/server/TLS.go:94-96, where ctxTag is the
+     * session id concatenated with the key share), split across the two
+     * constituent fields. */
     uint8_t ciphertext[64];
 } cloak_client_auth_payload_t;
 
@@ -62,7 +64,8 @@ typedef struct {
  * matching this project's config-parsing convention (see
  * cloak/config.h's CLOAK_PROXY_METHOD_LEN) rather than Go's
  * makeAuthenticationPayload, whose `copy` into a fixed-size slice would
- * silently truncate. A proxy method shorter than 12 bytes is NUL-padded;
+ * silently truncate (internal/client/auth.go:39,
+ * `copy(plaintext[16:28], authInfo.ProxyMethod)`). A proxy method shorter than 12 bytes is NUL-padded;
  * one of exactly 12 bytes fills the field with no room for a terminator,
  * which is fine -- the field is fixed-width on the wire and never
  * NUL-terminated there. encryption_method is written to the wire as a raw

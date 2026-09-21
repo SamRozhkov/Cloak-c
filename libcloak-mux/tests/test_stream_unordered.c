@@ -260,8 +260,8 @@ static void test_short_read_buffer_does_not_consume_the_datagram(void) {
     ASSERT_EQ_INT(cloak_stream_recv_available(&rx), 5);
 
     /* out_cap == 0: the one deliberate divergence from Go's Stream.Read,
-     * which short-circuits to (0, nil) before consulting the pipe. See
-     * cloak/stream.h. */
+     * which short-circuits to (0, nil) before consulting the pipe
+     * (internal/multiplex/stream.go:87-89). See cloak/stream.h. */
     ASSERT_EQ_INT(cloak_stream_read(&rx, out, 0), CLOAK_STREAM_ERR_SHORT_BUFFER);
     ASSERT_EQ_INT(cloak_stream_recv_available(&rx), 5);
 
@@ -894,7 +894,9 @@ static void test_exact_fit_into_a_non_empty_queue_is_accepted(void) {
  * Task 3's report tabulated, for ordered mode, "payload larger than the
  * receive queue -> -1" and "any frame after a close -> -1". Both were
  * true and neither had a test: the reviewer's N3 and N4 made each return
- * 0 instead and all 70 tests passed. They are pre-existing gaps rather
+ * 0 instead and all 70 tests passed (70 was the suite size when that
+ * mutation was run; it is larger now and the mutation has not been
+ * re-run). They are pre-existing gaps rather
  * than anything this module introduced -- but this module added a mode
  * branch to the front of cloak_stream_feed_frame, and "a new branch that
  * quietly makes the OLD path lenient" is exactly the defect no new
@@ -905,9 +907,14 @@ static void test_exact_fit_into_a_non_empty_queue_is_accepted(void) {
  *
  * Both retire the stream at the session layer (session.c's
  * `rc == 1 || rc == -1`), which is deliberate and, for the duplicate
- * cell, a known divergence from Go that module 9 still owes a decision
- * on. Asserting it is not endorsing it -- it is making the current
- * behaviour impossible to change by accident. */
+ * cell, a divergence from Go. THAT DECISION HAS SINCE BEEN MADE and
+ * this sentence used to say it was still owed: cloak/stream.h's ORDERED
+ * paragraph now records it as a deliberate improvement over Go, and
+ * names the Go defect it improves on -- the PENDING duplicate
+ * (internal/multiplex/streamBuffer.go:83-90), which wedges Go's stream
+ * permanently and grows its heap without bound. An ALREADY-DELIVERED
+ * seq is an error in Go too (streamBuffer.go:79-81), so the divergence
+ * is narrower than "Go has no error path here". */
 static void test_ordered_mode_still_rejects_oversize_and_post_close_frames(void) {
     cloak_obfuscator_t o;
     make_obfuscator(&o);

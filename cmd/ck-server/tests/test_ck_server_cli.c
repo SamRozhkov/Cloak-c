@@ -1107,7 +1107,9 @@ static void plugin_env(const char *opts, const char *remote_host, const char *re
 
 /* SS_PLUGIN_OPTIONS carries JSON for the server side, not the ssv the
  * client's SS_PLUGIN_OPTIONS carries -- Go's server.ParseConfig only ever
- * calls json.Unmarshal, whatever its comment says. */
+ * calls json.Unmarshal, whatever its comment says
+ * (internal/server/state.go:112-127; the client's, which really does
+ * switch on the string, is internal/client/state.go:127-145). */
 static void test_plugin_injects_proxy_and_binds_ss_address(void) {
     int port = free_port();
     ASSERT_TRUE(port > 0);
@@ -1441,8 +1443,10 @@ static void test_ss_local_host_alone_is_not_plugin_mode(void) {
 /* Case 9: BindAddr is RESOLVED, not copied                             */
 /* ------------------------------------------------------------------ */
 
-/* Go's resolveBindAddr runs every BindAddr through ResolveTCPAddr and
- * listens on the RESULT's String(). That step is what makes
+/* Go's resolveBindAddr (cmd/ck-server/ck-server.go:20-31) runs every
+ * BindAddr through ResolveTCPAddr and listens on the RESULT's String()
+ * (ck-server.go:183); parseSSBindAddr compares those canonical forms at
+ * ck-server.go:49-62. That step is what makes
  * parseSSBindAddr's comparisons meaningful -- they compare canonical forms
  * -- so if canon_addr degenerated into a verbatim copy, every merge rule
  * above would be comparing operator-typed strings and would silently stop
@@ -1706,33 +1710,151 @@ static void test_exit_codes_are_distinct(void) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* ONE FILE, TWO BINARIES (module 10b task 8)                           */
+/* ------------------------------------------------------------------ */
+
+/* NOTHING ABOVE THIS LINE CHANGED. Every case function, every helper and
+ * every assertion is byte-for-byte what the single binary ran; the ONLY
+ * change is which PROCESS runs which case, decided by the table below and
+ * by -DCK_CLI_PART on the two executables the build makes from this one
+ * source file. cmd/ck-client/tests/test_ck_client_cli.c carries the same
+ * mechanism and the long version of this comment.
+ *
+ * WHY THIS FILE TOO, when it was test_ck_client_cli that crossed its
+ * margin: at 41.4 s warm at -j4 this file was the SECOND-longest test in
+ * the suite, so splitting only the client would have promoted this one to
+ * the floor and bought one module's worth of room instead of a floor that
+ * stays down. That promotion was the outcome the plan asked to be told
+ * about; splitting both is the answer to it.
+ *
+ * THE UNIT OF COST IS A FORKED CHILD, measured at 919 ms each here (this
+ * file's 23 cases fork 42 children for 38.6 s of run) under
+ * LeakSanitizer's exit scan -- not an assertion. Fifteen of the
+ * twenty-three cases fork exactly one child and cost between 892 and
+ * 920 ms; the two expensive ones, test_uid_and_key_generation (7256 ms)
+ * and test_exit_codes_are_distinct (4529 ms), fork eight and five. A
+ * COUNTER ON THE fork() SITE was added to measure this (temporary
+ * instrumentation, not shipped) rather than counting call sites in the
+ * source, which undercounts: several cases fork from helpers.
+ *
+ * Unlike the client file, NO case here pays significant protocol wait on
+ * top of its forks -- every case is within ~3% of 919 ms x children. Size
+ * a new case by counting its fork/exec calls and multiplying.
+ *
+ * HOW A NEW CASE PICKS ITS HALF: both halves print their per-case costs
+ * and their own total on every run; add the row to the half with the
+ * smaller printed total. Today, serially under ASan+UBSan: CONFIG
+ * 17.3 s, RUNTIME 21.1 s.
+ * CONFIG is the configuration document -- where BindAddr and the plugin
+ * mode's ProxyBook come from and what they become. RUNTIME is the process
+ * -- what it prints, what it generates, how it exits and on what signal.
+ *
+ * A case function left OUT of this table is referenced by nothing and
+ * becomes a -Wunused-function warning, which this tree treats as a
+ * failure: a split that silently drops a case cannot get past the
+ * compiler. That is why the table exists rather than an #if around the
+ * old call list. */
+
+#define CK_CLI_CONFIG 1
+#define CK_CLI_RUNTIME 2
+
+#ifndef CK_CLI_PART
+#error "CK_CLI_PART must be defined by the build (1 = config, 2 = runtime)"
+#endif
+#if CK_CLI_PART != CK_CLI_CONFIG && CK_CLI_PART != CK_CLI_RUNTIME
+#error "CK_CLI_PART must be 1 (config) or 2 (runtime)"
+#endif
+
+typedef struct {
+    const char *name;
+    void (*fn)(void);
+    int part;
+} cli_case_t;
+
+/* The ms figures are the measurement this split was chosen from, and they
+ * are a READING of one serial ASan+UBSan run on one machine -- no test
+ * fails if they drift. What the run prints is the live number. */
+static const cli_case_t k_cases[] = {
+    {"missing_config_names_the_file",
+     test_missing_config_names_the_file, CK_CLI_CONFIG},  /*   903 ms */
+    {"config_from_a_file",
+     test_config_from_a_file, CK_CLI_CONFIG},  /*   916 ms */
+    {"a_readable_file_beats_the_inline_reading",
+     test_a_readable_file_beats_the_inline_reading, CK_CLI_CONFIG},  /*   913 ms */
+    {"default_bind_addresses",
+     test_default_bind_addresses, CK_CLI_CONFIG},  /*  1816 ms */
+    {"bind_addresses_are_resolved_not_copied",
+     test_bind_addresses_are_resolved_not_copied, CK_CLI_CONFIG},  /*  2756 ms */
+    {"plugin_injects_proxy_and_binds_ss_address",
+     test_plugin_injects_proxy_and_binds_ss_address, CK_CLI_CONFIG},  /*   911 ms */
+    {"plugin_v4_and_v6_upgrades_existing_entry",
+     test_plugin_v4_and_v6_upgrades_existing_entry, CK_CLI_CONFIG},  /*   914 ms */
+    {"plugin_wildcard_entry_suppresses_append",
+     test_plugin_wildcard_entry_suppresses_append, CK_CLI_CONFIG},  /*   904 ms */
+    {"plugin_dedupes_both_families_and_overwrites_proxy",
+     test_plugin_dedupes_both_families_and_overwrites_proxy, CK_CLI_CONFIG},  /*   904 ms */
+    {"plugin_without_remote_is_a_config_error",
+     test_plugin_without_remote_is_a_config_error, CK_CLI_CONFIG},  /*   906 ms */
+    {"plugin_identical_entry_suppresses_append",
+     test_plugin_identical_entry_suppresses_append, CK_CLI_CONFIG},  /*   908 ms */
+    {"plugin_ipv6_ss_host_is_bracketed",
+     test_plugin_ipv6_ss_host_is_bracketed, CK_CLI_CONFIG},  /*   915 ms */
+    {"plugin_two_pipes_is_not_a_family_pair",
+     test_plugin_two_pipes_is_not_a_family_pair, CK_CLI_CONFIG},  /*   906 ms */
+    {"plugin_one_sided_remote_env_is_refused",
+     test_plugin_one_sided_remote_env_is_refused, CK_CLI_CONFIG},  /*  1841 ms */
+    {"ss_local_host_alone_is_not_plugin_mode",
+     test_ss_local_host_alone_is_not_plugin_mode, CK_CLI_CONFIG},  /*   911 ms */
+    {"version_and_help_exit_before_config",
+     test_version_and_help_exit_before_config, CK_CLI_RUNTIME},  /*  1894 ms */
+    {"uid_and_key_generation",
+     test_uid_and_key_generation, CK_CLI_RUNTIME},  /*  7321 ms */
+    {"inline_json_starts_and_sigterm_stops",
+     test_inline_json_starts_and_sigterm_stops, CK_CLI_RUNTIME},  /*  1157 ms */
+    {"sigint_shuts_down_cleanly",
+     test_sigint_shuts_down_cleanly, CK_CLI_RUNTIME},  /*   901 ms */
+    {"runtime_exit_code_and_the_descriptor_budget",
+     test_runtime_exit_code_and_the_descriptor_budget, CK_CLI_RUNTIME},  /*  2732 ms */
+    {"a_flag_missing_its_value_is_a_usage_error",
+     test_a_flag_missing_its_value_is_a_usage_error, CK_CLI_RUNTIME},  /*   903 ms */
+    {"verbosity_changes_what_is_logged",
+     test_verbosity_changes_what_is_logged, CK_CLI_RUNTIME},  /*  1818 ms */
+    {"exit_codes_are_distinct",
+     test_exit_codes_are_distinct, CK_CLI_RUNTIME},  /*  4541 ms */
+};
+
 TEST_MAIN_BEGIN()
-    test_version_and_help_exit_before_config();
-    test_uid_and_key_generation();
-    test_missing_config_names_the_file();
-    test_inline_json_starts_and_sigterm_stops();
-    test_sigint_shuts_down_cleanly();
-    test_config_from_a_file();
-    test_default_bind_addresses();
-    test_plugin_injects_proxy_and_binds_ss_address();
-    test_plugin_v4_and_v6_upgrades_existing_entry();
-    test_plugin_wildcard_entry_suppresses_append();
-    test_plugin_dedupes_both_families_and_overwrites_proxy();
-    test_plugin_without_remote_is_a_config_error();
-    test_plugin_identical_entry_suppresses_append();
-    test_plugin_ipv6_ss_host_is_bracketed();
-    test_plugin_two_pipes_is_not_a_family_pair();
-    test_plugin_one_sided_remote_env_is_refused();
-    test_ss_local_host_alone_is_not_plugin_mode();
-    test_bind_addresses_are_resolved_not_copied();
-    test_runtime_exit_code_and_the_descriptor_budget();
-    test_a_flag_missing_its_value_is_a_usage_error();
-    test_verbosity_changes_what_is_logged();
-    test_a_readable_file_beats_the_inline_reading();
-    test_exit_codes_are_distinct();
+    /* Line-buffered for the same reason the client's half is: a ctest
+     * TIMEOUT on a block-buffered pipe arrives as "<end of output>" and
+     * says nothing about which case it reached. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+
+    unsigned ran = 0;
+    uint64_t total_ms = 0;
+    for (size_t i = 0; i < sizeof(k_cases) / sizeof(k_cases[0]); i++) {
+        if (k_cases[i].part != CK_CLI_PART) {
+            continue;
+        }
+        uint64_t t0 = now_ms();
+        k_cases[i].fn();
+        uint64_t took = now_ms() - t0;
+        total_ms += took;
+        ran++;
+        printf("[case] %-52s %6llu ms\n", k_cases[i].name,
+               (unsigned long long)took);
+    }
+    /* A half that ran NOTHING is a build that mis-set CK_CLI_PART, and it
+     * would otherwise print "All tests passed" and go green. */
+    ASSERT_TRUE(ran > 0);
+    printf("[part %d] %u case(s), %llu ms total\n", CK_CLI_PART, ran,
+           (unsigned long long)total_ms);
     /* The number SHUTDOWN_MS is pinned against. Printed rather than
      * asserted against a second constant: it is a measurement, and the
-     * bound above is chosen from it. */
+     * bound above is chosen from it. Each half reports its OWN worst,
+     * because shutdown_max_ms is per-process and both halves signal and
+     * reap children. */
     printf("worst signal-to-exit latency this run: %llu ms (bound %d ms)\n",
            (unsigned long long)shutdown_max_ms, SHUTDOWN_MS);
 TEST_MAIN_END()

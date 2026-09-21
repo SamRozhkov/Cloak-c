@@ -627,10 +627,15 @@ static void test_datagram_round_trip_preserves_boundaries(void) {
  *
  *    Go loses this datagram in BOTH directions and does it differently in
  *    each: its client's reader breaks out of its loop on the
- *    io.ErrShortBuffer that its 8192-byte read buffer produces (bug 6,
- *    which tears the whole peer stream down), and its server truncates an
+ *    io.ErrShortBuffer that its 8192-byte read buffer produces
+ *    (internal/client/piper.go:60-66 against
+ *    internal/multiplex/datagramBufferedPipe.go:59-60 -- bug 6, which
+ *    tears the whole peer stream down), and its server truncates an
  *    upstream datagram to whatever its own read buffer holds and forwards
- *    the fragment (bug 7). This port carries it whole in both directions,
+ *    the fragment (bug 7 -- common.Copy hands the UDP conn to
+ *    Stream.ReadFrom, internal/multiplex/stream.go:163, which reads
+ *    maxStreamUnitWrite = 16132 bytes and lets the kernel discard the
+ *    rest). This port carries it whole in both directions,
  *    which is a deliberate divergence and is why this case asserts the
  *    length as well as the bytes: a truncating relay would still deliver
  *    a prefix that ASSERT_MEM_EQ over the shorter length would accept.

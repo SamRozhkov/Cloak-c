@@ -35,6 +35,51 @@ target_include_directories(test_replay_cache PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_replay_cache PRIVATE cloak-server)
 add_test(NAME test_replay_cache COMMAND test_replay_cache)
 
+# The adversarial half of the replay cache's coverage, in its own binary
+# rather than appended to test_replay_cache.c: that file is the
+# functional suite and every one of its assertions passed on the code
+# this one's case 1 breaks. Keeping them apart is what makes "the
+# functional suite is green and the cache is still broken" a statement
+# you can read off the test list.
+#
+# In-process, no fork, so it stays "fast" by default (see the top-level
+# CMakeLists.txt on the fast/slow split). It is not free, though: case 2
+# runs 32 floods of ln(2)*C inserts each and case 3 allocates two more
+# tables and fills them, so its whole cost is proportional to
+# CLOAK_SERVER_STACK_DEFAULT_REPLAY_CACHE_CAPACITY.
+#
+# THE TIMEOUT MOVED WITH THE SESSION CAP, and this is the record of why.
+# When this test was added the capacity was 2^19, case 2 was about 11.6
+# million keyed hashes, and it MEASURED at 2.53 s through ctest in a
+# Debug build -- TIMEOUT 120, roughly a 47x margin, chosen to leave room
+# for the order-of-magnitude ASan+UBSan slowdown the other TIMEOUT
+# comments in this file report rather than from a sanitizer number anyone
+# had observed. Raising CLOAK_REGISTRY_MAX_SESSIONS from 256 to 1024
+# raised the sized handshake rate fourfold and the capacity with it, to
+# 2^21; case 2 is now about 46.5 million keyed hashes. MEASURED at
+# 14.66 s in a Debug build at that commit, same command.
+#
+# AND THE SANITIZER BUILD WAS MEASURED THIS TIME, which is worth recording
+# because the number the earlier comment reasoned its way to was wrong:
+# an ASan+UBSan build of the whole suite ran this test in 23.75 s, a
+# slowdown of 1.6x rather than the order of magnitude the other TIMEOUT
+# comments in this file assume. The prediction from that assumption was
+# ~147 s. TIMEOUT 600 is a 41x margin on the Debug measurement and a 25x
+# margin on the sanitizer one; the old 120 would in fact have survived,
+# and is being raised anyway because a 5x margin under -j4 on a loaded
+# machine is not one.
+#
+# NOTHING IN THE TEST ITSELF CHANGED SHAPE: every number in it is derived
+# from SHIPPED_CAPACITY and REPLAY_WINDOW_SECONDS, and the two literals
+# that are not (the insert count the sizing comment quotes, and the
+# capacity floor that stops the constant moving DOWN) moved to the values
+# the same two constants now produce.
+add_executable(test_replay_cache_keyed test_replay_cache_keyed.c)
+target_include_directories(test_replay_cache_keyed PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_replay_cache_keyed PRIVATE cloak-server)
+add_test(NAME test_replay_cache_keyed COMMAND test_replay_cache_keyed)
+set_tests_properties(test_replay_cache_keyed PROPERTIES TIMEOUT 600)
+
 add_executable(test_firstpacket test_firstpacket.c)
 target_include_directories(test_firstpacket PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
 target_link_libraries(test_firstpacket PRIVATE cloak-server)
@@ -46,6 +91,27 @@ target_include_directories(test_server_state PRIVATE ${CMAKE_SOURCE_DIR}/libcloa
 target_link_libraries(test_server_state PRIVATE cloak-server)
 add_test(NAME test_server_state COMMAND test_server_state)
 set_tests_properties(test_server_state PROPERTIES TIMEOUT 60)
+
+# The session cap at its own scale (module 10b task 4): 1024 sessions
+# established, the cost of finding one measured at four occupancies, and
+# the refusal at the cap held against the cover-site redirect.
+#
+# NOT labelled "slow": it forks nothing (the fast/slow split in the
+# top-level CMakeLists.txt is by fork-or-not, not by duration). It is not
+# free either -- case 1 builds 1024 real cloak_session_t's, case 2 builds
+# 1345 more across its four measurement points and runs 100k lookups, and
+# case 3 drives 242 real TCP probes through a dispatcher at a full
+# registry. MEASURED at 0.26 s through ctest in a Debug build at the
+# commit that added it (`ctest -R ^test_registry_scale$`), of which case 3
+# is most of it, and MEASURED at 1.47 s in an ASan+UBSan build of the same
+# tree -- a slowdown of 5.7x, not the order of magnitude the older TIMEOUT
+# comments in this file assume. TIMEOUT 300 is a 1150x margin on the first
+# number and a 204x margin on the second.
+add_executable(test_registry_scale test_registry_scale.c)
+target_include_directories(test_registry_scale PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_registry_scale PRIVATE cloak-server cloak-client)
+add_test(NAME test_registry_scale COMMAND test_registry_scale)
+set_tests_properties(test_registry_scale PROPERTIES TIMEOUT 300)
 
 add_executable(test_registry test_registry.c)
 target_include_directories(test_registry PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
@@ -568,6 +634,128 @@ set_tests_properties(test_go_interop PROPERTIES TIMEOUT 120)
 set_tests_properties(test_go_interop PROPERTIES LABELS "slow")
 
 # ---------------------------------------------------------------------------
+# THE CLIENTHELLO MATRIX (module 10b task 1).
+#
+# A SECOND binary rather than more cases in test_go_interop, for two
+# reasons and neither is tidiness. test_go_interop's TIMEOUT 120 is
+# already sized for a worst FAILING run of roughly 90 s (its own budget
+# comment does the arithmetic); six more forking scenarios would not fit,
+# and a bound that cannot cover its own failure mode reports "***Timeout"
+# instead of the assertion that diagnoses it. And the two files ask
+# different questions -- one asks whether the direct path interoperates at
+# all, this one asks whether all three ClientHello templates do -- so a
+# failure in one should not hide the other behind a single ctest row.
+#
+# The harness both share is go_oracle_harness.h, extracted verbatim from
+# test_go_interop.c when this file was written; see its own header.
+#
+# cloak-server for cloak_clienthello_parse (the relay locates the X25519
+# key share it corrupts by parsing the record that arrived, not by
+# reading a template table); cloak-common for base64, X25519 and the AEAD
+# the shared harness uses.
+add_executable(test_go_clienthello_matrix test_go_clienthello_matrix.c)
+target_include_directories(test_go_clienthello_matrix PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_go_clienthello_matrix PRIVATE cloak-server cloak-common)
+target_compile_definitions(test_go_clienthello_matrix PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_go_clienthello_matrix COMMAND test_go_clienthello_matrix)
+
+# The paths of OUR ck-client and ck-server are APPENDED at the end of the
+# top-level CMakeLists.txt, after cmd/ck-client and cmd/ck-server have
+# been added, exactly as test_go_interop's are.
+
+# TIMEOUT AND LABELS IN ONE CALL, AT THE SOURCE SITE. Task 8 of this
+# module found that "every test carries both" was true of the GENERATED
+# CTestTestfile.cmake and not of the source -- cloak_label_fast_tests()
+# was merging two adjacent calls after the fact, so the discipline was
+# the sweep's and not the file's. This is one call. (The older tests in
+# this file, test_go_interop and test_unordered_proof among them, still
+# use two adjacent calls; that is recorded rather than quietly fixed,
+# because changing them is not this task's work.)
+#
+# LABELS "slow": six scenarios, twelve forked children, four of them Go's
+# own binaries. That is exactly the cost module 9 task 0's split exists to
+# keep out of the `ctest -L fast` edit loop; the default `ctest` still
+# runs it.
+#
+# TIMEOUT 150, set from the worst FAILING run and not the passing one.
+# MEASURED in Debug: a passing run is ~14 s (twelve children, 128 KiB
+# each way through six of them). The bound has to cover a run where the
+# two ends cannot read each other's frames -- the shape of defect this
+# file exists to catch -- which is the shared harness's own arithmetic:
+# three positive scenarios stalling for XFER_MS (15 s) each, plus three
+# negative ones at HANDSHAKE_FAIL_MS + QUIET_MS (10 s) each, i.e. 75 s
+# before any child that also ignores SIGTERM adds EXIT_MS. 150 leaves
+# room for that and still fails loudly rather than being truncated.
+set_tests_properties(test_go_clienthello_matrix PROPERTIES
+    TIMEOUT 150
+    LABELS "slow")
+
+# ---------------------------------------------------------------------------
+# THE ENCRYPTION MATRIX (module 10b task 2).
+#
+# A THIRD binary rather than more cases in either of the two above, for
+# the same reason task 1 gave for splitting off the second and one more.
+# test_go_clienthello_matrix's TIMEOUT 150 is sized for a worst FAILING
+# run of six scenarios; twelve more would not fit under it, and a bound
+# that cannot cover its own failure mode reports "***Timeout" instead of
+# the assertion that diagnoses it. The three files also ask three
+# different questions -- does the direct path interoperate at all, do all
+# three ClientHello templates, do all four encryption methods -- so a
+# failure in one should not hide the others behind a single ctest row.
+# And at -j4 three rows run beside each other where one long row cannot.
+#
+# The harness all three share is go_oracle_harness.h. This task added the
+# post-handshake wire capture and the numbered-record corruption to it;
+# every existing scenario in the other two files is unchanged, because
+# both are opt-in fields that default to off.
+#
+# cloak-server for cloak_clienthello_parse (the ClientHello is parsed to
+# find the client's ephemeral key, which is what the session key is
+# recovered through); cloak-mux for nothing linked but CLOAK_FRAME_* and
+# CLOAK_CONN_MAX_FRAME_LEN, which are header constants -- the frame layer
+# is re-implemented in the test rather than called, deliberately, so the
+# assertion does not inherit the code it is judging; cloak-common for
+# base64, X25519, Salsa20 and the AEAD.
+add_executable(test_go_encryption_matrix test_go_encryption_matrix.c)
+target_include_directories(test_go_encryption_matrix PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_go_encryption_matrix PRIVATE cloak-server cloak-mux cloak-common)
+target_compile_definitions(test_go_encryption_matrix PRIVATE
+    GO_CK_CLIENT_PATH="${CLOAK_GO_CK_CLIENT}"
+    GO_CK_SERVER_PATH="${CLOAK_GO_CK_SERVER}")
+add_test(NAME test_go_encryption_matrix COMMAND test_go_encryption_matrix)
+
+# The paths of OUR ck-client and ck-server are APPENDED at the end of the
+# top-level CMakeLists.txt, after cmd/ck-client and cmd/ck-server have
+# been added, exactly as test_go_interop's are.
+
+# TIMEOUT AND LABELS IN ONE CALL, AT THE SOURCE SITE -- the discipline
+# task 8 of this module established and task 1 kept. (The older tests in
+# this file, test_go_interop and test_unordered_proof among them, still
+# use two adjacent calls merged after the fact by cloak_label_fast_tests();
+# that is recorded rather than quietly fixed, because changing them is
+# not this task's work either.)
+#
+# LABELS "slow": twelve scenarios, twenty-four forked children, twelve of
+# them Go's own binaries.
+#
+# TIMEOUT 300, set from the worst FAILING run and not the passing one.
+# MEASURED in Debug: a passing run is 6.9 s -- cheaper than its twelve
+# scenarios suggest, because three of the four corrupting ones end on
+# STALL_QUIET_MS (2 s of silence) rather than on XFER_MS. The bound has to
+# cover a run where the two ends cannot read each other's frames -- the shape of defect this file exists to catch -- which is the
+# shared harness's own arithmetic: eight positive scenarios stalling for
+# XFER_MS (15 s) each is 120 s, and four frame-corrupting scenarios that
+# never see their flipped bit land would also run to XFER_MS, 60 s more.
+# 180 s of stalling plus twenty-four child spawns and teardowns; 300
+# leaves room for that and still fails loudly rather than being
+# truncated.
+set_tests_properties(test_go_encryption_matrix PROPERTIES
+    TIMEOUT 300
+    LABELS "slow")
+
+# ---------------------------------------------------------------------------
 # UNORDERED MODE, PROVED (module 9 task 8).
 #
 # Five cases in one binary: the Go oracle in UDP mode (both roles), a
@@ -637,6 +825,48 @@ add_test(NAME test_unordered_proof COMMAND test_unordered_proof)
 # check that matters is on the GENERATED file:
 #     grep test_unordered_proof build/libcloak-server/tests/CTestTestfile.cmake
 set_tests_properties(test_unordered_proof PROPERTIES TIMEOUT 150 LABELS "slow")
+
+# THE USER MANAGER AT SCALE, AND THE STALL ITS PLAN ACCEPTED (module 10b
+# task 7). Links sqlite3 directly on top of the transitive link
+# cloak-server already provides, for the same reason test_usermanager.c
+# does: this file installs a wrapper VFS of its own -- the only layer at
+# which a slow disk can be induced and every I/O counted -- and that needs
+# sqlite3.h on the include path, which cloak-server's PRIVATE link
+# deliberately does not propagate.
+#
+# NO LD_PRELOAD HERE, unlike test_usermanager. That shim fails write(2)
+# against one named database to force a mid-batch SQLITE_IOERR; this file
+# wants I/O that SUCCEEDS and is merely slow, which is a different
+# mechanism and would be corrupted by a second one.
+#
+# TIMEOUT AND LABELS IN ONE CALL, AT THE SOURCE SITE -- the discipline the
+# top-level CMakeLists.txt's cloak_label_fast_tests() comment explains,
+# and the check that matters is on the GENERATED file:
+#     grep test_usermanager_scale build/libcloak-server/tests/CTestTestfile.cmake
+#
+# LABELS "slow", AND THIS FILE FORKS NOTHING. Every other "slow" test in
+# this directory earns the label by forking and exec'ing a real binary,
+# so the deviation is deliberate and is the label used for its stated
+# PURPOSE rather than its usual proxy: `ctest -L fast` is the edit loop,
+# and this file deliberately burns wall clock -- it induces 1 ms of
+# latency on every one of the ~2400 disk operations a 2048-user drain
+# performs, which is the measurement, not an inefficiency to be tuned
+# away: 2389 of those operations, measured, of which 2.39 s is the
+# induced latency itself. MEASURED at 3.5 s in this Debug build against
+# test_registry_scale's 0.26 s -- an order of magnitude more than any
+# other non-forking file here, which is what makes it not belong in a loop
+# a developer runs every few minutes. The default `ctest` with no
+# arguments still runs it, exactly as that split's comment promises.
+#
+# TIMEOUT 300 matches test_registry_scale, the other file in this
+# directory that builds a structure at its cap: an 85x margin on the 3.5 s
+# above, which leaves room for the sanitizer build without leaving a run
+# that has genuinely wedged to sit out ctest's 1500 s default.
+add_executable(test_usermanager_scale test_usermanager_scale.c)
+target_include_directories(test_usermanager_scale PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_usermanager_scale PRIVATE cloak-server sqlite3)
+add_test(NAME test_usermanager_scale COMMAND test_usermanager_scale)
+set_tests_properties(test_usermanager_scale PROPERTIES TIMEOUT 300 LABELS "slow")
 
 # Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's own
 # comment on cloak_label_fast_tests() for what this call does and why it

@@ -58,10 +58,11 @@
 
 /* ---- D2: the retry bound and the backoff -------------------------------
  *
- * Go retries FOREVER. internal/client/connector.go's `makeconn:` label is
- * jumped back to on every dial failure and every handshake failure, after
- * a flat time.Sleep(3 * time.Second), with a `// TODO increase the
- * interval if failed multiple times` admitting the interval is wrong. A
+ * Go retries FOREVER. internal/client/connector.go's `makeconn:` label
+ * (:26) is jumped back to on every dial failure (:33) and every
+ * handshake failure (:50), after a flat time.Sleep(3 * time.Second)
+ * (:32 and :48), with a `// TODO increase the interval if failed
+ * multiple times` (:31) admitting the interval is wrong. A
  * goroutine that never gives up is a defensible choice for a daemon whose
  * only job is to keep one tunnel alive; it is not a defensible choice for
  * a LIBRARY, because a caller that can never be told "this did not work"
@@ -253,7 +254,11 @@ typedef struct {
      * they need not outlive this call. */
     cloak_client_browser_t browser;
     cloak_transport_mode_t transport;
-    const char *server_name; /* "random" regenerates per attempt, as in Go */
+    /* "random" regenerates per attempt, as in Go: the
+     * strings.EqualFold check and randomServerName() call at
+     * internal/client/TLS.go:126-127 sit inside DirectTLS.Handshake,
+     * which runs once per connection attempt. */
+    const char *server_name;
     uint8_t server_pub[CLOAK_X25519_KEY_LEN];
     uint8_t uid[CLOAK_UID_LEN];
     const char *proxy_method;

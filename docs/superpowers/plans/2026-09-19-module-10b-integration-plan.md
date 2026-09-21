@@ -38,16 +38,30 @@
 
 **D4 — `admin && udp` is an unrecorded divergence either way, and this module records it.** Go accepts it and produces something broken: `ck-client.go:165` forces `NumConn = 1` in the admin branch but **leaves `authInfo.Unordered` alone**, and `:191` routes the admin API over `RouteUDP`. The C client refuses `admin && (num_conn != 1 || singleplex)` but **has no opinion on `admin && udp`.** Decide — refuse it, or test it — and write the decision down with its Go citation.
 
+**DECIDED BY TASK 5: ACCEPT AND TEST.** Go's citation re-read in the reference tree — the admin branch is `ck-client.go:159-167` and the `if authInfo.Unordered` that picks `RouteUDP` over `RouteTCP` is `:191-200`, outside it. Refusing would be a divergence with nothing behind it, and the combination **already worked**: `test_ck_client_cli.c` case 7a (`admin_over_udp_is_served`) now drives `-a` with `-u` through both real binaries and gets a real `200` with a JSON body back, 123 bytes in **one** datagram. What is *not* claimed: a response longer than one frame's payload still leaves as several datagrams that nothing joins up — the local endpoint is a UDP socket and this port does not pretend otherwise.
+
 **D5 — the restart test discharges a written debt and is not optional.** `cmd/ck-client/main.c:41-47` justifies there being no sixth exit code **on the grounds that** a client that cannot connect retries forever. Nothing proves it does, through the binaries, across a real restart. Module 7 said whoever argues five codes suffice owes this test. **This module owes it.**
 
 **D6 — what this module does NOT do.** `-u` × CDN stays unreachable (module 8b's; it needs a real TLS stack and a fingerprint decision). `singleplex + udp` stays unimplemented and refused by name. `read_whole_file`/`ck_err` stay duplicated in the two binaries — module 7 said a third binary makes sharing worth it, and there is no third binary. **Say so; do not re-litigate.**
 
-## Two more candidate bugs in the reference, both read and neither reproduced
+## Two more candidate bugs in the reference
 
 - **#10 — a duplicate of a *pending* seq wedges Go's stream permanently and grows its heap without bound.** Found by checking `stream.h:266`'s justification for our ordered-duplicate divergence, which claims *"Go … has no error path there at all"* — **that is false** (`streamBuffer.go:79-81`). The false comment is what hid the candidate.
+
+  **PROMOTED TO A FINDING BY TASK 5 — REPRODUCED, NOT READ.** Measured against the reference tree at `cbeuw/Cloak` `c3d5470` (a copy of it, with one added `_test.go`; the reference checkout itself was not modified), `go1.25.6`, driving `NewStreamBuffer` directly in-package:
+
+  ```
+  frames seq 1, 1, 0  ->  nextRecvSeq = 2, heap = [seq 1]   (the stale copy)
+  + 1000 in-order frames (seq 2..1001)
+                      ->  nextRecvSeq = 2 STILL, heap = 1001 entries
+  reader             ->  "AB" once, then deadline exceeded, forever
+  ```
+
+  The mechanism: `streamBuffer.go:79-81` only rejects `f.Seq < nextRecvSeq`, so a second copy of a seq still **pending** in the sorter heap is pushed again at `:86`; the drain loop at `:88` stops as soon as `sh[0].Seq != nextRecvSeq`, and by then `nextRecvSeq` has moved **past** the stale copy, which therefore sits at the head of the heap where it can never match again. **Reachable from a peer:** `Session.recvDataFromRemote` → `Stream.recvFrame` (`stream.go:72`) hands every deobfuscated frame straight to `streamBuffer.Write`, so an authenticated peer that repeats one pending frame wedges that stream and grows the process heap for as long as it keeps sending. **This port is immune** — `stream.c`'s check is `frame->seq < s->next_recv_seq || heap_contains_seq(s, frame->seq)` — and `cloak/stream.h`'s `ORDERED` paragraph now carries the corrected citation.
+
 - **#12 — Go's replay-cache cleaner sleeps `replayCacheAgeLimit` = 12 hours between passes** (`state.go:214-225`), so an unauthenticated flood grows `UsedRandom` unboundedly for up to twelve hours: a memory DoS from packets that never authenticate.
 
-**Both are read, not measured.** A task that reproduces either promotes it to a finding; a task that cannot must say so.
+**#12 is still read, not measured.** A task that reproduces it promotes it to a finding; a task that cannot must say so.
 
 ---
 
@@ -254,3 +268,128 @@ Note the warm/cold correction: the ~102 s ASan suite figure quoted through modul
 - **Counts chain** 76 → 77 → 78 → 79 → 80 → 81 → 82 → 83 → (8 raises it by the split) → (9 may add none).
 - **The riskiest task is 4**, because raising a cap and changing a data structure under the whole server is the only task here that can break something that currently works.
 - **The most consequential is 1**, because the spec names ClientHello mimicry the highest-risk component and **two of three templates have never been seen by foreign code** — the AAD defect's exact shape, with the oracle already installed.
+
+---
+
+## What this branch leaves for the next ones
+
+Twenty commits. The suite goes from 76 `ctest` binaries to 85, and from a
+floor of one CLI case to twelve. But the count is the least interesting
+number here, and two of this module's own corrections were about exactly
+that: `ctest` registers binaries, not cases, so the twelve cases added after
+Task 1 raised the count by zero. An agent asked to report a rising count
+declined and called 86 "the easy wrong answer".
+
+### The shape every defect in this module had
+
+Seven distinct instances, and they are one shape: **the configured intent
+said one thing, the wire carried another, and the suite stayed green because
+no test read the wire.** A test whose two ends are both our own code cannot
+see this, which is why the AAD divergence survived five modules. The
+corrective is mechanical and worth stating as a rule: *assert against what
+the hello, the frame, or the socket actually carries, never against the
+structure that produced it.*
+
+N1 is the cleanest specimen. The GREASE test read back the positions the
+template itself declared as `GROUP` and asserted they agreed -- definitional,
+and therefore empty. Re-tagging two offsets left the suite at 85/85 while 15
+of 16 hellos offered a `key_share` naming a group `supported_groups` did not
+list: an illegal ClientHello, guarded by an assertion that could not fail.
+
+### The GREASE change, and what it costs to keep
+
+`clienthello.c` now draws GREASE per connection from `cloak_random_bytes`
+over OpenSSL `RAND_bytes`, six (offset, role) positions per template. The
+frozen constant it replaced was a static per-build distinguisher -- the worst
+shape this class takes in a circumvention tool.
+
+Three traps are now written into the tests, and all three were found by
+running uTLS v1.8.0 rather than reading it:
+
+- A naive byte scan for `0x?A?A` **gets Safari wrong**: offset 72 is the
+  cipher-list length, `0x002a`. Only a structural walk finds the real slots.
+- GREASE must be written **before** the ECH `memmove`, or Chrome's trailing
+  GREASE extension is not carried.
+- `group(supported_groups)` must equal `group(key_share)` -- uTLS holds it
+  200/200 -- and `ext2 != ext1` holds 0/200. Firefox emits no GREASE at all.
+
+**Still owed:** Go shuffles Chrome's extension order every connection
+(measured: 200/200 distinct normalised orders for Chrome, **1/200 for
+Safari** -- the shuffle is Chrome-only). We pin ours. Our Chrome profile is
+therefore distinguishable from real Chrome by invariant extension order.
+Deferred deliberately: it reaches far deeper into the pinned byte vectors
+than a branch at its end could afford.
+
+### Reference bug #12, promoted from read to measured
+
+Go's replay cache is unbounded. `UsedRandom` is pruned only by a cleaner that
+sleeps `replayCacheAgeLimit` = 12 h **first**
+(`internal/server/state.go:214-225`). Measured on host Go, the map costs
+61.6-100.5 B/entry, so above roughly **19-31 sustained handshakes/s** an
+unauthenticated flood exceeds our entire 2^21 table and keeps going for up to
+twelve hours. Ours is bounded, keyed, and evict-never-refuse.
+
+The residual that policy accepts is now measured rather than argued: **37.2
+of 12,288 in-window handshakes are already replayable for zero attacker
+packets** (theory 35.93), and a prober's real cost is ~C/M, not ~C.
+
+### Growth: what the soak can and cannot see
+
+`tools/soak/` plus `docs/runbooks/soak-growth.md`, deliberately **outside
+`ctest`** -- a 60 s case would be 3.8x the longest test for 12.5x less
+sensitivity, and its most sensitive column is inert under ASan (`mallinfo2`
+reports `uordblks` 0 on both sides of a 1 MiB malloc).
+
+What it establishes: at ~42 handshakes/s over 900 s, nothing grows but the
+replay cache becoming resident, and that is bounded (94,832 kB measured
+against 95,400 kB computed independently). The positive control reads 96.0
+B/cycle +/- 0.06 % for a 64 B/cycle retained-and-reachable leak **that
+LeakSanitizer does not report** -- the class an exit scan cannot see.
+
+What it cannot see, stated as limits rather than discovered later:
+
+- **A quantisation floor of 1/T -- 4.8 units/hour at 750 s.** A 4 fd/hour
+  leak is below it and is *not* excluded.
+- **A peak-concurrency ratchet.** K is pinned all run and the reactor's slot
+  array never shrinks.
+- **One column is never enough.** At 1 MiB retained per cycle `uordblks` and
+  `arena` are bit-identical while `hblkhd` shows 1.844e10 B/hr; at 200 KB the
+  split reverses. glibc's mmap threshold is dynamic.
+- **THP.** `always` on the reference host, so `rss_anon_kb` is not flat even
+  in a clean run -- 10,240 of an 11,052 kB rise is `rss_anon_huge_kb`. A
+  non-THP host should see run B near-flat and that rise simply absent.
+
+The 240 s A/B/C artefact is committed under `tools/soak/artefacts/` and
+reproduces byte-identically through the committed analyzer. **The 900 s
+numbers quoted in prose are not reproducible from anything in the tree** --
+that is said plainly in the runbook, and it is the reason the artefact exists
+at all.
+
+### Comments that claim things about Go
+
+Two audit passes. The bulk rate of false claims is 2.6 % (1/39, Wilson 95 %
+[0.5 %, 13.2 %]); the stratum of blocks claiming a *divergence* runs
+**10.5 % misleading (4/38)**. Stratifying was the right call, and sampling
+the bulk would have missed all four.
+
+The audit's own blind spot, found afterwards: it enumerated blocks
+**mentioning Go**, so a security-cost comment naming no Go symbol was never
+in the population -- which is how `replay_cache.h` kept quoting a capacity
+two doublings out of date through both passes. The cheap recurring grep worth
+keeping is for **numbers that name a suite size or an open decision**: five
+were found here, none wrong when written, all wrong by now.
+
+### Carried forward
+
+- **Module 8b** -- the client CDN leg. Needs a real TLS stack and a
+  fingerprint decision.
+- **Chrome's extension shuffle** (above).
+- `singleplex + udp`, and `-u` x CDN.
+- **The client UDP peer map was never exercised** under churn -- read only
+  (`max_peers` 256, 300 s timeout, over-cap refused and counted).
+- The soak covers **one workload shape**: ordered TCP, BypassUID. No
+  unordered, no UDP, no admin, no metered user.
+- `test_client_transport` compares the wire against the same template struct
+  it built from, so a flipped non-GREASE byte leaves it passing while the
+  matrix test catches it. Pre-existing; not this branch's debt, but it is the
+  module's own defect shape sitting unfixed.

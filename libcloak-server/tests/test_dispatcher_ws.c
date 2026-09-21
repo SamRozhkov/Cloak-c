@@ -25,7 +25,7 @@
  *      already authorised the UID, made the user active and called
  *      finishHandshake. When that later check fails,
  *      websocketAux.go:129-138 returns WITHOUT sending on an unbuffered
- *      channel that websocket.go:47-50 is already blocked on, so the
+ *      channel that internal/server/websocket.go:47-50 is already blocked on, so the
  *      goroutine, the socket and the ActiveUser bookkeeping leak
  *      permanently. A CDN that rewrites `Connection`, regenerates a
  *      malformed `Sec-WebSocket-Key` or injects an `Origin` wedges EVERY
@@ -615,7 +615,7 @@ static int client_connect(int port) {
  * ciphertext+tag. The server then feeds exactly those to the SAME
  * decryption the TLS path uses, where the 64 bytes arrive as the
  * ClientHello's session_id and key_share fields concatenated
- * (auth.go:37). So the two transports differ in where the bytes were
+ * (internal/server/auth.go:37). So the two transports differ in where the bytes were
  * carried and in nothing else, which is why this helper produces the
  * same 48-byte payload layout cloak/server_auth.h documents. */
 

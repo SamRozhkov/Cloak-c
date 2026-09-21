@@ -72,8 +72,10 @@
  * map is deliberately NOT ported. A cloak_userpanel_user_t owns a valve, a
  * bypass flag and the rates it authenticated with; it does not own, count
  * or reference a single session. Everything session-shaped goes through
- * cloak_server_registry_count_for_uid / _close_all_for_uid, which are
- * linear scans over at most CLOAK_REGISTRY_MAX_SESSIONS entries. A second
+ * cloak_server_registry_count_for_uid / _close_all_for_uid, which cost
+ * one step per session THAT UID holds (they were linear scans over the
+ * whole table until the session cap was lifted; see
+ * CLOAK_REGISTRY_KEY_BUCKETS in cloak/registry.h). A second
  * per-user session table would have to be kept in step with the registry
  * through every teardown path this project spent a whole branch getting
  * right, and the two would disagree exactly when it mattered -- during a
@@ -140,7 +142,7 @@ typedef struct cloak_userpanel cloak_userpanel_t;
  * before it frees the entry -- so no session can outlive the valve it was
  * given. Do not cache this pointer across a reactor turn without also
  * re-checking cloak_userpanel_find. */
-typedef struct {
+typedef struct cloak_userpanel_user {
     uint8_t uid[CLOAK_UID_LEN];
 
     /* What cloak_usermanager_authenticate returned when this user became
@@ -167,6 +169,28 @@ typedef struct {
      * cloak_userpanel_notify_session_closed), exactly as if it had
      * already been removed. */
     int terminating;
+
+    /* PRIVATE TO libcloak-server/src/userpanel.c: this user's link in the
+     * active-user hash chain. Do not read or write them from anywhere
+     * else.
+     *
+     * They are HERE, in the entry, rather than in a side table, for the
+     * reason cloak/registry.h gives at CLOAK_REGISTRY_KEY_BUCKETS for the
+     * same shape: a separate structure keyed on UID is a second thing
+     * that can disagree about who is active, and the entry itself is the
+     * one place that cannot. The panel still owns the `active` array as
+     * the enumeration its periodic upload and reap walk, so unlike the
+     * registry this IS an index beside a table -- which is why
+     * libcloak-server/tests/test_registry_scale.c case 7 cross-checks
+     * every lookup against a scan of that array after a workload of
+     * activations and terminations, rather than trusting the pairing.
+     *
+     * WHY AT ALL: cloak_userpanel_get_user calls panel_find once per
+     * handshake, and CLOAK_USERPANEL_MAX_ACTIVE_USERS is
+     * CLOAK_REGISTRY_MAX_SESSIONS, which is now 1024. A scan of 1024
+     * pointers per handshake is the cost the session cap's own commit
+     * exists to avoid paying. */
+    struct cloak_userpanel_user *hash_next, **hash_pprev;
 } cloak_userpanel_user_t;
 
 /* Returns the valve to install in a session config for this user, or NULL
@@ -452,7 +476,8 @@ size_t cloak_userpanel_active_count(const cloak_userpanel_t *p);
  * depending on which side raced. */
 cloak_usermanager_t *cloak_userpanel_manager(cloak_userpanel_t *p);
 
-/* Go's TerminateActiveUser. In order: drains this user's valve onto the
+/* Go's TerminateActiveUser (internal/server/userpanel.go:91-100, whose
+ * three statements are in this same order). In order: drains this user's valve onto the
  * usage queue (so the bytes it moved are still billed), closes EVERY
  * session it holds through cloak_server_registry_close_all_for_uid, then
  * removes the entry from the active table and FREES IT.
@@ -633,12 +658,14 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
  * cloak_userpanel_terminate and is then gone from the active table; the
  * next upload still bills it, reporting active = 0. Go keeps
  * usageUpdateQueue separate from activeUsers for exactly this reason and
- * its commitUpdate reports Active: false for such a user; this is a port
+ * its commitUpdate reports Active: false for such a user
+ * (internal/server/userpanel.go:177, `Active: panel.isActive(...)`); this is a port
  * of that, not a coincidence.
  *
  * A FAILED UPLOAD IS RETRIED, NOT DISCARDED, and this is a deliberate
- * divergence from Go (which empties its queue BEFORE calling
- * UploadStatus, so a failure loses that interval's billing outright). The
+ * divergence from Go (internal/server/userpanel.go:186 replaces
+ * usageUpdateQueue with a fresh map BEFORE the UploadStatus call at
+ * :192, so a failure loses that interval's billing outright). The
  * manager's busy_timeout is 0, so a second writer -- an operator's
  * sqlite3 CLI, the admin API -- makes upload_status fail fast with
  * "database is locked". That is the right trade for the reactor (it never

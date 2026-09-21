@@ -3,11 +3,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cloak/common.h" /* cloak_random_bytes, for this registry's hash key */
+
+#include "hash_internal.h"
+
 /* One heap-allocated, never-moved entry per (uid, session_id). Its
  * address is handed to cloak_session_init as the userdata behind
  * registry_on_session_broken for as long as the session lives -- see
- * cloak/registry.h's own top-of-file comment for why this table is an
- * array of pointers to these rather than an array of the entries
+ * cloak/registry.h's own top-of-file comment for why this table is a
+ * hash of pointers to these rather than an array of the entries
  * themselves. */
 struct cloak_registry_entry {
     cloak_session_t sesh;
@@ -19,29 +23,190 @@ struct cloak_registry_entry {
      * own callback is invoked -- see registry_on_session_broken. Once
      * set, this entry is invisible to cloak_server_registry_find and
      * cloak_server_registry_close (both skip dead entries), and no
-     * longer counted by cloak_server_registry_count; it still occupies
-     * its table slot and its cloak_session_t is still live (not yet
-     * destroyed) until the deferred sweep reaches it. */
+     * longer counted by cloak_server_registry_count; it still holds its
+     * place in both hash chains, still spends one of the cap's
+     * CLOAK_REGISTRY_MAX_SESSIONS entries, and its cloak_session_t is
+     * still live (not yet destroyed) until the deferred sweep reaches
+     * it. Marking dead also links it onto reg->dead_head, which is how
+     * that sweep finds it in one step. */
     int dead;
+
+    /* THE THREE CHAINS, described in full at CLOAK_REGISTRY_KEY_BUCKETS
+     * in cloak/registry.h. Each is an intrusive doubly-linked list in the
+     * hlist shape: `next` forwards, `pprev` pointing AT the pointer that
+     * points at this entry (a bucket head, or the previous entry's next
+     * field), which is what makes an unlink O(1) without a head special
+     * case and without knowing which bucket the entry sits in.
+     *
+     * key_*  -- the (uid, session_id) bucket. Every entry, live or dead.
+     * uid_*  -- the uid bucket. Every entry, live or dead.
+     * dead_* -- reg->dead_head. Dead entries only; pprev is NULL for a
+     *           live one, which is what registry_entry_unlink tests. */
+    struct cloak_registry_entry *key_next, **key_pprev;
+    struct cloak_registry_entry *uid_next, **uid_pprev;
+    struct cloak_registry_entry *dead_next, **dead_pprev;
 };
+
+/* ------------------------------------------------------------------ */
+/* The keyed bucket functions                                          */
+/* ------------------------------------------------------------------ */
+
+static size_t registry_key_bucket(const cloak_server_registry_t *reg,
+                                   const uint8_t uid[CLOAK_UID_LEN], uint32_t session_id) {
+    uint8_t buf[CLOAK_UID_LEN + 4];
+    memcpy(buf, uid, CLOAK_UID_LEN);
+    /* Explicit little-endian, not a memcpy of the uint32_t: the bucket a
+     * session lands in must not depend on the host's byte order, or a
+     * test that pins a distribution passes on one machine and not
+     * another. */
+    buf[CLOAK_UID_LEN + 0] = (uint8_t)(session_id & 0xFFu);
+    buf[CLOAK_UID_LEN + 1] = (uint8_t)((session_id >> 8) & 0xFFu);
+    buf[CLOAK_UID_LEN + 2] = (uint8_t)((session_id >> 16) & 0xFFu);
+    buf[CLOAK_UID_LEN + 3] = (uint8_t)((session_id >> 24) & 0xFFu);
+    return (size_t)(cloak_siphash24(reg->hash_key, buf, sizeof(buf)) &
+                    (uint64_t)(CLOAK_REGISTRY_KEY_BUCKETS - 1));
+}
+
+static size_t registry_uid_bucket(const cloak_server_registry_t *reg,
+                                   const uint8_t uid[CLOAK_UID_LEN]) {
+    return (size_t)(cloak_siphash24(reg->hash_key, uid, CLOAK_UID_LEN) &
+                    (uint64_t)(CLOAK_REGISTRY_UID_BUCKETS - 1));
+}
+
+/* ------------------------------------------------------------------ */
+/* The three chains                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Six near-identical five-line functions rather than one macro or one
+ * offsetof-driven helper: a chain bug here is a use-after-free or a lost
+ * session, the three chains have different membership rules, and code
+ * that can be read without expanding anything is worth more than the
+ * duplication costs. */
+
+static void key_chain_add(cloak_server_registry_t *reg, struct cloak_registry_entry *e) {
+    struct cloak_registry_entry **head =
+        &reg->key_buckets[registry_key_bucket(reg, e->uid, e->session_id)];
+    e->key_next = *head;
+    if (*head != NULL) {
+        (*head)->key_pprev = &e->key_next;
+    }
+    *head = e;
+    e->key_pprev = head;
+}
+
+static void key_chain_del(struct cloak_registry_entry *e) {
+    if (e->key_pprev == NULL) {
+        return;
+    }
+    if (e->key_next != NULL) {
+        e->key_next->key_pprev = e->key_pprev;
+    }
+    *e->key_pprev = e->key_next;
+    e->key_next = NULL;
+    e->key_pprev = NULL;
+}
+
+static void uid_chain_add(cloak_server_registry_t *reg, struct cloak_registry_entry *e) {
+    struct cloak_registry_entry **head = &reg->uid_buckets[registry_uid_bucket(reg, e->uid)];
+    e->uid_next = *head;
+    if (*head != NULL) {
+        (*head)->uid_pprev = &e->uid_next;
+    }
+    *head = e;
+    e->uid_pprev = head;
+}
+
+static void uid_chain_del(struct cloak_registry_entry *e) {
+    if (e->uid_pprev == NULL) {
+        return;
+    }
+    if (e->uid_next != NULL) {
+        e->uid_next->uid_pprev = e->uid_pprev;
+    }
+    *e->uid_pprev = e->uid_next;
+    e->uid_next = NULL;
+    e->uid_pprev = NULL;
+}
+
+static void dead_chain_add(cloak_server_registry_t *reg, struct cloak_registry_entry *e) {
+    struct cloak_registry_entry **head = &reg->dead_head;
+    e->dead_next = *head;
+    if (*head != NULL) {
+        (*head)->dead_pprev = &e->dead_next;
+    }
+    *head = e;
+    e->dead_pprev = head;
+}
+
+static void dead_chain_del(struct cloak_registry_entry *e) {
+    if (e->dead_pprev == NULL) {
+        return;
+    }
+    if (e->dead_next != NULL) {
+        e->dead_next->dead_pprev = e->dead_pprev;
+    }
+    *e->dead_pprev = e->dead_next;
+    e->dead_next = NULL;
+    e->dead_pprev = NULL;
+}
+
+/* THE ONLY THREE FUNCTIONS THAT WRITE reg->n_entries OR reg->n_dead, and
+ * the only three that change an entry's chain membership. cloak/registry.h
+ * cites exactly this when it says the maintained counters keep the
+ * "exactly one place that can disagree with reality" property the old
+ * recomputing count had. */
+
+static void registry_entry_link(cloak_server_registry_t *reg, struct cloak_registry_entry *e) {
+    key_chain_add(reg, e);
+    uid_chain_add(reg, e);
+    reg->n_entries++;
+}
+
+static void registry_entry_unlink(cloak_server_registry_t *reg, struct cloak_registry_entry *e) {
+    key_chain_del(e);
+    uid_chain_del(e);
+    if (e->dead) {
+        dead_chain_del(e);
+        reg->n_dead--;
+    }
+    reg->n_entries--;
+}
+
+static void registry_mark_dead(cloak_server_registry_t *reg, struct cloak_registry_entry *e) {
+    e->dead = 1;
+    dead_chain_add(reg, e);
+    reg->n_dead++;
+}
 
 /* Destroys and frees one entry unconditionally -- used by the sweep, by
  * cloak_server_registry_close, and by cloak_server_registry_destroy. The
- * caller is responsible for having already cleared the entry's slot in
- * reg->entries first. */
+ * caller is responsible for having already called registry_entry_unlink
+ * on it first -- every caller here does, on the line above. */
 static void registry_free_entry(struct cloak_registry_entry *entry) {
     cloak_session_destroy(&entry->sesh);
     free(entry);
 }
 
 /* Finds the live (not dead) entry for (uid, session_id), or NULL. Shared
- * by get_or_create (existence check), find, and close. */
+ * by get_or_create (existence check), find, and close.
+ *
+ * One walk of one key bucket. A dead entry with the same key is skipped
+ * rather than removed from the chain, because a dead entry is still
+ * reachable BY UID until its sweep runs (see
+ * cloak_server_registry_close_all_for_uid) -- so both the dead entry and
+ * the live one a later get_or_create created for the same key can sit in
+ * the same bucket, and the live one is the answer.
+ *
+ * The two counters are the measurement test_registry_scale.c case 2
+ * reads; see their declaration in cloak/registry.h. */
 static struct cloak_registry_entry *registry_find_live(cloak_server_registry_t *reg,
                                                         const uint8_t uid[CLOAK_UID_LEN],
                                                         uint32_t session_id) {
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        struct cloak_registry_entry *entry = reg->entries[i];
-        if (entry != NULL && !entry->dead && entry->session_id == session_id &&
+    reg->lookup_calls++;
+    for (struct cloak_registry_entry *entry = reg->key_buckets[registry_key_bucket(reg, uid, session_id)];
+         entry != NULL; entry = entry->key_next) {
+        reg->lookup_probe_steps++;
+        if (!entry->dead && entry->session_id == session_id &&
             memcmp(entry->uid, uid, CLOAK_UID_LEN) == 0) {
             return entry;
         }
@@ -54,12 +219,18 @@ static struct cloak_registry_entry *registry_find_live(cloak_server_registry_t *
  * run it synchronously for anything still pending instead of duplicating
  * the loop. */
 static void registry_sweep_dead_entries(cloak_server_registry_t *reg) {
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        struct cloak_registry_entry *entry = reg->entries[i];
-        if (entry != NULL && entry->dead) {
-            reg->entries[i] = NULL;
-            registry_free_entry(entry);
-        }
+    /* Pops the dead chain's head each turn rather than walking it with a
+     * saved `next`: registry_free_entry runs cloak_session_destroy, and
+     * re-reading the head is what makes this correct without having to
+     * prove that nothing anywhere under that call can reach back into
+     * this registry and unlink the entry we were about to visit. It is
+     * also one step per DEAD entry rather than one per slot in the
+     * table, which is what a sweep armed by a single session's teardown
+     * needs to be once the cap is 1024. */
+    struct cloak_registry_entry *entry;
+    while ((entry = reg->dead_head) != NULL) {
+        registry_entry_unlink(reg, entry);
+        registry_free_entry(entry);
     }
 }
 
@@ -123,9 +294,9 @@ static void registry_arm_sweep(cloak_server_registry_t *reg) {
  * window this whole adapter exists to provide. */
 static void registry_on_session_broken(cloak_session_t *sesh, void *userdata) {
     struct cloak_registry_entry *entry = userdata;
-    entry->dead = 1;
-
     cloak_server_registry_t *reg = entry->reg;
+    registry_mark_dead(reg, entry);
+
     if (reg->on_broken != NULL) {
         reg->on_broken(reg, sesh, entry->uid, entry->session_id, reg->on_broken_userdata);
     }
@@ -152,6 +323,13 @@ int cloak_server_registry_init(cloak_server_registry_t *reg, cloak_reactor_t *r,
     reg->reactor = r;
     reg->on_broken = on_broken;
     reg->on_broken_userdata = userdata;
+
+    /* Drawn here, per registry, and never anywhere else -- the same
+     * discipline cloak_replay_cache_init follows, for the same reason.
+     * Drawn AFTER the argument checks so that a rejected init does no
+     * work, and before any entry can exist, since the bucket an entry
+     * lands in is computed from this key and nothing rehashes. */
+    cloak_random_bytes(reg->hash_key, sizeof(reg->hash_key));
     return 0;
 }
 
@@ -195,10 +373,10 @@ void cloak_server_registry_destroy(cloak_server_registry_t *reg) {
      * cloak_session_destroy on that entry's own sesh, called from within
      * that same sesh's own on_broken, is exactly the reentrant pattern
      * cloak_session_broken_cb's own doc comment documents as safe. */
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        struct cloak_registry_entry *entry = reg->entries[i];
-        if (entry != NULL) {
-            reg->entries[i] = NULL;
+    for (size_t i = 0; i < CLOAK_REGISTRY_KEY_BUCKETS; i++) {
+        struct cloak_registry_entry *entry;
+        while ((entry = reg->key_buckets[i]) != NULL) {
+            registry_entry_unlink(reg, entry);
             registry_free_entry(entry);
         }
     }
@@ -221,14 +399,12 @@ cloak_session_t *cloak_server_registry_get_or_create(cloak_server_registry_t *re
         return &existing->sesh;
     }
 
-    size_t slot = CLOAK_REGISTRY_MAX_SESSIONS;
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        if (reg->entries[i] == NULL) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot == CLOAK_REGISTRY_MAX_SESSIONS) {
+    /* DEAD ENTRIES COUNT AGAINST THE CAP, exactly as they did when they
+     * occupied a slot in the old array: one still owns its session, its
+     * connections and its memory until the sweep runs. This check is O(1)
+     * -- it has to be, it is on the handshake path -- which is why the
+     * counters exist at all; see their declaration in cloak/registry.h. */
+    if (reg->n_entries >= CLOAK_REGISTRY_MAX_SESSIONS) {
         return NULL; /* table full -- a resource limit, not an argument error; see cloak/registry.h */
     }
 
@@ -255,7 +431,10 @@ cloak_session_t *cloak_server_registry_get_or_create(cloak_server_registry_t *re
         return NULL;
     }
 
-    reg->entries[slot] = entry;
+    /* Linked only once the session is fully constructed, so nothing can
+     * ever find a half-initialized entry -- the same ordering the old
+     * slot assignment had. */
+    registry_entry_link(reg, entry);
     if (out_created != NULL) {
         *out_created = 1;
     }
@@ -284,14 +463,10 @@ void cloak_server_registry_close(cloak_server_registry_t *reg, const uint8_t uid
      * within that very session's own on_broken, where
      * registry_on_session_broken has already marked it dead before
      * invoking the owner's callback. */
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        struct cloak_registry_entry *entry = reg->entries[i];
-        if (entry != NULL && !entry->dead && entry->session_id == session_id &&
-            memcmp(entry->uid, uid, CLOAK_UID_LEN) == 0) {
-            reg->entries[i] = NULL;
-            registry_free_entry(entry);
-            return;
-        }
+    struct cloak_registry_entry *entry = registry_find_live(reg, uid, session_id);
+    if (entry != NULL) {
+        registry_entry_unlink(reg, entry);
+        registry_free_entry(entry);
     }
 }
 
@@ -300,14 +475,23 @@ size_t cloak_server_registry_count_for_uid(const cloak_server_registry_t *reg,
     if (reg == NULL || uid == NULL) {
         return 0;
     }
-    /* Linear over the whole table -- see this function's doc comment for
-     * why there is no per-UID index. Dead entries are excluded for the
-     * same reason cloak_server_registry_count excludes them: they are no
-     * longer sessions anyone can use. */
+    /* One walk of one uid bucket -- see this function's doc comment. Dead
+     * entries are excluded for the same reason cloak_server_registry_count
+     * excludes them: they are no longer sessions anyone can use.
+     *
+     * THE CONST CAST is for the two diagnostic counters and nothing else.
+     * This function is on the dispatcher's per-handshake path and is
+     * therefore half of what test_registry_scale.c case 2 measures, so it
+     * has to count its own steps; no cloak_server_registry_t is ever
+     * defined const, and no other field is touched. */
+    cloak_server_registry_t *counters = (cloak_server_registry_t *)reg;
+    counters->lookup_calls++;
+
     size_t n = 0;
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        const struct cloak_registry_entry *entry = reg->entries[i];
-        if (entry != NULL && !entry->dead && memcmp(entry->uid, uid, CLOAK_UID_LEN) == 0) {
+    for (const struct cloak_registry_entry *entry = reg->uid_buckets[registry_uid_bucket(reg, uid)];
+         entry != NULL; entry = entry->uid_next) {
+        counters->lookup_probe_steps++;
+        if (!entry->dead && memcmp(entry->uid, uid, CLOAK_UID_LEN) == 0) {
             n++;
         }
     }
@@ -322,16 +506,31 @@ size_t cloak_server_registry_close_all_for_uid(cloak_server_registry_t *reg,
         return 0;
     }
 
+    const size_t bucket = registry_uid_bucket(reg, uid);
     size_t closed = 0;
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        struct cloak_registry_entry *entry = reg->entries[i];
-        /* Dead entries are NOT skipped here, unlike in every other lookup
-         * in this file -- see this function's doc comment: a dead entry's
+    for (;;) {
+        /* RE-READ FROM THE HEAD every iteration rather than carrying a
+         * saved `next` across on_closing: that callback is documented as
+         * being allowed to reenter this module and close other sessions,
+         * and a saved pointer is exactly what such a call would leave
+         * dangling. Not a rescan -- every session of one uid hashes into
+         * this one bucket, so the head is a match except for the foreign
+         * uids that collided into it.
+         *
+         * Dead entries are NOT skipped, unlike in every other lookup in
+         * this file -- see this function's doc comment: a dead entry's
          * connections are still registered with the reactor until its
          * sweep runs, and the caller is about to free something they
          * still point at. */
-        if (entry == NULL || memcmp(entry->uid, uid, CLOAK_UID_LEN) != 0) {
-            continue;
+        struct cloak_registry_entry *entry = NULL;
+        for (struct cloak_registry_entry *e = reg->uid_buckets[bucket]; e != NULL; e = e->uid_next) {
+            if (memcmp(e->uid, uid, CLOAK_UID_LEN) == 0) {
+                entry = e;
+                break;
+            }
+        }
+        if (entry == NULL) {
+            break;
         }
 
         /* Unlink BEFORE anything else, so that an on_closing which
@@ -343,7 +542,7 @@ size_t cloak_server_registry_close_all_for_uid(cloak_server_registry_t *reg,
          * unlinking it does not lose it; this is the same ordering
          * registry_on_session_broken uses when it marks an entry dead
          * before invoking the owner's callback. */
-        reg->entries[i] = NULL;
+        registry_entry_unlink(reg, entry);
 
         if (on_closing != NULL) {
             /* Still fully alive here -- this is the caller's only window
@@ -362,12 +561,8 @@ size_t cloak_server_registry_count(const cloak_server_registry_t *reg) {
     if (reg == NULL) {
         return 0;
     }
-    size_t n = 0;
-    for (size_t i = 0; i < CLOAK_REGISTRY_MAX_SESSIONS; i++) {
-        const struct cloak_registry_entry *entry = reg->entries[i];
-        if (entry != NULL && !entry->dead) {
-            n++;
-        }
-    }
-    return n;
+    /* Live = every entry minus the dead ones awaiting their sweep. See
+     * the two counters' declaration in cloak/registry.h for why this is a
+     * subtraction rather than the scan it used to be. */
+    return reg->n_entries - reg->n_dead;
 }

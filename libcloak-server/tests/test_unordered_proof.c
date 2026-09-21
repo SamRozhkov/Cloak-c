@@ -949,7 +949,7 @@ static int write_temp_unique(char *path_out, size_t cap, const char *name, const
  * to do the same thing, that would itself be the divergence, and writing
  * the fixture twice would hide it.
  *
- * "udp" in the ProxyBook is the whole point -- Go's state.go:100 resolves
+ * "udp" in the ProxyBook is the whole point -- Go's internal/server/state.go:100 resolves
  * it to a net.UDPAddr and ours (config_server.c:67) to SOCK_DGRAM, and it
  * is what puts a datagram relay rather than a byte-stream relay behind
  * each server. */
@@ -970,7 +970,7 @@ static void write_server_config(char *path_out, size_t cap, const char *name, in
 }
 
 /* "UDP":true, not the -u flag, because it is the ONE spelling both
- * binaries accept from a file: Go's state.go:86 lists UDP among its
+ * binaries accept from a file: Go's internal/client/state.go:86 lists UDP among its
  * unquoted raw keys and ck-client.go:125 only overrides it when -u was
  * actually given, and module 9 task 7 taught ours the same key. */
 static void write_client_config(char *path_out, size_t cap, const char *name, const char *pub_b64,
@@ -1038,8 +1038,9 @@ typedef struct {
      * MAX_DGRAM for ours. */
     size_t client_read_cap;
     /* AND WHAT IT DOES WITH A BIGGER ONE, which is the whole of bug 7 and
-     * is NOT the same question as the cap. Go TRUNCATES: ReadFrom fills
-     * its 8192 bytes, the rest of the datagram is discarded by the kernel,
+     * is NOT the same question as the cap. Go TRUNCATES: ReadFrom
+     * (internal/client/piper.go:26, into the 8192-byte buffer allocated
+     * at :25) fills its 8192 bytes, the rest of the datagram is discarded by the kernel,
      * no error is reported anywhere, and the fragment is forwarded as
      * though it were the message -- which a UDP application cannot
      * distinguish from a genuinely short one. This port REFUSES: the

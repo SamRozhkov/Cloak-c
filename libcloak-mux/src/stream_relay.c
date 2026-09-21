@@ -92,8 +92,10 @@ static size_t stream_relay_frame_cost(const cloak_stream_relay_t *sr) {
  * pick lands on -- the guarantee this object actually needs to make.
  *
  * THE SECOND CONSTRAINT, folded into the same minimum: the user's tx
- * token bucket. Go limits this direction with LimitedValve.txWait, which
- * BLOCKS a goroutine until the bucket has enough; this reactor has no
+ * token bucket. Go limits this direction with LimitedValve.txWait
+ * (internal/multiplex/switchboard.go:64, on every send; the bucket
+ * itself is internal/multiplex/qos.go:39), which BLOCKS a goroutine
+ * until the bucket has enough; this reactor has no
  * thread to block, so the limit is applied by READING LESS instead. The
  * bytes are never pulled off the upstream socket in the first place,
  * which is why the limit lands here and not on the send side:

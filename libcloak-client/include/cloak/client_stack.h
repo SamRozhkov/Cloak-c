@@ -46,7 +46,8 @@
  * ONE STACK PER PROCESS, BUT THE GRAPH INSIDE IT IS DYNAMIC. This is the
  * one place the client is genuinely harder than the server. The server's
  * graph is static: built once, torn down once. SINGLEPLEX (Go's NumConn
- * <= 0) brings up ONE SESSION PER ACCEPTED LOCAL CONNECTION, so a
+ * <= 0 -- internal/client/state.go:212-214) brings up ONE SESSION PER
+ * ACCEPTED LOCAL CONNECTION, so a
  * connector, a session and a bring-up's worth of state are created and
  * destroyed on a hot path with overlapping lifetimes. Two consequences
  * that are requirements, not observations:
@@ -392,7 +393,9 @@ typedef struct {
     uint64_t reconnect_base_ms;
     int max_rounds;
 
-    /* ADMIN MODE -- Go's `ck-client -a`. 1 makes every session this stack
+    /* ADMIN MODE -- Go's `ck-client -a` (cmd/ck-client/ck-client.go:159-163,
+     * which sets UID, SessionId 0 and NumConn 1 together). 1 makes every
+     * session this stack
      * brings up carry SESSION ID 0 instead of the fresh random id edge E4
      * otherwise requires.
      *

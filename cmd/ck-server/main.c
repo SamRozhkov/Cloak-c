@@ -11,7 +11,9 @@
  * mode's environment translation.
  *
  * ---------------------------------------------------------------------
- * EXIT CODES. Go uses log.Fatal for every failure, which is exit 1 for
+ * EXIT CODES. Go uses log.Fatal for every failure (every error arm in
+ * cmd/ck-server/ck-server.go:136-185 is log.Fatal or log.Fatalf), which
+ * is exit 1 for
  * everything: a supervisor cannot tell "this config will never work" from
  * "port 443 was busy this second" from "the database disappeared". This
  * port distinguishes them, deliberately, and the mapping is part of the
@@ -41,7 +43,7 @@
  *
  * Go's flag help for the server says "config: path to the configuration
  * file or its content", and the second half of that sentence is false.
- * server.ParseConfig (internal/server/state.go) reads:
+ * server.ParseConfig (internal/server/state.go:113-127) reads:
  *
  *     content, errPath := ioutil.ReadFile(conf)
  *     if errPath != nil {
@@ -66,7 +68,8 @@
  * ---------------------------------------------------------------------
  * DIVERGENCE FROM GO, D6: NO -d / pprof.
  *
- * Go's -d starts net/http/pprof on an operator-supplied address. A second
+ * Go's -d (declared at cmd/ck-server/ck-server.go:93, acted on at
+ * :127-134) starts net/http/pprof on an operator-supplied address. A second
  * listening socket, speaking a trivially fingerprintable protocol, in a
  * program whose entire purpose is not being noticed, is not a debugging
  * convenience worth having. -d is recognised and rejected with that
@@ -83,15 +86,19 @@
  *
  * P1. PLUGIN MODE IGNORES -verbosity, AND STANDALONE MODE HONOURS IT --
  *     faithfully, and the opposite way round from ck-client. In Go's
- *     server, log.SetLevel sits INSIDE the standalone `else` branch; in
- *     Go's client it sits outside the if/else and applies to both modes.
+ *     server, log.SetLevel sits INSIDE the standalone `else` branch
+ *     (cmd/ck-server/ck-server.go:139, the `if`/`else` opened at :80);
+ *     in Go's client it sits outside the if/else and applies to both
+ *     modes (cmd/ck-client/ck-client.go:85, after the branch that ends
+ *     at :78).
  *     Each port follows its own original. The visible consequence is that
  *     `-verbosity error` silences a plugin-mode ck-client and does not
  *     silence a plugin-mode ck-server, while usage() advertises
  *     -verbosity unconditionally.
  *
  * P2. PLUGIN MODE IGNORES EVERY ARGV TOKEN, including a misspelt one --
- *     also Go's ("Go does not look at argv at all in plugin mode"), and
+ *     also Go's (its plugin branch, cmd/ck-server/ck-server.go:80-82,
+ *     declares no flags and never calls flag.Parse), and
  *     also the opposite of ck-client, which refuses an unknown flag in
  *     plugin mode by name and lists what it does accept. A launcher that
  *     passes ck-server a typo in plugin mode gets no complaint from
@@ -99,7 +106,8 @@
  *
  * P3. AN EMPTY SS_REMOTE_HOST IS FATAL HERE AND IS FINE IN GO.
  *     merge_ss_bind_addr refuses the one-sided environment; Go's
- *     parseSSBindAddr takes net.JoinHostPort("", port) -> ":port", which
+ *     parseSSBindAddr (cmd/ck-server/ck-server.go:34-68) takes
+ *     net.JoinHostPort("", port) -> ":port" at :41, which
  *     resolves and listens on the wildcard. Refusing is the better
  *     behaviour -- a half-populated SS environment is a broken launcher
  *     and should say so rather than silently listening somewhere the
@@ -108,7 +116,7 @@
  *     divergence and was simply never declared.
  *
  * P4. -v PRINTS A TRAILING NEWLINE; Go's fmt.Printf("ck-server %s",
- *     version) does not. Cosmetic, deliberate, and recorded so nobody
+ *     version) (cmd/ck-server/ck-server.go:100) does not. Cosmetic, deliberate, and recorded so nobody
  *     "fixes" a diff that is not a defect.
  */
 
@@ -272,7 +280,9 @@ static int canon_addr(const char *addr, char *out, size_t cap, char *err, size_t
     if (host[0] == '\0') {
         snprintf(out, cap, ":%s", pbuf);
     } else if (strchr(hbuf, ':') != NULL) {
-        /* Go's net.JoinHostPort / TCPAddr.String() bracket an IPv6 literal. */
+        /* Go's net.JoinHostPort / TCPAddr.String() bracket an IPv6
+         * literal (cmd/ck-server/ck-server.go:41, then the .String()
+         * comparisons at :50-58). */
         snprintf(out, cap, "[%s]:%s", hbuf, pbuf);
     } else {
         snprintf(out, cap, "%s:%s", hbuf, pbuf);
@@ -410,7 +420,8 @@ static int merge_ss_bind_addr(const char *ss_host, const char *ss_port, ck_bind_
 }
 
 /* ProxyBook["shadowsocks"] = ["tcp", host:port], overwriting whatever the
- * config said, exactly as Go's assignment into the map does. */
+ * config said, exactly as Go's assignment into the map does
+ * (cmd/ck-server/ck-server.go:167 -- unconditional, not a lookup). */
 static int inject_ss_proxy(cJSON *root, const char *host, const char *port, char *err,
                            size_t err_cap) {
     char joined[CLOAK_MAX_HOST_LEN];
@@ -775,7 +786,9 @@ int main(int argc, char **argv) {
     char *config_text = NULL;
 
     if (plugin_mode) {
-        /* Go does not look at argv at all in plugin mode. Neither do we. */
+        /* Go does not look at argv at all in plugin mode
+         * (cmd/ck-server/ck-server.go:80-82 declares no flags and never
+         * calls flag.Parse). Neither do we. */
         const char *opts = getenv("SS_PLUGIN_OPTIONS");
         config_source = "SS_PLUGIN_OPTIONS";
         config_text = strdup(opts != NULL ? opts : "");

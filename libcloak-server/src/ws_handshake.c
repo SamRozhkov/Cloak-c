@@ -259,8 +259,10 @@ static int parse_request_line(span_t line) {
     if (memchr(vers, ' ', vers_len) != NULL) {
         return REQLINE_MALFORMED;
     }
-    /* Case-sensitive and exact, as Go's `r.Method != http.MethodGet` is:
-     * "get" and "GETX" are both refused (measured: 405). */
+    /* Case-sensitive and exact, as Go's `r.Method != http.MethodGet` is
+     * (gorilla/websocket@v1.5.3 server.go:136-138): "get" and "GETX" are
+     * both refused (measured: 405; re-measured in module 10b task 10
+     * against go1.25.6 + gorilla v1.5.3). */
     if (method_len != 3 || memcmp(line.p, "GET", 3) != 0) {
         return REQLINE_NOT_GET;
     }

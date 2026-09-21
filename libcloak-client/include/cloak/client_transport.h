@@ -58,9 +58,16 @@
  *     here rather than delegated to the caller, because unlike
  *     cloak_firstpacket_t this object does own the reactor and the fd.
  *
- * Go has no equivalent client-side deadline at all (DirectTLS.Handshake
- * sets none; only the dial itself is bounded). Adding one is a
- * deliberate divergence, not an oversight: a blocked goroutine in Go
+ * Go has no equivalent client-side deadline at all, and NOTHING IN GO
+ * BOUNDS THE DIAL EITHER -- an earlier version of this paragraph said
+ * "only the dial itself is bounded", which credited Go with a bound it
+ * does not set. DirectTLS.Handshake (internal/client/TLS.go:116-150)
+ * arms no deadline, and the only net.Dialer Go Cloak's client ever
+ * builds is `&net.Dialer{Control: protector, KeepAlive: ...}`
+ * (cmd/ck-client/ck-client.go:157) -- no Timeout field, so a connect is
+ * bounded by the kernel's own TCP connect timeout and by nothing in the
+ * program. Adding a handshake deadline is a deliberate divergence, not
+ * an oversight: a blocked goroutine in Go
  * costs a goroutine, while a blocked handshake here would cost a
  * registered fd on a shared reactor. */
 
