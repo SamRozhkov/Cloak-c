@@ -1,0 +1,187 @@
+# Release pipeline: fires when a tag is pushed, builds ck-server and
+# ck-client for Ubuntu and FreeBSD, and attaches the tarballs to a GitHub
+# Release named after the tag.
+#
+# READ THIS BEFORE WONDERING WHY FREEBSD IS RED
+# ---------------------------------------------
+# The FreeBSD job is written in full and is expected to FAIL until the
+# reactor grows a kqueue backend. The tree is Linux-only today: 15 epoll
+# call sites in libcloak-common/src/reactor.c, signalfd in
+# libcloak-common/src/signals.c, and accept4/pipe2/SOCK_NONBLOCK across
+# nine more source files -- with ZERO portability guards anywhere (a grep
+# for __linux__, __FreeBSD__ or CMAKE_SYSTEM_NAME returns nothing).
+#
+# That list was read, not measured -- there is no FreeBSD host here to
+# compile on. The job exists precisely so the first tag turns the guess
+# into a real compiler error list, which is a better starting point for
+# the port than a prediction. It is marked continue-on-error so a tag
+# still produces Ubuntu binaries while that work is outstanding; delete
+# that line once the port lands.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets you rehearse the whole pipeline on a branch without cutting a tag.
+  # The release job is skipped unless the run was triggered by a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------
+  ubuntu:
+    name: Ubuntu (x86_64)
+    # Pinned to the oldest supported runner on purpose: the binaries link
+    # glibc and OpenSSL dynamically, so building on 22.04 lets them run on
+    # 22.04 and newer, while building on 24.04 would not run on 22.04.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCLOAK_VERSION="${GITHUB_REF_NAME}"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Several tests in this suite measure elapsed time, and three of them
+      # were fixed this year after failing only under CPU starvation. A
+      # hosted runner is a shared, oversubscribed machine, so the suite runs
+      # at -j2 on a 4-core runner rather than -j4: leaving headroom costs
+      # about a minute and removes the contention that makes wall-clock
+      # assertions flap. There is deliberately no retry wrapper -- a red
+      # suite should block a release, not be papered over.
+      - name: Test
+        run: ctest --test-dir build -j2 --output-on-failure
+
+      - name: Package
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="cloak-c-${VERSION}-linux-x86_64"
+          mkdir -p "dist/${PKG}"
+          cp build/cmd/ck-server/ck-server "dist/${PKG}/"
+          cp build/cmd/ck-client/ck-client "dist/${PKG}/"
+          cp README.md LICENSE "dist/${PKG}/"
+          strip "dist/${PKG}/ck-server" "dist/${PKG}/ck-client"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+          ls -l dist
+
+      - name: Report what the binaries link against
+        run: |
+          ./build/cmd/ck-server/ck-server -v
+          ./build/cmd/ck-client/ck-client -v
+          ldd build/cmd/ck-server/ck-server || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-x86_64
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  freebsd:
+    name: FreeBSD (amd64)
+    # Expected to fail until the kqueue port lands -- see the header
+    # comment. Remove this line at that point so the job can gate releases.
+    continue-on-error: true
+    # There is no FreeBSD runner on GitHub Actions; this boots one in a VM
+    # on top of a Linux runner. The `run:` body below executes inside that
+    # VM, not on the host, so everything it needs must be installed there.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and package inside a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.2"
+          usesh: true
+          # OpenSSL ships in the FreeBSD base system, so only cmake and a
+          # toolchain are fetched. clang is base too.
+          prepare: |
+            pkg install -y cmake
+          run: |
+            set -eu
+            VERSION="${GITHUB_REF_NAME#v}"
+            PKG="cloak-c-${VERSION}-freebsd-amd64"
+
+            cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCLOAK_VERSION="${GITHUB_REF_NAME}"
+            cmake --build build -j"$(sysctl -n hw.ncpu)"
+
+            # The VM is slower and more contended than the Linux runner, and
+            # this suite has wall-clock assertions, so the tests run
+            # single-threaded here.
+            ctest --test-dir build -j1 --output-on-failure
+
+            mkdir -p "dist/${PKG}"
+            cp build/cmd/ck-server/ck-server "dist/${PKG}/"
+            cp build/cmd/ck-client/ck-client "dist/${PKG}/"
+            cp README.md LICENSE "dist/${PKG}/"
+            strip "dist/${PKG}/ck-server" "dist/${PKG}/ck-client"
+            tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+            (cd dist && sha256 -r "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+            ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-freebsd-amd64
+          path: dist/*.tar.gz*
+          # Not `error`: while the FreeBSD build is known to fail, the
+          # packaging step never runs and there is nothing to upload. That
+          # must not turn into a second, confusing red X on top of the
+          # real one.
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [ubuntu, freebsd]
+    # `always()` so a red FreeBSD job does not withhold the Ubuntu
+    # binaries; the explicit ubuntu check keeps a genuinely broken Linux
+    # build from being published anyway.
+    if: always() && needs.ubuntu.result == 'success' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: List what is being published
+        run: ls -l dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Binaries for `ck-server` and `ck-client`, built from ${{ github.ref_name }}.
+
+            Verify a download against its `.sha256` file before running it.
+
+            **Linux (x86_64)** — built on Ubuntu 22.04; glibc and OpenSSL are
+            linked dynamically, so it runs on 22.04 and newer.
+
+            **FreeBSD (amd64)** — not published yet. The reactor uses `epoll`
+            and `signalfd`, which FreeBSD does not have; the build job is in
+            the pipeline and will start producing artefacts once a `kqueue`
+            backend lands.

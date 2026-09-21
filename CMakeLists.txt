@@ -10,6 +10,28 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+# ---------------------------------------------------------------------------
+# Version stamping for release artefacts.
+#
+# `-DCLOAK_VERSION=v1.2.3` makes `ck-server -v` and `ck-client -v` report
+# that tag instead of the in-tree default. The release workflow passes the
+# tag it was triggered by; nobody else needs to pass anything.
+#
+# A leading "v" is stripped so that the conventional tag name `v1.2.3`
+# produces `cloak-c-1.2.3` rather than the doubled `cloak-c-v1.2.3`.
+#
+# Left unset -- which is every developer build and every CI run that is not
+# a tag -- libcloak-common/src/version.c keeps returning its own literal,
+# "cloak-c-0.1.0-dev". That default is load-bearing: test_ck_server_cli.c
+# and test_ck_client_cli.c each assert `-v` contains "0.1.0-dev", so a
+# build that stamped unconditionally would turn those two red.
+# ---------------------------------------------------------------------------
+if(CLOAK_VERSION)
+    string(REGEX REPLACE "^v" "" CLOAK_VERSION_CLEAN "${CLOAK_VERSION}")
+    add_compile_definitions(CLOAK_VERSION_STRING="cloak-c-${CLOAK_VERSION_CLEAN}")
+    message(STATUS "cloak-c: version stamped as cloak-c-${CLOAK_VERSION_CLEAN}")
+endif()
+
 enable_testing()
 
 # ---------------------------------------------------------------------------
