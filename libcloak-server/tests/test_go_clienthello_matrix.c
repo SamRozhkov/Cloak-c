@@ -87,15 +87,59 @@
  * real client put on a real socket and asks which of the three they are.
  * A silent Chrome fallback is invisible to that file and fatal here.
  *
- * WHAT MAKES THEM DISCRIMINATING, which is the property case 3 needs:
- * the three lists disagree at their very first entry (Chrome's GREASE
- * 0xfafa, Firefox's 0x1301, Safari's GREASE 0x2a2a) and stay disagreeing
- * -- Firefox orders the TLS 1.3 suites 1301/1303/1302 where Chrome orders
- * them 1301/1302/1303, and Safari alone still offers the 3DES tail
- * (0xc008, 0xc012, 0x000a) and alone carries a padding extension. That is
- * asserted, not assumed: test_the_wire_fingerprint_can_fail below runs
- * every captured hello against the other two browsers' literals and
- * requires a mismatch each time.
+ * WHAT MAKES THEM DISCRIMINATING, which is the property case 3 needs.
+ * NOT the first entry: Chrome's and Safari's first cipher suite is a
+ * GREASE codepoint, drawn fresh per connection since GREASE stopped
+ * being frozen in the template, so the two can and sometimes do draw the
+ * SAME value there. An earlier version of this comment named exactly
+ * that as the discriminator, and it was wrong even then -- it was
+ * describing a defect (a frozen GREASE constant) as a feature.
+ *
+ * What actually discriminates, with GREASE set aside: the lists are
+ * different LENGTHS (16 / 17 / 21 suites, 18 / 15 / 16 extensions);
+ * Firefox orders the TLS 1.3 suites 1301/1303/1302 where Chrome and
+ * Safari order them 1301/1302/1303; Chrome and Safari diverge from each
+ * other at the first NON-GREASE position where both have one
+ * (0xc02b vs 0xc02c at index 4); Safari alone still offers the 3DES tail
+ * (0xc008, 0xc012, 0x000a) and alone carries a padding extension; and
+ * Chrome alone carries application_settings (0x44cd). That is asserted,
+ * not assumed: test_the_wire_fingerprint_can_fail below runs every
+ * captured hello against the other two browsers' literals and requires a
+ * mismatch each time, and it runs on hellos whose GREASE was drawn at
+ * random.
+ *
+ * TWO KNOWN, DELIBERATE DIVERGENCES FROM GO, recorded here because this
+ * is the file that reads what a client really put on a socket.
+ *
+ * (a) GREASE VALUES -- no longer a divergence. Go Cloak's client builds
+ *     its hello with utls.UClient (internal/client/TLS.go:66-80) and
+ *     uTLS v1.8.0 draws BoringSSL-style GREASE per connection. This port
+ *     froze one draw into each captured template until module 10b's fix
+ *     wave; cloak_clienthello_build now re-draws it. The GREASE entries
+ *     in the literals below are therefore matched BY FORM (0x?A?A), not
+ *     by value -- see grease_slot() below.
+ *
+ * (b) CHROME'S EXTENSION ORDER -- STILL A DIVERGENCE, and this file's
+ *     ext-order assertion for Chrome pins OUR fixed order, not Go's.
+ *     Measured, not remembered: 200 utls.HelloChrome_Auto builds on the
+ *     host with uTLS v1.8.0, GREASE codepoints normalised before
+ *     comparing, gave 200 DISTINCT extension orders -- Chrome has
+ *     shuffled its extensions since Chrome 110 and uTLS reproduces that,
+ *     keeping only the GREASE extensions first and last. The same
+ *     measurement gave 1 distinct order for Firefox and 1 for Safari, so
+ *     their pinned orders are correct.
+ *
+ *     THE COST, stated plainly: our Chrome profile is distinguishable
+ *     from real Chrome, and from Go Cloak's Chrome profile, by having an
+ *     INVARIANT extension order. A censor that collects two hellos from
+ *     the same client and sees an identical extension permutation has a
+ *     signal real Chrome does not give it. This is not fixed on this
+ *     branch -- the shuffle reaches into every pinned offset in
+ *     clienthello.c (each extension's body would have to move, and the
+ *     template's random_regions, keyshare, ECH and padding offsets are
+ *     all absolute) -- and is carried as work. It is recorded rather
+ *     than fixed, deliberately; see
+ *     .superpowers/.../progress.md's carried-work list.
  *
  * WHEN A TEMPLATE IS REGENERATED, these are updated in the same commit,
  * from the same capture, and never by copying whatever the new template
@@ -105,7 +149,7 @@
 #define MAX_FP_EXTS 32
 
 static const uint16_t chrome_suites[] = {
-    0xfafa, /* GREASE, frozen by this capture */
+    0xfafa, /* GREASE -- matched by FORM, not value; see grease_slot() */
     0x1301, 0x1302, 0x1303,
     0xc02b, 0xc02f, 0xc02c, 0xc030,
     0xcca9, 0xcca8,
@@ -292,6 +336,30 @@ static wire_fingerprint_t read_wire_fingerprint(const uint8_t *rec, size_t len) 
  * browser's literals on purpose: it must still count, but it must not
  * print FAIL lines, because a file that prints expected FAILs teaches a
  * reader to skim past real ones. */
+/* A GREASE codepoint, RFC 8701's 0x?A?A form. */
+static int grease_slot(uint16_t v) {
+    return (v & 0x0f0fu) == 0x0a0au && (uint8_t)(v >> 8) == (uint8_t)(v & 0xffu);
+}
+
+/* Compares one fingerprint entry. Where the PINNED literal is a GREASE
+ * codepoint the wire value must be a GREASE codepoint -- any of the
+ * sixteen -- rather than that exact one, because the client re-draws
+ * GREASE every connection the way uTLS does. Where the pinned literal is
+ * anything else, the comparison is exact, as before.
+ *
+ * This is the ONLY place this file relaxes, it relaxes exactly as far as
+ * the randomisation requires, and it still rejects a slot that is not a
+ * legal GREASE value at all. cloak_clienthello_build_with_grease_seed
+ * exists for tests that need byte-exactness; it is unusable here,
+ * because these hellos come off a socket from a separately spawned
+ * ck-client process. */
+static int fp_entry_differs(uint16_t wire, uint16_t want) {
+    if (grease_slot(want)) {
+        return !grease_slot(wire);
+    }
+    return wire != want;
+}
+
 static int wire_fingerprint_mismatches(const char *who, const uint8_t *rec, size_t len,
                                        const browser_fp_t *want, int report) {
     int bad = 0;
@@ -328,7 +396,7 @@ static int wire_fingerprint_mismatches(const char *who, const uint8_t *rec, size
         }
     }
     for (size_t i = 0; i < want->suite_count && i < f.suite_count; i++) {
-        if (f.suites[i] != want->suites[i]) {
+        if (fp_entry_differs(f.suites[i], want->suites[i])) {
             bad++;
             if (report) {
                 fprintf(stderr,
@@ -350,7 +418,7 @@ static int wire_fingerprint_mismatches(const char *who, const uint8_t *rec, size
         }
     }
     for (size_t i = 0; i < want->ext_count && i < f.ext_count; i++) {
-        if (f.ext_types[i] != want->exts[i]) {
+        if (fp_entry_differs(f.ext_types[i], want->exts[i])) {
             bad++;
             if (report) {
                 fprintf(stderr,

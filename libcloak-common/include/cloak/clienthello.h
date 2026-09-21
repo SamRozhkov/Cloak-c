@@ -17,6 +17,67 @@
 
 #define CLOAK_CLIENTHELLO_MAX_ECH_PAYLOAD_CANDIDATES 4
 
+/* GREASE (RFC 8701). A real Chrome or Safari draws its GREASE codepoints
+ * fresh for every ClientHello; the captured templates below necessarily
+ * froze one draw each. A frozen GREASE value is not merely a missing
+ * randomisation: because every deployment ships the same template bytes,
+ * it is a SINGLE STATIC VALUE THAT EVERY CLOAK-C CLIENT IN THE WORLD
+ * OFFERS, in the one field of a ClientHello whose entire purpose is to
+ * carry a value with no meaning and no stability. That is the strongest
+ * shape a fingerprint can take against a censorship-circumvention
+ * transport, so these are re-drawn per connection.
+ *
+ * WHAT GO DOES, measured rather than remembered. Go Cloak's client
+ * (`internal/client/TLS.go:66-80`) hands the whole hello to
+ * `utls.UClient(..., utls.HelloChrome_Auto / HelloFirefox_Auto /
+ * HelloSafari_Auto)`; uTLS v1.8.0 (the version `/Users/sam/Cloak/go.mod`
+ * pins) implements BoringSSL's scheme -- a per-connection seed byte per
+ * ROLE, mapped to 0x?A?A by `(b & 0xf0) | 0x0a`, replicated into both
+ * bytes, with the second GREASE EXTENSION forced to differ from the
+ * first by `^= 0x1010`. Over 200 uTLS builds per browser: each of the
+ * five roles took all 16 values; the supported_groups and key_share
+ * GREASE group agreed 200/200 (it is ONE role appearing in two places,
+ * so it MUST agree); ext2 == ext1 zero times out of 200; and cipher ==
+ * ext1 about 1 time in 16, i.e. the roles are independent. Firefox
+ * offers no GREASE at all -- also measured, and why
+ * cloak_clienthello_firefox has zero positions below. */
+#define CLOAK_CLIENTHELLO_GREASE_ROLES 5
+
+/* At most six positions: cipher, ext1, group x2 (supported_groups and
+ * key_share), version, ext2. Both Chrome and Safari use all six. */
+#define CLOAK_CLIENTHELLO_MAX_GREASE_POSITIONS 6
+
+/* Which of BoringSSL's GREASE draws a position carries. Two positions
+ * sharing a role ALWAYS carry the same value in one hello -- that is the
+ * whole reason roles exist rather than one draw per position, and it is
+ * load-bearing: a key_share whose group is not also offered in
+ * supported_groups is an illegal ClientHello and a distinguisher in
+ * itself. */
+typedef enum {
+    CLOAK_CH_GREASE_CIPHER = 0,  /* the GREASE cipher suite */
+    CLOAK_CH_GREASE_GROUP = 1,   /* the GREASE named group (supported_groups AND key_share) */
+    CLOAK_CH_GREASE_EXT1 = 2,    /* the first GREASE extension type */
+    CLOAK_CH_GREASE_EXT2 = 3,    /* the last GREASE extension type; forced != EXT1 */
+    CLOAK_CH_GREASE_VERSION = 4  /* the GREASE entry in supported_versions */
+} cloak_clienthello_grease_role_t;
+
+/* A 2-byte big-endian GREASE codepoint inside a template. `off` is in
+ * template coordinates, i.e. before cloak_clienthello_build's SNI shift,
+ * exactly like cloak_clienthello_region_t::off. */
+typedef struct {
+    size_t off;
+    cloak_clienthello_grease_role_t role;
+} cloak_clienthello_grease_pos_t;
+
+/* Derives the GREASE codepoint for `role` from a 5-byte seed, the way
+ * BoringSSL's ssl_get_grease_value and uTLS's GetBoringGREASEValue do.
+ * The result always has the RFC 8701 0x?A?A form. Exposed so a test can
+ * assert the form and the EXT1/EXT2 rule directly, and so a test that
+ * needs a byte-exact hello can compute what a pinned seed produces
+ * instead of hard-coding it. */
+uint16_t cloak_clienthello_grease_value(const uint8_t seed[CLOAK_CLIENTHELLO_GREASE_ROLES],
+                                        cloak_clienthello_grease_role_t role);
+
 /* How the bytes of a cloak_clienthello_region_t must be generated. Some
  * regions are free-form (any random string is a plausible value); others
  * hold a typed protocol field whose wire encoding constrains which byte
@@ -144,6 +205,18 @@ typedef struct {
      * template (used to compute unpadded_len before the recomputed value
      * is known). Unused if padding_ext_off == 0. */
     size_t padding_data_len;
+
+    /* Every 2-byte GREASE codepoint in this template, each tagged with
+     * the BoringSSL role whose per-connection draw fills it. Firefox has
+     * none (grease_position_count == 0) because real Firefox offers no
+     * GREASE; Chrome and Safari have six each. The offsets were obtained
+     * by a structural walk of the template's TLS wire format (cipher
+     * list, extension list, and the supported_groups / key_share /
+     * supported_versions bodies), not by scanning for 0x?A?A byte pairs
+     * -- Safari's cipher-list length field is itself 0x2a and a byte scan
+     * finds it. */
+    cloak_clienthello_grease_pos_t grease_positions[CLOAK_CLIENTHELLO_MAX_GREASE_POSITIONS];
+    size_t grease_position_count;
 } cloak_clienthello_template_t;
 
 extern const cloak_clienthello_template_t cloak_clienthello_chrome;
@@ -177,12 +250,42 @@ extern const cloak_clienthello_template_t cloak_clienthello_safari;
  * failure (server_name empty or too long, out_cap too small for the
  * result, or an X25519 or secp256r1 keygen failure). out_cap should be
  * at least CLOAK_CLIENTHELLO_MAX_BYTES to always succeed for any
- * supported template and any valid server_name. */
+ * supported template and any valid server_name.
+ *
+ * It ALSO re-draws every GREASE codepoint in tmpl->grease_positions from
+ * a fresh 5-byte seed taken from cloak_random_bytes, so two consecutive
+ * calls do not offer the same GREASE values -- see
+ * CLOAK_CLIENTHELLO_GREASE_ROLES above for why that matters and for the
+ * uTLS measurement it reproduces. Consequently the output of this
+ * function is NOT a deterministic function of its arguments even for
+ * templates with a fixed-length ECH payload. */
 long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
                               const uint8_t random[32],
                               const uint8_t session_id[32],
                               const uint8_t x25519_key_share[32],
                               const char *server_name,
                               uint8_t *out, size_t out_cap);
+
+/* cloak_clienthello_build with the GREASE seed supplied rather than
+ * drawn. EXISTS FOR TESTS, and for nothing else: production code calls
+ * cloak_clienthello_build, which is this function with a fresh
+ * cloak_random_bytes seed. It is a separate entry point rather than a
+ * settable global precisely so that the shipping path has no branch, no
+ * mutable state and no way to be left pinned by accident.
+ *
+ * The two GREASE-bearing templates froze one uTLS draw each when they
+ * were captured, so the seeds that reproduce their captured bytes are
+ * {0xf0, 0xa0, 0xf0, 0x20, 0xf0} for Chrome (fafa/aaaa/fafa/2a2a/fafa)
+ * and {0x20, 0x70, 0x20, 0x10, 0x30} for Safari
+ * (2a2a/7a7a/2a2a/1a1a/3a3a), in CLOAK_CH_GREASE_* order. Only the high
+ * nibble of each seed byte is used. */
+long cloak_clienthello_build_with_grease_seed(
+    const cloak_clienthello_template_t *tmpl,
+    const uint8_t random[32],
+    const uint8_t session_id[32],
+    const uint8_t x25519_key_share[32],
+    const char *server_name,
+    const uint8_t grease_seed[CLOAK_CLIENTHELLO_GREASE_ROLES],
+    uint8_t *out, size_t out_cap);
 
 #endif

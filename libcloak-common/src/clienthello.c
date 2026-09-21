@@ -189,6 +189,19 @@ const cloak_clienthello_template_t cloak_clienthello_chrome = {
     .ech_payload_candidate_count = 4,
     .padding_ext_off = 0,
     .padding_data_len = 0,
+    /* Structural walk of chrome_template: cipher suite [0] at 73, first
+     * extension type at 109, key_share's GREASE group entry at 195,
+     * supported_groups' at 1478, supported_versions' at 1493, last
+     * extension type at 1715. */
+    .grease_positions = {
+        {73, CLOAK_CH_GREASE_CIPHER},
+        {109, CLOAK_CH_GREASE_EXT1},
+        {195, CLOAK_CH_GREASE_GROUP},   /* key_share */
+        {1478, CLOAK_CH_GREASE_GROUP},  /* supported_groups -- same role, same value */
+        {1493, CLOAK_CH_GREASE_VERSION},
+        {1715, CLOAK_CH_GREASE_EXT2},
+    },
+    .grease_position_count = 6,
 };
 
 /* Captured via github.com/refraction-networking/utls v1.8.0's
@@ -281,6 +294,13 @@ const cloak_clienthello_template_t cloak_clienthello_firefox = {
     .ech_payload_candidate_count = 0,
     .padding_ext_off = 0,
     .padding_data_len = 0,
+    /* Real Firefox offers no GREASE anywhere in its ClientHello --
+     * confirmed over 200 utls.HelloFirefox_Auto builds, zero 0x?A?A
+     * codepoints in the cipher list, the extension list,
+     * supported_groups, key_share or supported_versions. Adding GREASE
+     * here would be the distinguisher, not removing it. */
+    .grease_positions = {{0, CLOAK_CH_GREASE_CIPHER}},
+    .grease_position_count = 0,
 };
 
 /* Captured via github.com/refraction-networking/utls v1.8.0's
@@ -361,6 +381,18 @@ const cloak_clienthello_template_t cloak_clienthello_safari = {
     .ech_payload_candidate_count = 0,
     .padding_ext_off = 317,
     .padding_data_len = 191,
+    /* Structural walk of safari_template. NOTE 73, not 72: the byte at
+     * 72 is the cipher-suite LIST LENGTH, which is 0x2a here, so a scan
+     * for 0x?A?A byte pairs finds a three-byte run and the wrong offset. */
+    .grease_positions = {
+        {73, CLOAK_CH_GREASE_CIPHER},
+        {119, CLOAK_CH_GREASE_EXT1},
+        {162, CLOAK_CH_GREASE_GROUP},  /* supported_groups */
+        {243, CLOAK_CH_GREASE_GROUP},  /* key_share -- same role, same value */
+        {295, CLOAK_CH_GREASE_VERSION},
+        {312, CLOAK_CH_GREASE_EXT2},
+    },
+    .grease_position_count = 6,
 };
 
 static void patch_be16_delta(uint8_t *p, long delta) {
@@ -492,6 +524,32 @@ static void fill_aead_id_choice(uint8_t *out, const uint16_t choices[2]) {
     store_be16(out, choices[r & 1]);
 }
 
+/* BoringSSL's ssl_get_grease_value, which uTLS v1.8.0 reimplements as
+ * GetBoringGREASEValue -- the scheme Go Cloak inherits by handing its
+ * hello to utls.UClient (internal/client/TLS.go:66-80).
+ *
+ * `(b & 0xf0) | 0x0a` forces the low nibble to 0xA and keeps the high
+ * nibble from the seed; replicating the byte gives the 0x?A?A form RFC
+ * 8701 reserves, so all 16 legal values are reachable and nothing else
+ * is. The EXT2 correction is BoringSSL's: the two GREASE extension types
+ * in one ClientHello must differ, and `^= 0x1010` flips the high nibble
+ * of both bytes, which keeps the 0x?A?A form. Measured against uTLS:
+ * ext2 == ext1 zero times in 200 builds, each role uniform over all 16
+ * values. */
+uint16_t cloak_clienthello_grease_value(const uint8_t seed[CLOAK_CLIENTHELLO_GREASE_ROLES],
+                                        cloak_clienthello_grease_role_t role) {
+    uint16_t v = (uint16_t)((seed[role] & 0xf0u) | 0x0au);
+    v = (uint16_t)(v | (uint16_t)(v << 8));
+    if (role == CLOAK_CH_GREASE_EXT2) {
+        uint16_t e1 = (uint16_t)((seed[CLOAK_CH_GREASE_EXT1] & 0xf0u) | 0x0au);
+        e1 = (uint16_t)(e1 | (uint16_t)(e1 << 8));
+        if (v == e1) {
+            v ^= 0x1010u;
+        }
+    }
+    return v;
+}
+
 /* Shifts an offset that is expressed in template coordinates into output
  * coordinates after cloak_clienthello_build's SNI splice. Everything after
  * the placeholder hostname moves by sni_delta; everything before it does
@@ -509,6 +567,22 @@ long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
                               const uint8_t x25519_key_share[32],
                               const char *server_name,
                               uint8_t *out, size_t out_cap) {
+    /* The ONLY place a GREASE seed is drawn in production. Same CSPRNG
+     * as every other per-handshake secret in this file. */
+    uint8_t grease_seed[CLOAK_CLIENTHELLO_GREASE_ROLES];
+    cloak_random_bytes(grease_seed, sizeof(grease_seed));
+    return cloak_clienthello_build_with_grease_seed(tmpl, random, session_id, x25519_key_share,
+                                                    server_name, grease_seed, out, out_cap);
+}
+
+long cloak_clienthello_build_with_grease_seed(
+    const cloak_clienthello_template_t *tmpl,
+    const uint8_t random[32],
+    const uint8_t session_id[32],
+    const uint8_t x25519_key_share[32],
+    const char *server_name,
+    const uint8_t grease_seed[CLOAK_CLIENTHELLO_GREASE_ROLES],
+    uint8_t *out, size_t out_cap) {
     size_t host_len = strlen(server_name);
     if (host_len == 0 || host_len > 253) {
         return -1;
@@ -636,6 +710,20 @@ long cloak_clienthello_build(const cloak_clienthello_template_t *tmpl,
     if (tmpl->aead_id_off != 0) {
         size_t region_off = shift_off(tmpl->aead_id_off, tmpl->sni_host_off, sni_delta);
         fill_aead_id_choice(out + region_off, tmpl->aead_id_choices);
+    }
+
+    /* 3d: GREASE. Written BEFORE phases 4 and 5 on purpose. Chrome's
+     * trailing GREASE extension type at template offset 1715 lies inside
+     * the tail that phase 5's memmove shifts when the ECH payload grows,
+     * so writing it here lets that memmove carry it, rather than needing
+     * a second delta applied to the offset. Safari's last GREASE
+     * extension ends at template offset 316 and its padding extension
+     * starts at 317, so phase 4 never touches one of these positions
+     * either. */
+    for (size_t i = 0; i < tmpl->grease_position_count; i++) {
+        size_t region_off = shift_off(tmpl->grease_positions[i].off, tmpl->sni_host_off, sni_delta);
+        store_be16(out + region_off,
+                   cloak_clienthello_grease_value(grease_seed, tmpl->grease_positions[i].role));
     }
 
     /* Phase 4: recompute the padding extension (Safari) now that the SNI
