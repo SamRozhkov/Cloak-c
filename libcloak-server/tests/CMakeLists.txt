@@ -826,6 +826,48 @@ add_test(NAME test_unordered_proof COMMAND test_unordered_proof)
 #     grep test_unordered_proof build/libcloak-server/tests/CTestTestfile.cmake
 set_tests_properties(test_unordered_proof PROPERTIES TIMEOUT 150 LABELS "slow")
 
+# THE USER MANAGER AT SCALE, AND THE STALL ITS PLAN ACCEPTED (module 10b
+# task 7). Links sqlite3 directly on top of the transitive link
+# cloak-server already provides, for the same reason test_usermanager.c
+# does: this file installs a wrapper VFS of its own -- the only layer at
+# which a slow disk can be induced and every I/O counted -- and that needs
+# sqlite3.h on the include path, which cloak-server's PRIVATE link
+# deliberately does not propagate.
+#
+# NO LD_PRELOAD HERE, unlike test_usermanager. That shim fails write(2)
+# against one named database to force a mid-batch SQLITE_IOERR; this file
+# wants I/O that SUCCEEDS and is merely slow, which is a different
+# mechanism and would be corrupted by a second one.
+#
+# TIMEOUT AND LABELS IN ONE CALL, AT THE SOURCE SITE -- the discipline the
+# top-level CMakeLists.txt's cloak_label_fast_tests() comment explains,
+# and the check that matters is on the GENERATED file:
+#     grep test_usermanager_scale build/libcloak-server/tests/CTestTestfile.cmake
+#
+# LABELS "slow", AND THIS FILE FORKS NOTHING. Every other "slow" test in
+# this directory earns the label by forking and exec'ing a real binary,
+# so the deviation is deliberate and is the label used for its stated
+# PURPOSE rather than its usual proxy: `ctest -L fast` is the edit loop,
+# and this file deliberately burns wall clock -- it induces 1 ms of
+# latency on every one of the ~2400 disk operations a 2048-user drain
+# performs, which is the measurement, not an inefficiency to be tuned
+# away: 2389 of those operations, measured, of which 2.39 s is the
+# induced latency itself. MEASURED at 3.5 s in this Debug build against
+# test_registry_scale's 0.26 s -- an order of magnitude more than any
+# other non-forking file here, which is what makes it not belong in a loop
+# a developer runs every few minutes. The default `ctest` with no
+# arguments still runs it, exactly as that split's comment promises.
+#
+# TIMEOUT 300 matches test_registry_scale, the other file in this
+# directory that builds a structure at its cap: an 85x margin on the 3.5 s
+# above, which leaves room for the sanitizer build without leaving a run
+# that has genuinely wedged to sit out ctest's 1500 s default.
+add_executable(test_usermanager_scale test_usermanager_scale.c)
+target_include_directories(test_usermanager_scale PRIVATE ${CMAKE_SOURCE_DIR}/libcloak-common/tests)
+target_link_libraries(test_usermanager_scale PRIVATE cloak-server sqlite3)
+add_test(NAME test_usermanager_scale COMMAND test_usermanager_scale)
+set_tests_properties(test_usermanager_scale PROPERTIES TIMEOUT 300 LABELS "slow")
+
 # Module 9 task 0's fast/slow split (see the top-level CMakeLists.txt's own
 # comment on cloak_label_fast_tests() for what this call does and why it
 # has to be made from here rather than from that file). Placed after the
