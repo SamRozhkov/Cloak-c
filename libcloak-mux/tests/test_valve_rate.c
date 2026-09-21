@@ -1528,19 +1528,54 @@ static void test_relay_pool_pause_becomes_a_rate_pause(void) {
     ASSERT_EQ_INT(cloak_valve_take_tx(&v, 16384), 0);
 
     /* Release the pool. This delivers the one and only drain
-     * notification the relay is going to get. */
+     * notification the relay is going to get.
+     *
+     * THE ORIGIN IS TAKEN HERE, BEFORE THE RELEASE, AND IT IS THE
+     * VALVE'S TX COUNTER AND NOT THE BYTES THIS TEST HAS READ BACK OFF
+     * THE SOCKET. Both halves of that are what make the window below
+     * BRACKET the handover instead of racing it, and an earlier version
+     * of this test got both wrong: it pumped twenty reactor turns first
+     * and took p.drained AFTER them. Those turns are exactly where the
+     * handover's own timer fires -- the bucket is left only 2 ms in debt
+     * -- so the twenty turns were a race against the resume they were
+     * supposed to precede, and the winner was decided by the scheduler.
+     *
+     * MEASURED, not reasoned: at `docker run --cpus=1` with seven busy
+     * spinners, `ctest -R ^test_valve_rate$` failed 7 times in 12 on
+     * this assertion and nothing else. With the release loop printing
+     * its own duration, every run whose twenty turns took >= 91 ms
+     * reported `resumed 0` and every run under 45 ms passed -- while the
+     * TOTAL relayed was ~395 kB either way, identical to within 0.2%.
+     * The relay never stalled in any of them; it had simply finished
+     * before the old origin was taken, and the test then measured an
+     * idle relay and called it a stall.
+     *
+     * cloak_valve_tx is the quantity that cannot be raced, because a
+     * frame is charged against it at the moment it is ENQUEUED
+     * (cloak_switchboard_send), not when the socket drains: the ~32 KiB
+     * already sitting in the send queue when the pool is released was
+     * billed BEFORE this origin, so flushing it moves p.drained but
+     * cannot move this counter. Only work the relay does after the
+     * release can -- and it can do none without first being granted
+     * tokens, which is the one thing the handover exists to arm for.
+     *
+     * THAT HALF IS MEASURED TOO, and it is why the quantity had to
+     * change and not only the origin: with the arming in
+     * cloak_stream_relay_notify_writable deleted, this assertion reading
+     * cloak_valve_tx FAILS, and the same assertion reading p.drained
+     * from the same early origin PASSES -- a green test over a relay
+     * that will never move another byte, bought by the send queue's
+     * residue flushing out behind it. */
+    int64_t billed_at_release = cloak_valve_tx(&v);
     int64_t freed = drain_peer(&p);
     ASSERT_TRUE(freed > 0);
-    for (int i = 0; i < 20; i++) {
-        cloak_reactor_run_once(r, 1);
-        drain_peer(&p);
-    }
-    int64_t at_handover = p.drained;
 
     /* From here the pool is empty, so nothing will ever drain again and
      * no further notification exists. Nothing is written to the upstream
      * either. If the handover above did not arm a timer, this relay is
-     * finished for good. */
+     * finished for good. The pool's one drain notification is delivered
+     * by the first turns of this loop, INSIDE the window, so a resume it
+     * triggers is counted rather than lost. */
     uint64_t t0 = real_mono_ms();
     int turns = 0;
     while (real_mono_ms() - t0 < QUIET_MS && turns < 1000000) {
@@ -1548,7 +1583,7 @@ static void test_relay_pool_pause_becomes_a_rate_pause(void) {
         drain_peer(&p);
         turns++;
     }
-    int64_t resumed = p.drained - at_handover;
+    int64_t resumed = cloak_valve_tx(&v) - billed_at_release;
     if (resumed <= 0) {
         fprintf(stderr, "HANDOVER STALL: nothing relayed in %llu ms after the pool drained\n",
                 (unsigned long long)QUIET_MS);
