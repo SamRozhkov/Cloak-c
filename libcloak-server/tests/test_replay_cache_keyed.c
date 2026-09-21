@@ -571,11 +571,98 @@ static void test_hash_is_siphash24(void) {
     siphash_vector("key 0f0e0d..00, msg fffefd..e0", k2, m2, 0x77E5A9E509102DFCULL);
 }
 
+/* ------------------------------------------------------------------ */
+/* Case 5: what the table costs the defender for ZERO attacker packets   */
+/* ------------------------------------------------------------------ */
+
+/* THE PROBE THE HEADER'S "WHAT REMAINS" PARAGRAPH CITES. It exists
+ * because that paragraph used to answer the wrong question.
+ *
+ * "To evict ONE CHOSEN entry at 50 % you must land ln(2)*C inserts in
+ * the window" (case 2) is the right law for an attacker who has picked a
+ * victim. It is NOT the prober's problem. A prober that captured M
+ * handshakes needs ANY ONE of them to become replayable, and can simply
+ * replay all M at one packet each and watch which the server answers
+ * instead of redirecting. The cost of "any of M" is ~C/M, so it FALLS as
+ * the server gets busier -- the opposite of the intuition a per-entry
+ * capacity argument builds.
+ *
+ * And the prober does not have to flood at all, which is what this case
+ * measures. The table is direct-mapped, so LEGITIMATE TRAFFIC EVICTS
+ * ITSELF: at the design load of SIZED_INSERTS_PER_REPLAY_WINDOW inserts
+ * per replay window, some entries are already gone before any attacker
+ * sends anything. That is not a new defect -- it is server_stack.h's own
+ * e^(-12288/2097152) = 99.42 % survival, read as the 0.58 % loss it also
+ * is. The header only ever stated the reassuring half.
+ *
+ * Counting is by occupied slots, for survivors_after's stated reason:
+ * re-querying would itself insert. */
+static double expected_self_collisions(size_t c, size_t n) {
+    double dn = (double)n, dc = (double)c;
+    return dn * dn / (2.0 * dc) - dn * dn * dn / (6.0 * dc * dc);
+}
+
+static void test_case5_free_replayable_entries_at_design_load(void) {
+    const size_t c = SHIPPED_CAPACITY;
+    const size_t n = SIZED_INSERTS_PER_REPLAY_WINDOW; /* 12288 */
+
+    /* The expected number of entries lost to self-collision is
+     * N - C*(1 - (1-1/C)^N). Expanded (no libm, so this file needs no
+     * -lm): N^2/2C - N^3/6C^2 + ..., which at N=12288, C=2^21 is
+     * 36.000 - 0.070 = 35.93. The third term is 1e-4 and is dropped. */
+    double theory = expected_self_collisions(c, n);
+
+    /* Ten trials, each a fresh 80 MiB table with a fresh hash key. The
+     * run cost of this case is dominated by those callocs and the
+     * whole-table occupancy scans, not by the 12,288 inserts; ten is
+     * cheap next to case 2's 32 x ln(2)*C flood and keeps the printed
+     * mean stable to about an entry. */
+    const int trials = 10;
+    double total_lost = 0.0;
+    for (int t = 0; t < trials; t++) {
+        /* A fresh cache per trial, so a fresh per-instance hash key --
+         * this is an average over keyings, not over one lucky one. */
+        size_t surv = survivors_after(c, n, 0x5EA51DE00000ULL + (uint64_t)t * 1000003ULL);
+        ASSERT_TRUE(surv > 0);
+        total_lost += (double)(n - surv);
+    }
+    double mean_lost = total_lost / trials;
+    printf("case 5: at the design load (%zu inserts / %zu s window, C=%zu), %.2f of %zu "
+           "in-window handshakes are already untracked -- %.4f%% of N, for ZERO attacker "
+           "packets. Theory %.2f.\n",
+           n, REPLAY_WINDOW_SECONDS, c, mean_lost, n, 100.0 * mean_lost / (double)n, theory);
+
+    /* The bracket. Loose enough for the variance of ten trials of a
+     * randomly keyed hash, tight enough that it is a real measurement:
+     * a chained or set-associative table reads 0 here, and the
+     * superseded 2^19 capacity reads ~144. */
+    ASSERT_TRUE(mean_lost > 0.5 * theory);
+    ASSERT_TRUE(mean_lost < 2.0 * theory);
+    ASSERT_TRUE(mean_lost >= 20.0 && mean_lost <= 60.0);
+
+    /* And the smaller load the sizing also quotes, so the N^2/2C shape
+     * is visible rather than asserted: a quarter of the load should lose
+     * about a sixteenth as many. */
+    const size_t n_small = SIZED_INSERTS_PER_REPLAY_WINDOW / 4; /* 3072 */
+    double theory_small = expected_self_collisions(c, n_small);
+    double total_small = 0.0;
+    for (int t = 0; t < trials; t++) {
+        size_t surv = survivors_after(c, n_small, 0x5EA52DE00000ULL + (uint64_t)t * 1000003ULL);
+        total_small += (double)(n_small - surv);
+    }
+    double mean_small = total_small / trials;
+    printf("case 5: at a quarter of that load (%zu inserts), %.2f untracked (%.4f%%); "
+           "theory %.2f -- the loss is quadratic in N, not linear.\n",
+           n_small, mean_small, 100.0 * mean_small / (double)n_small, theory_small);
+    ASSERT_TRUE(mean_small < mean_lost / 4.0); /* quadratic, so < N/4's linear share */
+}
+
 TEST_MAIN_BEGIN()
     test_shipped_capacity_meets_its_floor();
     test_case1_targeted_eviction();
     test_case2_whole_table_flood_cost();
     test_case3_steady_state_bracket();
     test_case4_key_is_per_instance();
+    test_case5_free_replayable_entries_at_design_load();
     test_hash_is_siphash24();
 TEST_MAIN_END()

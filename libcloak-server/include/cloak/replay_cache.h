@@ -54,18 +54,57 @@
  * that land in the same slot inside the same age window still evict one
  * another and the older entry silently stops being tracked. What changed
  * is who can arrange that. Blind flooding is all an attacker has left,
- * and to reach even a 50 % chance of evicting one chosen entry it must
+ * and to reach even a 50 % chance of evicting ONE CHOSEN entry it must
  * land ln(2) * capacity inserts inside the window in which the captured
  * ciphertext is still replayable at all (2 *
  * CLOAK_SERVER_AUTH_TIMESTAMP_TOLERANCE_SECONDS, because a client clock
  * may run up to the tolerance ahead of the server's). At the shipped
- * capacity that is ~363,000 handshakes in 360 s, about 1,009 per second,
- * sustained -- against ONE packet before. THAT IS A COST RATIO, NOT
- * IMPOSSIBILITY: a state-level adversary can push 1,009 handshakes a
- * second. What it cannot do any more is evict silently and surgically;
- * it has to mount a flood that is a denial of service in its own right
- * and looks like one. test_replay_cache_keyed.c case 2 measures the
- * underlying probability law rather than asserting it.
+ * capacity -- 2^21, set by Task 4 of module 10b; this paragraph quoted
+ * the superseded 2^19 figures until the same module's review caught it
+ * -- that is ln(2) * 2,097,152 = 1,453,634 handshakes in 360 s, 4,037
+ * per second, sustained, against ONE packet before. THAT IS A COST
+ * RATIO, NOT IMPOSSIBILITY: a state-level adversary can push 4,037
+ * handshakes a second. What it cannot do any more is evict silently and
+ * surgically; it has to mount a flood that is a denial of service in its
+ * own right and looks like one. test_replay_cache_keyed.c case 2
+ * measures the underlying probability law rather than asserting it.
+ *
+ * THAT LAW IS NOT THE PROBER'S PROBLEM, AND THE RESIDUAL IS LARGER THAN
+ * IT LOOKS. Two corrections, both from module 10b's final review:
+ *
+ *   (a) "Evict THIS entry" is the wrong goal. A prober that has captured
+ *       M handshakes needs ANY ONE of them to become replayable, and can
+ *       replay all M at one packet each and watch which one the server
+ *       answers instead of redirecting (dispatcher.c returns -1 on a
+ *       replay, i.e. the decoy redirect; a fresh hello is what reaches
+ *       cloak_server_auth_decrypt). The cost of "any of M" is ~C/M, not
+ *       ~C, so it FALLS as the server gets busier -- the opposite of the
+ *       intuition the capacity argument above builds.
+ *
+ *   (b) The prober need not flood at all, because legitimate traffic
+ *       evicts itself. MEASURED, against this cache's own API at the
+ *       shipped capacity and at the load server_stack.h's sizing itself
+ *       assumes (12,288 inserts per 360 s window):
+ *       test_replay_cache_keyed.c case 5 reads about 36 of those 12,288
+ *       in-window handshakes as already untracked -- ~0.29 % of N, for
+ *       ZERO attacker packets, one free replayable capture every ~10
+ *       seconds. Theory (N^2/2C - N^3/6C^2) is 35.93. A prober replaying
+ *       its whole capture set therefore gets ~36 confirmations per
+ *       window before spending anything.
+ *
+ * NONE OF THAT IS A NEW DEFECT: it is server_stack.h's own
+ * e^(-12288/2097152) = 99.42 % survival, read as the 0.58 % loss it also
+ * is. What was wrong was that this paragraph stated only the reassuring
+ * half and then quantified the attacker's cost with a law that does not
+ * apply to the attacker's actual goal.
+ *
+ * THE FIX, IF THE RESIDUAL IS EVER JUDGED TOO HIGH, IS SET-ASSOCIATIVITY
+ * AND NOT REFUSAL. Two ways at 2^20 buckets is the same 80 MiB and drops
+ * the self-collision loss from ~N^2/2C to ~N^3/6C^2 -- about 0.0002 %
+ * instead of 0.29 % at this load -- while keeping every property the
+ * never-refuse argument below depends on. That is carried work, not a
+ * decision deferred: the never-refuse policy itself was re-attacked in
+ * module 10b's review and held.
  *
  * WHEN IT IS FULL: IT EVICTS, AND IT NEVER REFUSES, AND THAT IS THE
  * DELIBERATE CHOICE. Direct-mapped means the table is never "full" in a
