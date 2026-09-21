@@ -59,11 +59,16 @@
  *   keeps running. It cannot be carried (one datagram is one frame, and
  *   cloak_stream_write refuses to split -- the far end does no
  *   reassembly), so the only choices are drop it or deliver part of it.
- *   Go delivers part of it: its read buffer silently truncates
- *   (internal/client/piper.go:25-26, an 8192-byte buffer handed
- *   straight to ReadFrom) and the fragment is forwarded as though it
- *   were the message (bug 7), which a
- *   UDP application cannot distinguish from a genuinely short reply.
+ *   Go delivers part of it: its read buffer silently truncates and the
+ *   fragment is forwarded as though it were the message (bug 7), which
+ *   a UDP application cannot distinguish from a genuinely short reply.
+ *   THE BUFFER DIFFERS BY SIDE, and commit 1f8c3e8 cited only the
+ *   client's here, which is the wrong one for this object: this relay is
+ *   the SERVER's upstream socket (proxy.c), whose Go analogue is
+ *   Stream.ReadFrom reading maxStreamUnitWrite bytes -- 16132 at
+ *   appDataMaxLength 16401 (internal/multiplex/stream.go:163,
+ *   session.go:111). The client's local socket truncates at 8192
+ *   instead (internal/client/piper.go:25-26). Same bug, two sizes.
  *   Dropping is what the network itself would have done with a datagram
  *   too large for a hop.
  *

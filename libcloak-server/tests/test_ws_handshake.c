@@ -197,7 +197,8 @@ static cloak_ws_hs_result_t parse_str(const char *req, cloak_ws_hs_t *out) {
  * Every false "measured" claim this file has carried -- four of them,
  * found across three review rounds -- was a claim about a request literal
  * with NO Host header. Go answers `400 Bad Request: missing required Host
- * header` to ANY HTTP/1.1 request that omits it (RFC 9112 3.2), before
+ * header` to ANY HTTP/1.1 request that omits it (RFC 9112 3.2;
+ * re-measured in module 10b task 10 on go1.25.6, verbatim), before
  * the handler runs and for a reason that has nothing to do with the
  * property under test. So a Go measurement taken against such a literal
  * measures the Host check and nothing else, and it will agree with

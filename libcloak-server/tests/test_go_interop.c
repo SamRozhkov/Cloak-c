@@ -199,7 +199,9 @@ static void test_c_client_refuses_a_corrupted_serverhello(void) {
          *
          * With NumConn 2 this case PASSED against a client that had the
          * AEAD check removed entirely -- measured, by re-applying the
-         * review's own mutation. Our connector has a defence Go does not:
+         * review's own mutation. Our connector has a defence Go does not
+         * (internal/client/connector.go:52 stores every connection's key
+         * into one atomic.Value and compares nothing):
          * cloak_client_connector's keys_agree() refuses a round whose N
          * connections did not derive the SAME session key
          * (CLOAK_CLIENT_CONNECTOR_ERR_KEY_MISMATCH). Each connection's

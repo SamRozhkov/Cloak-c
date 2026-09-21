@@ -566,8 +566,10 @@ size_t cloak_udp_piper_peers_expired(const cloak_udp_piper_t *pp);
  * UN-DIAGNOSABLE, which is why it is here rather than only in the
  * stream: an operator seeing a UDP tunnel lose datagrams needs to know
  * whether the loss is in this process or on the path, and Go -- which
- * blocks instead of dropping -- has no equivalent number to compare
- * against. */
+ * blocks instead of dropping (datagramBufferedPipe.Write waits on its
+ * condition variable once the buffer passes recvBufferSizeLimit,
+ * internal/multiplex/datagramBufferedPipe.go:76-80) -- has no
+ * equivalent number to compare against. */
 uint64_t cloak_udp_piper_dropped_datagrams(const cloak_udp_piper_t *pp);
 
 /* Datagrams read from the local socket that were larger than one frame's

@@ -466,8 +466,11 @@ static void piper_on_local_readable(cloak_reactor_t *r, int fd, uint32_t events,
          *
          * WHY A PEEK RATHER THAN THE READ Go DOES HERE, and this is the
          * one deliberate divergence in this file. Go reads the first
-         * bytes into a 10 KiB buffer and only then opens its stream, which
-         * works because its session already exists by that point. Here it
+         * bytes into a 10 KiB buffer and only then opens its stream
+         * (internal/client/piper.go:114-124: `data := make([]byte,
+         * 10240)`, io.ReadAtLeast, THEN sesh.OpenStream), which works
+         * because its session already exists by that point -- in
+         * singleplex it is made at :111, before the read. Here it
          * does not, and that has two consequences that both point the
          * same way:
          *

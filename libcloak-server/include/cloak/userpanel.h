@@ -658,12 +658,14 @@ void cloak_userpanel_registry_broken(cloak_server_registry_t *reg, cloak_session
  * cloak_userpanel_terminate and is then gone from the active table; the
  * next upload still bills it, reporting active = 0. Go keeps
  * usageUpdateQueue separate from activeUsers for exactly this reason and
- * its commitUpdate reports Active: false for such a user; this is a port
+ * its commitUpdate reports Active: false for such a user
+ * (internal/server/userpanel.go:177, `Active: panel.isActive(...)`); this is a port
  * of that, not a coincidence.
  *
  * A FAILED UPLOAD IS RETRIED, NOT DISCARDED, and this is a deliberate
- * divergence from Go (which empties its queue BEFORE calling
- * UploadStatus, so a failure loses that interval's billing outright). The
+ * divergence from Go (internal/server/userpanel.go:186 replaces
+ * usageUpdateQueue with a fresh map BEFORE the UploadStatus call at
+ * :192, so a failure loses that interval's billing outright). The
  * manager's busy_timeout is 0, so a second writer -- an operator's
  * sqlite3 CLI, the admin API -- makes upload_status fail fast with
  * "database is locked". That is the right trade for the reactor (it never

@@ -1193,8 +1193,10 @@ static inline int write_temp_unique(char *path_out, size_t cap, const char *name
  * fixture twice would hide it.
  *
  * Written to a FILE rather than passed inline, because Go's
- * server.ParseConfig reads a path and, when the read fails, unmarshals the
- * empty buffer it just failed to fill -- so its own flag help's "path to
+ * server.ParseConfig (internal/server/state.go:113-120) reads a path and,
+ * when the read fails, unmarshals the empty buffer it just failed to fill
+ * (`json.Unmarshal(content, &raw)` at :116, where content is what
+ * ReadFile could not fill) -- so its own flag help's "path to
  * the configuration file or its content" is false for the server. (Our
  * ck-server accepts both; see the binaries plan's D3.) */
 static inline void write_server_config(char *path_out, size_t cap, const char *name, int bind_port,

@@ -2102,7 +2102,10 @@ static void test_server_opened_streams_are_refused(void) {
 
 /* A REAL DEFECT THIS BRANCH SHIPPED WITH: no socket anywhere in this
  * project set TCP_NODELAY. Go's net.TCPConn sets NoDelay(true) by
- * default, so the reference implementation has it on every socket and
+ * default (re-measured in module 10b task 10 on go1.25.6: a dialed
+ * conn, an accepted conn and one from a bare net.Dialer all report
+ * TCP_NODELAY non-zero), so the reference implementation has it on
+ * every socket and
  * this port had it on none -- a silent divergence, invisible to every
  * functional assertion in the suite because Nagle costs latency and never
  * correctness.

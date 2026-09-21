@@ -432,8 +432,11 @@ int cloak_usermanager_get(cloak_usermanager_t *m, const uint8_t uid[CLOAK_UID_LE
  * credit, expiry) default to deny, which is where the safety lives.
  *
  * Go has no defined behaviour here at all: its CreateBucketIfNotExists
- * simply leaves the unnamed keys absent, and a later read does
- * binary.BigEndian.Uint64(nil), which panics. Defining the defaults is a
+ * (internal/server/usermanager/localmanager.go:221) simply leaves the
+ * unnamed keys absent, and a later read does
+ * binary.BigEndian.Uint64(nil) -- `u64` is that function (:12) and
+ * :54-56 call it straight on bucket.Get, which returns nil for an
+ * absent key -- which panics. Defining the defaults is a
  * deliberate divergence, not a port of anything.
  *
  * A `fields` mask carrying bits outside CLOAK_USER_FIELD_ALL is rejected

@@ -1307,7 +1307,10 @@ static int force_key_disagreement(struct fixture *fx, gate_t *gate, cloak_client
  *
  * Part A is the basic claim: two connections, one key corrupted, and the
  * connector refuses the whole session rather than doing what Go does --
- * store each key into an atomic and use whichever landed last, which here
+ * store each key into an atomic and use whichever landed last
+ * (internal/client/connector.go:20 declares `var _sessionKey
+ * atomic.Value` and :52 does `_sessionKey.Store(sk)` from every
+ * connection's goroutine, with no comparison anywhere), which here
  * would produce a live session whose obfuscator is wrong for one of its
  * two connections.
  *

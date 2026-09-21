@@ -180,7 +180,10 @@ typedef struct cloak_dispatcher cloak_dispatcher_t;
 
 /* A DELIBERATE DIVERGENCE FROM GO: Go's dispatchConnection has no cap on
  * how many connections it will handle concurrently and relies on its
- * runtime instead -- goroutines are cheap, and there is no per-connection
+ * runtime instead (internal/server/dispatcher.go:41 is a bare
+ * `go dispatchConnection(conn, sta)` per accept, with no semaphore and
+ * no counter -- the `fails` backoff just above it bounds ACCEPT ERRORS,
+ * not live connections) -- goroutines are cheap, and there is no per-connection
  * heap allocation of this module's shape for a cap to protect. This is a
  * C server: cloak_dispatcher_accept heap-allocates one
  * cloak_dispatch_conn_t (~3KB, dominated by cloak_firstpacket_t's own
@@ -697,9 +700,10 @@ struct cloak_dispatcher {
      * when they do. It is monotonic for the life of the dispatcher and is
      * never reset.
      *
-     * THE DIVERGENCE ITSELF. Go's ActiveUser.GetSession returns the
-     * existing session and discards the joining connection's own
-     * SessionConfig, so the connection is spliced on and its frames are
+     * THE DIVERGENCE ITSELF. Go's ActiveUser.GetSession
+     * (internal/server/activeuser.go:43-48) returns the existing session
+     * from its map and never touches the `config` argument on that arm,
+     * so it discards the joining connection's own SessionConfig, so the connection is spliced on and its frames are
      * interpreted under the SESSION's mode rather than its own -- which,
      * once the two modes frame differently, is silent corruption with no
      * error at either end. Refusing costs nothing against an honest peer

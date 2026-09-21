@@ -561,8 +561,11 @@ static void test_every_method_both_roles(void) {
  * Record 2 of the post-ClientHello client -> server stream. MEASURED:
  * the eight positive runs above each filled the 64 KiB capture buffer,
  * within which Go's ck-client produced 7 whole records and ours 4 (Go
- * caps one on-wire message at appDataMaxLength = 16401 bytes; ours sends
- * larger ones), and EVERY ONE of those records was a walkable data frame
+ * caps one on-wire message at appDataMaxLength = 16401 bytes --
+ * internal/client/TLS.go:11 and internal/server/TLS.go:16, fed to
+ * SessionConfig.MsgOnWireSizeLimit at connector.go:72 and
+ * dispatcher.go:196; ours sends larger ones), and EVERY ONE of those
+ * records was a walkable data frame
  * -- 0 with an unreadable header and 0 of any other TLS content type. So
  * a Cloak client really does send its ClientHello and then nothing but
  * frames in this direction, and record 2 is simply "a frame that is

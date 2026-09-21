@@ -257,7 +257,7 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     inside that does gorilla's Upgrader.Upgrade finally check
  *     `Connection`, `Sec-WebSocket-Key` and `Origin`. When that last
  *     check fails, websocketAux.go:129-138 returns WITHOUT sending on the
- *     unbuffered `finished` channel that websocket.go:47-50 is already
+ *     unbuffered `finished` channel that internal/server/websocket.go:47-50 is already
  *     blocked on, so the goroutine, the socket and the ActiveUser
  *     bookkeeping leak PERMANENTLY. Three reachable triggers were
  *     reproduced (module 8 scouting report, section 6.5): a CDN that
@@ -276,7 +276,7 @@ static void conn_drop(cloak_dispatch_conn_t *c) {
  *     32-byte quantities out of the decoded `Hidden` payload instead
  *     (randPubKey || ciphertextWithTag, split 32/32/32 -- Go's own
  *     unmarshalHidden, internal/server/websocket.go:76-99, feeding the
- *     SAME decryption the TLS path uses at auth.go:37).
+ *     SAME decryption the TLS path uses at internal/server/auth.go:37).
  *  3. cloak_server_check_replay against the RAW, not-yet-authenticated
  *     ch.random -- BEFORE any decryption, so a replayed handshake is
  *     rejected without the server doing any asymmetric work (both
@@ -675,8 +675,9 @@ static int dispatcher_authenticate(cloak_dispatch_conn_t *c) {
          * honest peer and turns a silent misinterpretation into an
          * immediate failure against a broken or hostile one. This is a
          * DELIBERATE DIVERGENCE from Go, whose ActiveUser.GetSession
-         * returns the existing session and drops the joining connection's
-         * own SessionConfig on the floor.
+         * (internal/server/activeuser.go:43-48) returns the existing
+         * session and drops the joining connection's own SessionConfig on
+         * the floor -- the `config` argument is untouched on that arm.
          *
          * THE REFUSAL IS THE ORDINARY REDIRECT, indistinguishable from
          * the one a bad UID gets -- see step 6's comment for why every

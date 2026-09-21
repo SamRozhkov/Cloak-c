@@ -129,7 +129,7 @@ typedef struct {
      * sends in its auth payload. */
     char name[CLOAK_PROXY_METHOD_LEN + 1];
     /* 0 for "tcp", 1 for "udp". A ProxyBook entry naming any other network
-     * is a config error here; Go's parseProxyBook (state.go:88-105) has no
+     * is a config error here; Go's parseProxyBook (internal/server/state.go:88-105) has no
      * default case in its switch, so such an entry is silently dropped
      * from the proxy book rather than rejected -- a server config that
      * boots under Go Cloak may fail to parse under this implementation. */

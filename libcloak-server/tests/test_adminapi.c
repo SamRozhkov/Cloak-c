@@ -1825,7 +1825,8 @@ static void test_post_with_empty_body(void) {
 
 /* ---- 12f. A query string is stripped before routing ----------------------
  *
- * Go's gorilla/mux matches on r.URL.Path, which excludes the query, so a
+ * Go's gorilla/mux matches on r.URL.Path, which excludes the query
+ * (gorilla/mux@v1.8.1 mux.go:177, `path := req.URL.Path`), so a
  * router that matched the raw target would answer 404 for
  * /admin/users?x=1 and 400 for /admin/users/<uid>?x=1 -- two divergences
  * from upstream, neither visible to any other case here. */

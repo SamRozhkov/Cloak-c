@@ -88,8 +88,8 @@
  * A DELIBERATE DIVERGENCE FROM GO, and the right one. Go's server keeps
  * its replay window in an exact, UNBOUNDED map: State.UsedRandom
  * (internal/server/state.go:47, allocated at :139), written by
- * State.registerRandom (state.go:228-231) and swept only by
- * State.UsedRandomCleaner (state.go:214-225), whose loop body begins
+ * State.registerRandom (internal/server/state.go:228-231) and swept only by
+ * State.UsedRandomCleaner (internal/server/state.go:214-225), whose loop body begins
  * `time.Sleep(replayCacheAgeLimit)` -- twelve hours between passes. So a
  * Go server's replay set grows without limit for up to twelve hours at a
  * time, driven by packets that never authenticate, which is a memory

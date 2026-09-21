@@ -44,12 +44,17 @@ typedef struct {
  * record layer's own declared length field against len; it assumes the
  * caller has already delivered exactly one un-fragmented ClientHello
  * record (matching Go Cloak's own parser, which makes the same
- * assumption).
+ * assumption: internal/server/TLSAux.go:103-121 checks the record type
+ * and version bytes and the HANDSHAKE length, never the record layer's
+ * own declared length against len(data)).
  *
  * The extensions block is parsed strictly within its declared
  * extensions_len -- a deliberate, stricter divergence from Go Cloak's
  * reference parser, which never checks that extensions actually stop at
- * the declared boundary (see clienthello_parse.c for details). */
+ * the declared boundary (internal/server/TLSAux.go:143-146 reads
+ * extensionsLen into the struct and then hands parseExtensions
+ * `peeled[pointer:]`, every remaining byte of the message; see
+ * clienthello_parse.c for details). */
 int cloak_clienthello_parse(const uint8_t *data, size_t len, cloak_clienthello_parsed_t *out);
 
 #endif

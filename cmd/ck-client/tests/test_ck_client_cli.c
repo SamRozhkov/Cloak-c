@@ -1228,7 +1228,9 @@ static void test_udp_is_honoured(void) {
 /* THE TRAP THIS TASK OPENED, and the reason it is a case of its own.
  *
  * NumConn <= 0 -- INCLUDING AN OMITTED NumConn -- means singleplex, in
- * this port and in Go (cloak/config.h, and Go's ProcessRawConfig). This
+ * this port and in Go (cloak/config.h, and Go's ProcessRawConfig at
+ * internal/client/state.go:212-217, which sets NumConn 1 and
+ * Singleplex true for any value <= 0). This
  * build does not implement singleplex WITH udp and refuses the pair. So
  * the very first configuration a reader of Go's documentation writes,
  *

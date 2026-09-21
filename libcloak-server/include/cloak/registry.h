@@ -72,7 +72,7 @@ typedef struct cloak_server_registry cloak_server_registry_t;
  * the least visible moment this protocol has.
  *
  * WHY THERE IS A CAP AT ALL: A DELIBERATE DIVERGENCE FROM GO. Go has no
- * equivalent. /Users/sam/Cloak/internal/server/activeuser.go:21 is
+ * equivalent. internal/server/activeuser.go:21 is
  * `sessions map[uint32]*mux.Session`, an unbounded map, one per
  * ActiveUser, hanging off userpanel.go:22's equally unbounded
  * `activeUsers map[[16]byte]*ActiveUser`. Go can afford that: its map

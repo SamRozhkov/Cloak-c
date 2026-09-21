@@ -949,7 +949,7 @@ static int write_temp_unique(char *path_out, size_t cap, const char *name, const
  * to do the same thing, that would itself be the divergence, and writing
  * the fixture twice would hide it.
  *
- * "udp" in the ProxyBook is the whole point -- Go's state.go:100 resolves
+ * "udp" in the ProxyBook is the whole point -- Go's internal/server/state.go:100 resolves
  * it to a net.UDPAddr and ours (config_server.c:67) to SOCK_DGRAM, and it
  * is what puts a datagram relay rather than a byte-stream relay behind
  * each server. */
@@ -970,7 +970,7 @@ static void write_server_config(char *path_out, size_t cap, const char *name, in
 }
 
 /* "UDP":true, not the -u flag, because it is the ONE spelling both
- * binaries accept from a file: Go's state.go:86 lists UDP among its
+ * binaries accept from a file: Go's internal/client/state.go:86 lists UDP among its
  * unquoted raw keys and ck-client.go:125 only overrides it when -u was
  * actually given, and module 9 task 7 taught ours the same key. */
 static void write_client_config(char *path_out, size_t cap, const char *name, const char *pub_b64,

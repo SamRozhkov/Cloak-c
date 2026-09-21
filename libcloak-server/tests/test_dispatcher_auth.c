@@ -807,8 +807,8 @@ static void test_unordered_flag_selects_the_session_ordering(void) {
  * because it comes from one client's one config. So refusing costs
  * nothing against an honest peer, and against a broken or hostile one it
  * converts a silent misinterpretation into a loud, immediate failure.
- * Go's user.GetSession returns the existing session and drops the new
- * seshConfig on the floor, which is the silent behaviour this deliberately
+ * Go's user.GetSession (internal/server/activeuser.go:43-48) returns the
+ * existing session and drops the new seshConfig on the floor, which is the silent behaviour this deliberately
  * does not port.
  *
  * WHAT "A NAMED ERROR" MEANS HERE, and why the assertion below is on a
@@ -835,7 +835,9 @@ static void test_unordered_flag_selects_the_session_ordering(void) {
  *
  *  (a) DELETE THE CHECK, i.e. the pre-task-6 behaviour this case used to
  *      assert. Fails the redirect, the counter and the attach count, in
- *      BOTH rows -- and nothing else in the 73-test suite, which is the
+ *      BOTH rows -- and nothing else in the 73-test suite as it stood
+ *      when the mutation was run (it is larger now; not re-run), which
+ *      is the
  *      measurement that says this refusal costs no other behaviour.
  *  (b) RE-DERIVE INSTEAD OF REFUSING (sesh->ordering = asked, the
  *      smallest thing that looks like a fix). Fails the same three AND
