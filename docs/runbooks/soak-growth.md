@@ -146,7 +146,14 @@ transparent hugepages are not `always` — including in `cloak-c-dev` on
 some hosts — and it was the chief confounder on the host that produced
 the published A/B/C numbers. Check
 `/sys/kernel/mm/transparent_hugepage/enabled` before comparing your
-numbers to anyone else's.
+numbers to anyone else's. **On a host where it is not `always`, the
+baseline to expect is not the published one:** `rss_anon_huge_kb` reads 0
+throughout *and* run B's `rss_anon_kb` should be flat or nearly so — the
+~11 MB rise published here (2188 → 13,240 kB) should simply be absent,
+not relocated into some other column, since every malloc column is
+bit-identical across it either way. A non-THP host that *does* see run B
+climb has found something this harness did not, and that is worth
+chasing.
 
 **`analyze.py` has a self-check; run it.** `python3 tools/soak/analyze.py
 --self-check` drives the tool against synthetic data with known answers.
