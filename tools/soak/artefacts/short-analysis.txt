@@ -1,0 +1,144 @@
+# analyze.py output for the committed short A/B/C soak artefact.
+# Produced on the host that ran them; see docs/runbooks/soak-growth.md.
+# Tool version: the one committed alongside, with --self-check passing.
+
+==================================================================
+== run A : python3 tools/soak/analyze.py tools/soak/artefacts/short-A.csv --skip-seconds=30
+==================================================================
+# soak_growth seconds=240 sample_ms=1000 concurrency=16 cycle_ms=20
+# replay_capacity=2097152 leak_bytes=0 mallinfo2=1
+samples=211  window=[30.0, 240.0] s  T=210.0 s  dt=1.000 s
+cycles over window: 8387  (39.93/s)
+failed cycles over window: 0
+
+column                first         last     slope/hr  r_lag1      k +-2se_naive/hr   +-2se_ar1/hr
+--------------------------------------------------------------------------------------------------
+rss_kb            1.259e+04    9.676e+04    1.897e+06  0.9780   9.49      8.962e+04      8.506e+05
+rss_anon_kb            6784    9.096e+04    1.897e+06  0.9780   9.49      8.962e+04      8.506e+05
+rss_file_kb            5808         5808            0  0.0000   1.00              0              0
+rss_anon_huge_kb            0    8.806e+04    2.084e+06  0.9805  10.08      1.290e+05      1.301e+06
+uordblks          1.343e+07    1.343e+07            0  0.0000   1.00              0              0
+hblkhd            8.412e+07    8.412e+07            0  0.0000   1.00              0              0
+arena             1.357e+07    1.357e+07            0  0.0000   1.00              0              0
+fds                      76           76            0  0.0000   1.00              0              0
+timers                   33           33            0  0.0000   1.00              0              0
+sessions                 16           16            0  0.0000   1.00              0              0
+proxy_streams            16           16            0  0.0000   1.00              0              0
+proxy_sessions           16           16            0  0.0000   1.00              0              0
+
+Separation: run length T_req needed for |slope| to reach 2 sigma (AR1-corrected),
+and the smallest slope a run of the given length could separate.
+
+column               resid_sd       T_req(s)    bmin@60s/hr   bmin@900s/hr
+--------------------------------------------------------------------------
+rss_kb              1.101e+04            124      5.609e+06      9.655e+04
+rss_anon_kb         1.101e+04            124      5.609e+06      9.655e+04
+rss_file_kb                 0 n/a (quantised)           60 q            4 q
+rss_anon_huge_kb      1.585e+04            154      8.577e+06      1.476e+05
+uordblks                    0 n/a (quantised)           60 q            4 q
+hblkhd                      0 n/a (quantised)           60 q            4 q
+arena                       0 n/a (quantised)           60 q            4 q
+fds                         0 n/a (quantised)           60 q            4 q
+timers                      0 n/a (quantised)           60 q            4 q
+sessions                    0 n/a (quantised)           60 q            4 q
+proxy_streams               0 n/a (quantised)           60 q            4 q
+proxy_sessions              0 n/a (quantised)           60 q            4 q
+
+q = QUANTISATION FLOOR, 3600/T units per hour, not a standard error. The column
+  did not scatter, so its limit is one integer unit over the run. This tool used
+  to print 0 here, which read as 'a 60-second run separates an arbitrarily small
+  leak in fds/timers/sessions'. It does not.
+
+==================================================================
+== run B : python3 tools/soak/analyze.py tools/soak/artefacts/short-B.csv --skip-seconds=30
+==================================================================
+# soak_growth seconds=240 sample_ms=1000 concurrency=16 cycle_ms=20
+# replay_capacity=4096 leak_bytes=0 mallinfo2=1
+samples=211  window=[30.0, 240.0] s  T=210.0 s  dt=1.000 s
+cycles over window: 8401  (40.00/s)
+failed cycles over window: 0
+
+column                first         last     slope/hr  r_lag1      k +-2se_naive/hr   +-2se_ar1/hr
+--------------------------------------------------------------------------------------------------
+rss_kb                 7996    1.904e+04    2.820e+05  0.9711   8.25       2.03e+04      1.675e+05
+rss_anon_kb            2188    1.324e+04    2.820e+05  0.9711   8.25       2.03e+04      1.675e+05
+rss_file_kb            5808         5808            0  0.0000   1.00              0              0
+rss_anon_huge_kb            0    1.024e+04    2.614e+05  0.9704   8.16       1.89e+04      1.543e+05
+uordblks          1.343e+07    1.343e+07            0  0.0000   1.00              0              0
+hblkhd            3.932e+05    3.932e+05            0  0.0000   1.00              0              0
+arena             1.357e+07    1.357e+07            0  0.0000   1.00              0              0
+fds                      76           76            0  0.0000   1.00              0              0
+timers                   33           33            0  0.0000   1.00              0              0
+sessions                 16           16            0  0.0000   1.00              0              0
+proxy_streams            16           16            0  0.0000   1.00              0              0
+proxy_sessions           16           16            0  0.0000   1.00              0              0
+
+Separation: run length T_req needed for |slope| to reach 2 sigma (AR1-corrected),
+and the smallest slope a run of the given length could separate.
+
+column               resid_sd       T_req(s)    bmin@60s/hr   bmin@900s/hr
+--------------------------------------------------------------------------
+rss_kb                   2495            149      1.105e+06      1.902e+04
+rss_anon_kb              2495            149      1.105e+06      1.902e+04
+rss_file_kb                 0 n/a (quantised)           60 q            4 q
+rss_anon_huge_kb           2323            149      1.018e+06      1.752e+04
+uordblks                    0 n/a (quantised)           60 q            4 q
+hblkhd                      0 n/a (quantised)           60 q            4 q
+arena                       0 n/a (quantised)           60 q            4 q
+fds                         0 n/a (quantised)           60 q            4 q
+timers                      0 n/a (quantised)           60 q            4 q
+sessions                    0 n/a (quantised)           60 q            4 q
+proxy_streams               0 n/a (quantised)           60 q            4 q
+proxy_sessions              0 n/a (quantised)           60 q            4 q
+
+q = QUANTISATION FLOOR, 3600/T units per hour, not a standard error. The column
+  did not scatter, so its limit is one integer unit over the run. This tool used
+  to print 0 here, which read as 'a 60-second run separates an arbitrarily small
+  leak in fds/timers/sessions'. It does not.
+
+==================================================================
+== run C : python3 tools/soak/analyze.py tools/soak/artefacts/short-C.csv --skip-seconds=30
+==================================================================
+# soak_growth seconds=240 sample_ms=1000 concurrency=16 cycle_ms=20
+# replay_capacity=4096 leak_bytes=64 mallinfo2=1
+samples=211  window=[30.0, 240.0] s  T=210.0 s  dt=1.000 s
+cycles over window: 8401  (40.01/s)
+failed cycles over window: 0
+
+column                first         last     slope/hr  r_lag1      k +-2se_naive/hr   +-2se_ar1/hr
+--------------------------------------------------------------------------------------------------
+rss_kb            1.068e+04    2.036e+04    1.878e+05  0.9736   8.64      1.933e+04      1.670e+05
+rss_anon_kb            4876    1.456e+04    1.878e+05  0.9736   8.64      1.933e+04      1.670e+05
+rss_file_kb            5808         5808            0  0.0000   1.00              0              0
+rss_anon_huge_kb            0    1.229e+04    2.467e+05  0.9733   8.60      2.742e+04      2.357e+05
+uordblks          1.354e+07    1.435e+07    1.386e+07  0.9375   5.57           2315       1.29e+04
+hblkhd            3.932e+05    3.932e+05            0  0.0000   1.00              0              0
+arena             1.389e+07    1.465e+07    1.543e+07  0.9016   4.39      4.567e+05      2.007e+06
+fds                      76           76            0  0.0000   1.00              0              0
+timers                   33           33            0  0.0000   1.00              0              0
+sessions                 16           16            0  0.0000   1.00              0              0
+proxy_streams            16           16            0  0.0000   1.00              0              0
+proxy_sessions           16           16            0  0.0000   1.00              0              0
+
+Separation: run length T_req needed for |slope| to reach 2 sigma (AR1-corrected),
+and the smallest slope a run of the given length could separate.
+
+column               resid_sd       T_req(s)    bmin@60s/hr   bmin@900s/hr
+--------------------------------------------------------------------------
+rss_kb                   2375            195      1.101e+06      1.896e+04
+rss_anon_kb              2375            195      1.101e+06      1.896e+04
+rss_file_kb                 0 n/a (quantised)           60 q            4 q
+rss_anon_huge_kb           3369            205      1.554e+06      2.675e+04
+uordblks                284.5              2      8.504e+04           1464
+hblkhd                      0 n/a (quantised)           60 q            4 q
+arena               5.612e+04             54      1.324e+07      2.278e+05
+fds                         0 n/a (quantised)           60 q            4 q
+timers                      0 n/a (quantised)           60 q            4 q
+sessions                    0 n/a (quantised)           60 q            4 q
+proxy_streams               0 n/a (quantised)           60 q            4 q
+proxy_sessions              0 n/a (quantised)           60 q            4 q
+
+q = QUANTISATION FLOOR, 3600/T units per hour, not a standard error. The column
+  did not scatter, so its limit is one integer unit over the run. This tool used
+  to print 0 here, which read as 'a 60-second run separates an arbitrarily small
+  leak in fds/timers/sessions'. It does not.

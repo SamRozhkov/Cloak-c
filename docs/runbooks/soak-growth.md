@@ -116,6 +116,46 @@ number any threshold would have to clear.
 | `timers` | the reactor's pending timers. Drift in *either* direction is a finding: module 10b's slot-indexed heap can lose a timer to a stale handle cancelling a recycled slot as easily as it can gain one. |
 | `sessions` | the registry is not retiring sessions. Should sit at `--concurrency`. |
 | `proxy_streams` | the proxy's per-session table is not retiring streams. |
+| `proxy_sessions` | the proxy's session table. Live (0 → K). It was written by the harness from the start but missing from `analyze.py`'s `DEFAULT_COLUMNS`, so it was sampled and never fitted until module 10b's fix wave. |
+
+### What NO column can see: growth proportional to PEAK concurrency
+
+**This is a limit of the workload, not of the column list, and adding a
+column does not fix it.** `soak_growth` pins `--concurrency` for the
+whole run and recycles the same K slots, so every structure sized by
+*peak* rather than by *rate* sits at its K plateau from the warm-up
+onward and cannot move again. Thirty-eight thousand cycles at a constant
+K = 16 will never show it, in any column, however long the run.
+
+The reactor's timer-slot array is exactly that shape: `timer_slot_free`
+returns a slot to a free list and **never shrinks `r->slots`**, and a
+slot whose generation counter is exhausted is retired and leaked by
+design. The registry's chains and the strmtab are the same. A server
+that ratchets 16 → 512 → 16 keeps the 512-slot allocation for the rest
+of its life, and this harness would report every column bit-identical
+throughout.
+
+Closing it needs a **`--concurrency-sweep`** that walks K up and back
+down and then asserts the columns return to their pre-sweep values.
+Cheap, no new column, and carried out of module 10b rather than done.
+
+### Two more limits worth stating before you quote a number
+
+**`rss_anon_huge_kb` is host-dependent.** It reads identically 0 wherever
+transparent hugepages are not `always` — including in `cloak-c-dev` on
+some hosts — and it was the chief confounder on the host that produced
+the published A/B/C numbers. Check
+`/sys/kernel/mm/transparent_hugepage/enabled` before comparing your
+numbers to anyone else's.
+
+**`analyze.py` has a self-check; run it.** `python3 tools/soak/analyze.py
+--self-check` drives the tool against synthetic data with known answers.
+It is deliberately not a ctest case (`cloak-c-dev` has no python3, so it
+would silently not register), and it exists because two defects in this
+instrument shipped — one printing a detectable-slope of **zero** for
+every column that does not scatter, one switching the AR(1) correction
+off at exactly the autocorrelation where it mattered. Run it whenever
+`analyze.py` changes.
 
 ### The two confounds you will hit first
 
@@ -153,11 +193,29 @@ one paragraph:
 
 Three measured reasons, in the order they decide it.
 
-**There is no growth to find.** Over 750 s and 31,876 churn cycles with
-the replay cache out of the way, every watched column was bit-identical
-from the first sample to the last. The ruling's condition for overturning
-the default was a ctest case that *finds real growth within the budget*;
-no such growth exists here, so the condition is not met.
+**There is no growth to find — IN RUN B.** Over 750 s and 31,876 churn
+cycles, every watched column was bit-identical from the first sample to
+the last. **State which run that is, because it matters: it is run B,
+the `--replay-capacity=4096` configuration, which the server does not
+ship.** In run A — the shipping 2^21 cache — `rss_anon_kb` is *not* flat
+and is not supposed to be: it rose 1052 → 15356 kB over a 90 s
+re-measurement and was still rising linearly at the end (531,054 kB/hr
+over 30–60 s, 502,528 kB/hr over 60–90 s, i.e. no decay at all). That is
+the 80 MiB replay table faulting in at the handshake rate; at ~510,000
+kB/hr it needs **~578 s** to become fully resident, so in a 900 s run A
+that column is a warm-up transient for roughly two thirds of the fit
+window even after `--skip-seconds=30`. **A genuine anonymous leak of up
+to ~500 MB/hr is not separable from it in run A.**
+
+The shipping configuration is therefore defended not by a flat column
+but by an **independent arithmetic cross-check**: run A's observed
+94,832 kB against 82,144 (the table) + 13,256 (everything else, from run
+B) = 95,400 computed. That is sound, and it is a different kind of
+evidence from "the column did not move" — say so when you quote it.
+
+The ruling's condition for overturning the ctest default was a case that
+*finds real growth within the budget*; no such growth exists in run B, so
+the condition is not met.
 
 **The budget.** Sixty seconds is about twice the entire Debug suite's
 measured wall clock at `-j4`, and roughly five times its longest Debug
@@ -177,6 +235,53 @@ units/hour. Twelve and a half times coarser, on every column.
 A "no growth detected" from a 60-second run is not a small measurement.
 It is a green light for a class of defect nobody has actually looked
 for.
+
+## The committed artefact, and what it is NOT
+
+`tools/soak/artefacts/` holds a **240-second** A/B/C run and the
+`analyze.py` output for it (`short-A.csv`, `short-B.csv`, `short-C.csv`,
+`short-analysis.txt`). It is committed because module 10b's final review
+could not verify Task 9's central claim at all: `/tmp/soak` was gone, the
+900 s A/B/C CSVs had never been committed, and the number the ledger
+quotes as fact was reproducible from nothing in the tree. **A
+measurement quoted as fact with no surviving artefact is not a
+measurement.**
+
+**Say this plainly, because it is the whole point of the section: the
+committed artefact is the SHORT run. The 900 s numbers this runbook
+quotes elsewhere — 750 s, 31,876 cycles, 94,832 kB against 95,400
+computed — are NOT reproducible from anything in this repository.** They
+are the ledger's prose and nothing more. Re-run them if you need them.
+
+What the short artefact does establish, on the host that produced it
+(THP `always`, 40 cycles/s, 8,400 cycles per fitted window):
+
+- **Run C, the positive control, lights up and B does not.** `uordblks`
+  goes 1.354e7 → 1.435e7 B in C (slope 1.39e7 B/hr against an AR(1)
+  2-sigma interval of 1.29e4) and is **bit-identical** in B. 64 retained
+  bytes per cycle, reachable at exit and therefore invisible to LSan, is
+  seen. The instrument works.
+- **Run B: nine of the twelve columns are bit-identical** over the fitted
+  window — `uordblks`, `hblkhd`, `arena`, `fds`, `timers`, `sessions`,
+  `proxy_streams`, `proxy_sessions`, `rss_file_kb`.
+- **The three anonymous-RSS columns are NOT flat even in run B on this
+  host, and that is THP, not a leak.** `rss_anon_kb` rises 2188 → 13240
+  kB while `rss_anon_huge_kb` rises 0 → 10240 kB, i.e. the kernel
+  collapsing the heap accounts for almost the whole rise, with
+  `uordblks`, `hblkhd` and `arena` bit-identical throughout. This is the
+  confound documented above, reproduced. **The review's host had THP off
+  and saw `rss_anon_huge_kb` identically 0; ours does not. Check your own
+  host before comparing.**
+- **Run A is the shipping configuration and its `rss_anon_kb` is a
+  ramp**, 6784 → 90,960 kB in 240 s, still climbing at the end. Every
+  counter column is bit-identical throughout. With THP on, the 80 MiB
+  table faults in far faster than the ~578 s the review measured without
+  it — another reason that figure is host-specific.
+
+240 seconds is a quarter of the published run, so by the 1/T floor the
+artefact resolves 15 units/hour on a non-scattering column against the
+750 s fit's 4.8. It is an artefact that proves the instrument and the
+procedure, **not** a replacement for the long run.
 
 ## The comparison this does not make
 
