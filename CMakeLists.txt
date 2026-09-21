@@ -368,3 +368,15 @@ target_compile_definitions(test_unordered_proof PRIVATE
 # on, so that a reader who finds this line is one scroll from what it
 # does.
 add_subdirectory(fuzz)
+
+# The out-of-band growth harness (module 10b task 9). NOT a test and not
+# in the default build: tools/soak/CMakeLists.txt is only entered when
+# CLOAK_BUILD_SOAK is ON, so `ctest` still runs exactly the tests it ran
+# before this line existed, and a default `cmake --build` compiles
+# exactly the same objects. The option is declared here rather than in
+# that file so it is visible to `cmake -LH` without configuring the
+# subdirectory first. See docs/runbooks/soak-growth.md.
+option(CLOAK_BUILD_SOAK "Build the long-running growth harness (tools/soak)" OFF)
+if(CLOAK_BUILD_SOAK)
+    add_subdirectory(tools/soak)
+endif()
