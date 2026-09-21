@@ -233,11 +233,17 @@ it and, just as importantly, what it cannot see.
 
 ## What is not here yet
 
-- **Linux only.** The reactor is built on `epoll` and the signal handling on
-  `signalfd`, with `accept4`, `pipe2` and `SOCK_NONBLOCK` used throughout and
-  no portability guards anywhere in the tree. FreeBSD and macOS need a
-  `kqueue` backend behind the reactor's interface before they can build at
-  all — a real piece of work, not a compiler flag.
+- **Linux only.** Two files stand between this tree and FreeBSD or macOS:
+  `libcloak-common/src/reactor.c` (five `epoll_create1`/`epoll_ctl`/
+  `epoll_wait` calls, plus the translation of `EPOLLIN`/`EPOLLOUT`) and
+  `libcloak-common/src/signals.c` (95 lines built on `signalfd`). Nothing
+  else needs porting: the reactor already hides the backend behind
+  `CLOAK_REACTOR_READABLE`/`CLOAK_REACTOR_WRITABLE`, so no caller names an
+  `EPOLL*` constant outside a comment, and the remaining Linux-flavoured
+  calls — `accept4` with `SOCK_NONBLOCK|SOCK_CLOEXEC` in `listener.c`, and
+  `MSG_NOSIGNAL` on every send — exist on FreeBSD too. There is no `pipe2`,
+  `eventfd`, `timerfd` or `splice` anywhere in the tree. Two tests count
+  descriptors through `/proc/self/fd` and would need a local equivalent.
 - **The client's CDN/WebSocket leg.** The server accepts CDN-fronted
   WebSocket connections; the client cannot yet originate them. This needs a
   real TLS stack and a decision about what fingerprint to present.

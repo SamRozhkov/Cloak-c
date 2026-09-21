@@ -4,12 +4,12 @@
 #
 # Linux only, on purpose. A FreeBSD job was written and then removed
 # (see the commit history of this file) because the tree cannot build
-# there yet: 15 epoll call sites in libcloak-common/src/reactor.c,
-# signalfd in libcloak-common/src/signals.c, and accept4/pipe2/
-# SOCK_NONBLOCK across nine more source files -- with ZERO portability
-# guards anywhere (a grep for __linux__, __FreeBSD__ or
-# CMAKE_SYSTEM_NAME returns nothing). Adding the platform back is a
-# kqueue backend for the reactor, not a change to this file.
+# there yet -- but the reason is narrower than that removal first
+# claimed. It is two files: five epoll calls in
+# libcloak-common/src/reactor.c and a 95-line
+# libcloak-common/src/signals.c built on signalfd. Everything else is
+# portable; see the README. Adding the platform back is a kqueue backend
+# behind the reactor's existing interface, not a change to this file.
 #
 # WHY THERE ARE TWO BUILDS, AND WHY THEY ARE NOT THE SAME BUILD
 # -------------------------------------------------------------
