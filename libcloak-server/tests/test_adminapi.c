@@ -846,7 +846,9 @@ static void test_delete(void) {
     finish(&fx, &cs, st2, &r2);
 
     /* A second DELETE is 404 too, not 200 and not 500: Go answers 500
-     * here (and then writes 200 over it, which is its own bug). */
+     * here (and then writes 200 over it, which is its own bug) --
+     * internal/server/usermanager/api_router.go:123-128, where the
+     * http.Error(500) arm has no `return` before w.WriteHeader(200). */
     snprintf(reqbuf, sizeof(reqbuf), "DELETE /admin/users/%s HTTP/1.1\r\nHost: admin\r\n\r\n", up);
     resp_t r3;
     cloak_stream_t *st3 = request(&fx, &cs, reqbuf, &r3);

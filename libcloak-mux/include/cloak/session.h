@@ -276,7 +276,9 @@ cloak_stream_t *cloak_session_open_stream(cloak_session_t *sesh, uint32_t *out_i
  * the session's active-stream count. Does NOT free stream's memory --
  * see cloak_session_release_stream, and this file's own top-of-task
  * "Stream memory ownership" note. Returns 0 on success, -1 if stream was
- * already closed this way (matches Go's errRepeatStreamClosing) or if
+ * already closed this way (matches Go's errRepeatStreamClosing,
+ * returned by the failed CompareAndSwap at
+ * internal/multiplex/session.go:181-183) or if
  * sesh is already closed. stream remains valid to read from (and must
  * still be released) after this call. */
 int cloak_session_close_stream(cloak_session_t *sesh, cloak_stream_t *stream);

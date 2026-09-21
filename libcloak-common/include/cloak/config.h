@@ -116,9 +116,9 @@ typedef struct {
     char cdn_ws_url_path[CLOAK_MAX_PATH_LEN];
 
     /* Seconds. stream_timeout_sec defaults to 300. A negative
-     * StreamTimeout is a config error here; Go's client (state.go:269-273)
-     * accepts a negative value silently and passes it straight through to
-     * time.Duration. keep_alive_sec is -1 when TCP keepalive is disabled,
+     * StreamTimeout is a config error here; Go's client
+     * (internal/client/state.go:271-276) accepts a negative value
+     * silently and passes it straight through to time.Duration. keep_alive_sec is -1 when TCP keepalive is disabled,
      * which is the default. */
     int stream_timeout_sec;
     int keep_alive_sec;

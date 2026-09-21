@@ -1038,8 +1038,9 @@ typedef struct {
      * MAX_DGRAM for ours. */
     size_t client_read_cap;
     /* AND WHAT IT DOES WITH A BIGGER ONE, which is the whole of bug 7 and
-     * is NOT the same question as the cap. Go TRUNCATES: ReadFrom fills
-     * its 8192 bytes, the rest of the datagram is discarded by the kernel,
+     * is NOT the same question as the cap. Go TRUNCATES: ReadFrom
+     * (internal/client/piper.go:26, into the 8192-byte buffer allocated
+     * at :25) fills its 8192 bytes, the rest of the datagram is discarded by the kernel,
      * no error is reported anywhere, and the fragment is forwarded as
      * though it were the message -- which a UDP application cannot
      * distinguish from a genuinely short one. This port REFUSES: the

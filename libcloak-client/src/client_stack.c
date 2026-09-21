@@ -431,8 +431,9 @@ static cloak_client_browser_t stack_browser(cloak_browser_t b) {
  * Go's randomServerName(), internal/client/TLS.go:35, which is a
  * different thing entirely: it invents a random gibberish hostname, and
  * only when the chosen MockDomain is the literal string "random"
- * (TLS.go:125-127). An earlier version of this comment attributed the
- * list selection to randomServerName; that was the wrong symbol.)
+ * (internal/client/TLS.go:125-127). An earlier version of this comment
+ * attributed the list selection to randomServerName; that was the wrong
+ * symbol.)
  *
  * SO THIS IS AN UNRECORDED, WIRE-VISIBLE DIVERGENCE, AND THIS IS THE
  * RECORD. 256 is not a multiple of any list length but 1, 2, 4, 8, 16

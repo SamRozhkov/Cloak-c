@@ -382,7 +382,10 @@ static void peer_drain(cloak_udp_piper_peer_t *peer) {
             return;
         }
         peer->out_len = (size_t)n;
-        peer_touch(peer); /* Go refreshes the deadline on every read too */
+        /* Go refreshes the deadline on every read too:
+         * internal/client/piper.go:67, immediately after each successful
+         * stream.Read in the same direction. */
+        peer_touch(peer);
         if (peer_flush(peer) != 0) {
             return;
         }

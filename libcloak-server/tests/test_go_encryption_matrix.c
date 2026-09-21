@@ -55,7 +55,9 @@
  * which test_go_clienthello_matrix.c owns. It says nothing about the
  * SERVER's choice of method either, because neither implementation has
  * one: both take the method from byte 28 of the client's authentication
- * payload (see auth_method_byte below).
+ * payload (see auth_method_byte below; Go writes that byte at
+ * internal/client/auth.go:40 and reads it back at
+ * internal/server/auth.go:48).
  *
  * Every wait is bounded by CLOCK_MONOTONIC, every port is ephemeral, and
  * the oracle binaries are checked for before any case runs. */

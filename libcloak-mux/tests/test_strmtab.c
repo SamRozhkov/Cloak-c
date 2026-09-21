@@ -33,7 +33,9 @@ static void test_insert_lookup_tombstone_reinsert(void) {
     ASSERT_EQ_INT(cloak_strmtab_insert_active(&t, 42, &dummy1), -1);
 
     /* Tombstone it -- lookup must report TOMBSTONE, not ABSENT. This is
-     * the distinction Go's nil-but-present map entry exists to capture: a
+     * the distinction Go's nil-but-present map entry exists to capture
+     * (internal/multiplex/session.go:213 stores nil, and :248 reads the
+     * two-value form that tells nil from absent): a
      * late frame for id 42 must be recognized as "known dead", not
      * mistaken for a brand new stream. */
     ASSERT_EQ_INT(cloak_strmtab_tombstone(&t, 42), 0);

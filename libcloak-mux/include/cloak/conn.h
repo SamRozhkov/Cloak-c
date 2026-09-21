@@ -127,10 +127,14 @@
  * directions.
  *
  *   - On the CDN path the TLS record header must NOT be there. Go's
- *     WSOverTLS (/Users/sam/Cloak/internal/common/websocket.go) embeds
- *     only a *websocket.Conn: the real TLS session lives OUTSIDE the
- *     WebSocket, between this host and the CDN, and supplies its own
- *     records. A conn left in TLS_RECORD mode on a WebSocket connection
+ *     WSOverTLS (internal/client/websocket.go:16-19 -- NOT
+ *     internal/common/websocket.go, which an earlier version of this
+ *     comment named, and which holds the WebSocketConn it wraps) embeds
+ *     a *common.WebSocketConn, itself a thin binary-message wrapper
+ *     around gorilla's *websocket.Conn
+ *     (internal/common/websocket.go:14-28). There is no TLSConn anywhere
+ *     in that chain: the real TLS session lives OUTSIDE the WebSocket,
+ *     between this host and the CDN, and supplies its own records. A conn left in TLS_RECORD mode on a WebSocket connection
  *     emits 0x17 0x03 0x03 <len> INSIDE a WebSocket binary frame. That is
  *     wire-incompatible with Go -- the far end feeds those five bytes to
  *     a deobfuscator and fails -- and to anyone who can see inside the

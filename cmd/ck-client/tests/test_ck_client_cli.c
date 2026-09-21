@@ -2035,7 +2035,9 @@ static void test_admin_over_udp_is_served(void) {
      *
      * THAT COMBINATION WAS MEASURED TO SURVIVE THE WHOLE SUITE. Making
      * client_stack.c's `cc.unordered = c->udp` read
-     * `s->cfg.admin_session ? 0 : c->udp` passed all 83 tests, this
+     * `s->cfg.admin_session ? 0 : c->udp` passed all 83 tests AS THE
+     * SUITE STOOD WHEN THIS WAS MEASURED (commit 2808d61; the suite has
+     * grown since and the mutation has not been re-run), this
      * case's every assertion included: on loopback the piper writes one
      * frame per datagram and an ORDERED stream hands those bytes back in
      * order, so a 200 with a JSON body still arrives. What changes is

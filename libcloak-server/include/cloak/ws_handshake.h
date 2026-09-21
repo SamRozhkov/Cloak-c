@@ -267,8 +267,11 @@ typedef struct {
  * ORDER OF REFUSALS, because tests pin it and a reader should know why:
  * `Hidden` is checked first, then Connection/Upgrade/method, then the
  * version, then the key -- which is the order the two Go layers apply
- * them in (processFirstPacket before Upgrader.Upgrade, and then gorilla's
- * own sequence). It is NOT a security property: every failure here has
+ * them in (processFirstPacket, internal/server/websocket.go:22-39,
+ * decodes and unmarshals `hidden` before it ever builds the responder
+ * that calls Upgrader.Upgrade; gorilla's own sequence is then
+ * Connection, Upgrade, method, version, origin, key --
+ * gorilla/websocket@v1.5.3 server.go:128-158). It is NOT a security property: every failure here has
  * the same consequence, a redirect to the cover site, and the dispatcher
  * must not branch on which one it was.
  *

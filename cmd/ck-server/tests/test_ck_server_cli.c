@@ -1107,7 +1107,9 @@ static void plugin_env(const char *opts, const char *remote_host, const char *re
 
 /* SS_PLUGIN_OPTIONS carries JSON for the server side, not the ssv the
  * client's SS_PLUGIN_OPTIONS carries -- Go's server.ParseConfig only ever
- * calls json.Unmarshal, whatever its comment says. */
+ * calls json.Unmarshal, whatever its comment says
+ * (internal/server/state.go:112-127; the client's, which really does
+ * switch on the string, is internal/client/state.go:127-145). */
 static void test_plugin_injects_proxy_and_binds_ss_address(void) {
     int port = free_port();
     ASSERT_TRUE(port > 0);
@@ -1441,8 +1443,10 @@ static void test_ss_local_host_alone_is_not_plugin_mode(void) {
 /* Case 9: BindAddr is RESOLVED, not copied                             */
 /* ------------------------------------------------------------------ */
 
-/* Go's resolveBindAddr runs every BindAddr through ResolveTCPAddr and
- * listens on the RESULT's String(). That step is what makes
+/* Go's resolveBindAddr (cmd/ck-server/ck-server.go:20-31) runs every
+ * BindAddr through ResolveTCPAddr and listens on the RESULT's String()
+ * (ck-server.go:183); parseSSBindAddr compares those canonical forms at
+ * ck-server.go:49-62. That step is what makes
  * parseSSBindAddr's comparisons meaningful -- they compare canonical forms
  * -- so if canon_addr degenerated into a verbatim copy, every merge rule
  * above would be comparing operator-typed strings and would silently stop

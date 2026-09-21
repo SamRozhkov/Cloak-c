@@ -911,11 +911,16 @@ static void test_exact_size_output_buffer_stress(void) {
  * measured what that oracle CANNOT see, and this was the headline:
  * replacing the Chrome template's three TLS 1.3 cipher suites
  * (0x1301/0x1302/0x1303) with TLS_RSA_WITH_3DES_EDE_CBC_SHA (0x000a) left
- * the ENTIRE 69-test suite green. Go's server reads the record header,
- * the `random`, the session id and the key share, and looks at nothing
- * else in the ClientHello -- so no interoperability test, against any Go
- * peer, present or future, can ever notice that these templates stopped
- * looking like a browser.
+ * the ENTIRE 69-test suite green (69 was the count in module 9; the
+ * suite is larger now, and the measurement has not been re-run since).
+ * Go's server reads the record header, the `random`, the session id and
+ * the key share, and ACTS on nothing else in the ClientHello
+ * (internal/server/TLS.go:73-99 consumes ch.random, ch.sessionId and
+ * extension 0x0033 and nothing more; internal/server/TLSAux.go:133-141
+ * walks past the cipher-suite and compression lists for their LENGTHS
+ * without ever examining their contents) -- so no interoperability
+ * test, against any Go peer, present or future, can ever notice that
+ * these templates stopped looking like a browser.
  *
  * But the one reader that is not in this repository -- a censor's
  * fingerprinter -- reads all of it. Offering 3DES where Chrome offers

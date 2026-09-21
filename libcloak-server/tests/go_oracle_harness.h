@@ -1243,7 +1243,9 @@ static inline void write_client_config(char *path_out, size_t cap, const char *n
  * payload -- the same bytes the server's own auth decrypt sees, obtained
  * without asking either implementation anything.
  *
- * Layout (Go: internal/client/auth.go makeAuthenticationPayload):
+ * Layout (Go: internal/client/auth.go:22-48, makeAuthenticationPayload;
+ * the server reads the same offsets back at
+ * internal/server/auth.go:44-50):
  *   [0:16) UID  [16:28) proxy method  [28] encryption method
  *   [29:37) timestamp  [37:41) session id  [41] FLAGS  [42:48) reserved
  * Bit 0 of byte 41 is UNORDERED_FLAG.

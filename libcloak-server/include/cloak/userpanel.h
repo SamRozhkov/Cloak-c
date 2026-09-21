@@ -476,7 +476,8 @@ size_t cloak_userpanel_active_count(const cloak_userpanel_t *p);
  * depending on which side raced. */
 cloak_usermanager_t *cloak_userpanel_manager(cloak_userpanel_t *p);
 
-/* Go's TerminateActiveUser. In order: drains this user's valve onto the
+/* Go's TerminateActiveUser (internal/server/userpanel.go:91-100, whose
+ * three statements are in this same order). In order: drains this user's valve onto the
  * usage queue (so the bytes it moved are still billed), closes EVERY
  * session it holds through cloak_server_registry_close_all_for_uid, then
  * removes the entry from the active table and FREES IT.

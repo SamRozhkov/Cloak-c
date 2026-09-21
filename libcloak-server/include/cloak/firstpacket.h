@@ -101,8 +101,10 @@ typedef struct {
      * terminating CRLFCRLF have been matched so far. */
     unsigned crlf_state;
 
-    /* Go's redirOnErr: whether a failure here should still be forwarded
-     * to RedirAddr rather than dropped. */
+    /* Go's redirOnErr (the third result of readFirstPacket,
+     * internal/server/dispatcher.go:62, acted on at :156): whether a
+     * failure here should still be forwarded to RedirAddr rather than
+     * dropped. */
     int redirect_on_error;
 } cloak_firstpacket_t;
 
@@ -122,7 +124,8 @@ void cloak_firstpacket_init(cloak_firstpacket_t *fp);
  *
  * On the WebSocket path this returns 1: HTTP headers have no length to
  * read ahead of, so the request is consumed one byte at a time, exactly
- * as Go's connReadLine does. That is a handshake-time cost of a few
+ * as Go's connReadLine does (internal/server/dispatcher.go:46-57:
+ * io.ReadFull into buf[i:i+1], one byte per call, until '\n'). That is a handshake-time cost of a few
  * hundred syscalls per connection, paid once, in exchange for the
  * no-over-read guarantee. */
 size_t cloak_firstpacket_want(const cloak_firstpacket_t *fp);

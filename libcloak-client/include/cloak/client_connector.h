@@ -253,7 +253,11 @@ typedef struct {
      * they need not outlive this call. */
     cloak_client_browser_t browser;
     cloak_transport_mode_t transport;
-    const char *server_name; /* "random" regenerates per attempt, as in Go */
+    /* "random" regenerates per attempt, as in Go: the
+     * strings.EqualFold check and randomServerName() call at
+     * internal/client/TLS.go:126-127 sit inside DirectTLS.Handshake,
+     * which runs once per connection attempt. */
+    const char *server_name;
     uint8_t server_pub[CLOAK_X25519_KEY_LEN];
     uint8_t uid[CLOAK_UID_LEN];
     const char *proxy_method;
