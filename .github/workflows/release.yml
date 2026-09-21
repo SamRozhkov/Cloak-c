@@ -1,22 +1,15 @@
 # Release pipeline: fires when a tag is pushed, builds ck-server and
-# ck-client for Ubuntu and FreeBSD, and attaches the tarballs to a GitHub
-# Release named after the tag.
+# ck-client for Ubuntu, and attaches the tarball to a GitHub Release named
+# after the tag.
 #
-# READ THIS BEFORE WONDERING WHY FREEBSD IS RED
-# ---------------------------------------------
-# The FreeBSD job is written in full and is expected to FAIL until the
-# reactor grows a kqueue backend. The tree is Linux-only today: 15 epoll
-# call sites in libcloak-common/src/reactor.c, signalfd in
-# libcloak-common/src/signals.c, and accept4/pipe2/SOCK_NONBLOCK across
-# nine more source files -- with ZERO portability guards anywhere (a grep
-# for __linux__, __FreeBSD__ or CMAKE_SYSTEM_NAME returns nothing).
-#
-# That list was read, not measured -- there is no FreeBSD host here to
-# compile on. The job exists precisely so the first tag turns the guess
-# into a real compiler error list, which is a better starting point for
-# the port than a prediction. It is marked continue-on-error so a tag
-# still produces Ubuntu binaries while that work is outstanding; delete
-# that line once the port lands.
+# Linux only, on purpose. A FreeBSD job was written and then removed
+# (see the commit that added this file) because the tree cannot build
+# there yet: 15 epoll call sites in libcloak-common/src/reactor.c,
+# signalfd in libcloak-common/src/signals.c, and accept4/pipe2/
+# SOCK_NONBLOCK across nine more source files -- with ZERO portability
+# guards anywhere (a grep for __linux__, __FreeBSD__ or
+# CMAKE_SYSTEM_NAME returns nothing). Adding the platform back is a
+# kqueue backend for the reactor, not a change to this file.
 
 name: Release
 
@@ -94,69 +87,10 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------
-  freebsd:
-    name: FreeBSD (amd64)
-    # Expected to fail until the kqueue port lands -- see the header
-    # comment. Remove this line at that point so the job can gate releases.
-    continue-on-error: true
-    # There is no FreeBSD runner on GitHub Actions; this boots one in a VM
-    # on top of a Linux runner. The `run:` body below executes inside that
-    # VM, not on the host, so everything it needs must be installed there.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and package inside a FreeBSD VM
-        uses: vmactions/freebsd-vm@v1
-        with:
-          release: "14.2"
-          usesh: true
-          # OpenSSL ships in the FreeBSD base system, so only cmake and a
-          # toolchain are fetched. clang is base too.
-          prepare: |
-            pkg install -y cmake
-          run: |
-            set -eu
-            VERSION="${GITHUB_REF_NAME#v}"
-            PKG="cloak-c-${VERSION}-freebsd-amd64"
-
-            cmake -S . -B build \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCLOAK_VERSION="${GITHUB_REF_NAME}"
-            cmake --build build -j"$(sysctl -n hw.ncpu)"
-
-            # The VM is slower and more contended than the Linux runner, and
-            # this suite has wall-clock assertions, so the tests run
-            # single-threaded here.
-            ctest --test-dir build -j1 --output-on-failure
-
-            mkdir -p "dist/${PKG}"
-            cp build/cmd/ck-server/ck-server "dist/${PKG}/"
-            cp build/cmd/ck-client/ck-client "dist/${PKG}/"
-            cp README.md LICENSE "dist/${PKG}/"
-            strip "dist/${PKG}/ck-server" "dist/${PKG}/ck-client"
-            tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
-            (cd dist && sha256 -r "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
-            ls -l dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist-freebsd-amd64
-          path: dist/*.tar.gz*
-          # Not `error`: while the FreeBSD build is known to fail, the
-          # packaging step never runs and there is nothing to upload. That
-          # must not turn into a second, confusing red X on top of the
-          # real one.
-          if-no-files-found: warn
-
-  # ---------------------------------------------------------------------
   release:
     name: Publish release
-    needs: [ubuntu, freebsd]
-    # `always()` so a red FreeBSD job does not withhold the Ubuntu
-    # binaries; the explicit ubuntu check keeps a genuinely broken Linux
-    # build from being published anyway.
-    if: always() && needs.ubuntu.result == 'success' && startsWith(github.ref, 'refs/tags/')
+    needs: [ubuntu]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -181,7 +115,5 @@ jobs:
             **Linux (x86_64)** — built on Ubuntu 22.04; glibc and OpenSSL are
             linked dynamically, so it runs on 22.04 and newer.
 
-            **FreeBSD (amd64)** — not published yet. The reactor uses `epoll`
-            and `signalfd`, which FreeBSD does not have; the build job is in
-            the pipeline and will start producing artefacts once a `kqueue`
-            backend lands.
+            Linux is the only platform for now: the reactor uses `epoll` and
+            `signalfd`, so a FreeBSD build needs a `kqueue` backend first.

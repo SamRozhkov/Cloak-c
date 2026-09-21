@@ -233,6 +233,11 @@ it and, just as importantly, what it cannot see.
 
 ## What is not here yet
 
+- **Linux only.** The reactor is built on `epoll` and the signal handling on
+  `signalfd`, with `accept4`, `pipe2` and `SOCK_NONBLOCK` used throughout and
+  no portability guards anywhere in the tree. FreeBSD and macOS need a
+  `kqueue` backend behind the reactor's interface before they can build at
+  all — a real piece of work, not a compiler flag.
 - **The client's CDN/WebSocket leg.** The server accepts CDN-fronted
   WebSocket connections; the client cannot yet originate them. This needs a
   real TLS stack and a decision about what fingerprint to present.
