@@ -1,15 +1,38 @@
-# Release pipeline: fires when a tag is pushed, builds ck-server and
-# ck-client for Ubuntu, and attaches the tarball to a GitHub Release named
-# after the tag.
+# Release pipeline: fires when a tag is pushed, runs the full test suite,
+# builds ck-server and ck-client for Linux, and attaches the tarball to a
+# GitHub Release named after the tag.
 #
 # Linux only, on purpose. A FreeBSD job was written and then removed
-# (see the commit that added this file) because the tree cannot build
+# (see the commit history of this file) because the tree cannot build
 # there yet: 15 epoll call sites in libcloak-common/src/reactor.c,
 # signalfd in libcloak-common/src/signals.c, and accept4/pipe2/
 # SOCK_NONBLOCK across nine more source files -- with ZERO portability
 # guards anywhere (a grep for __linux__, __FreeBSD__ or
 # CMAKE_SYSTEM_NAME returns nothing). Adding the platform back is a
 # kqueue backend for the reactor, not a change to this file.
+#
+# WHY THERE ARE TWO BUILDS, AND WHY THEY ARE NOT THE SAME BUILD
+# -------------------------------------------------------------
+# Testing and shipping want opposite things from their environment here.
+#
+# The suite cannot run on a bare runner. Five of its tests put real Go on
+# the far end -- that is the point of them, and it is how the AAD
+# divergence was eventually caught after five modules of our-encoder-
+# against-our-decoder tests missed it. test_ws_interop compiles a Go
+# oracle against gorilla/websocket at BUILD time, and four more drive Go
+# Cloak v2.12.0's own ck-client and ck-server as subprocesses at RUN
+# time. Those tests fail loudly when the binaries are absent rather than
+# skipping, which is correct and which is also why a bare `ubuntu-latest`
+# turns them red. Dockerfile.dev exists to supply exactly that
+# environment, and it is the environment every local verification of this
+# project has used.
+#
+# The released binary must not come from there. That image is Debian 12,
+# glibc 2.36, so anything built in it refuses to start on Ubuntu 22.04.
+# The artefact is therefore built on the oldest supported runner, with
+# -DCLOAK_REQUIRE_GO=OFF and only the two executables as targets -- no
+# tests are compiled in that job at all, so it needs no Go and proves
+# nothing, which is fine, because `test` has already proved it.
 
 name: Release
 
@@ -26,8 +49,47 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------
-  ubuntu:
-    name: Ubuntu (x86_64)
+  test:
+    name: Full suite (cloak-c-dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The image installs clang, llvm, a Go toolchain and builds Go
+      # Cloak's own binaries, so it is expensive to build and almost never
+      # changes. The registry cache keeps that off the critical path of
+      # every tag after the first.
+      - name: Build the dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          tags: cloak-c-dev:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # -j2 on a 4-core runner rather than -j4. Three wall-clock
+      # assertions in this suite were fixed after failing only under CPU
+      # starvation, and a hosted runner is a shared, oversubscribed
+      # machine; leaving headroom costs about a minute. There is
+      # deliberately no retry wrapper -- a red suite blocks the release.
+      - name: Build and run the suite
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
+            bash -c '
+              set -eu
+              cmake -S /src -B /tmp/build -DCMAKE_BUILD_TYPE=Debug
+              cmake --build /tmp/build -j"$(nproc)"
+              cd /tmp/build && ctest -j2 --output-on-failure
+            '
+
+  # ---------------------------------------------------------------------
+  build-linux:
+    name: Linux x86_64 binaries
+    needs: [test]
     # Pinned to the oldest supported runner on purpose: the binaries link
     # glibc and OpenSSL dynamically, so building on 22.04 lets them run on
     # 22.04 and newer, while building on 24.04 would not run on 22.04.
@@ -41,24 +103,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake libssl-dev
 
+      # CLOAK_REQUIRE_GO=OFF drops test_ws_interop, whose Go oracle is
+      # compiled at configure time and which is the only thing in the tree
+      # that needs a toolchain to BUILD. Nothing is being tested in this
+      # job, so nothing is lost: the target list below builds the two
+      # executables and not one test.
       - name: Configure
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCLOAK_REQUIRE_GO=OFF \
             -DCLOAK_VERSION="${GITHUB_REF_NAME}"
 
       - name: Build
-        run: cmake --build build -j"$(nproc)"
-
-      # Several tests in this suite measure elapsed time, and three of them
-      # were fixed this year after failing only under CPU starvation. A
-      # hosted runner is a shared, oversubscribed machine, so the suite runs
-      # at -j2 on a 4-core runner rather than -j4: leaving headroom costs
-      # about a minute and removes the contention that makes wall-clock
-      # assertions flap. There is deliberately no retry wrapper -- a red
-      # suite should block a release, not be papered over.
-      - name: Test
-        run: ctest --test-dir build -j2 --output-on-failure
+        run: cmake --build build -j"$(nproc)" --target ck-server ck-client
 
       - name: Package
         run: |
@@ -74,11 +132,14 @@ jobs:
           (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
           ls -l dist
 
-      - name: Report what the binaries link against
+      # Prints the version the binaries actually report and the libraries
+      # they actually need, so the release notes' claims are checkable
+      # against the run that produced the files.
+      - name: Report what the binaries are
         run: |
           ./build/cmd/ck-server/ck-server -v
           ./build/cmd/ck-client/ck-client -v
-          ldd build/cmd/ck-server/ck-server || true
+          ldd build/cmd/ck-server/ck-server
 
       - uses: actions/upload-artifact@v4
         with:
@@ -89,7 +150,7 @@ jobs:
   # ---------------------------------------------------------------------
   release:
     name: Publish release
-    needs: [ubuntu]
+    needs: [build-linux]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -116,4 +177,5 @@ jobs:
             linked dynamically, so it runs on 22.04 and newer.
 
             Linux is the only platform for now: the reactor uses `epoll` and
-            `signalfd`, so a FreeBSD build needs a `kqueue` backend first.
+            `signalfd`, so a FreeBSD or macOS build needs a `kqueue` backend
+            first.
