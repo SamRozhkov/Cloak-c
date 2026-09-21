@@ -393,3 +393,77 @@ were found here, none wrong when written, all wrong by now.
   it built from, so a flipped non-GREASE byte leaves it passing while the
   matrix test catches it. Pre-existing; not this branch's debt, but it is the
   module's own defect shape sitting unfixed.
+
+---
+
+## Post-merge addendum: three flakes, and one that was never named
+
+The first `ctest` run on merged `main` reported **1 failure out of 85**. The
+name was lost — the command that ran it piped ctest through a `grep` matching
+the summary line but not the name on the line after it. That is a defect in
+the instrument, not in the tree, and it is the reason this addendum exists
+instead of a one-line fix.
+
+Hunting it found **three real test defects**, none of them a regression from
+this module and none of them in shipping code:
+
+**`da380b1` — `test_valve_rate.c:1556`**, `ASSERT_TRUE(resumed > 0)` after
+`HANDOVER STALL: nothing relayed in 300 ms`. 7 of 12 at `--cpus=1` with seven
+spinners. The valve was fine: instrumented, every run relayed ~395.2 kB to
+within 0.2 %, pass and fail alike. The test released the pool, pumped 20
+turns, and only *then* took its origin, while the bucket was 2 ms in debt — so
+the resume fired inside the pump. Fixed by moving the origin before the
+release and changing the quantity from `p.drained` to `cloak_valve_tx`, which
+is charged at enqueue. 0 of 20 after.
+
+**`ae89178` — `test_signals.c:191`**, `ASSERT_EQ_INT(ctx.count, 2) -> 1 != 2`.
+3 of 12 at the same lever. The test asserted that two SIGINTs 40 ms apart
+cannot coalesce; instrumented, both timers fire in **one** reactor turn ~100 ms
+late, the two `raise()`s land back to back with SIGINT blocked, and **the
+kernel merges them** — which `cloak/signals.h`'s second-signal contract already
+disclaims. (It is `signalfd(2)`, not a self-pipe.) Fixed by raising the second
+signal from inside the first delivery, causally after that siginfo left the fd.
+0 of 20 after.
+
+**`f8f8966` — `test_dispatcher_ws.c:1476,1486`**, a 1000 µs spread over 31
+runs. Its own comment already argued the clock detected nothing, and that was
+right: porting Go's ordering in as a mutation, the clock-free assertion fails
+deterministically while the old brackets **pass** — median spread 686/663 µs,
+fastest 313/394 µs, all inside the bound. Brackets removed, every number still
+printed, replaced by a clock-free check after each of the 31x5 probes.
+
+### What makes these three worth reading together
+
+All three were fixed the same way — **anchor, do not widen.** Not one
+tolerance was loosened, no `ctest` TIMEOUT moved, nothing skipped or wrapped
+in a retry. And each fix was proved by a **mutation pair**, where the second
+mutation is the one that earns its keep:
+
+- valve: the same broken arming read from the early origin with the *old*
+  quantity **passes** — a false green off 32 KiB of already-billed residue.
+- signals: the obvious alternative fix (keep both timers, raise SIGTERM
+  second) removes the flake **and passes with the latch defect still in** —
+  which is why the repeat must stay the same signal.
+- ws: the old brackets pass against a real ordering defect.
+
+**A fix seen only to pass is not a fix.**
+
+### What is still not known
+
+- **Which test failed on merged `main` is still unidentified.** It was
+  unconstrained; all three flakes above reproduce only under starvation. The
+  candidate set is now smaller by three, and that is all that can be said.
+- **Defect 2 was never observed failing** — 0 of 12 before at the lever that
+  gives `test_signals` 3 of 12. Its removal rests entirely on the mutation,
+  not on a sighting.
+- The `--cpus=1` + 4-spinner lever, which an earlier sweep ran 20 times
+  against the 75-test suite for 0/20, now breaks several tests at once. At a
+  ~8 %/run rate a clean twenty has roughly one chance in five, so the old
+  result does not conflict with these flakes having been there all along.
+  `test_valve_rate` dates from when the suite held 45 tests, so suite growth
+  did not introduce it. Neither explanation is asserted.
+- `test_client_stack.c:1845,2140` are unanchored wall-clock upper bounds, and
+  every `ASSERT_TRUE(pump_until(...))` in that file is wall-clock budgeted:
+  starvation candidates, unexamined.
+- `test_replay_cache_keyed` (TIMEOUT 600) **dominates a starved full-suite
+  run** — it alone ran for minutes after the other 84 finished.
