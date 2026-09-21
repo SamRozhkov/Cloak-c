@@ -1573,7 +1573,9 @@ static void test_safari_grease_varies_between_handshakes(void) {
  * tmpl->grease_positions, because a check that asks the template where
  * its GREASE is and then compares those bytes to each other can only
  * confirm that the template agrees with itself. Both were measured to be
- * blind that way, by mutation, with the whole 85-binary suite green:
+ * blind that way, by mutation. That the PRE-FIX tree passed all 85
+ * binaries under each of them is the re-review's measurement, read here
+ * rather than re-taken; what was measured here is the other half, below:
  *
  *   MUT-E: re-tag chrome offset 1478 and safari offset 162 (the
  *   supported_groups GREASE) as CLOAK_CH_GREASE_CIPHER. 15 of every 16
@@ -1588,9 +1590,12 @@ static void test_safari_grease_varies_between_handshakes(void) {
  *   notices, because the dropped position is simply never read. Caught
  *   only by grease_positions_are_complete_for below.
  *
- * Both mutations were applied, built and run; each makes exactly the
- * named case fail and is reverted. Nothing in this section consults
- * tmpl->grease_positions to decide WHERE to look. */
+ * Both mutations were applied to libcloak-common/src/clienthello.c,
+ * rebuilt, and run through the WHOLE suite with these cases in place:
+ * each fails test_clienthello and no other binary -- 84 of 85 pass --
+ * so each gap is closed by exactly the case named above it and by
+ * nothing that already existed. Both were then reverted. Nothing in this
+ * section consults tmpl->grease_positions to decide WHERE to look. */
 
 #define MAX_CH_SLOTS 64
 
