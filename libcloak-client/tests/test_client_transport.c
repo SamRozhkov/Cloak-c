@@ -668,29 +668,6 @@ static void test_partial_client_hello_write(void) {
     memset(&res, 0, sizeof(res));
     int fd = connect_nonblocking_ex(fake_server_port(&fs), 1);
     ASSERT_TRUE(fd >= 0);
-
-    /* CAP THE CLIENT'S OWN SEND BUFFER TOO, OR THE PREMISE IS A BET ON
-     * THE KERNEL RATHER THAN A CONSTRUCTION.
-     *
-     * A tiny SO_RCVBUF on the listener stops the PEER from receiving; it
-     * does not stop this socket's send buffer from swallowing the whole
-     * ClientHello in one write(), and epoll calls the fd writable while
-     * that buffer has room regardless of the peer's window. On Linux
-     * 6.17.0-1022-azure that is exactly what happened: stuffed=3776,
-     * hello_len=1821, write_calls=1, and both assertions below failed on
-     * 5 runs out of 5 -- deterministically, not as a flake -- while the
-     * same code on 6.12.76-linuxkit produced the short write the test
-     * was written around. The diagnostic fprintf below is what said so.
-     *
-     * SO_SNDBUF=1 is clamped up to the kernel's floor (SOCK_MIN_SNDBUF,
-     * 4608 on Linux), which is the point: the stuffing loop then fills a
-     * buffer small enough that freeing 64 bytes at a time cannot leave
-     * room for a ClientHello, on any kernel whose floor is below it.
-     * ASSERT_TRUE(h.hello_len > 1024) below already pins the other half
-     * of that inequality. */
-    int tiny_sndbuf = 1;
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &tiny_sndbuf, sizeof(tiny_sndbuf));
-
     pump_until_accepted(r, &fs);
 
     /* Stuff the connection until the kernel refuses more. The 1KB chunk
