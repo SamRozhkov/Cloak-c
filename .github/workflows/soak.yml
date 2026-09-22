@@ -1,0 +1,119 @@
+# The growth harness, on demand.
+#
+# WHY IT IS HERE AT ALL, GIVEN THAT IT IS DELIBERATELY OUT-OF-BAND.
+# docs/runbooks/soak-growth.md argues -- with numbers -- that a long run
+# does not belong in `ctest`: a 60-second case would be several times the
+# suite's longest test for a fraction of the sensitivity, and its most
+# sensitive column is inert under ASan. None of that is a reason for the
+# harness to be hard to run. This job is the runbook, executed: one click,
+# no local toolchain, and the three runs the runbook defines.
+#
+# AND ONE REASON THAT IS NEW. Every number the runbook quotes was measured
+# on aarch64, on a host where transparent hugepages are `always`. Two tests
+# in this project have now been caught assuming a platform -- a fuzz oracle
+# that trusted FIONREAD and a partial-write case that bet on the kernel's
+# send-buffer arithmetic -- and both were found the first time anything ran
+# on x86_64. A measuring instrument calibrated on one platform and quoted as
+# fact on all of them is the same shape of mistake, one level up. This job
+# is how that gets checked rather than assumed.
+#
+# It is manual: a soak costs minutes of runner time and answers a question
+# nobody asks on every push.
+
+name: Soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Duration of each of the three runs, in seconds"
+        required: false
+        default: "240"
+
+jobs:
+  soak:
+    name: Growth (A/B/C)
+    runs-on: ubuntu-latest
+    # The runbook's own runs are 900 s each and they run concurrently, so
+    # the ceiling is one run's length plus build and analysis, not three.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          tags: cloak-c-dev:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Before the measurement, the instrument. analyze.py ships a
+      # --self-check that runs it against synthetic data with known
+      # answers; two of its regressions were found that way and are
+      # pinned by it. If it fails, nothing below means anything.
+      - name: Self-check the analyzer
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
+            bash -c 'python3 tools/soak/analyze.py --self-check'
+
+      - name: Build the harness
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
+            bash -c '
+              set -eu
+              cmake -S /src -B /tmp/soak -DCMAKE_BUILD_TYPE=Release -DCLOAK_BUILD_SOAK=ON
+              cmake --build /tmp/soak --target soak_growth -j"$(nproc)"
+            '
+
+      # The three runs the runbook defines, and the reason C exists is
+      # worth repeating here: it retains 64 reachable bytes per cycle, so
+      # LeakSanitizer sees nothing and the fit must. If C does not light
+      # up, A and B are not evidence of anything.
+      - name: Run A, B and C
+        env:
+          SECONDS_EACH: ${{ inputs.seconds }}
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/soak-out"
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src \
+            -e SECONDS_EACH="${SECONDS_EACH}" cloak-c-dev:latest \
+            bash -c '
+              set -eu
+              echo "transparent_hugepage: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo unavailable)"
+              uname -m; uname -r
+              S="${SECONDS_EACH}"
+              O=/src/soak-out
+              /tmp/soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
+                  --concurrency=16 --cycle-ms=20 --csv="$O/runA.csv" &
+              /tmp/soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
+                  --concurrency=16 --cycle-ms=20 --replay-capacity=4096 \
+                  --csv="$O/runB.csv" &
+              /tmp/soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
+                  --concurrency=16 --cycle-ms=20 --replay-capacity=4096 \
+                  --leak-bytes=64 --csv="$O/runC.csv" &
+              wait
+            '
+
+      - name: Fit
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
+            bash -c '
+              set -eu
+              for r in A B C; do
+                echo "================ run $r ================"
+                python3 tools/soak/analyze.py "/src/soak-out/run$r.csv" --skip-seconds=30
+              done
+              echo "================ run B, windowed ================"
+              python3 tools/soak/analyze.py /src/soak-out/runB.csv --skip-seconds=30 --window=60
+            ' | tee "${GITHUB_WORKSPACE}/soak-out/analysis.txt"
+
+      # Kept so the fit can be re-derived from the same rows later, which
+      # is the whole reason a 240 s artefact is committed in tools/soak at
+      # all: the runbook's 900 s numbers are not reproducible from the
+      # tree, and it says so.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soak-csv-and-analysis
+          path: soak-out/*
+          if-no-files-found: error
