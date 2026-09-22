@@ -155,6 +155,29 @@ bit-identical across it either way. A non-THP host that *does* see run B
 climb has found something this harness did not, and that is worth
 chasing.
 
+**That prediction has now been tested, and it held.** The Soak workflow
+(`.github/workflows/soak.yml`) ran the same three runs on a GitHub x86_64
+runner, kernel 6.17.0-1022-azure, where THP is not `always`. Artefact:
+`tools/soak/artefacts/x86_64-{A,B,C}.csv` and `x86_64-analysis.txt`,
+240 s each, beside the aarch64 set. What it shows:
+
+- `rss_anon_huge_kb` reads **0 for every sample of all three runs**, as
+  predicted.
+- Run B's `rss_anon_kb` goes **2108 -> 2120 kB** across the run. The
+  ~11 MB rise published from the THP host is absent, not relocated.
+- Run A still shows the replay cache becoming resident and nothing else:
+  `rss_anon_kb` 81,940 -> 92,360 kB while `hblkhd` sits at 8.412e7 the
+  whole run, and `uordblks`, `arena`, `fds`, `timers`, `sessions`,
+  `proxy_streams` and `proxy_sessions` are bit-identical first sample to
+  last.
+- Run C lights up: `uordblks` 1.582e7 B/hr against a column that is
+  exactly 0 in A and B. The instrument works on this platform too, which
+  is what makes A and B evidence rather than silence.
+
+So the harness's conclusions survive the platform change, and the one
+column the runbook warned was host-dependent behaved exactly as the
+warning said it would. That is worth more than the warning was.
+
 **`analyze.py` has a self-check; run it.** `python3 tools/soak/analyze.py
 --self-check` drives the tool against synthetic data with known answers.
 It is deliberately not a ctest case (`cloak-c-dev` has no python3, so it
