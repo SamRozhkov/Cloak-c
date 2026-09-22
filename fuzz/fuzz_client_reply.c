@@ -81,7 +81,10 @@
  *
  *   O1 CONSERVATION / NO OVER-READ. Every byte written to the peer is
  *      either counted in h->reply_bytes or still sitting unread in the
- *      client's socket: FIONREAD(fd) + h->reply_bytes == bytes written.
+ *      client's socket: unread(fd) + h->reply_bytes == bytes written,
+ *      where unread() drains the socket and counts, rather than asking
+ *      FIONREAD -- see drain_unread below for the measurement that
+ *      forced the change.
  *      This is the guarantee the header calls load-bearing -- "a byte of
  *      the session's first frame consumed here would be silently lost
  *      and the session would desynchronise immediately" -- and it is
@@ -127,11 +130,11 @@
 #include "cloak/crypto.h"
 #include "cloak/reactor.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -272,12 +275,44 @@ static int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static size_t readable_bytes(int fd) {
-    int n = 0;
-    if (ioctl(fd, FIONREAD, &n) != 0 || n < 0) {
-        return 0;
+/* O1'S INSTRUMENT, AND WHY IT IS NOT FIONREAD.
+ *
+ * This used to ask FIONREAD how many bytes were still unread. FIONREAD is
+ * not exact for an AF_UNIX stream socket across kernels, and the error is
+ * not hypothetical: on the SAME corpus input (client_reply/02abce5c...),
+ * with byte-identical reader state on both sides -- reply_bytes 122,
+ * written 215, status FAILED, err 5, sh_len 112, header_len 5,
+ * body_total 34438 -- FIONREAD reported
+ *
+ *     93 on Linux 6.12.76-linuxkit (aarch64)
+ *     95 on Linux 6.17.0-1022-azure (x86_64)
+ *
+ * for the same 215 bytes written and 122 consumed. Two of those bytes
+ * exist only in the kernel's answer. O1 then fired on every x86_64 run
+ * (40/40) and on none locally (0/40), reporting "the reader consumed more
+ * than it accounted for" about a reader that had consumed exactly the
+ * right number -- the accounting was over, not under, which the old
+ * message could not say.
+ *
+ * So the remainder is now MEASURED rather than asked for: read the socket
+ * dry and count what comes out. Nothing after O1 reads this fd again --
+ * every later oracle inspects `h`, `stream` and `ref` -- so draining here
+ * costs nothing. */
+static size_t drain_unread(int fd) {
+    size_t total = 0;
+    uint8_t buf[4096];
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
     }
-    return (size_t)n;
+    return total;
 }
 
 /* Everything the structural invariants (O6) say about h, checked after
@@ -457,9 +492,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     cloak_client_handshake_status_t status = cloak_client_handshake_status(&h);
     cloak_client_handshake_error_t err = cloak_client_handshake_error(&h);
 
-    /* O1: every byte written is either accounted for or still unread. */
-    FUZZ_CHECK(readable_bytes(sv[0]) + h.reply_bytes == written,
-               "bytes vanished: the reader consumed more than it accounted for");
+    /* O1: every byte written is either accounted for or still unread.
+     * The message names both directions, because the one time this fired
+     * it fired the other way: see drain_unread above. */
+    FUZZ_CHECK(drain_unread(sv[0]) + h.reply_bytes == written,
+               "conservation broken: unread + reply_bytes is not the number of bytes written");
 
     ref_t ref;
     reference_scan(stream, written, &ref);
