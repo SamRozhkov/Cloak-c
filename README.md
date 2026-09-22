@@ -1,5 +1,7 @@
 # Cloak-c
 
+[![CI](https://github.com/SamRozhkov/Cloak-c/actions/workflows/ci.yml/badge.svg)](https://github.com/SamRozhkov/Cloak-c/actions/workflows/ci.yml)
+
 A C11 port of [Cloak](https://github.com/cbeuw/Cloak) — a pluggable transport
 that disguises a proxy server as a normal web server, so that the traffic
 resists active probing and protocol fingerprinting.
@@ -206,6 +208,29 @@ cd build && ctest -j4
 85 test binaries, about 45 seconds wall-clock at `-j4`. Always go through
 `ctest` rather than running a test binary directly — several tests need the
 working directory and the fixtures CTest sets up.
+
+Five of those tests put **real Go** on the far end — one compiles a Go oracle
+against `gorilla/websocket` at build time, four drive Go Cloak v2.12.0's own
+`ck-client` and `ck-server` as subprocesses — and they fail loudly rather
+than skipping when those binaries are absent. `Dockerfile.dev` builds an
+image that supplies them, and that is what CI uses:
+
+```sh
+docker build -f Dockerfile.dev -t cloak-c-dev .
+docker run --rm -v "$PWD":/src -w /src cloak-c-dev \
+    bash -c 'cmake -S . -B /tmp/b -DCMAKE_BUILD_TYPE=Debug \
+             && cmake --build /tmp/b -j && cd /tmp/b && ctest -j4'
+```
+
+To build without a Go toolchain, configure with `-DCLOAK_REQUIRE_GO=OFF`;
+that removes `test_ws_interop` and says so. The other four still need Go's
+binaries at run time.
+
+CI runs both the Debug suite and an ASan+UBSan+LSan pass on every push to
+`main`, on x86_64. Note that the project was developed on aarch64, and the
+first x86_64 run found two tests whose assumptions were wrong on that
+kernel — so if you build on a third platform, treat a green suite as news
+rather than as a formality.
 
 Under the sanitizers:
 
