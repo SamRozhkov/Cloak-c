@@ -53,18 +53,24 @@ jobs:
       # --self-check that runs it against synthetic data with known
       # answers; two of its regressions were found that way and are
       # pinned by it. If it fails, nothing below means anything.
+      # ON THE RUNNER, NOT IN THE IMAGE. cloak-c-dev has no python3 --
+      # measured, not assumed: the first dispatch of this workflow died
+      # here with "bash: line 1: python3: command not found", exit 127.
+      # That absence is also why analyze.py is deliberately not a ctest
+      # case; its own docstring says so.
       - name: Self-check the analyzer
-        run: |
-          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
-            bash -c 'python3 tools/soak/analyze.py --self-check'
+        run: python3 tools/soak/analyze.py --self-check
 
       - name: Build the harness
         run: |
           docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
             bash -c '
               set -eu
-              cmake -S /src -B /tmp/soak -DCMAKE_BUILD_TYPE=Release -DCLOAK_BUILD_SOAK=ON
-              cmake --build /tmp/soak --target soak_growth -j"$(nproc)"
+              # Into the MOUNTED workspace, not /tmp: every step here is
+              # its own --rm container, so a binary built in /tmp would
+              # not exist by the time the next step tried to run it.
+              cmake -S /src -B /src/build-soak -DCMAKE_BUILD_TYPE=Release -DCLOAK_BUILD_SOAK=ON
+              cmake --build /src/build-soak --target soak_growth -j"$(nproc)"
             '
 
       # The three runs the runbook defines, and the reason C exists is
@@ -84,29 +90,30 @@ jobs:
               uname -m; uname -r
               S="${SECONDS_EACH}"
               O=/src/soak-out
-              /tmp/soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
+              /src/build-soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
                   --concurrency=16 --cycle-ms=20 --csv="$O/runA.csv" &
-              /tmp/soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
+              /src/build-soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
                   --concurrency=16 --cycle-ms=20 --replay-capacity=4096 \
                   --csv="$O/runB.csv" &
-              /tmp/soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
+              /src/build-soak/tools/soak/soak_growth --seconds="$S" --sample-ms=1000 \
                   --concurrency=16 --cycle-ms=20 --replay-capacity=4096 \
                   --leak-bytes=64 --csv="$O/runC.csv" &
               wait
             '
 
+      # Also on the runner: same reason as the self-check above.
       - name: Fit
         run: |
-          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
-            bash -c '
-              set -eu
-              for r in A B C; do
-                echo "================ run $r ================"
-                python3 tools/soak/analyze.py "/src/soak-out/run$r.csv" --skip-seconds=30
-              done
-              echo "================ run B, windowed ================"
-              python3 tools/soak/analyze.py /src/soak-out/runB.csv --skip-seconds=30 --window=60
-            ' | tee "${GITHUB_WORKSPACE}/soak-out/analysis.txt"
+          set -eu
+          sudo chown -R "$(id -u):$(id -g)" soak-out
+          {
+            for r in A B C; do
+              echo "================ run $r ================"
+              python3 tools/soak/analyze.py "soak-out/run$r.csv" --skip-seconds=30
+            done
+            echo "================ run B, windowed ================"
+            python3 tools/soak/analyze.py soak-out/runB.csv --skip-seconds=30 --window=60
+          } | tee soak-out/analysis.txt
 
       # Kept so the fit can be re-derived from the same rows later, which
       # is the whole reason a 240 s artefact is committed in tools/soak at
