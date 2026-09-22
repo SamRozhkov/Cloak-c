@@ -40,6 +40,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -668,6 +669,34 @@ static void test_partial_client_hello_write(void) {
     memset(&res, 0, sizeof(res));
     int fd = connect_nonblocking_ex(fake_server_port(&fs), 1);
     ASSERT_TRUE(fd >= 0);
+
+    /* TCP_NOTSENT_LOWAT IS WHAT MAKES THE SHORT WRITE A CONSTRUCTION
+     * RATHER THAN A BET ON THE KERNEL'S BUFFER ARITHMETIC.
+     *
+     * A small SO_SNDBUF (connect_nonblocking_ex's `small_buffers`, above)
+     * is not enough on its own, and the failure was not hypothetical:
+     * on Linux 6.17.0-1022-azure this case failed 10 times out of 10
+     * with stuffed=3776, hello_len=1725..1821, write_calls=1, while the
+     * same code on 6.12.76-linuxkit produced stuffed=3776,
+     * hello_len=1757, write_calls=2. Identical buffer, opposite verdict.
+     *
+     * The reason is that Linux only reports EPOLLOUT once about half the
+     * send buffer is free -- roughly 2304 bytes against the 4608-byte
+     * floor -- and no ClientHello this client can build is that long.
+     * Measured, not assumed: stretching the server name to 242
+     * characters, the longest this config accepts, moved hello_len only
+     * from 1757 to 1952. So on a kernel that applies the rule strictly,
+     * the whole hello always fits in the first write and the resume path
+     * is simply unreachable this way.
+     *
+     * TCP_NOTSENT_LOWAT caps the UNSENT bytes the kernel will queue, so
+     * sendmsg returns a short count and the next writable edge comes
+     * when that queue drains below the cap. That is the same resume the
+     * case is about, and it does not depend on the buffer arithmetic
+     * that differs between kernels. */
+    int lowat = 128;
+    setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
+
     pump_until_accepted(r, &fs);
 
     /* Stuff the connection until the kernel refuses more. The 1KB chunk
