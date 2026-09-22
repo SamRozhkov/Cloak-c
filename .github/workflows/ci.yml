@@ -1,0 +1,90 @@
+# The suite on every push to main and every pull request.
+#
+# WHY THIS EXISTS SEPARATELY FROM release.yml. That workflow runs the suite
+# too, but only when a tag is pushed -- so until now a regression could sit
+# on main until release day and be discovered by the release. The first tag
+# this project ever cut did exactly that: it went red on two tests, and
+# both had been broken on main for as long as x86_64 had gone unmeasured.
+#
+# Both jobs run inside cloak-c-dev for the reason release.yml spells out:
+# five tests in this suite put real Go on the far end, and they fail loudly
+# rather than skipping when its binaries are absent.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's answer stale, so
+# it is cancelled rather than left to finish and confuse the history.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    name: Debug suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          tags: cloak-c-dev:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # -j2 on a 4-core runner rather than -j4. Several assertions in this
+      # suite measure elapsed time, and a hosted runner is a shared,
+      # oversubscribed machine; leaving headroom costs about a minute.
+      # There is deliberately no retry wrapper -- a red suite is an answer.
+      - name: Build and test
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
+            bash -c '
+              set -eu
+              cmake -S /src -B /tmp/build -DCMAKE_BUILD_TYPE=Debug
+              cmake --build /tmp/build -j"$(nproc)" 2>&1 | tee /tmp/build.log
+              ! grep -q "warning:" /tmp/build.log
+              cd /tmp/build && ctest -j2 --output-on-failure
+            '
+
+  sanitizers:
+    name: ASan + UBSan + LSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          tags: cloak-c-dev:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # halt_on_error so a UBSan report fails the run instead of being
+      # printed and passed over; detect_leaks is on because this project
+      # has a whole soak harness devoted to the growth LSan CANNOT see,
+      # and the part it can see should not go unwatched.
+      - name: Build and test under sanitizers
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src \
+            -e ASAN_OPTIONS=detect_leaks=1 \
+            -e UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            cloak-c-dev:latest \
+            bash -c '
+              set -eu
+              cmake -S /src -B /tmp/asan -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+              cmake --build /tmp/asan -j"$(nproc)"
+              cd /tmp/asan && ctest -j2 --output-on-failure
+            '
