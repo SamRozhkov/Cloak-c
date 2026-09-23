@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "cloak/conn.h"
 
 #include <errno.h>
@@ -35,7 +36,7 @@
  * sized so it cannot fill (cloak_conn_init). */
 static uint32_t conn_desired_interest(const cloak_conn_t *c) {
     uint32_t events = 0;
-    if (!c->read_paused) {
+    if (!c->read_paused && !c->rx_backpressure) {
         events |= CLOAK_REACTOR_READABLE;
     }
     if (c->want_writable) {
@@ -186,6 +187,24 @@ static void conn_tls_extract_and_dispatch(cloak_conn_t *c) {
         }
         if (c->broken) {
             return; /* the callback may have torn c down re-entrantly */
+        }
+        /* THE PART THAT MAKES THE PAUSE MEAN ANYTHING.
+         *
+         * The callback above may have filled a stream to its watermark
+         * and switched this connection's backpressure on. Reading the
+         * interest mask is not enough to act on that: this loop is
+         * already inside one readable event, with a whole socket buffer
+         * worth of envelopes decoded and waiting in recv_acc, and it
+         * would deliver every one of them before the reactor ever
+         * consulted the mask again. Measured: one call delivered 56 more
+         * frames after the pause, which is exactly what overflowed the
+         * receive heap and dropped the frame that killed the stream.
+         *
+         * Stopping here leaves the rest of recv_acc untouched -- nothing
+         * is decrypted until it is dispatched -- so cloak_conn_set_rx_-
+         * backpressure(c, 0) resumes precisely where this left off. */
+        if (c->rx_backpressure) {
+            return;
         }
     }
 }
@@ -520,6 +539,16 @@ static void conn_rx_resume_cb(cloak_reactor_t *r, void *userdata) {
 }
 
 static void conn_handle_readable(cloak_conn_t *c) {
+    if (c->rx_backpressure) {
+        return;
+    }
+    /* Envelopes left in recv_acc by a previous pause come out before any
+     * new byte is read, or a resume would read the socket while already
+     * holding undelivered frames and grow recv_acc without bound. */
+    conn_extract_and_dispatch(c);
+    if (c->broken || c->rx_backpressure) {
+        return;
+    }
     for (;;) {
         size_t room = cloak_bytequeue_free_space(&c->recv_acc);
         if (room == 0) {
@@ -586,9 +615,30 @@ static void conn_handle_readable(cloak_conn_t *c) {
         cloak_valve_add_rx(c->valve, (int64_t)n);
         cloak_bytequeue_write(&c->recv_acc, tmp, (size_t)n); /* always fits: n <= room */
         conn_extract_and_dispatch(c);
-        if (c->broken) {
+        if (c->broken || c->rx_backpressure) {
             return;
         }
+    }
+}
+
+void cloak_conn_set_rx_backpressure(cloak_conn_t *c, int on) {
+    if (c == NULL || c->broken) {
+        return;
+    }
+    on = on ? 1 : 0;
+    if (c->rx_backpressure == on) {
+        return;
+    }
+    c->rx_backpressure = on;
+    conn_sync_interest(c);
+    if (!on && !c->read_paused) {
+        /* THE SAME REDUNDANT PAIR conn_rx_resume_cb DOCUMENTS, and for
+         * the same reason: conn_sync_interest's 0 -> READABLE transition
+         * re-arms an edge-triggered fd and re-reports what is already in
+         * the socket, and this call pulls it directly. Either alone would
+         * usually do; together they mean a resume cannot depend on an
+         * epoll_ctl(EPOLL_CTL_MOD) detail being what we think it is. */
+        conn_handle_readable(c);
     }
 }
 

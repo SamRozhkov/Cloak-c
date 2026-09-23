@@ -199,6 +199,52 @@ void cloak_stream_destroy(cloak_stream_t *s) {
     memset(s, 0, sizeof(*s));
 }
 
+
+/* Recomputes receive-side saturation and fires the owner's callback only
+ * when it changes.
+ *
+ * THE WATERMARK IS HALF THE HEAP, NOT THE WHOLE OF IT, and that slack is
+ * the entire point. Frames already sitting in the connection's socket
+ * buffer, and frames already parsed out of one read batch, arrive AFTER
+ * the decision to stop reading -- backpressure is never instantaneous.
+ * Pausing only once the heap is completely full would leave nowhere to
+ * put them and drop exactly the frame the pause existed to save. At the
+ * default max_pending_frames of 64 this keeps 32 frames -- about 516 KB
+ * at the usual maximum payload -- in reserve for that flight.
+ *
+ * The recv_bytes half of the test is what actually fires in a healthy
+ * bulk transfer: frames arrive in order, try_drain moves each into
+ * recv_bytes, and the heap stays near empty until recv_bytes fills. The
+ * heap half catches the out-of-order case, where try_drain cannot
+ * advance at all. */
+static void stream_update_saturation(cloak_stream_t *s) {
+    int now = 0;
+    if (s->ordering != CLOAK_SESSION_ORDERING_UNORDERED) {
+        now = cloak_bytequeue_free_space(&s->recv_bytes) < s->max_payload_per_frame ||
+              s->heap_len * 2 >= s->max_pending_frames;
+    }
+    if (now == s->recv_saturated) {
+        return;
+    }
+    s->recv_saturated = now;
+    if (s->on_saturation != NULL) {
+        s->on_saturation(s->on_saturation_userdata, now);
+    }
+}
+
+int cloak_stream_recv_saturated(const cloak_stream_t *s) {
+    return s == NULL ? 0 : s->recv_saturated;
+}
+
+void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata, int saturated),
+                                    void *userdata) {
+    if (s == NULL) {
+        return;
+    }
+    s->on_saturation = cb;
+    s->on_saturation_userdata = userdata;
+}
+
 long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
     if (s->write_closed) {
         return -1;
@@ -408,11 +454,21 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
     pf.payload_len = frame->payload_len;
 
     if (heap_push(s, pf) != 0) {
+        /* Now genuinely a misbehaving peer rather than ordinary
+         * congestion: with backpressure in place, in-order traffic pauses
+         * the connection at the half-heap watermark long before this, so
+         * reaching a full heap means a peer sending far-future sequence
+         * numbers it never intends to fill in. Retiring the stream is the
+         * right answer to that, and was always the right answer -- what
+         * was wrong was reaching here on a perfectly ordinary transfer. */
         free(payload_copy);
+        stream_update_saturation(s);
         return -1;
     }
 
-    return try_drain(s);
+    int rc = try_drain(s);
+    stream_update_saturation(s);
+    return rc;
 }
 
 long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
@@ -437,6 +493,10 @@ long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
     size_t n = cloak_bytequeue_read(&s->recv_bytes, out, out_cap);
     if (n > 0) {
         try_drain(s);
+        /* The resume half. try_drain has already refilled recv_bytes from
+         * the heap where it could, so this sees the state the next frame
+         * will actually meet. */
+        stream_update_saturation(s);
         return (long)n;
     }
     if (cloak_bytequeue_is_eof(&s->recv_bytes)) {

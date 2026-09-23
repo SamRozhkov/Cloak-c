@@ -149,6 +149,7 @@ struct cloak_switchboard {
     /* Borrowed, may be NULL ("this pool is not metered"). Forwarded to
      * every cloak_conn_t this pool creates -- see cloak/valve.h. */
     cloak_valve_t *valve;
+    int rx_backpressure; /* 1 while every conn has READABLE dropped for a full stream */
 };
 
 /* max_frame_len/conn_send_queue_cap are forwarded unchanged to every
@@ -223,6 +224,11 @@ void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard
  * successful write); each connection counts the RX half as it reads. See
  * cloak/valve.h before touching either -- rx and tx are from the SERVER's
  * perspective and are NOT the user manager's up/down. */
+/* Stops or resumes reading on EVERY connection in this switchboard
+ * because a stream downstream is full. See cloak_conn_set_rx_backpressure.
+ * A connection added while this is on starts paused. */
+void cloak_switchboard_set_rx_backpressure(cloak_switchboard_t *sb, int on);
+
 void cloak_switchboard_set_valve(cloak_switchboard_t *sb, cloak_valve_t *v);
 
 /* Summed over every connection in the pool. An empty pool reports 0 for

@@ -103,6 +103,30 @@ typedef struct {
      * returning -1 would retire a stream over transient backpressure. */
     uint64_t recv_dropped_datagrams;
 
+    /* ORDERED only: receive-side backpressure.
+     *
+     * The unordered comment above states this port's deliberate
+     * divergence -- Go blocks the writer, a single-threaded reactor
+     * cannot, so a full datagram queue drops the newest. For DATAGRAMS
+     * that is defensible: a UDP application is already written against
+     * loss. The ORDERED path inherited the same shape and it is NOT
+     * defensible there, because a gap in the sequence can never be
+     * filled: once one frame is dropped, next_recv_seq can never advance
+     * past it and every later frame sits on the heap forever. Measured,
+     * not argued: a 1 MiB transfer through the full stack stopped dead at
+     * 606,569 bytes with `heap_len=64 max=64 recv_len=59392
+     * recv_free=6144` and never moved again in 80 seconds of pumping.
+     *
+     * The premise "a single-threaded reactor cannot block the writer" is
+     * true only of BLOCKING. It can stop READING, which is what TCP
+     * backpressure is for and what these two fields drive: the stream
+     * reports when it can no longer accept a maximum-size frame, the
+     * session counts how many of its streams say so, and the switchboard
+     * drops READABLE from every connection until they drain. */
+    int recv_saturated;
+    void (*on_saturation)(void *userdata, int saturated);
+    void *on_saturation_userdata;
+
     /* BOTH modes, with subtly different meanings. ORDERED: a closing
      * frame has been drained INTO ORDER (it reached next_recv_seq).
      * UNORDERED: a closing frame has ARRIVED, full stop -- there is no
@@ -167,6 +191,16 @@ typedef struct {
  * too small to ever hold this stream's own largest possible frame
  * payload, which would otherwise let a single oversized frame wedge the
  * stream permanently). */
+/* Whether this stream can no longer accept a maximum-size frame. Always 0
+ * in unordered mode, which drops rather than backpressures on purpose --
+ * see recv_dropped_datagrams. */
+int cloak_stream_recv_saturated(const cloak_stream_t *s);
+
+/* Fires ONLY on a change, with the new value, so the owner can keep a
+ * count rather than rescan. Set before the stream carries any traffic. */
+void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata, int saturated),
+                                    void *userdata);
+
 int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *obfuscator,
                        size_t max_on_wire_size, size_t recv_capacity, size_t max_pending_frames,
                        cloak_session_ordering_t ordering,

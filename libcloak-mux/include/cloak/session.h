@@ -179,6 +179,12 @@ struct cloak_session {
 
     uint32_t next_stream_id;
     size_t active_stream_count;
+    /* How many of this session's live streams currently report that they
+     * cannot accept another maximum-size frame. Nonzero means every
+     * connection has READABLE dropped -- see
+     * cloak_switchboard_set_rx_backpressure. A count rather than a rescan
+     * because the streams themselves report only transitions. */
+    size_t saturated_streams;
 
     size_t max_on_wire_size;
     size_t stream_recv_capacity;

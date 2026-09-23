@@ -311,6 +311,15 @@ struct cloak_conn {
     int read_paused;
     cloak_timer_id_t rx_resume_timer; /* CLOAK_TIMER_INVALID when none is pending */
 
+    /* 1 while READABLE has been dropped because a STREAM this connection
+     * feeds cannot take another frame. Deliberately a second flag rather
+     * than a second writer of read_paused: the two pauses have different
+     * owners and different resumes -- the one above is the valve's and
+     * only the clock ends it, this one is the session's and only a
+     * consumer draining ends it -- and a single flag would let whichever
+     * resumed first re-arm reads the other still needs stopped. */
+    int rx_backpressure;
+
     uint32_t interest; /* the mask currently registered with the reactor */
 };
 
@@ -457,6 +466,16 @@ void cloak_conn_set_valve(cloak_conn_t *c, cloak_valve_t *v);
  * cloak_conn_init. A producer should treat queued approaching capacity as
  * "stop producing": cloak_conn_send fails once a frame no longer fits,
  * and that failure is fatal to the whole pool, not just this connection. */
+/* Stops or resumes reading because a consumer downstream is full. This is
+ * the receive-side mirror of the send-side budget in stream_relay.c, and
+ * it is what makes a bounded receive buffer safe: without it the only
+ * thing a full buffer can do is drop, and a dropped frame in an ordered
+ * stream is a gap that can never be filled.
+ *
+ * Independent of the valve's own rate pause -- both must be clear before
+ * the connection reads again. */
+void cloak_conn_set_rx_backpressure(cloak_conn_t *c, int on);
+
 size_t cloak_conn_send_queued(const cloak_conn_t *c);
 size_t cloak_conn_send_capacity(const cloak_conn_t *c);
 

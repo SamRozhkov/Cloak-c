@@ -53,12 +53,56 @@ static int session_stream_sink_adapter(void *userdata, const uint8_t *bytes, siz
  * they call cloak_stream_read -- this was caught by this plan's own
  * integration test during design verification). Safe to call on an
  * already-retired stream (no-op). */
+
+/* THE RECEIVE-SIDE BACKPRESSURE HINGE.
+ *
+ * A stream calls this only when its answer CHANGES, so the count below is
+ * exact without rescanning the table, and the switchboard is touched only
+ * on the 0 <-> nonzero edge rather than once per frame.
+ *
+ * Why it must exist at all: before it, a stream that could not accept a
+ * frame dropped it. In unordered mode that is a documented, deliberate
+ * divergence (see recv_dropped_datagrams) and a UDP application survives
+ * it. In ORDERED mode the same drop is fatal -- the sequence gap can never
+ * be filled, so next_recv_seq never advances again and the stream is dead
+ * while looking healthy. A 1 MiB transfer stopped at 606,569 bytes and
+ * stayed there. */
+static void session_on_stream_saturation(void *userdata, int saturated) {
+    cloak_session_t *sesh = (cloak_session_t *)userdata;
+    if (sesh == NULL) {
+        return;
+    }
+    if (saturated) {
+        sesh->saturated_streams++;
+        if (sesh->saturated_streams == 1) {
+            cloak_switchboard_set_rx_backpressure(&sesh->sb, 1);
+        }
+        return;
+    }
+    if (sesh->saturated_streams == 0) {
+        return; /* defensive: a transition we never counted */
+    }
+    sesh->saturated_streams--;
+    if (sesh->saturated_streams == 0) {
+        cloak_switchboard_set_rx_backpressure(&sesh->sb, 0);
+    }
+}
+
 static void session_retire_stream(cloak_session_t *sesh, cloak_stream_t *stream) {
     cloak_session_stream_entry_t *entry = (cloak_session_stream_entry_t *)stream;
     if (entry->retired) {
         return;
     }
     entry->retired = 1;
+    /* Hand back its saturation before it stops being drainable. A retired
+     * stream has no consumer left to free its buffers, so a count left
+     * behind here would hold every connection paused for the life of the
+     * session -- the exact stall this mechanism exists to remove, arrived
+     * at from the other side. */
+    if (cloak_stream_recv_saturated(stream)) {
+        session_on_stream_saturation(sesh, 0);
+    }
+    cloak_stream_set_saturation_cb(stream, NULL, NULL);
     cloak_strmtab_tombstone(&sesh->streams, stream->id);
     sesh->active_stream_count--;
     if (sesh->active_stream_count == 0 && !sesh->closed) {
@@ -361,6 +405,7 @@ static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_by
         free(entry);
         return;
     }
+    cloak_stream_set_saturation_cb(stream, session_on_stream_saturation, sesh);
     if (cloak_strmtab_insert_active(&sesh->streams, frame.stream_id, stream) != 0) {
         cloak_stream_destroy(stream);
         free(entry);
@@ -523,6 +568,7 @@ cloak_stream_t *cloak_session_open_stream(cloak_session_t *sesh, uint32_t *out_i
         free(entry);
         return NULL;
     }
+    cloak_stream_set_saturation_cb(stream, session_on_stream_saturation, sesh);
     if (cloak_strmtab_insert_active(&sesh->streams, id, stream) != 0) {
         cloak_stream_destroy(stream);
         free(entry);

@@ -192,6 +192,11 @@ int cloak_switchboard_add_conn_framed(cloak_switchboard_t *sb, int fd,
     cloak_conn_set_drained_cb(c, switchboard_conn_drained_adapter, sb);
     cloak_conn_set_valve(c, sb->valve); /* NULL if this pool is unmetered */
     sb->conns[sb->conns_len++] = c;
+    /* A connection that joins while the session is backed up must start
+     * paused, or the pause has a hole exactly the size of a reconnect. */
+    if (sb->rx_backpressure) {
+        cloak_conn_set_rx_backpressure(sb->conns[sb->conns_len - 1], 1);
+    }
     return 0;
 }
 
@@ -290,6 +295,24 @@ void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard
     }
     sb->on_drained = cb;
     sb->on_drained_userdata = userdata;
+}
+
+void cloak_switchboard_set_rx_backpressure(cloak_switchboard_t *sb, int on) {
+    if (sb == NULL) {
+        return;
+    }
+    /* EVERY connection, because a session's streams are multiplexed
+     * across all of them and a frame for the saturated stream can arrive
+     * on any one. Pausing only the connection the last frame came in on
+     * would leave the other NumConn-1 free to deliver the frame that
+     * overflows. The cost of being conservative here is throughput on
+     * OTHER streams sharing the session while one of them is backed up;
+     * the cost of being precise would be per-stream credit, which is a
+     * wire change Go does not have either. */
+    sb->rx_backpressure = on ? 1 : 0;
+    for (size_t i = 0; i < sb->conns_len; i++) {
+        cloak_conn_set_rx_backpressure(sb->conns[i], sb->rx_backpressure);
+    }
 }
 
 void cloak_switchboard_set_valve(cloak_switchboard_t *sb, cloak_valve_t *v) {
