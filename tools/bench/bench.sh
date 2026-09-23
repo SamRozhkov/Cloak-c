@@ -179,15 +179,27 @@ echo "client_version=$("$CLIENT_BIN" -v 2>&1 | head -1)"
 # would make the first row look slow for a reason that is not the code.
 "$LOAD" --mode=latency --port="$LOCAL_PORT" --rounds=200 --size="$SIZE" >/dev/null 2>&1 || true
 
+# A failed repetition must not abort the run. The logs printed below are
+# the most diagnostic part of this script, and `set -e` skipping them
+# exactly when a measurement failed is the opposite of useful -- the
+# first run of this harness lost three of four rows' logs that way.
+FAILURES=0
 for r in $(seq 1 "$REPEAT"); do
     echo "--- repetition $r ---"
-    "$LOAD" --mode=throughput --port="$LOCAL_PORT" --bytes="$BYTES"
-    "$LOAD" --mode=latency --port="$LOCAL_PORT" --rounds="$ROUNDS" --size="$SIZE"
+    if ! "$LOAD" --mode=throughput --port="$LOCAL_PORT" --bytes="$BYTES"; then
+        echo "throughput_failed=1"
+        FAILURES=$((FAILURES + 1))
+    fi
+    if ! "$LOAD" --mode=latency --port="$LOCAL_PORT" --rounds="$ROUNDS" --size="$SIZE"; then
+        echo "latency_failed=1"
+        FAILURES=$((FAILURES + 1))
+    fi
 done
+echo "failed_measurements=$FAILURES" 
 
 # Server and client logs are part of the result: a run that quietly lost
 # a connection and re-handshaked is not the run the numbers describe.
 echo "--- server log (tail) ---"
-tail -5 "$WORK/server.log" || true
+tail -30 "$WORK/server.log" || true
 echo "--- client log (tail) ---"
-tail -5 "$WORK/client.log" || true
+tail -30 "$WORK/client.log" || true
