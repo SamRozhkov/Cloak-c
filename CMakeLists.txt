@@ -402,3 +402,14 @@ option(CLOAK_BUILD_SOAK "Build the long-running growth harness (tools/soak)" OFF
 if(CLOAK_BUILD_SOAK)
     add_subdirectory(tools/soak)
 endif()
+
+# The end-to-end benchmark's helpers, off by default for the same reason
+# and declared here for the same visibility. Unlike the soak harness these
+# link nothing from this project on purpose -- they speak plain TCP from
+# outside the tunnel, so the same two programs measure our ck-client and
+# ck-server and Go Cloak's, which is the only comparison worth printing.
+# See docs/runbooks/bench.md.
+option(CLOAK_BUILD_BENCH "Build the end-to-end benchmark helpers (tools/bench)" OFF)
+if(CLOAK_BUILD_BENCH)
+    add_subdirectory(tools/bench)
+endif()

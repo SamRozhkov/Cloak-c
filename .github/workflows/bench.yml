@@ -1,0 +1,112 @@
+# The end-to-end benchmark, on demand.
+#
+# WHAT IT ANSWERS. How fast an established Cloak tunnel moves bytes and how
+# much latency it adds -- for our ck-client and ck-server, and for Go
+# Cloak v2.12.0's, on the same machine in the same run.
+#
+# WHY THE MATRIX. Four rows, because one end at a time is the only way to
+# attribute a difference. ours/ours against go/go says which stack is
+# faster; ours/go and go/ours say which HALF of it is. A benchmark that
+# only ran the first pair would produce a headline nobody could defend.
+#
+# WHAT IT DOES NOT MEASURE, and this is not a detail: the Cloak handshake.
+# It happens once, at client start-up, before the load generator connects.
+# Every number here describes a tunnel that is already up. The handshake
+# is where X25519, the AEAD-sealed auth payload and the replay cache live,
+# so it is arguably the more interesting half -- and it has no harness yet.
+# tools/soak's cycle rate is NOT that measurement: its loop ends with a
+# deliberate 20 ms pump, so its ~45 cycles/s is its own pacing, not a
+# capacity.
+#
+# Manual, and nothing here gates a merge. A timing number that can fail a
+# build on shared CI hardware is a flake generator, and this project has
+# already paid for three wall-clock assertions that were true on one
+# machine and false on another.
+
+name: Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      bytes:
+        description: "Throughput payload each way, in bytes"
+        required: false
+        default: "67108864"
+      rounds:
+        description: "Latency round trips per repetition"
+        required: false
+        default: "2000"
+      repeat:
+        description: "Repetitions per matrix row"
+        required: false
+        default: "3"
+
+jobs:
+  bench:
+    name: Throughput and latency (4-way matrix)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # cloak-c-dev carries Go Cloak's own ck-client and ck-server in
+      # /usr/local/bin, which is the only reason this comparison can be
+      # made at all without building Go here.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          tags: cloak-c-dev:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Release, not Debug: a benchmark of an unoptimised build measures
+      # the build. Into the mounted workspace because each step below is
+      # its own --rm container.
+      - name: Build ck-server, ck-client and the bench helpers
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src cloak-c-dev:latest \
+            bash -c '
+              set -eu
+              cmake -S /src -B /src/build-bench -DCMAKE_BUILD_TYPE=Release \
+                    -DCLOAK_REQUIRE_GO=OFF -DCLOAK_BUILD_BENCH=ON
+              cmake --build /src/build-bench -j"$(nproc)" \
+                    --target ck-server ck-client bench_upstream bench_load
+            '
+
+      - name: Run the matrix
+        env:
+          BYTES: ${{ inputs.bytes }}
+          ROUNDS: ${{ inputs.rounds }}
+          REPEAT: ${{ inputs.repeat }}
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/bench-out"
+          docker run --rm -v "${GITHUB_WORKSPACE}":/src -w /src \
+            -e BYTES -e ROUNDS -e REPEAT cloak-c-dev:latest \
+            bash -c '
+              set -u
+              uname -m; uname -r; nproc
+              for combo in ours:ours ours:go go:ours go:go; do
+                s="${combo%%:*}"; c="${combo##*:}"
+                out="/src/bench-out/server-$s-client-$c.txt"
+                echo "################ server=$s client=$c ################"
+                bash tools/bench/bench.sh --server="$s" --client="$c" \
+                     --build=/src/build-bench --bytes="$BYTES" \
+                     --rounds="$ROUNDS" --repeat="$REPEAT" 2>&1 | tee "$out"
+                echo
+              done
+            ' | tee "${GITHUB_WORKSPACE}/bench-out/all.txt"
+
+      - name: Summarise
+        run: |
+          set -eu
+          sudo chown -R "$(id -u):$(id -g)" bench-out
+          python3 tools/bench/summarise.py bench-out | tee bench-out/summary.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-out/*
+          if-no-files-found: error
