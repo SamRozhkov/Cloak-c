@@ -476,6 +476,12 @@ void cloak_conn_set_valve(cloak_conn_t *c, cloak_valve_t *v);
  * the connection reads again. */
 void cloak_conn_set_rx_backpressure(cloak_conn_t *c, int on);
 
+/* Dispatches envelopes a pause left sitting in this connection's receive
+ * accumulator. Separate from the setter above because dispatching runs
+ * consumer callbacks, and those must not run until every connection's
+ * flag is settled -- see the setter's own comment. */
+void cloak_conn_flush_buffered(cloak_conn_t *c);
+
 size_t cloak_conn_send_queued(const cloak_conn_t *c);
 size_t cloak_conn_send_capacity(const cloak_conn_t *c);
 

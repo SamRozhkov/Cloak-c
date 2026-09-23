@@ -630,16 +630,32 @@ void cloak_conn_set_rx_backpressure(cloak_conn_t *c, int on) {
         return;
     }
     c->rx_backpressure = on;
+    /* FLAG AND INTEREST ONLY -- no dispatch, deliberately. Dispatching
+     * from here runs consumer callbacks that can fill a stream straight
+     * back up and re-enter the switchboard's loop mid-iteration, leaving
+     * some connections paused and others not while sb->rx_backpressure
+     * claims one answer for all of them. That divergence is a permanent
+     * stall: the connections left paused are never visited again, because
+     * the switchboard's own flag already reads as the value it wants.
+     * Measured as a 1-in-3 deadlock in test_server_e2e, which delivered
+     * exactly 1 byte of 131072.
+     *
+     * The buffered envelopes still have to come out, so the switchboard
+     * flushes every connection in a SECOND pass, once every flag is
+     * settled. See cloak_conn_flush_buffered. */
     conn_sync_interest(c);
-    if (!on && !c->read_paused) {
-        /* THE SAME REDUNDANT PAIR conn_rx_resume_cb DOCUMENTS, and for
-         * the same reason: conn_sync_interest's 0 -> READABLE transition
-         * re-arms an edge-triggered fd and re-reports what is already in
-         * the socket, and this call pulls it directly. Either alone would
-         * usually do; together they mean a resume cannot depend on an
-         * epoll_ctl(EPOLL_CTL_MOD) detail being what we think it is. */
-        conn_handle_readable(c);
+}
+
+void cloak_conn_flush_buffered(cloak_conn_t *c) {
+    if (c == NULL || c->broken || c->rx_backpressure || c->read_paused) {
+        return;
     }
+    /* conn_sync_interest's 0 -> READABLE transition re-arms the
+     * edge-triggered fd and re-reports what is still in the SOCKET. It
+     * cannot re-report what this connection already read out and left in
+     * recv_acc when a pause stopped it mid-buffer: no event will ever
+     * fire for those bytes again. This is the only thing that moves them. */
+    conn_extract_and_dispatch(c);
 }
 
 static void conn_reactor_cb(cloak_reactor_t *r, int fd, uint32_t events, void *userdata) {

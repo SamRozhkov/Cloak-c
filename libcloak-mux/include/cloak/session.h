@@ -192,6 +192,9 @@ struct cloak_session {
     uint64_t inactivity_timeout_ms;
     cloak_timer_id_t inactivity_timer_id;
     cloak_timer_id_t teardown_timer_id;
+    /* Zero-delay timer that lifts receive backpressure at a turn
+     * boundary. CLOAK_TIMER_INVALID when none is pending. */
+    cloak_timer_id_t rx_resume_timer_id;
 
     int closed;
 

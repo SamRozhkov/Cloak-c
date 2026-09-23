@@ -301,17 +301,40 @@ void cloak_switchboard_set_rx_backpressure(cloak_switchboard_t *sb, int on) {
     if (sb == NULL) {
         return;
     }
+    on = on ? 1 : 0;
+    if (sb->rx_backpressure == on) {
+        return;
+    }
     /* EVERY connection, because a session's streams are multiplexed
      * across all of them and a frame for the saturated stream can arrive
      * on any one. Pausing only the connection the last frame came in on
      * would leave the other NumConn-1 free to deliver the frame that
-     * overflows. The cost of being conservative here is throughput on
-     * OTHER streams sharing the session while one of them is backed up;
-     * the cost of being precise would be per-stream credit, which is a
-     * wire change Go does not have either. */
-    sb->rx_backpressure = on ? 1 : 0;
+     * overflows. The cost of being conservative is throughput on OTHER
+     * streams sharing the session while one is backed up; the cost of
+     * being precise would be per-stream credit, which is a wire change
+     * Go does not have either.
+     *
+     * TWO PASSES, AND THE ORDER IS THE WHOLE POINT. The first settles
+     * every flag and touches no callback. Only then does the second move
+     * the buffered envelopes, because dispatching runs consumers that can
+     * re-enter this function with the opposite answer -- and a re-entry
+     * that finds the flags half-updated leaves connections paused that
+     * nothing will ever visit again. */
+    sb->rx_backpressure = on;
     for (size_t i = 0; i < sb->conns_len; i++) {
-        cloak_conn_set_rx_backpressure(sb->conns[i], sb->rx_backpressure);
+        cloak_conn_set_rx_backpressure(sb->conns[i], on);
+    }
+    if (on) {
+        return; /* pausing has nothing to flush */
+    }
+    for (size_t i = 0; i < sb->conns_len; i++) {
+        /* A nested call may have paused us again between flushes. Its own
+         * first pass has already set every flag, so stopping here leaves
+         * a consistent state rather than a partly-resumed one. */
+        if (sb->rx_backpressure) {
+            return;
+        }
+        cloak_conn_flush_buffered(sb->conns[i]);
     }
 }
 
