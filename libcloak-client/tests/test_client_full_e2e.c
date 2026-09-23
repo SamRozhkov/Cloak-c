@@ -2200,8 +2200,19 @@ static void test_a_megabyte_survives_the_whole_stack(void) {
     struct fixture fx;
     ASSERT_EQ_INT(0, fixture_init(&fx));
 
+    /* FOUR CONNECTIONS, NOT ONE, AND THAT IS THE WHOLE DIFFERENCE.
+     *
+     * This case first shipped with one, and it passed against a stack the
+     * real binaries still could not get a megabyte through -- a false
+     * green found by tools/bench, not by the suite. NumConn defaults to 4
+     * in ckclient.json and multiplexing across several connections is
+     * what Cloak is FOR, so one connection tests the configuration nobody
+     * runs.
+     *
+     * The difference is not subtle. At NumConn=1 a megabyte arrives
+     * intact; at 4 the transfer stops around 26 KB, run after run. */
     client_t cl;
-    ASSERT_EQ_INT(0, client_up(&cl, &fx, SID_BULK, 1, front_port(&fx), fx.uid));
+    ASSERT_EQ_INT(0, client_up(&cl, &fx, SID_BULK, 4, front_port(&fx), fx.uid));
 
     local_peer_t lp;
     ASSERT_EQ_INT(0, lp_open(&lp, fx.reactor, cl.local_port));
