@@ -596,7 +596,7 @@ static int fixture_init(struct fixture *fx) {
     dcfg.panel = fx->panel;
     dcfg.session_config_template.max_on_wire_size = fx->wire;
     dcfg.session_config_template.stream_recv_capacity = 65536;
-    dcfg.session_config_template.stream_max_pending_frames = 64;
+    dcfg.session_config_template.stream_max_pending_frames = 256;
     dcfg.session_config_template.conn_send_queue_cap = 262144;
     dcfg.session_config_template.inactivity_timeout_ms = 60000;
     dcfg.prepare_session = cloak_proxy_prepare_session;
@@ -1334,7 +1334,7 @@ static int client_up(client_t *cl, struct fixture *fx, uint32_t session_id, int 
     cfg.handshake_timeout_ms = 10000;
     cfg.session_template.max_on_wire_size = fx->wire;
     cfg.session_template.stream_recv_capacity = 65536;
-    cfg.session_template.stream_max_pending_frames = 64;
+    cfg.session_template.stream_max_pending_frames = 256;
     cfg.session_template.conn_send_queue_cap = 262144;
     cfg.session_template.inactivity_timeout_ms = 60000;
     cfg.on_done = conn_done;
