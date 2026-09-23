@@ -6,9 +6,12 @@
 
 static int heap_grow(cloak_stream_t *s) {
     size_t new_cap = s->heap_cap == 0 ? 8 : s->heap_cap * 2;
-    if (new_cap > s->max_pending_frames) {
-        new_cap = s->max_pending_frames;
-    }
+    /* NO CLAMP TO max_pending_frames ANY MORE, and removing it was not
+     * optional: that value is now a BYTE budget enforced in heap_push, so
+     * a clamp here silently returned success without growing once the
+     * count reached 64, and the caller then wrote one past the end.
+     * Caught immediately as "double free or corruption (out)" -- the
+     * clamp and the guard it belonged to have to go together. */
     cloak_pending_frame_t *new_heap =
         (cloak_pending_frame_t *)realloc(s->heap, new_cap * sizeof(cloak_pending_frame_t));
     if (new_heap == NULL) {
@@ -20,7 +23,29 @@ static int heap_grow(cloak_stream_t *s) {
 }
 
 static int heap_push(cloak_stream_t *s, cloak_pending_frame_t pf) {
-    if (s->heap_len >= s->max_pending_frames) {
+    /* A BYTE BUDGET, NOT A FRAME COUNT, AND THE HEAP MUST NOT BE A
+     * BACKPRESSURE POINT AT ALL.
+     *
+     * What sits here is the peer's REORDERING window: with NumConn > 1 a
+     * session sprays frames across several connections, TCP preserves
+     * order only within each one, so the frame that lets next_recv_seq
+     * advance routinely arrives after frames that follow it. That window
+     * is bounded by what the sender can have in flight -- its own
+     * per-connection send queues -- not by anything this side controls.
+     *
+     * Refusing here therefore cannot be congestion control, and a
+     * previous attempt to treat it as such deadlocked: pausing every
+     * connection when the heap filled stopped reading the very
+     * connection carrying the missing sequence number. At NumConn=1 that
+     * never showed, because there is no reordering; at 4 a megabyte
+     * stopped after about 26 KB.
+     *
+     * So the bound is memory, and only memory: the same product the
+     * frame count always implied, expressed so that a peer sending many
+     * tiny frames cannot exhaust it and a peer sending legitimate
+     * full-size ones is not refused while well inside it. */
+    size_t budget = s->max_pending_frames * s->max_payload_per_frame;
+    if (s->heap_bytes + pf.payload_len > budget) {
         return -1;
     }
     if (s->heap_len == s->heap_cap) {
@@ -29,6 +54,7 @@ static int heap_push(cloak_stream_t *s, cloak_pending_frame_t pf) {
         }
     }
     size_t i = s->heap_len++;
+    s->heap_bytes += pf.payload_len;
     s->heap[i] = pf;
     while (i > 0) {
         size_t parent = (i - 1) / 2;
@@ -44,6 +70,9 @@ static int heap_push(cloak_stream_t *s, cloak_pending_frame_t pf) {
 }
 
 static cloak_pending_frame_t heap_pop(cloak_stream_t *s) {
+    /* Kept in step with heap_push's budget; the top frame's length is
+     * read before the heap is reshaped. */
+    s->heap_bytes -= s->heap[0].payload_len;
     cloak_pending_frame_t top = s->heap[0];
     s->heap_len--;
     if (s->heap_len > 0) {
@@ -220,8 +249,13 @@ void cloak_stream_destroy(cloak_stream_t *s) {
 static void stream_update_saturation(cloak_stream_t *s) {
     int now = 0;
     if (s->ordering != CLOAK_SESSION_ORDERING_UNORDERED) {
-        now = cloak_bytequeue_free_space(&s->recv_bytes) < s->max_payload_per_frame ||
-              s->heap_len * 2 >= s->max_pending_frames;
+        /* recv_bytes ONLY. The heap deliberately does not appear here: it
+         * holds the peer's reordering window, and pausing on it stops the
+         * connection carrying the frame that would drain it. recv_bytes
+         * is different -- it fills only when the CONSUMER is behind, and
+         * a consumer that is behind is exactly what backpressure is
+         * for. */
+        now = cloak_bytequeue_free_space(&s->recv_bytes) < s->max_payload_per_frame;
     }
     if (now == s->recv_saturated) {
         return;

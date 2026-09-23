@@ -83,6 +83,12 @@ typedef struct {
     size_t heap_len;                  /* ORDERED only */
     size_t heap_cap;                  /* ORDERED only */
     size_t max_pending_frames;        /* ORDERED only: defensive cap on out-of-order buffering */
+    /* ORDERED only: bytes of payload currently on the heap. The cap is a
+     * BYTE budget (max_pending_frames * max_payload_per_frame) rather
+     * than a frame count, because the heap's occupancy is the peer's
+     * reordering window and a count cannot tell one 16 KB frame from one
+     * 16-byte frame. See heap_push. */
+    size_t heap_bytes;
 
     cloak_msgqueue_t recv_msgs;       /* UNORDERED only -- zeroed and unused when ORDERED */
 

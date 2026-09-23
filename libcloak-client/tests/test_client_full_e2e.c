@@ -2191,7 +2191,7 @@ static void test_a_vanished_client_is_reaped_by_the_server(void) {
  * correct transfer. */
 
 #define SID_BULK ((uint32_t)7108)
-#define BULK_LEN ((size_t)(1u << 20))
+#define BULK_LEN ((size_t)(3u << 20))
 
 static void test_a_megabyte_survives_the_whole_stack(void) {
     int fds_before = count_open_fds();
@@ -2210,7 +2210,17 @@ static void test_a_megabyte_survives_the_whole_stack(void) {
      * runs.
      *
      * The difference is not subtle. At NumConn=1 a megabyte arrives
-     * intact; at 4 the transfer stops around 26 KB, run after run. */
+     * intact; at 4 the transfer stops around 26 KB, run after run.
+     *
+     * AND THE SIZE IS THREE MEGABYTES, NOT ONE, FOR THE SAME REASON THE
+     * CONNECTION COUNT IS FOUR. One megabyte over four connections passes
+     * against a stack the real binaries still cannot move 8 MiB through
+     * -- tools/bench, ours against ours, gets 1,143,141 bytes and then
+     * the peer closes. Three reproduces the product's behaviour in
+     * seconds: outbound stops at 26,624 bytes, three runs out of three,
+     * with the harness proven not to be the one stalling (lp.out_head
+     * and lp.out_len are both 0 at the failure, so all 3 MiB reached the
+     * socket). It still fits both 4 MiB harness buffers. */
     client_t cl;
     ASSERT_EQ_INT(0, client_up(&cl, &fx, SID_BULK, 4, front_port(&fx), fx.uid));
 
