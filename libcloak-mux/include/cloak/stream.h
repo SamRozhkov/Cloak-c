@@ -140,6 +140,17 @@ typedef struct {
      * Nothing acts on the updates yet -- the sending side of credit is a
      * later stage. They are emitted now, and ignored on arrival, so that
      * their FREQUENCY can be measured before anything depends on them. */
+    /* SEND-SIDE CREDIT (stage 3). How many more bytes this side may put
+     * on the wire for this stream. It starts at the receive capacity both
+     * ends agree on from the session config -- nothing is exchanged to
+     * establish it -- and is replenished by the peer's window updates.
+     *
+     * ACCOUNTED BUT NOT YET ENFORCED. cloak_stream_write still sends
+     * whatever it is given; the clamp belongs with the relay change that
+     * makes a short write safe, and landing the two separately would mean
+     * a producer silently losing the bytes it was not told about. */
+    size_t send_credit;
+
     size_t recv_window;
     size_t recv_freed;
     int flow_control; /* 0 suppresses window updates -- see cloak_session_config_t */
@@ -220,6 +231,11 @@ int cloak_stream_recv_saturated(const cloak_stream_t *s);
 /* How many window updates this stream has emitted. For tests: the update
  * rate is the thing worth pinning before anything depends on it. */
 uint64_t cloak_stream_window_updates_sent(const cloak_stream_t *s);
+
+/* How many more bytes the peer has room for on this stream. Once the
+ * clamp lands this is the most cloak_stream_write will accept; today it
+ * is the number a producer should already be pacing against. */
+size_t cloak_stream_send_credit(const cloak_stream_t *s);
 
 /* Turns window updates off for this stream. Only the Go-interoperability
  * tests use it; see cloak_session_config_t.flow_control. */

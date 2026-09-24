@@ -744,9 +744,87 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
     wire_free(&wrx);
 }
 
+
+/* ---- credit: spent by writing, granted by a peer's update ------------- */
+
+/* PINS THE ACCOUNTING BEFORE ANYTHING DEPENDS ON IT. Credit is not
+ * enforced yet -- the clamp lands with the relay change that makes a short
+ * write safe -- so the only way to know the arithmetic is right is to read
+ * it directly. Getting it wrong here would surface much later as a stream
+ * that stalls with no visible cause, which is the failure this whole
+ * mechanism exists to remove rather than to add.
+ *
+ * The saturating case is not decoration: a delta that wrapped would take
+ * credit from near-SIZE_MAX back to a small number and stall the stream,
+ * which is exactly the shape of bug a "+=" would introduce and no
+ * ordinary transfer would ever reach. */
+static void test_credit_is_spent_by_writes_and_granted_by_updates(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t w;
+    wire_init(&w);
+
+    cloak_stream_t tx;
+    ASSERT_EQ_INT(cloak_stream_init(&tx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
+
+    /* Starts at the window both ends know from the session config. */
+    ASSERT_EQ_INT((int)RECV_CAP, (int)cloak_stream_send_credit(&tx));
+
+    const size_t chunk = 1000;
+    uint8_t buf[1000];
+    memset(buf, 0x3d, sizeof(buf));
+    ASSERT_EQ_INT((long)chunk, cloak_stream_write(&tx, buf, chunk));
+    ASSERT_EQ_INT((int)(RECV_CAP - chunk), (int)cloak_stream_send_credit(&tx));
+
+    ASSERT_EQ_INT((long)chunk, cloak_stream_write(&tx, buf, chunk));
+    ASSERT_EQ_INT((int)(RECV_CAP - 2 * chunk), (int)cloak_stream_send_credit(&tx));
+
+    /* A peer's update gives it back. */
+    uint8_t upd_payload[CLOAK_FRAME_WINDOW_UPDATE_LEN] = {0xE8, 0x03, 0x00, 0x00}; /* 1000 */
+    cloak_frame_t upd;
+    upd.stream_id = 13;
+    upd.seq = 0;
+    upd.closing = CLOAK_FRAME_TYPE_WINDOW_UPDATE;
+    upd.payload = upd_payload;
+    upd.payload_len = sizeof(upd_payload);
+    ASSERT_EQ_INT(0, cloak_stream_feed_frame(&tx, &upd));
+    ASSERT_EQ_INT((int)(RECV_CAP - chunk), (int)cloak_stream_send_credit(&tx));
+
+    /* An update carrying nothing usable grants nothing and does not
+     * disturb the stream. */
+    cloak_frame_t bad = upd;
+    bad.payload_len = 1;
+    ASSERT_EQ_INT(0, cloak_stream_feed_frame(&tx, &bad));
+    ASSERT_EQ_INT((int)(RECV_CAP - chunk), (int)cloak_stream_send_credit(&tx));
+
+    /* THE SATURATING GUARD IS NOT TESTED HERE, AND SAYING SO IS THE
+     * POINT. Reaching it needs the credit to approach SIZE_MAX, which on
+     * a 64-bit size_t means about four billion maximal updates -- not a
+     * test, an afternoon. A first version of this case fed 64 of them and
+     * asserted the credit had not gone backwards; it passed against a
+     * deliberately wrapping `+=` too, because 274 GiB is nowhere near the
+     * top of the range. An assertion that cannot fail is worse than none,
+     * so it is gone and the gap is recorded instead. The guard stays in
+     * the code: it costs one comparison and the alternative is a stall
+     * nobody could diagnose.
+
+     */
+
+    /* Data still flows on this stream afterwards: the update path has not
+     * touched the sequence space. */
+    size_t frames_before = w.frame_count;
+    ASSERT_EQ_INT((long)chunk, cloak_stream_write(&tx, buf, chunk));
+    ASSERT_TRUE(w.frame_count > frames_before);
+
+    cloak_stream_destroy(&tx);
+    wire_free(&w);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_in_order();
     test_window_updates_are_emitted_at_half_the_window();
+    test_credit_is_spent_by_writes_and_granted_by_updates();
     test_multi_frame_chunking_and_reassembly();
     test_out_of_order_delivery();
     test_shuffled_delivery_many_frames();

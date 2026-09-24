@@ -180,13 +180,15 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
      * per-field mode annotations. */
     if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         s->recv_window = recv_capacity;
+        s->send_credit = recv_capacity;
         s->flow_control = 1;
         if (cloak_msgqueue_init(&s->recv_msgs, recv_capacity) != 0) {
             free(s->write_buf);
             s->write_buf = NULL;
             return -1;
         }
-    } else if ((s->recv_window = recv_capacity, s->flow_control = 1,
+    } else if ((s->recv_window = recv_capacity, s->send_credit = recv_capacity,
+                s->flow_control = 1,
                 cloak_bytequeue_init(&s->recv_bytes, recv_capacity)) != 0) {
         free(s->write_buf);
         s->write_buf = NULL;
@@ -303,6 +305,23 @@ void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata
  * A failure to send is deliberately not fatal. The sink refuses when the
  * session is already broken, and turning that into a torn-down stream
  * would make a connection that is going away anyway fail twice. */
+
+/* Grants the credit a peer's window update carries.
+ *
+ * SATURATING, NOT WRAPPING. A peer that sends nonsense -- or a long-lived
+ * stream whose deltas legitimately sum past the type's range -- must not
+ * be able to wrap this back to a small number, which would stall the
+ * stream, nor to a huge one, which would defeat the point of having a
+ * window at all. */
+static void stream_grant_credit(cloak_stream_t *s, uint32_t delta) {
+    size_t room = (size_t)-1 - s->send_credit;
+    s->send_credit += (size_t)delta < room ? (size_t)delta : room;
+}
+
+size_t cloak_stream_send_credit(const cloak_stream_t *s) {
+    return s == NULL ? 0 : s->send_credit;
+}
+
 static void stream_maybe_send_window_update(cloak_stream_t *s) {
     if (!s->flow_control || s->recv_window == 0 || s->recv_freed * 2 < s->recv_window) {
         return;
@@ -412,6 +431,10 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
             return -1;
         }
         n += chunk;
+        /* Clamped subtraction: the clamp on the way in is not here yet,
+         * so a producer can legitimately outrun its credit and this must
+         * floor at zero rather than wrap to SIZE_MAX. */
+        s->send_credit -= chunk < s->send_credit ? chunk : s->send_credit;
     }
     return (long)in_len;
 }
@@ -527,6 +550,16 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
      * Nothing acts on it yet; the sending half of credit is a later
      * stage. */
     if (frame->closing == CLOAK_FRAME_TYPE_WINDOW_UPDATE) {
+        if (frame->payload_len == CLOAK_FRAME_WINDOW_UPDATE_LEN) {
+            uint32_t delta = (uint32_t)frame->payload[0] | ((uint32_t)frame->payload[1] << 8) |
+                             ((uint32_t)frame->payload[2] << 16) |
+                             ((uint32_t)frame->payload[3] << 24);
+            stream_grant_credit(s, delta);
+        }
+        /* A malformed update is ignored rather than fatal: it grants no
+         * credit, so the worst it can do is leave the sender where it
+         * already was. Tearing the stream down for it would turn a
+         * garbled frame into a lost connection. */
         return 0;
     }
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
