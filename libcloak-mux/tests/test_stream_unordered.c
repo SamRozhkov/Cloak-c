@@ -57,8 +57,7 @@ static void wire_free(wire_t *w) {
     free(w->frame_lens);
 }
 
-static int wire_sink(void *userdata, uint32_t stream_id, const uint8_t *bytes, size_t len) {
-    (void)stream_id;
+static int wire_sink(void *userdata, const uint8_t *bytes, size_t len) {
     wire_t *w = (wire_t *)userdata;
     if (w->frames_data_len + len > w->frames_data_cap) {
         size_t new_cap = (w->frames_data_cap + len) * 2 + 64;

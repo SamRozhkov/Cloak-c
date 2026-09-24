@@ -262,7 +262,7 @@ static void stream_update_saturation(cloak_stream_t *s) {
     }
     s->recv_saturated = now;
     if (s->on_saturation != NULL) {
-        s->on_saturation(s->on_saturation_userdata, s->id, now);
+        s->on_saturation(s->on_saturation_userdata, now);
     }
 }
 
@@ -270,8 +270,7 @@ int cloak_stream_recv_saturated(const cloak_stream_t *s) {
     return s == NULL ? 0 : s->recv_saturated;
 }
 
-void cloak_stream_set_saturation_cb(cloak_stream_t *s,
-                                    void (*cb)(void *userdata, uint32_t stream_id, int saturated),
+void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata, int saturated),
                                     void *userdata) {
     if (s == NULL) {
         return;
@@ -345,7 +344,7 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
             return -1;
         }
         s->next_write_seq++;
-        if (s->sink(s->sink_userdata, s->id, s->write_buf, (size_t)written) != 0) {
+        if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
             s->write_closed = 1;
             return -1;
         }
@@ -390,7 +389,7 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type) {
         return -1;
     }
     s->next_write_seq++;
-    if (s->sink(s->sink_userdata, s->id, s->write_buf, (size_t)written) != 0) {
+    if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
         return -1;
     }
     return 0;
@@ -478,9 +477,8 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
      *
      * Every frame used to cost a malloc, a copy into it, a heap push, a
      * pop, a second copy into recv_bytes and a free -- even when it
-     * arrived exactly in order, which is the overwhelmingly common case
-     * and the ONLY case once a stream is pinned to one connection. This
-     * writes it straight through: no allocation, one copy, no heap.
+     * arrived exactly in order, which is the overwhelmingly common case.
+     * This writes it straight through: no allocation, one copy, no heap.
      *
      * The conditions are deliberately conservative. A closing frame goes
      * the long way so that try_drain keeps being the single place that

@@ -105,10 +105,6 @@ int cloak_switchboard_init(cloak_switchboard_t *sb, cloak_reactor_t *reactor,
                             cloak_switchboard_envelope_cb on_envelope, void *on_envelope_userdata,
                             cloak_switchboard_broken_cb on_broken, void *on_broken_userdata) {
     memset(sb, 0, sizeof(*sb));
-    /* Drawn once, from the same source the rest of this object uses for
-     * its connection draws, so the stream-id -> connection mapping is
-     * stable for this switchboard's life and unguessable from outside. */
-    cloak_random_bytes((uint8_t *)&sb->route_salt, sizeof(sb->route_salt));
     /* CLOAK_CONN_MAX_FRAME_LEN, not a 65535 of its own: switchboard.h
      * promises "same validation as cloak_conn_init", and max_frame_len is
      * forwarded to cloak_conn_init unchanged by add_conn. Restating the
@@ -204,62 +200,11 @@ int cloak_switchboard_add_conn_framed(cloak_switchboard_t *sb, int fd,
     return 0;
 }
 
-static int switchboard_send_on(cloak_switchboard_t *sb, size_t idx, const uint8_t *frame_bytes,
-                               size_t frame_len);
-
-/* Stream id -> connection index. Salted so the mapping is stable for this
- * switchboard's life and not guessable from outside it; multiplied by
- * Knuth's constant so adjacent ids do not land on the same connection. */
-static size_t switchboard_route_index(const cloak_switchboard_t *sb, uint32_t stream_id) {
-    uint32_t h = (stream_id ^ sb->route_salt) * 2654435761u;
-    return (size_t)(h % (uint32_t)sb->conns_len);
-}
-
-int cloak_switchboard_send_for_stream(cloak_switchboard_t *sb, uint32_t stream_id,
-                                      const uint8_t *frame_bytes, size_t frame_len) {
-    if (sb == NULL || sb->broken || sb->conns_len == 0) {
+int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len) {
+    if (sb->broken || sb->conns_len == 0) {
         return -1;
     }
-    /* ONE STREAM, ONE CONNECTION, AND THAT IS THE WHOLE POINT.
-     *
-     * Choosing a connection at random per FRAME is what Go does, and it
-     * is why Go's ordered receive buffer has to be unbounded: TCP keeps
-     * order only within a connection, so a stream sprayed across four of
-     * them arrives shuffled, and the receiver must hold everything ahead
-     * of the frame it is still waiting for. Measured here, with the
-     * sender's queues perfectly level: that window grew to about 70% of
-     * the transfer, linearly, at every size and every connection count.
-     * No fixed budget can survive that.
-     *
-     * Pinning removes the cause instead of enlarging the cure. Frames of
-     * one stream travel one connection, arrive in order, and take
-     * cloak_stream_feed_frame's allocation-free fast path; the heap stays
-     * empty. Different streams still spread across every connection, so
-     * the session still uses them all and still looks like a browser
-     * holding several TLS connections open.
-     *
-     * SALTED, NOT stream_id % conns_len. The unsalted form makes the
-     * mapping predictable from the outside: an observer who can open
-     * streams learns which connection carries which id. The salt is drawn
-     * once per switchboard from the same CSPRNG as the rest, so the
-     * mapping is stable for the session's life and unguessable from
-     * outside it.
-     *
-     * WHAT IT COSTS: one stream can no longer exceed one connection's
-     * throughput. Measured on this project's benchmark, NumConn 1 through
-     * 8 differ by less than the run-to-run spread -- for this port and
-     * for Go alike -- so on the paths measured here it costs nothing. On
-     * a path where connections genuinely differ it trades aggregate
-     * throughput for a bounded receive buffer, which is the trade this
-     * port chose deliberately. */
-    return switchboard_send_on(sb, switchboard_route_index(sb, stream_id), frame_bytes, frame_len);
-}
-
-static int switchboard_send_on(cloak_switchboard_t *sb, size_t idx, const uint8_t *frame_bytes,
-                               size_t frame_len) {
-    if (sb->broken || sb->conns_len == 0 || idx >= sb->conns_len) {
-        return -1;
-    }
+    size_t idx = (size_t)switchboard_random_below(sb, (uint32_t)sb->conns_len);
     int rc = cloak_conn_send(sb->conns[idx], frame_bytes, frame_len);
     if (rc == 0) {
         /* TX counting point. Go's switchboard.go:106 -- sb.valve.AddTx(int64(n))
@@ -329,18 +274,6 @@ static int switchboard_send_on(cloak_switchboard_t *sb, size_t idx, const uint8_
     return rc;
 }
 
-int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len) {
-    /* The unkeyed form, kept for callers with no stream to route on --
-     * the session's own control frames. Still a random draw, which is
-     * what those frames want: they belong to no stream, so pinning them
-     * would only make one connection carry every session's housekeeping. */
-    if (sb == NULL || sb->broken || sb->conns_len == 0) {
-        return -1;
-    }
-    size_t idx = (size_t)switchboard_random_below(sb, (uint32_t)sb->conns_len);
-    return switchboard_send_on(sb, idx, frame_bytes, frame_len);
-}
-
 void cloak_switchboard_close_all(cloak_switchboard_t *sb) {
     for (size_t i = 0; i < sb->conns_len; i++) {
         int fd = sb->conns[i]->fd;
@@ -362,44 +295,6 @@ void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard
     }
     sb->on_drained = cb;
     sb->on_drained_userdata = userdata;
-}
-
-void cloak_switchboard_set_rx_backpressure_for_stream(cloak_switchboard_t *sb, uint32_t stream_id,
-                                                      int on) {
-    if (sb == NULL || sb->conns_len == 0) {
-        return;
-    }
-    /* PINNING IS WHAT MAKES THIS EXACT, and being exact is what makes it
-     * correct. A stream's frames all travel one connection, so a stream
-     * that cannot take another frame needs exactly THAT connection
-     * stopped -- not all of them.
-     *
-     * Stopping all of them was the previous behaviour and it deadlocked
-     * as soon as two streams shared a session: reader A drains its stream
-     * while reader B has not started, B saturates, every connection stops
-     * including A's, and A can never be given the frame that would let it
-     * continue. Measured as both streams of test_server_e2e stopping dead
-     * at 65,537 and 65,285 bytes of 131,072 -- one receive buffer each.
-     *
-     * The count is per connection because several streams can hash to the
-     * same one; the connection reads again only when the last of them has
-     * room. */
-    cloak_conn_t *c = sb->conns[switchboard_route_index(sb, stream_id)];
-    if (on) {
-        c->rx_saturated_streams++;
-        if (c->rx_saturated_streams == 1) {
-            cloak_conn_set_rx_backpressure(c, 1);
-        }
-        return;
-    }
-    if (c->rx_saturated_streams == 0) {
-        return;
-    }
-    c->rx_saturated_streams--;
-    if (c->rx_saturated_streams == 0) {
-        cloak_conn_set_rx_backpressure(c, 0);
-        cloak_conn_flush_buffered(c);
-    }
 }
 
 void cloak_switchboard_set_rx_backpressure(cloak_switchboard_t *sb, int on) {

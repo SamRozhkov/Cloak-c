@@ -19,13 +19,7 @@
  * so the sink must fully copy or fully consume bytes before returning;
  * retaining the pointer past this call (e.g. for a later batched write)
  * will read overwritten/corrupted data. */
-/* The stream id travels with the frame so the layer below can route on
- * it. That is what lets a session pin one stream to one connection --
- * see cloak_switchboard_send_for_stream -- which removes cross-connection
- * reordering entirely and with it the unbounded reassembly window that
- * spraying frames at random produces. */
-typedef int (*cloak_stream_frame_sink_t)(void *userdata, uint32_t stream_id,
-                                         const uint8_t *bytes, size_t len);
+typedef int (*cloak_stream_frame_sink_t)(void *userdata, const uint8_t *bytes, size_t len);
 
 typedef struct {
     uint64_t seq;
@@ -136,7 +130,7 @@ typedef struct {
      * session counts how many of its streams say so, and the switchboard
      * drops READABLE from every connection until they drain. */
     int recv_saturated;
-    void (*on_saturation)(void *userdata, uint32_t stream_id, int saturated);
+    void (*on_saturation)(void *userdata, int saturated);
     void *on_saturation_userdata;
 
     /* BOTH modes, with subtly different meanings. ORDERED: a closing
@@ -210,8 +204,7 @@ int cloak_stream_recv_saturated(const cloak_stream_t *s);
 
 /* Fires ONLY on a change, with the new value, so the owner can keep a
  * count rather than rescan. Set before the stream carries any traffic. */
-void cloak_stream_set_saturation_cb(cloak_stream_t *s,
-                                    void (*cb)(void *userdata, uint32_t stream_id, int saturated),
+void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata, int saturated),
                                     void *userdata);
 
 int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *obfuscator,

@@ -150,9 +150,6 @@ struct cloak_switchboard {
      * every cloak_conn_t this pool creates -- see cloak/valve.h. */
     cloak_valve_t *valve;
     int rx_backpressure; /* 1 while every conn has READABLE dropped for a full stream */
-    /* Salts the stream-id -> connection mapping so it is stable for this
-     * switchboard's life and not guessable from outside it. */
-    uint32_t route_salt;
 };
 
 /* max_frame_len/conn_send_queue_cap are forwarded unchanged to every
@@ -204,12 +201,6 @@ int cloak_switchboard_add_conn_framed(cloak_switchboard_t *sb, int fd,
  * other connections). Must not block. */
 int cloak_switchboard_send(cloak_switchboard_t *sb, const uint8_t *frame_bytes, size_t frame_len);
 
-/* Sends a frame belonging to stream_id, always on the SAME connection for
- * that id. See the implementation for why pinning replaces random spraying
- * and what it costs. */
-int cloak_switchboard_send_for_stream(cloak_switchboard_t *sb, uint32_t stream_id,
-                                      const uint8_t *frame_bytes, size_t frame_len);
-
 /* Destroys and close()s every connection in the pool and empties it.
  * Idempotent (a second call is a harmless no-op). Does not fire
  * on_broken (that callback signals "something failed", not "cleanup
@@ -237,12 +228,6 @@ void cloak_switchboard_set_drained_cb(cloak_switchboard_t *sb, cloak_switchboard
  * because a stream downstream is full. See cloak_conn_set_rx_backpressure.
  * A connection added while this is on starts paused. */
 void cloak_switchboard_set_rx_backpressure(cloak_switchboard_t *sb, int on);
-
-/* Stops or resumes reading on the ONE connection that carries stream_id.
- * Exact because streams are pinned; see the implementation for the
- * deadlock that stopping every connection produced. */
-void cloak_switchboard_set_rx_backpressure_for_stream(cloak_switchboard_t *sb, uint32_t stream_id,
-                                                      int on);
 
 void cloak_switchboard_set_valve(cloak_switchboard_t *sb, cloak_valve_t *v);
 

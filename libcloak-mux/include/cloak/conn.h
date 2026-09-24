@@ -325,11 +325,6 @@ struct cloak_conn {
      * CLOAK_CONN_READ_BATCH. CLOAK_TIMER_INVALID when none is pending. */
     cloak_timer_id_t read_more_timer;
 
-    /* How many streams pinned to this connection currently cannot take
-     * another frame. The connection reads again when the last of them
-     * has room. */
-    size_t rx_saturated_streams;
-
     uint32_t interest; /* the mask currently registered with the reactor */
 };
 
