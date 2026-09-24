@@ -467,7 +467,22 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
      * before it ever touches the socket, and why the two changes land in
      * one commit. */
     if (s->flow_control) {
-        if (in_len > s->send_credit) {
+        /* UNORDERED MUST NOT BE TRUNCATED, ONLY REFUSED. A datagram is
+         * atomic: the far end does no reassembly in this mode, so sending
+         * the first 596 bytes of a 700-byte datagram is not a short write
+         * but silent corruption. Measured exactly that way --
+         * test_udp_piper saw cloak_stream_write answer 596 for a 700-byte
+         * datagram -- before this branch existed.
+         *
+         * So the whole datagram waits for credit. 0 means "not now", the
+         * same answer the ordered path gives when it has none, and the
+         * relay's budget clamp keeps the caller from asking in the first
+         * place. */
+        if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+            if (in_len > s->send_credit) {
+                return 0;
+            }
+        } else if (in_len > s->send_credit) {
             in_len = s->send_credit;
         }
         if (in_len == 0) {
