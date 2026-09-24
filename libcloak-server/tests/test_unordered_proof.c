@@ -963,7 +963,8 @@ static void write_server_config(char *path_out, size_t cap, const char *name, in
              "\"BypassUID\":[\"%s\"],"
              "\"RedirAddr\":\"127.0.0.1:1\","
              "\"PrivateKey\":\"%s\","
-             "\"KeepAlive\":0"
+             "\"KeepAlive\":0,"
+             "\"FlowControl\":false"
              "}",
              upstream_port, bind_port, UID_B64, PRIV_B64);
     ASSERT_EQ_INT(0, write_temp_unique(path_out, cap, name, cfg));

@@ -300,6 +300,13 @@ static void far_on_new_stream(cloak_session_t *sesh, cloak_stream_t *stream, voi
     }
     struct far_stream *fs = &fe->st[fe->nstreams++];
     memset(fs, 0, sizeof(*fs));
+    /* NO FLOW CONTROL ON A STUB. This far end has no session of its own,
+     * so nothing here ever reads a stream and nothing ever emits a window
+     * update -- a stream with credit enabled would spend one window and
+     * refuse everything after, and a retry loop around the write spins
+     * until the test times out (measured). The piper under test keeps its
+     * own flow control; this is the double, not the subject. */
+    cloak_stream_set_flow_control(stream, 0);
     fs->s = stream;
     /* on_stream_data is deliberately NOT fired for the frame that created
      * the stream (cloak/session.h), so a harness that only drained there
@@ -937,6 +944,11 @@ static void far_send(struct stalled *sc, struct far_stream *fs, uint8_t seq, siz
     uint8_t buf[2048];
     ASSERT_TRUE(len <= sizeof(buf));
     fill_pattern(buf, len, seq);
+    /* The far end is a STUB, not a session: nothing over there reads,
+     * so nothing over there would ever grant this stream credit, and a
+     * retry loop would spin until the test timed out (measured: it did).
+     * Flow control is switched off on it at construction instead -- see
+     * far_stream_open -- so this assertion means what it always did. */
     ASSERT_EQ_INT((int)len, (int)cloak_stream_write(fs->s, buf, len));
     /* The frame is already in the socketpair by now; this only lets the
      * reactor carry it the rest of the way, and returns as soon as it
