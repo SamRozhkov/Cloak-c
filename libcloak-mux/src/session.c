@@ -439,7 +439,7 @@ static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_by
         free(entry);
         return;
     }
-    cloak_stream_set_saturation_cb(stream, session_on_stream_saturation, sesh);
+    cloak_stream_set_flow_control(stream, !sesh->disable_flow_control);
     if (cloak_strmtab_insert_active(&sesh->streams, frame.stream_id, stream) != 0) {
         cloak_stream_destroy(stream);
         free(entry);
@@ -513,6 +513,7 @@ int cloak_session_init(cloak_session_t *sesh, uint32_t id, cloak_reactor_t *reac
     sesh->max_on_wire_size = config->max_on_wire_size;
     sesh->stream_recv_capacity = config->stream_recv_capacity;
     sesh->stream_max_pending_frames = config->stream_max_pending_frames;
+    sesh->disable_flow_control = config->disable_flow_control;
     sesh->inactivity_timeout_ms = config->inactivity_timeout_ms;
     sesh->on_new_stream = config->on_new_stream;
     sesh->on_new_stream_userdata = config->on_new_stream_userdata;
@@ -608,6 +609,7 @@ cloak_stream_t *cloak_session_open_stream(cloak_session_t *sesh, uint32_t *out_i
         free(entry);
         return NULL;
     }
+    cloak_stream_set_flow_control(stream, !sesh->disable_flow_control);
     cloak_stream_set_saturation_cb(stream, session_on_stream_saturation, sesh);
     if (cloak_strmtab_insert_active(&sesh->streams, id, stream) != 0) {
         cloak_stream_destroy(stream);

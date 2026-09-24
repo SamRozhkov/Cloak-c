@@ -1199,6 +1199,18 @@ static inline int write_temp_unique(char *path_out, size_t cap, const char *name
  * ReadFile could not fill) -- so its own flag help's "path to
  * the configuration file or its content" is false for the server. (Our
  * ck-server accepts both; see the binaries plan's D3.) */
+/* "FlowControl":false ON EVERY CONFIG THIS HARNESS WRITES.
+ *
+ * Our binaries emit a window-update frame type (CLOAK_FRAME_TYPE_WINDOW_-
+ * UPDATE) that Go Cloak does not know. Parity with Go is no longer a
+ * requirement for this port, but these oracles are the most valuable
+ * tests here -- they are what caught the AEAD divergence five modules of
+ * our-code-on-both-ends testing missed -- so they keep our binaries in
+ * the dialect Go speaks rather than being retired.
+ *
+ * A config WITHOUT this key is the product's behaviour. If a future
+ * change makes these tests pass with flow control on, the key should go,
+ * not be left as a silent second mode nobody exercises. */
 static inline void write_server_config(char *path_out, size_t cap, const char *name, int bind_port,
                                 int upstream_port) {
     char cfg[1024];
@@ -1209,7 +1221,8 @@ static inline void write_server_config(char *path_out, size_t cap, const char *n
              "\"BypassUID\":[\"%s\"],"
              "\"RedirAddr\":\"127.0.0.1:1\","
              "\"PrivateKey\":\"%s\","
-             "\"KeepAlive\":0"
+             "\"KeepAlive\":0,"
+             "\"FlowControl\":false"
              "}",
              upstream_port, bind_port, UID_B64, PRIV_B64);
     ASSERT_EQ_INT(0, write_temp_unique(path_out, cap, name, cfg));
@@ -1230,7 +1243,8 @@ static inline void write_client_config(char *path_out, size_t cap, const char *n
              "\"NumConn\":%d,"
              "\"BrowserSig\":\"%s\","
              "\"RemoteHost\":\"127.0.0.1\",\"RemotePort\":\"%d\","
-             "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"%d\""
+             "\"LocalHost\":\"127.0.0.1\",\"LocalPort\":\"%d\","
+             "\"FlowControl\":false"
              "}",
              encryption, UID_B64, pub_b64, num_conn, browser, remote_port, local_port);
     ASSERT_EQ_INT(0, write_temp_unique(path_out, cap, name, cfg));

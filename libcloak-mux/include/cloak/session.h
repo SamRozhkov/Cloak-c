@@ -147,6 +147,26 @@ typedef struct {
     size_t max_on_wire_size;         /* forwarded to every cloak_stream_init and cloak_conn_init this session performs */
     size_t stream_recv_capacity;     /* forwarded to every cloak_stream_init this session performs */
     size_t stream_max_pending_frames;/* forwarded to every cloak_stream_init this session performs */
+
+    /* PER-STREAM FLOW CONTROL, and the only reason it can be turned off.
+     *
+     * Window updates (CLOAK_FRAME_TYPE_WINDOW_UPDATE) are a frame type Go
+     * Cloak does not know. Parity with Go is no longer a requirement for
+     * this port, but the reference tests that drive Go's own binaries are
+     * still the most valuable oracles here -- they are what caught the
+     * AEAD divergence that five modules of our-code-on-both-ends testing
+     * missed -- and keeping them alive is worth one switch.
+     *
+     * INVERTED SENSE ON PURPOSE. Every caller in this tree memsets its
+     * config to zero and fills in the fields it knows about, so a field
+     * whose zero value meant "off" would silently disable flow control
+     * for anyone who had not heard of it -- which is exactly how a
+     * previous field in this struct went missing. Zero here is the
+     * product's behaviour; only the Go tests set it.
+     *
+     * Received updates are ignored in either setting, so a mixed pair
+     * degrades rather than breaks. */
+    int disable_flow_control;
     size_t conn_send_queue_cap;      /* forwarded to every cloak_conn_init this session performs, via its switchboard */
     uint64_t inactivity_timeout_ms;  /* how long with zero active streams before the session auto-closes */
     cloak_session_new_stream_cb on_new_stream;
@@ -189,6 +209,7 @@ struct cloak_session {
     size_t max_on_wire_size;
     size_t stream_recv_capacity;
     size_t stream_max_pending_frames;
+    int disable_flow_control;
     uint64_t inactivity_timeout_ms;
     cloak_timer_id_t inactivity_timer_id;
     cloak_timer_id_t teardown_timer_id;

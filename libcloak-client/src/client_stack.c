@@ -894,6 +894,12 @@ int cloak_client_stack_open(cloak_client_stack_t **out, const cloak_client_stack
         s->cfg.max_rounds = CLOAK_CLIENT_STACK_ROUNDS_UNBOUNDED;
     }
     fill_template_defaults(&s->cfg.session_template);
+    /* The one session-template field that is not a "0 means default"
+     * number but a switch, and whose value comes from the operator's
+     * config rather than a constant: "FlowControl": false is what the
+     * Go-interoperability tests set so our binaries speak only frame
+     * types Go knows. See cloak_session_config_t.disable_flow_control. */
+    s->cfg.session_template.disable_flow_control = s->cfg.config->disable_flow_control;
 
     /* ---- EDGE: the configuration itself, checked here because every
      * one of these otherwise surfaces as a connector error on the first

@@ -624,7 +624,7 @@ static int server_start(server_t *s) {
              "\"BypassUID\":[\"%s\"],"
              "\"RedirAddr\":\"127.0.0.1:1\","
              "\"PrivateKey\":\"%s\","
-             "\"KeepAlive\":0}",
+             "\"KeepAlive\":0,\"FlowControl\":false}",
              s->up.port, UID_B64, PRIV_B64);
 
     char *const argv[] = {(char *)"ck-server", (char *)"-c", cfg, NULL};

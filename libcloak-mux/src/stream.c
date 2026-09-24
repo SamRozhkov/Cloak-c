@@ -179,12 +179,15 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
      * either must be behind the same branch this is; see cloak/stream.h's
      * per-field mode annotations. */
     if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        s->recv_window = recv_capacity;
+        s->flow_control = 1;
         if (cloak_msgqueue_init(&s->recv_msgs, recv_capacity) != 0) {
             free(s->write_buf);
             s->write_buf = NULL;
             return -1;
         }
-    } else if (cloak_bytequeue_init(&s->recv_bytes, recv_capacity) != 0) {
+    } else if ((s->recv_window = recv_capacity, s->flow_control = 1,
+                cloak_bytequeue_init(&s->recv_bytes, recv_capacity)) != 0) {
         free(s->write_buf);
         s->write_buf = NULL;
         return -1;
@@ -277,6 +280,66 @@ void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata
     }
     s->on_saturation = cb;
     s->on_saturation_userdata = userdata;
+}
+
+
+/* Emits one window update if the consumer has freed at least half the
+ * window since the last one.
+ *
+ * HALF, NOT EVERY READ. An update per read would put a frame on the wire
+ * for every application-sized read -- on a bulk transfer, one per few
+ * kilobytes -- and the storm would cost more than the flow control it
+ * serves. Half bounds the rate at two updates per window while still
+ * refilling a peer long before it could run dry.
+ *
+ * IT DOES NOT ADVANCE next_write_seq, AND THAT IS LOAD-BEARING. The
+ * sequence space belongs to the data stream: a receiver that ignores
+ * these frames (which is every receiver until the sending half of credit
+ * lands) never advances next_recv_seq past one, so a consumed sequence
+ * number would be a permanent gap and the stream would wedge. The seq
+ * field is therefore a don't-care, carried only because the header has
+ * one.
+ *
+ * A failure to send is deliberately not fatal. The sink refuses when the
+ * session is already broken, and turning that into a torn-down stream
+ * would make a connection that is going away anyway fail twice. */
+static void stream_maybe_send_window_update(cloak_stream_t *s) {
+    if (!s->flow_control || s->recv_window == 0 || s->recv_freed * 2 < s->recv_window) {
+        return;
+    }
+    uint32_t delta = s->recv_freed > 0xffffffffu ? 0xffffffffu : (uint32_t)s->recv_freed;
+    uint8_t payload[CLOAK_FRAME_WINDOW_UPDATE_LEN];
+    payload[0] = (uint8_t)(delta & 0xffu);
+    payload[1] = (uint8_t)((delta >> 8) & 0xffu);
+    payload[2] = (uint8_t)((delta >> 16) & 0xffu);
+    payload[3] = (uint8_t)((delta >> 24) & 0xffu);
+
+    cloak_frame_t frame;
+    frame.stream_id = s->id;
+    frame.seq = s->next_write_seq; /* not consumed -- see above */
+    frame.closing = CLOAK_FRAME_TYPE_WINDOW_UPDATE;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    long written = cloak_frame_obfuscate(s->obfuscator, &frame, s->write_buf, s->write_buf_cap, 0);
+    if (written < 0) {
+        return;
+    }
+    if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
+        return;
+    }
+    s->recv_freed = 0;
+    s->window_updates_sent++;
+}
+
+void cloak_stream_set_flow_control(cloak_stream_t *s, int on) {
+    if (s != NULL) {
+        s->flow_control = on ? 1 : 0;
+    }
+}
+
+uint64_t cloak_stream_window_updates_sent(const cloak_stream_t *s) {
+    return s == NULL ? 0 : s->window_updates_sent;
 }
 
 long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
@@ -457,6 +520,15 @@ static int feed_frame_unordered(cloak_stream_t *s, const cloak_frame_t *frame) {
 }
 
 int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
+    /* A window update is credit for the OTHER direction, not stream data.
+     * It is consumed here, before the mode split and before anything
+     * looks at seq, so it neither advances the sequence space nor trips
+     * the closing-frame path -- both of which would wedge the stream.
+     * Nothing acts on it yet; the sending half of credit is a later
+     * stage. */
+    if (frame->closing == CLOAK_FRAME_TYPE_WINDOW_UPDATE) {
+        return 0;
+    }
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         return feed_frame_unordered(s, frame);
     }
@@ -551,6 +623,8 @@ long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
     size_t n = cloak_bytequeue_read(&s->recv_bytes, out, out_cap);
     if (n > 0) {
         try_drain(s);
+        s->recv_freed += n;
+        stream_maybe_send_window_update(s);
         /* The resume half. try_drain has already refilled recv_bytes from
          * the heap where it could, so this sees the state the next frame
          * will actually meet. */

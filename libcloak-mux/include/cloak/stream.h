@@ -108,6 +108,7 @@ typedef struct {
      * is NOT an error: cloak_stream_feed_frame still returns 0, because
      * returning -1 would retire a stream over transient backpressure. */
     uint64_t recv_dropped_datagrams;
+    uint64_t window_updates_sent;
 
     /* ORDERED only: receive-side backpressure.
      *
@@ -129,6 +130,20 @@ typedef struct {
      * reports when it can no longer accept a maximum-size frame, the
      * session counts how many of its streams say so, and the switchboard
      * drops READABLE from every connection until they drain. */
+    /* RECEIVE-SIDE CREDIT BOOKKEEPING (stage 2 of per-stream credit).
+     *
+     * recv_freed counts bytes the local consumer has taken since the last
+     * window update went out; recv_window is the capacity those updates
+     * are measured against. One update is emitted when recv_freed reaches
+     * half the window.
+     *
+     * Nothing acts on the updates yet -- the sending side of credit is a
+     * later stage. They are emitted now, and ignored on arrival, so that
+     * their FREQUENCY can be measured before anything depends on them. */
+    size_t recv_window;
+    size_t recv_freed;
+    int flow_control; /* 0 suppresses window updates -- see cloak_session_config_t */
+
     int recv_saturated;
     void (*on_saturation)(void *userdata, int saturated);
     void *on_saturation_userdata;
@@ -201,6 +216,14 @@ typedef struct {
  * in unordered mode, which drops rather than backpressures on purpose --
  * see recv_dropped_datagrams. */
 int cloak_stream_recv_saturated(const cloak_stream_t *s);
+
+/* How many window updates this stream has emitted. For tests: the update
+ * rate is the thing worth pinning before anything depends on it. */
+uint64_t cloak_stream_window_updates_sent(const cloak_stream_t *s);
+
+/* Turns window updates off for this stream. Only the Go-interoperability
+ * tests use it; see cloak_session_config_t.flow_control. */
+void cloak_stream_set_flow_control(cloak_stream_t *s, int on);
 
 /* Fires ONLY on a change, with the new value, so the owner can keep a
  * count rather than rescan. Set before the stream carries any traffic. */

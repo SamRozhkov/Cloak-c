@@ -635,8 +635,118 @@ static void test_stream_init_rejects_invalid_ordering(void) {
     wire_free(&w);
 }
 
+
+/* ---- window updates: they go out, and at the rate they are meant to --- */
+
+/* WITHOUT THIS CASE THE WHOLE MECHANISM IS UNPINNED, and that was not a
+ * guess: suppressing every window update left all 85 test binaries green.
+ * A mechanism nothing would miss is a mechanism that will be deleted or
+ * broken by someone who has no way to find out.
+ *
+ * Three properties, and the rate is the one that matters most. An update
+ * per read would be a frame on the wire for every application-sized read
+ * -- on a bulk transfer, one per few kilobytes -- and that storm would
+ * cost more than the flow control it serves. Half the window bounds it at
+ * two per window.
+ */
+static void test_window_updates_are_emitted_at_half_the_window(void) {
+    cloak_obfuscator_t o;
+    make_obfuscator(&o);
+    wire_t wtx, wrx;
+    wire_init(&wtx);
+    wire_init(&wrx);
+
+    cloak_stream_t tx;
+    ASSERT_EQ_INT(cloak_stream_init(&tx, 11, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &wtx), 0);
+    cloak_stream_t rx;
+    ASSERT_EQ_INT(cloak_stream_init(&rx, 11, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
+                                    CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &wrx), 0);
+
+    /* A quarter of the window, read out in full: under the half-window
+     * mark, so nothing should go out yet. */
+    const size_t quarter = RECV_CAP / 4;
+    uint8_t *payload = (uint8_t *)malloc(quarter);
+    ASSERT_TRUE(payload != NULL);
+    memset(payload, 0x27, quarter);
+
+    ASSERT_EQ_INT((long)quarter, cloak_stream_write(&tx, payload, quarter));
+    size_t nframes = wtx.frame_count;
+    size_t *order = (size_t *)malloc(nframes * sizeof(size_t));
+    ASSERT_TRUE(order != NULL);
+    for (size_t i = 0; i < nframes; i++) {
+        order[i] = i;
+    }
+    deliver_frames(&wtx, &o, &rx, order, nframes);
+
+    uint8_t *out = (uint8_t *)malloc(RECV_CAP);
+    ASSERT_TRUE(out != NULL);
+    size_t drained = 0;
+    for (;;) {
+        long got = cloak_stream_read(&rx, out, RECV_CAP);
+        if (got <= 0) {
+            break;
+        }
+        drained += (size_t)got;
+    }
+    ASSERT_EQ_INT((int)quarter, (int)drained);
+    ASSERT_EQ_INT(0, (int)cloak_stream_window_updates_sent(&rx));
+    ASSERT_EQ_INT(0, (int)wrx.frame_count);
+
+    /* Another quarter takes the total past half the window: exactly one
+     * update, not one per read. */
+    ASSERT_EQ_INT((long)quarter, cloak_stream_write(&tx, payload, quarter));
+    free(order);
+    size_t nframes2 = wtx.frame_count;
+    order = (size_t *)malloc(nframes2 * sizeof(size_t));
+    ASSERT_TRUE(order != NULL);
+    for (size_t i = 0; i < nframes2; i++) {
+        order[i] = i;
+    }
+    /* deliver_frames replays from the start of the wire, so the receiver
+     * sees the first quarter again -- already-consumed sequence numbers,
+     * which it drops. Only the new frames land. */
+    deliver_frames(&wtx, &o, &rx, order, nframes2);
+
+    for (;;) {
+        long got = cloak_stream_read(&rx, out, RECV_CAP);
+        if (got <= 0) {
+            break;
+        }
+        drained += (size_t)got;
+    }
+    ASSERT_EQ_INT((int)(quarter * 2), (int)drained);
+    ASSERT_EQ_INT(1, (int)cloak_stream_window_updates_sent(&rx));
+
+    /* And what went out really is a window update, with the right length
+     * and the delta the consumer actually freed. */
+    ASSERT_EQ_INT(1, (int)wrx.frame_count);
+    cloak_frame_t upd;
+    ASSERT_EQ_INT(0, cloak_frame_deobfuscate(&o, &upd, wrx.frames_data, wrx.frame_lens[0]));
+    ASSERT_EQ_INT(upd.closing, CLOAK_FRAME_TYPE_WINDOW_UPDATE);
+    ASSERT_EQ_INT(upd.stream_id, 11);
+    ASSERT_EQ_INT((int)upd.payload_len, CLOAK_FRAME_WINDOW_UPDATE_LEN);
+    uint32_t delta = (uint32_t)upd.payload[0] | ((uint32_t)upd.payload[1] << 8) |
+                     ((uint32_t)upd.payload[2] << 16) | ((uint32_t)upd.payload[3] << 24);
+    ASSERT_EQ_INT((int)delta, (int)(quarter * 2));
+
+    /* A receiver must ignore one rather than treat it as data or as a
+     * close: feeding it back into a stream changes nothing. */
+    ASSERT_EQ_INT(0, cloak_stream_feed_frame(&tx, &upd));
+    ASSERT_EQ_INT(0, (int)cloak_stream_recv_available(&tx));
+
+    free(payload);
+    free(order);
+    free(out);
+    cloak_stream_destroy(&tx);
+    cloak_stream_destroy(&rx);
+    wire_free(&wtx);
+    wire_free(&wrx);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_in_order();
+    test_window_updates_are_emitted_at_half_the_window();
     test_multi_frame_chunking_and_reassembly();
     test_out_of_order_delivery();
     test_shuffled_delivery_many_frames();

@@ -122,6 +122,12 @@ typedef struct {
      * which is the default. */
     int stream_timeout_sec;
     int keep_alive_sec;
+
+    /* "FlowControl": false turns off the per-stream window updates this
+     * port adds. They are a frame type Go Cloak does not know, and this
+     * is the switch that lets our binaries still be driven against Go's
+     * in the reference tests. Default (key absent) is ON. */
+    int disable_flow_control;
 } cloak_client_config_t;
 
 typedef struct {
@@ -172,6 +178,7 @@ typedef struct {
     /* Seconds, -1 when disabled (the default). Applies to connections the
      * server makes to upstream proxies. */
     int keep_alive_sec;
+    int disable_flow_control; /* see the client config's field */
 } cloak_server_config_t;
 
 /* Parses a NUL-terminated JSON document. Returns 0 / -1. */
