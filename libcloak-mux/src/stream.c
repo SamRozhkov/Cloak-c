@@ -262,7 +262,7 @@ static void stream_update_saturation(cloak_stream_t *s) {
     }
     s->recv_saturated = now;
     if (s->on_saturation != NULL) {
-        s->on_saturation(s->on_saturation_userdata, now);
+        s->on_saturation(s->on_saturation_userdata, s->id, now);
     }
 }
 
@@ -270,7 +270,8 @@ int cloak_stream_recv_saturated(const cloak_stream_t *s) {
     return s == NULL ? 0 : s->recv_saturated;
 }
 
-void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata, int saturated),
+void cloak_stream_set_saturation_cb(cloak_stream_t *s,
+                                    void (*cb)(void *userdata, uint32_t stream_id, int saturated),
                                     void *userdata) {
     if (s == NULL) {
         return;
@@ -344,7 +345,7 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
             return -1;
         }
         s->next_write_seq++;
-        if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
+        if (s->sink(s->sink_userdata, s->id, s->write_buf, (size_t)written) != 0) {
             s->write_closed = 1;
             return -1;
         }
@@ -389,7 +390,7 @@ int cloak_stream_send_closing(cloak_stream_t *s, uint8_t closing_type) {
         return -1;
     }
     s->next_write_seq++;
-    if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
+    if (s->sink(s->sink_userdata, s->id, s->write_buf, (size_t)written) != 0) {
         return -1;
     }
     return 0;
@@ -470,6 +471,31 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
     size_t recv_total_capacity = cloak_bytequeue_len(&s->recv_bytes) + cloak_bytequeue_free_space(&s->recv_bytes);
     if (frame->payload_len > recv_total_capacity) {
         return -1;
+    }
+
+    /* THE FAST PATH: the frame that was expected, with nothing queued
+     * ahead of it and room to take it.
+     *
+     * Every frame used to cost a malloc, a copy into it, a heap push, a
+     * pop, a second copy into recv_bytes and a free -- even when it
+     * arrived exactly in order, which is the overwhelmingly common case
+     * and the ONLY case once a stream is pinned to one connection. This
+     * writes it straight through: no allocation, one copy, no heap.
+     *
+     * The conditions are deliberately conservative. A closing frame goes
+     * the long way so that try_drain keeps being the single place that
+     * interprets one. A non-empty heap goes the long way because this
+     * frame might unblock what is already queued, and try_drain is what
+     * knows how. */
+    if (frame->closing == CLOAK_FRAME_CLOSING_NOTHING && s->heap_len == 0 &&
+        frame->seq == s->next_recv_seq &&
+        cloak_bytequeue_free_space(&s->recv_bytes) >= frame->payload_len) {
+        if (frame->payload_len > 0) {
+            cloak_bytequeue_write(&s->recv_bytes, frame->payload, frame->payload_len);
+        }
+        s->next_recv_seq++;
+        stream_update_saturation(s);
+        return 0;
     }
 
     uint8_t *payload_copy = NULL;

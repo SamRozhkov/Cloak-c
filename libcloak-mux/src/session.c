@@ -39,9 +39,10 @@ static void session_reschedule_inactivity_timer(cloak_session_t *sesh) {
                                                          session_check_timeout, sesh);
 }
 
-static int session_stream_sink_adapter(void *userdata, const uint8_t *bytes, size_t len) {
+static int session_stream_sink_adapter(void *userdata, uint32_t stream_id, const uint8_t *bytes,
+                                       size_t len) {
     cloak_session_t *sesh = (cloak_session_t *)userdata;
-    return cloak_switchboard_send(&sesh->sb, bytes, len);
+    return cloak_switchboard_send_for_stream(&sesh->sb, stream_id, bytes, len);
 }
 
 /* Stops stream from receiving any more routed frames (tombstones its
@@ -67,59 +68,24 @@ static int session_stream_sink_adapter(void *userdata, const uint8_t *bytes, siz
  * be filled, so next_recv_seq never advances again and the stream is dead
  * while looking healthy. A 1 MiB transfer stopped at 606,569 bytes and
  * stayed there. */
-static void session_rx_resume_cb(cloak_reactor_t *r, void *userdata) {
-    (void)r;
+static void session_on_stream_saturation(void *userdata, uint32_t stream_id, int saturated) {
     cloak_session_t *sesh = (cloak_session_t *)userdata;
-    sesh->rx_resume_timer_id = CLOAK_TIMER_INVALID;
-    if (sesh->closed || sesh->saturated_streams > 0) {
-        return; /* it filled up again before the turn boundary arrived */
-    }
-    cloak_switchboard_set_rx_backpressure(&sesh->sb, 0);
-}
-
-static void session_on_stream_saturation(void *userdata, int saturated) {
-    cloak_session_t *sesh = (cloak_session_t *)userdata;
-    if (sesh == NULL) {
+    if (sesh == NULL || sesh->closed) {
         return;
     }
-    if (saturated) {
-        sesh->saturated_streams++;
-        if (sesh->saturated_streams == 1) {
-            /* Pausing is safe inline: it sets flags and interest masks and
-             * runs no consumer callback. */
-            cloak_switchboard_set_rx_backpressure(&sesh->sb, 1);
-        }
-        return;
-    }
-    if (sesh->saturated_streams == 0) {
-        return; /* defensive: a transition we never counted */
-    }
-    sesh->saturated_streams--;
-    if (sesh->saturated_streams != 0 || sesh->closed) {
-        return;
-    }
-    /* RESUMING IS NOT SAFE INLINE, AND THE CALL STACK IS WHY.
+    /* PER STREAM, ON ITS OWN CONNECTION. Streams are pinned
+     * (cloak_switchboard_send_for_stream), so the connection that must
+     * stop is exactly the one carrying this stream -- and stopping only
+     * that one is what keeps a busy stream from starving a quiet one
+     * sharing the session.
      *
-     * This runs from cloak_stream_read, which runs from the relay's
-     * try_fill_from_stream, which runs from inside pump_stream_to_fd's
-     * fill/drain loop. Resuming dispatches the envelopes the pause left
-     * buffered, which delivers frames, which notifies that same relay --
-     * re-entering pump_stream_to_fd while the outer call is still
-     * mid-loop with its own idea of what to_fd contains.
-     *
-     * A zero-delay timer puts the resume on the next reactor turn
-     * instead, where no relay is part-way through anything. The same
-     * shape stream_relay.c already uses for its finish timer. */
-    if (sesh->rx_resume_timer_id == CLOAK_TIMER_INVALID) {
-        sesh->rx_resume_timer_id =
-            cloak_reactor_add_timer(sesh->reactor, 0, session_rx_resume_cb, sesh);
-        if (sesh->rx_resume_timer_id == CLOAK_TIMER_INVALID) {
-            /* The timer heap could not grow. Resuming inline risks the
-             * re-entrancy above; NOT resuming is a permanent stall, which
-             * is strictly worse. */
-            cloak_switchboard_set_rx_backpressure(&sesh->sb, 0);
-        }
-    }
+     * Both directions run inline. Pausing never dispatches. Resuming does
+     * -- cloak_conn_flush_buffered empties what the pause left in
+     * recv_acc -- but only for this one connection, and the re-entrancy
+     * that forced the previous session-wide version onto a timer came
+     * from iterating every connection while a nested call changed the
+     * decision underneath. There is no loop here to be re-entered. */
+    cloak_switchboard_set_rx_backpressure_for_stream(&sesh->sb, stream_id, saturated);
 }
 
 static void session_retire_stream(cloak_session_t *sesh, cloak_stream_t *stream) {
@@ -130,11 +96,11 @@ static void session_retire_stream(cloak_session_t *sesh, cloak_stream_t *stream)
     entry->retired = 1;
     /* Hand back its saturation before it stops being drainable. A retired
      * stream has no consumer left to free its buffers, so a count left
-     * behind here would hold every connection paused for the life of the
+     * behind here would hold its connection paused for the life of the
      * session -- the exact stall this mechanism exists to remove, arrived
      * at from the other side. */
     if (cloak_stream_recv_saturated(stream)) {
-        session_on_stream_saturation(sesh, 0);
+        session_on_stream_saturation(sesh, stream->id, 0);
     }
     cloak_stream_set_saturation_cb(stream, NULL, NULL);
     cloak_strmtab_tombstone(&sesh->streams, stream->id);

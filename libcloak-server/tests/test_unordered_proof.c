@@ -2088,7 +2088,9 @@ static void run_reordering(cloak_session_ordering_t ordering, const char *label)
      * loop is bounded by the clock at 5 s against a measured ~15 ms per
      * attempt, so exhausting it is a ~2^-300 event and is reported as a
      * failure rather than skipped. */
-    uint64_t deadline = now_ms() + 5000;
+    /* No retry deadline any more: the loop below used to spin until the
+     * switchboard happened to spread one stream over two connections, and
+     * pinning means it never will. One pass is now the whole case. */
     for (;;) {
         mb_env_t e;
         mb_env_init(&e, ordering, MB_REVERSE2);
@@ -2132,22 +2134,27 @@ static void run_reordering(cloak_session_ordering_t ordering, const char *label)
         e.mb.release_deferred = 1;
         mb_run_until(&e, 2, 1000);
 
-        int two_conns = e.mb.rec_seen >= 2 && e.mb.rec_conn[0] != e.mb.rec_conn[1];
-        if (!two_conns && now_ms() < deadline) {
-            cloak_session_release_stream(&e.client, cs);
-            if (e.sh.last_new_stream != NULL) {
-                cloak_session_release_stream(&e.server, e.sh.last_new_stream);
-            }
-            mb_env_close(&e);
-            continue;
-        }
-        if (!two_conns) {
-            fprintf(stderr,
-                    "FAIL %s:%d: %s: after 5 s the switchboard never put the two frames on "
-                    "different connections (last: %zu and %zu)\n",
-                    __FILE__, __LINE__, label, e.mb.rec_conn[0], e.mb.rec_conn[1]);
-            cloak_test_failures++;
-        }
+        /* THE "DID THEY LAND ON DIFFERENT CONNECTIONS" GATE IS GONE, AND
+         * ITS ABSENCE IS THE POINT.
+         *
+         * This case used to retry until the switchboard happened to put
+         * the two frames on different connections, because that was the
+         * only way one stream's frames could arrive out of order. A
+         * stream is now PINNED to one connection
+         * (cloak_switchboard_send_for_stream), so that never happens and
+         * the retry loop could only ever time out.
+         *
+         * The property under test is untouched: the RECEIVER must handle
+         * a later frame arriving before an earlier one. The middle box
+         * still produces exactly that by holding frame A and releasing B
+         * first -- it is a man in the middle, so it reorders whether or
+         * not the two frames shared a connection. What is gone is a
+         * precondition about how the SENDER distributes, which this port
+         * deliberately no longer satisfies.
+         *
+         * If pinning is ever reverted, this gate is worth restoring: it
+         * was what proved the spraying was real rather than assumed. */
+        ASSERT_TRUE(e.mb.rec_seen >= 2);
 
         ASSERT_EQ_INT(1, e.sh.new_stream_count);
         cloak_stream_t *ss = e.sh.last_new_stream;
@@ -2440,7 +2447,8 @@ typedef struct {
     cloak_obfuscator_t o;
 } pad_ctx_t;
 
-static int pad_sink(void *userdata, const uint8_t *bytes, size_t len) {
+static int pad_sink(void *userdata, uint32_t stream_id, const uint8_t *bytes, size_t len) {
+    (void)stream_id;
     pad_ctx_t *p = (pad_ctx_t *)userdata;
     /* The frame as it would go on the wire: 14 header + payload + pad +
      * 16 tag. The payload is a fixed 10 bytes, so the pad length is the
@@ -2466,7 +2474,8 @@ typedef struct {
     size_t extra[16];
 } boundary_ctx_t;
 
-static int boundary_sink(void *userdata, const uint8_t *bytes, size_t len) {
+static int boundary_sink(void *userdata, uint32_t stream_id, const uint8_t *bytes, size_t len) {
+    (void)stream_id;
     boundary_ctx_t *b = (boundary_ctx_t *)userdata;
     (void)bytes;
     if (b->n < sizeof(b->extra) / sizeof(b->extra[0])) {
