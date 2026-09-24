@@ -92,3 +92,25 @@ removing them is why this is expected to be faster as well as more stable.
 - **A stream whose consumer never reads** must stop its own sender and
   nothing else. That is the property pinning got wrong, so it deserves its
   own case: two streams, one consumer idle, the other must complete.
+
+
+## Measured 2026-09-24: the branch without credit is not reliable, only lucky
+
+A single repetition at 4, 8 and 16 MiB passed on the branch that has stages
+1–3 but no enforcement — 145.8, 181.1 and 154.5 MiB/s, nothing failing —
+and that nearly became "the bulk defect is already fixed".
+
+It is not. Three further runs at 16 MiB with two repetitions each:
+
+| run | result |
+|---|---|
+| 1 | both repetitions complete, 187.4 and 174.6 MiB/s |
+| 2 | first completes at 189.3, second stalls at 4,224,869 |
+| 3 | first stalls at 4,852,329, second never starts |
+
+So the unbounded reassembly window is still there without credit; it simply
+does not always overflow. One trial was an anecdote, again.
+
+That settles the open question this plan exists for: credit is not an
+optimisation on top of a working stack, it is what makes the stack work at
+all above a few megabytes. Stage 4 has to land.
