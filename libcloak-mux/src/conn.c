@@ -538,6 +538,16 @@ static void conn_rx_resume_cb(cloak_reactor_t *r, void *userdata) {
     conn_handle_readable(c);
 }
 
+static void conn_read_more_cb(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    cloak_conn_t *c = (cloak_conn_t *)userdata;
+    c->read_more_timer = CLOAK_TIMER_INVALID;
+    if (c->broken) {
+        return;
+    }
+    conn_handle_readable(c);
+}
+
 static void conn_handle_readable(cloak_conn_t *c) {
     if (c->rx_backpressure) {
         return;
@@ -549,7 +559,30 @@ static void conn_handle_readable(cloak_conn_t *c) {
     if (c->broken || c->rx_backpressure) {
         return;
     }
+    size_t taken = 0;
     for (;;) {
+        /* ONE CONNECTION'S TURN ENDS HERE, and the fd is deliberately
+         * left readable. Everything past this point in the socket is
+         * still there; what changes is that the OTHER connections get
+         * read before it, which is the whole mechanism that keeps the
+         * peer's reassembly window bounded. See CLOAK_CONN_READ_BATCH.
+         *
+         * An edge-triggered fd will not report itself again just because
+         * it still has data, so the continuation is explicit: a
+         * zero-delay timer, the same shape session.c uses to lift
+         * backpressure and stream_relay.c uses to finish. Armed only if
+         * one is not already pending. If the timer cannot be armed the
+         * read continues instead -- an unfair read is a performance
+         * problem, a read that never resumes is a stall. */
+        if (taken >= CLOAK_CONN_READ_BATCH) {
+            if (c->read_more_timer != CLOAK_TIMER_INVALID) {
+                return;
+            }
+            c->read_more_timer = cloak_reactor_add_timer(c->reactor, 0, conn_read_more_cb, c);
+            if (c->read_more_timer != CLOAK_TIMER_INVALID) {
+                return;
+            }
+        }
         size_t room = cloak_bytequeue_free_space(&c->recv_acc);
         if (room == 0) {
             return; /* structurally unreachable given recv_acc's capacity invariant; defensive only */
@@ -613,6 +646,7 @@ static void conn_handle_readable(cloak_conn_t *c) {
          * rx/tx here are the SERVER's directions, NOT the user manager's
          * up/down -- see cloak/valve.h before touching this line. */
         cloak_valve_add_rx(c->valve, (int64_t)n);
+        taken += (size_t)n;
         cloak_bytequeue_write(&c->recv_acc, tmp, (size_t)n); /* always fits: n <= room */
         conn_extract_and_dispatch(c);
         if (c->broken || c->rx_backpressure) {
@@ -802,6 +836,10 @@ void cloak_conn_destroy(cloak_conn_t *c) {
          * outlived its connection fires with a dangling userdata. */
         cloak_reactor_cancel_timer(c->reactor, c->rx_resume_timer);
         c->rx_resume_timer = CLOAK_TIMER_INVALID;
+        /* Same class, same reason: a continuation timer that outlived its
+         * connection fires with a dangling userdata. */
+        cloak_reactor_cancel_timer(c->reactor, c->read_more_timer);
+        c->read_more_timer = CLOAK_TIMER_INVALID;
         cloak_reactor_remove_fd(c->reactor, c->fd); /* no-op-with-error-return if already removed */
     }
     free(c->recv_scratch);

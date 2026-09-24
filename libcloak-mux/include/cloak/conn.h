@@ -320,6 +320,11 @@ struct cloak_conn {
      * resumed first re-arm reads the other still needs stopped. */
     int rx_backpressure;
 
+    /* A zero-delay timer that resumes a read this connection stopped
+     * part-way through so the others could have a turn. See
+     * CLOAK_CONN_READ_BATCH. CLOAK_TIMER_INVALID when none is pending. */
+    cloak_timer_id_t read_more_timer;
+
     uint32_t interest; /* the mask currently registered with the reactor */
 };
 
@@ -348,6 +353,37 @@ struct cloak_conn {
  * Returns 0 on success, -1 on invalid parameters (max_frame_len == 0,
  * max_frame_len > CLOAK_CONN_MAX_FRAME_LEN, or send_queue_cap == 0) or
  * allocation/reactor registration failure. */
+/* THE MOST BYTES ONE READABLE EVENT WILL TAKE FROM ONE CONNECTION.
+ *
+ * Draining a socket to EAGAIN sounds like the efficient thing and is the
+ * reason a multiplexed stream could not be reassembled. A session sprays
+ * one stream's frames across every connection; TCP preserves order only
+ * within each, so the receiver's heap has to hold everything that arrives
+ * ahead of the frame it is still waiting for. Reading one connection dry
+ * while its neighbours wait for the next reactor turn makes that window
+ * as large as the transfer.
+ *
+ * MEASURED, over a 3 MiB transfer with the sender's queues perfectly
+ * balanced (max skew across connections: 0 bytes, every run):
+ *
+ *   payload    peak heap     frames        NumConn   peak heap
+ *   1 MiB      775,451       91            1         123,908
+ *   2 MiB    1,389,253      168            2       1,410,092
+ *   3 MiB    2,075,651      245            4       2,062,975
+ *                                          8       2,569,227
+ *
+ * About 70% of the transfer, growing linearly with it -- so no fixed cap
+ * on the reassembly heap can ever be right, and the 256 frames this port
+ * settled on was passing with 245 used.
+ *
+ * Bounding the batch bounds the window instead: at most NumConn * this
+ * many bytes can be ahead of the missing frame, whatever the transfer
+ * size. It costs no throughput -- the same bytes, read in a different
+ * order -- which is why it is preferred to capping socket buffers (tried,
+ * and it broke four tests that pin queue-dynamics invariants) or to
+ * matching Go's unbounded heap. */
+#define CLOAK_CONN_READ_BATCH ((size_t)65536)
+
 int cloak_conn_init(cloak_conn_t *c, int fd, cloak_reactor_t *reactor,
                      size_t max_frame_len, size_t send_queue_cap,
                      cloak_conn_envelope_cb on_envelope, void *on_envelope_userdata,
