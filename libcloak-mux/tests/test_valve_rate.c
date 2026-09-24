@@ -1034,7 +1034,23 @@ static int tx_probe_start(struct tx_probe *p, cloak_reactor_t *r, cloak_valve_t 
     cfg.obfuscator = obfs;
     cfg.ordering = CLOAK_SESSION_ORDERING_ORDERED;
     cfg.max_on_wire_size = 16401;
-    cfg.stream_recv_capacity = 65536;
+    /* A WINDOW FAR LARGER THAN THE POOL, AND THAT IS THE PREMISE OF
+     * EVERY CASE THAT USES THIS PROBE.
+     *
+     * These cases fill the send POOL and assert the relay paused for that
+     * reason rather than for the rate bucket's. Per-stream credit added a
+     * third way to stop, and at 65,536 it became the FIRST one: measured
+     * at the assertion below, min_conn_free was 32,768 -- the pool
+     * completely empty -- with credit at 0 and nothing queued. The kernel
+     * socket buffer had absorbed every byte the window allowed, so the
+     * queue never backed up at all.
+     *
+     * So the window has to exceed what the socket buffer and the queue
+     * can swallow between them, or the pool can never be the tightest
+     * constraint and the case tests something else while appearing to
+     * pass. 1 MiB against a 32 KiB pool and a ~200 KiB socket buffer is
+     * comfortably past that. */
+    cfg.stream_recv_capacity = 1048576;
     cfg.stream_max_pending_frames = 64;
     cfg.conn_send_queue_cap = conn_send_queue_cap;
     cfg.inactivity_timeout_ms = 60000;
