@@ -596,7 +596,7 @@ static int fixture_init(struct fixture *fx) {
     dcfg.panel = fx->panel;
     dcfg.session_config_template.max_on_wire_size = fx->wire;
     dcfg.session_config_template.stream_recv_capacity = 65536;
-    dcfg.session_config_template.stream_max_pending_frames = 64;
+    dcfg.session_config_template.stream_max_pending_frames = 256;
     dcfg.session_config_template.conn_send_queue_cap = 262144;
     dcfg.session_config_template.inactivity_timeout_ms = 60000;
     dcfg.prepare_session = cloak_proxy_prepare_session;
@@ -1334,7 +1334,7 @@ static int client_up(client_t *cl, struct fixture *fx, uint32_t session_id, int 
     cfg.handshake_timeout_ms = 10000;
     cfg.session_template.max_on_wire_size = fx->wire;
     cfg.session_template.stream_recv_capacity = 65536;
-    cfg.session_template.stream_max_pending_frames = 64;
+    cfg.session_template.stream_max_pending_frames = 256;
     cfg.session_template.conn_send_queue_cap = 262144;
     cfg.session_template.inactivity_timeout_ms = 60000;
     cfg.on_done = conn_done;
@@ -2162,6 +2162,111 @@ static void test_a_vanished_client_is_reaped_by_the_server(void) {
     ASSERT_EQ_INT(fds_before, count_open_fds());
 }
 
+
+/* ---- case 8: a bulk transfer, which nothing in this suite ever did ------
+ *
+ * WHY THIS CASE EXISTS. The end-to-end benchmark (tools/bench) found that
+ * this stack cannot sustain a bulk transfer: against Go's server our client
+ * received exactly 16132 bytes -- one maxStreamUnitWrite, one frame's
+ * payload -- and then nothing, while ours against ours wedged at ~32 KB and
+ * ours against Go's client at ~878 KB. Sixty seconds later the session died
+ * of the inactivity timeout, correctly, because nothing had moved.
+ *
+ * The reason it took a benchmark to find is the point of this case: the
+ * largest payload anywhere in these 85 test binaries is a few kilobytes.
+ * Every case above proves the ROUTE -- that a byte gets there, transformed,
+ * on the right stream -- and not one of them proves the stack can keep a
+ * stream moving past the first frame or two. "Volume" was an unmeasured
+ * axis in exactly the way "architecture" was until x86_64 ran the suite.
+ *
+ * ONE MEGABYTE, and the size is chosen rather than picked: it is 65x the
+ * 16132 the client stopped at, 32x where ours-against-ours wedged, and it
+ * still fits both 4 MiB harness buffers with room to spare. A payload that
+ * merely exceeded one frame would not distinguish "the second frame works"
+ * from "the stack keeps going".
+ *
+ * A COUNTER, NOT A CONSTANT FILL. The payload is an LCG stream, so a block
+ * delivered twice, a block dropped, or two blocks transposed all fail the
+ * comparison -- none of which a memset(0x5a) payload can tell apart from a
+ * correct transfer. */
+
+#define SID_BULK ((uint32_t)7108)
+#define BULK_LEN ((size_t)(3u << 20))
+
+static void test_a_megabyte_survives_the_whole_stack(void) {
+    int fds_before = count_open_fds();
+    ASSERT_TRUE(fds_before >= 0);
+
+    struct fixture fx;
+    ASSERT_EQ_INT(0, fixture_init(&fx));
+
+    /* FOUR CONNECTIONS, NOT ONE, AND THAT IS THE WHOLE DIFFERENCE.
+     *
+     * This case first shipped with one, and it passed against a stack the
+     * real binaries still could not get a megabyte through -- a false
+     * green found by tools/bench, not by the suite. NumConn defaults to 4
+     * in ckclient.json and multiplexing across several connections is
+     * what Cloak is FOR, so one connection tests the configuration nobody
+     * runs.
+     *
+     * The difference is not subtle. At NumConn=1 a megabyte arrives
+     * intact; at 4 the transfer stops around 26 KB, run after run.
+     *
+     * AND THE SIZE IS THREE MEGABYTES, NOT ONE, FOR THE SAME REASON THE
+     * CONNECTION COUNT IS FOUR. One megabyte over four connections passes
+     * against a stack the real binaries still cannot move 8 MiB through
+     * -- tools/bench, ours against ours, gets 1,143,141 bytes and then
+     * the peer closes. Three reproduces the product's behaviour in
+     * seconds: outbound stops at 26,624 bytes, three runs out of three,
+     * with the harness proven not to be the one stalling (lp.out_head
+     * and lp.out_len are both 0 at the failure, so all 3 MiB reached the
+     * socket). It still fits both 4 MiB harness buffers. */
+    client_t cl;
+    ASSERT_EQ_INT(0, client_up(&cl, &fx, SID_BULK, 4, front_port(&fx), fx.uid));
+
+    local_peer_t lp;
+    ASSERT_EQ_INT(0, lp_open(&lp, fx.reactor, cl.local_port));
+    ASSERT_TRUE(pump_until(fx.reactor, lp_connected, &lp, FE2E_MAX_TURNS, FE2E_TURN_MS));
+    ASSERT_EQ_INT(1, lp.connected);
+
+    uint8_t *payload = malloc(BULK_LEN);
+    uint8_t *want = malloc(BULK_LEN);
+    ASSERT_TRUE(payload != NULL && want != NULL);
+    uint32_t lcg = 0x1234567u;
+    for (size_t i = 0; i < BULK_LEN; i++) {
+        lcg = lcg * 1664525u + 1013904223u;
+        payload[i] = (uint8_t)(lcg >> 24);
+    }
+    xor_fill(want, payload, BULK_LEN);
+
+    lp_send(&lp, payload, BULK_LEN);
+
+    /* Outbound first, so a failure says which direction stalled rather
+     * than only that the round trip did. */
+    struct up_wait uw = {&fx.up, 0, BULK_LEN};
+    ASSERT_TRUE(pump_until(fx.reactor, up_has_len, &uw, FE2E_MAX_TURNS, FE2E_TURN_MS));
+    ASSERT_EQ_INT((int)BULK_LEN, (int)fx.up.conns[0].in_len);
+    assert_up_bytes(&fx.up, 0, payload, BULK_LEN);
+
+    struct lp_wait lw = {&lp, BULK_LEN};
+    ASSERT_TRUE(pump_until(fx.reactor, lp_has_len, &lw, FE2E_MAX_TURNS, FE2E_TURN_MS));
+    ASSERT_EQ_INT((int)BULK_LEN, (int)lp.in_len);
+    ASSERT_MEM_EQ(lp.in, want, BULK_LEN);
+    ASSERT_MEM_NE(lp.in, payload, BULK_LEN);
+
+    ASSERT_EQ_INT(1, (int)cloak_server_registry_count(&fx.registry));
+    ASSERT_EQ_INT(1, (int)cloak_client_piper_stream_count(&cl.piper));
+    ASSERT_EQ_INT(0, fx.cover.accept_count);
+    ASSERT_EQ_INT(0, cl.broken_calls);
+
+    free(payload);
+    free(want);
+    lp_destroy(&lp);
+    client_down(&cl);
+    fixture_destroy(&fx);
+    ASSERT_EQ_INT(fds_before, count_open_fds());
+}
+
 TEST_MAIN_BEGIN()
 test_a_round_trip_through_the_whole_stack();
 test_four_concurrent_connections_over_one_session();
@@ -2170,4 +2275,5 @@ test_one_underlying_connection_dying_kills_the_session();
 test_clean_shutdown_from_the_client_end();
 test_clean_shutdown_from_the_server_end();
 test_a_vanished_client_is_reaped_by_the_server();
+test_a_megabyte_survives_the_whole_stack();
 TEST_MAIN_END()

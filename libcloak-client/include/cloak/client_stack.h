@@ -249,7 +249,11 @@ const char *cloak_client_stack_strerror(int code);
  * broken by the connection layer rather than tolerated. */
 #define CLOAK_CLIENT_STACK_DEFAULT_MAX_ON_WIRE_SIZE      ((size_t)16401)
 #define CLOAK_CLIENT_STACK_DEFAULT_STREAM_RECV_CAPACITY  ((size_t)65536)
-#define CLOAK_CLIENT_STACK_DEFAULT_STREAM_MAX_PENDING    ((size_t)64)
+/* 256 rather than 64, for the reason spelled out at
+ * CLOAK_SERVER_STACK_DEFAULT_STREAM_MAX_PENDING: this heap holds the
+ * peer's reordering window across NumConn connections, and the budget has
+ * to exceed the peer's maximum in-flight rather than merely match it. */
+#define CLOAK_CLIENT_STACK_DEFAULT_STREAM_MAX_PENDING    ((size_t)256)
 #define CLOAK_CLIENT_STACK_DEFAULT_CONN_SEND_QUEUE_CAP   ((size_t)262144)
 #define CLOAK_CLIENT_STACK_DEFAULT_INACTIVITY_TIMEOUT_MS ((uint64_t)60000)
 

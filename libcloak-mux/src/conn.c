@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "cloak/conn.h"
 
 #include <errno.h>
@@ -35,7 +36,7 @@
  * sized so it cannot fill (cloak_conn_init). */
 static uint32_t conn_desired_interest(const cloak_conn_t *c) {
     uint32_t events = 0;
-    if (!c->read_paused) {
+    if (!c->read_paused && !c->rx_backpressure) {
         events |= CLOAK_REACTOR_READABLE;
     }
     if (c->want_writable) {
@@ -186,6 +187,24 @@ static void conn_tls_extract_and_dispatch(cloak_conn_t *c) {
         }
         if (c->broken) {
             return; /* the callback may have torn c down re-entrantly */
+        }
+        /* THE PART THAT MAKES THE PAUSE MEAN ANYTHING.
+         *
+         * The callback above may have filled a stream to its watermark
+         * and switched this connection's backpressure on. Reading the
+         * interest mask is not enough to act on that: this loop is
+         * already inside one readable event, with a whole socket buffer
+         * worth of envelopes decoded and waiting in recv_acc, and it
+         * would deliver every one of them before the reactor ever
+         * consulted the mask again. Measured: one call delivered 56 more
+         * frames after the pause, which is exactly what overflowed the
+         * receive heap and dropped the frame that killed the stream.
+         *
+         * Stopping here leaves the rest of recv_acc untouched -- nothing
+         * is decrypted until it is dispatched -- so cloak_conn_set_rx_-
+         * backpressure(c, 0) resumes precisely where this left off. */
+        if (c->rx_backpressure) {
+            return;
         }
     }
 }
@@ -519,8 +538,51 @@ static void conn_rx_resume_cb(cloak_reactor_t *r, void *userdata) {
     conn_handle_readable(c);
 }
 
+static void conn_read_more_cb(cloak_reactor_t *r, void *userdata) {
+    (void)r;
+    cloak_conn_t *c = (cloak_conn_t *)userdata;
+    c->read_more_timer = CLOAK_TIMER_INVALID;
+    if (c->broken) {
+        return;
+    }
+    conn_handle_readable(c);
+}
+
 static void conn_handle_readable(cloak_conn_t *c) {
+    if (c->rx_backpressure) {
+        return;
+    }
+    /* Envelopes left in recv_acc by a previous pause come out before any
+     * new byte is read, or a resume would read the socket while already
+     * holding undelivered frames and grow recv_acc without bound. */
+    conn_extract_and_dispatch(c);
+    if (c->broken || c->rx_backpressure) {
+        return;
+    }
+    size_t taken = 0;
     for (;;) {
+        /* ONE CONNECTION'S TURN ENDS HERE, and the fd is deliberately
+         * left readable. Everything past this point in the socket is
+         * still there; what changes is that the OTHER connections get
+         * read before it, which is the whole mechanism that keeps the
+         * peer's reassembly window bounded. See CLOAK_CONN_READ_BATCH.
+         *
+         * An edge-triggered fd will not report itself again just because
+         * it still has data, so the continuation is explicit: a
+         * zero-delay timer, the same shape session.c uses to lift
+         * backpressure and stream_relay.c uses to finish. Armed only if
+         * one is not already pending. If the timer cannot be armed the
+         * read continues instead -- an unfair read is a performance
+         * problem, a read that never resumes is a stall. */
+        if (taken >= CLOAK_CONN_READ_BATCH) {
+            if (c->read_more_timer != CLOAK_TIMER_INVALID) {
+                return;
+            }
+            c->read_more_timer = cloak_reactor_add_timer(c->reactor, 0, conn_read_more_cb, c);
+            if (c->read_more_timer != CLOAK_TIMER_INVALID) {
+                return;
+            }
+        }
         size_t room = cloak_bytequeue_free_space(&c->recv_acc);
         if (room == 0) {
             return; /* structurally unreachable given recv_acc's capacity invariant; defensive only */
@@ -584,12 +646,50 @@ static void conn_handle_readable(cloak_conn_t *c) {
          * rx/tx here are the SERVER's directions, NOT the user manager's
          * up/down -- see cloak/valve.h before touching this line. */
         cloak_valve_add_rx(c->valve, (int64_t)n);
+        taken += (size_t)n;
         cloak_bytequeue_write(&c->recv_acc, tmp, (size_t)n); /* always fits: n <= room */
         conn_extract_and_dispatch(c);
-        if (c->broken) {
+        if (c->broken || c->rx_backpressure) {
             return;
         }
     }
+}
+
+void cloak_conn_set_rx_backpressure(cloak_conn_t *c, int on) {
+    if (c == NULL || c->broken) {
+        return;
+    }
+    on = on ? 1 : 0;
+    if (c->rx_backpressure == on) {
+        return;
+    }
+    c->rx_backpressure = on;
+    /* FLAG AND INTEREST ONLY -- no dispatch, deliberately. Dispatching
+     * from here runs consumer callbacks that can fill a stream straight
+     * back up and re-enter the switchboard's loop mid-iteration, leaving
+     * some connections paused and others not while sb->rx_backpressure
+     * claims one answer for all of them. That divergence is a permanent
+     * stall: the connections left paused are never visited again, because
+     * the switchboard's own flag already reads as the value it wants.
+     * Measured as a 1-in-3 deadlock in test_server_e2e, which delivered
+     * exactly 1 byte of 131072.
+     *
+     * The buffered envelopes still have to come out, so the switchboard
+     * flushes every connection in a SECOND pass, once every flag is
+     * settled. See cloak_conn_flush_buffered. */
+    conn_sync_interest(c);
+}
+
+void cloak_conn_flush_buffered(cloak_conn_t *c) {
+    if (c == NULL || c->broken || c->rx_backpressure || c->read_paused) {
+        return;
+    }
+    /* conn_sync_interest's 0 -> READABLE transition re-arms the
+     * edge-triggered fd and re-reports what is still in the SOCKET. It
+     * cannot re-report what this connection already read out and left in
+     * recv_acc when a pause stopped it mid-buffer: no event will ever
+     * fire for those bytes again. This is the only thing that moves them. */
+    conn_extract_and_dispatch(c);
 }
 
 static void conn_reactor_cb(cloak_reactor_t *r, int fd, uint32_t events, void *userdata) {
@@ -736,6 +836,10 @@ void cloak_conn_destroy(cloak_conn_t *c) {
          * outlived its connection fires with a dangling userdata. */
         cloak_reactor_cancel_timer(c->reactor, c->rx_resume_timer);
         c->rx_resume_timer = CLOAK_TIMER_INVALID;
+        /* Same class, same reason: a continuation timer that outlived its
+         * connection fires with a dangling userdata. */
+        cloak_reactor_cancel_timer(c->reactor, c->read_more_timer);
+        c->read_more_timer = CLOAK_TIMER_INVALID;
         cloak_reactor_remove_fd(c->reactor, c->fd); /* no-op-with-error-return if already removed */
     }
     free(c->recv_scratch);

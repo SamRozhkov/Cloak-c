@@ -311,6 +311,20 @@ struct cloak_conn {
     int read_paused;
     cloak_timer_id_t rx_resume_timer; /* CLOAK_TIMER_INVALID when none is pending */
 
+    /* 1 while READABLE has been dropped because a STREAM this connection
+     * feeds cannot take another frame. Deliberately a second flag rather
+     * than a second writer of read_paused: the two pauses have different
+     * owners and different resumes -- the one above is the valve's and
+     * only the clock ends it, this one is the session's and only a
+     * consumer draining ends it -- and a single flag would let whichever
+     * resumed first re-arm reads the other still needs stopped. */
+    int rx_backpressure;
+
+    /* A zero-delay timer that resumes a read this connection stopped
+     * part-way through so the others could have a turn. See
+     * CLOAK_CONN_READ_BATCH. CLOAK_TIMER_INVALID when none is pending. */
+    cloak_timer_id_t read_more_timer;
+
     uint32_t interest; /* the mask currently registered with the reactor */
 };
 
@@ -339,6 +353,37 @@ struct cloak_conn {
  * Returns 0 on success, -1 on invalid parameters (max_frame_len == 0,
  * max_frame_len > CLOAK_CONN_MAX_FRAME_LEN, or send_queue_cap == 0) or
  * allocation/reactor registration failure. */
+/* THE MOST BYTES ONE READABLE EVENT WILL TAKE FROM ONE CONNECTION.
+ *
+ * Draining a socket to EAGAIN sounds like the efficient thing and is the
+ * reason a multiplexed stream could not be reassembled. A session sprays
+ * one stream's frames across every connection; TCP preserves order only
+ * within each, so the receiver's heap has to hold everything that arrives
+ * ahead of the frame it is still waiting for. Reading one connection dry
+ * while its neighbours wait for the next reactor turn makes that window
+ * as large as the transfer.
+ *
+ * MEASURED, over a 3 MiB transfer with the sender's queues perfectly
+ * balanced (max skew across connections: 0 bytes, every run):
+ *
+ *   payload    peak heap     frames        NumConn   peak heap
+ *   1 MiB      775,451       91            1         123,908
+ *   2 MiB    1,389,253      168            2       1,410,092
+ *   3 MiB    2,075,651      245            4       2,062,975
+ *                                          8       2,569,227
+ *
+ * About 70% of the transfer, growing linearly with it -- so no fixed cap
+ * on the reassembly heap can ever be right, and the 256 frames this port
+ * settled on was passing with 245 used.
+ *
+ * Bounding the batch bounds the window instead: at most NumConn * this
+ * many bytes can be ahead of the missing frame, whatever the transfer
+ * size. It costs no throughput -- the same bytes, read in a different
+ * order -- which is why it is preferred to capping socket buffers (tried,
+ * and it broke four tests that pin queue-dynamics invariants) or to
+ * matching Go's unbounded heap. */
+#define CLOAK_CONN_READ_BATCH ((size_t)65536)
+
 int cloak_conn_init(cloak_conn_t *c, int fd, cloak_reactor_t *reactor,
                      size_t max_frame_len, size_t send_queue_cap,
                      cloak_conn_envelope_cb on_envelope, void *on_envelope_userdata,
@@ -457,6 +502,22 @@ void cloak_conn_set_valve(cloak_conn_t *c, cloak_valve_t *v);
  * cloak_conn_init. A producer should treat queued approaching capacity as
  * "stop producing": cloak_conn_send fails once a frame no longer fits,
  * and that failure is fatal to the whole pool, not just this connection. */
+/* Stops or resumes reading because a consumer downstream is full. This is
+ * the receive-side mirror of the send-side budget in stream_relay.c, and
+ * it is what makes a bounded receive buffer safe: without it the only
+ * thing a full buffer can do is drop, and a dropped frame in an ordered
+ * stream is a gap that can never be filled.
+ *
+ * Independent of the valve's own rate pause -- both must be clear before
+ * the connection reads again. */
+void cloak_conn_set_rx_backpressure(cloak_conn_t *c, int on);
+
+/* Dispatches envelopes a pause left sitting in this connection's receive
+ * accumulator. Separate from the setter above because dispatching runs
+ * consumer callbacks, and those must not run until every connection's
+ * flag is settled -- see the setter's own comment. */
+void cloak_conn_flush_buffered(cloak_conn_t *c);
+
 size_t cloak_conn_send_queued(const cloak_conn_t *c);
 size_t cloak_conn_send_capacity(const cloak_conn_t *c);
 

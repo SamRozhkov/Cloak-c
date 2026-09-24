@@ -163,7 +163,25 @@ const char *cloak_server_stack_strerror(int code);
  * that ceiling is a wire-format constant and not a policy). */
 #define CLOAK_SERVER_STACK_DEFAULT_MAX_ON_WIRE_SIZE       ((size_t)16401)
 #define CLOAK_SERVER_STACK_DEFAULT_STREAM_RECV_CAPACITY   ((size_t)65536)
-#define CLOAK_SERVER_STACK_DEFAULT_STREAM_MAX_PENDING     ((size_t)64)
+/* 256, NOT 64, AND THE NUMBER IS DERIVED RATHER THAN CHOSEN.
+ *
+ * With NumConn > 1 a session sprays frames across every connection, and
+ * TCP preserves order only within each one -- so this heap holds the
+ * peer's REORDERING window, and that window is as large as whatever the
+ * peer can have in flight: NumConn * conn_send_queue_cap. At the shipped
+ * defaults that is 4 * 262144 = 1 MiB.
+ *
+ * 64 frames at the usual 16132-byte payload is a budget of about 1 MiB --
+ * exactly marginal, and it overflowed by ONE frame. Measured: a 3 MiB
+ * transfer over 4 connections stopped after 26,624 bytes with exactly one
+ * refused frame, three runs out of three, and one refusal is fatal
+ * because an ordered stream can never fill the gap it leaves. At 256 the
+ * same transfer completes with zero refusals.
+ *
+ * So the rule, for anyone tuning this: the budget must EXCEED the peer's
+ * maximum in-flight, not merely match it. 256 gives 4x headroom at the
+ * shipped defaults. */
+#define CLOAK_SERVER_STACK_DEFAULT_STREAM_MAX_PENDING     ((size_t)256)
 #define CLOAK_SERVER_STACK_DEFAULT_CONN_SEND_QUEUE_CAP    ((size_t)262144)
 #define CLOAK_SERVER_STACK_DEFAULT_INACTIVITY_TIMEOUT_MS  ((uint64_t)60000)
 

@@ -83,6 +83,12 @@ typedef struct {
     size_t heap_len;                  /* ORDERED only */
     size_t heap_cap;                  /* ORDERED only */
     size_t max_pending_frames;        /* ORDERED only: defensive cap on out-of-order buffering */
+    /* ORDERED only: bytes of payload currently on the heap. The cap is a
+     * BYTE budget (max_pending_frames * max_payload_per_frame) rather
+     * than a frame count, because the heap's occupancy is the peer's
+     * reordering window and a count cannot tell one 16 KB frame from one
+     * 16-byte frame. See heap_push. */
+    size_t heap_bytes;
 
     cloak_msgqueue_t recv_msgs;       /* UNORDERED only -- zeroed and unused when ORDERED */
 
@@ -102,6 +108,56 @@ typedef struct {
      * is NOT an error: cloak_stream_feed_frame still returns 0, because
      * returning -1 would retire a stream over transient backpressure. */
     uint64_t recv_dropped_datagrams;
+    uint64_t window_updates_sent;
+
+    /* ORDERED only: receive-side backpressure.
+     *
+     * The unordered comment above states this port's deliberate
+     * divergence -- Go blocks the writer, a single-threaded reactor
+     * cannot, so a full datagram queue drops the newest. For DATAGRAMS
+     * that is defensible: a UDP application is already written against
+     * loss. The ORDERED path inherited the same shape and it is NOT
+     * defensible there, because a gap in the sequence can never be
+     * filled: once one frame is dropped, next_recv_seq can never advance
+     * past it and every later frame sits on the heap forever. Measured,
+     * not argued: a 1 MiB transfer through the full stack stopped dead at
+     * 606,569 bytes with `heap_len=64 max=64 recv_len=59392
+     * recv_free=6144` and never moved again in 80 seconds of pumping.
+     *
+     * The premise "a single-threaded reactor cannot block the writer" is
+     * true only of BLOCKING. It can stop READING, which is what TCP
+     * backpressure is for and what these two fields drive: the stream
+     * reports when it can no longer accept a maximum-size frame, the
+     * session counts how many of its streams say so, and the switchboard
+     * drops READABLE from every connection until they drain. */
+    /* RECEIVE-SIDE CREDIT BOOKKEEPING (stage 2 of per-stream credit).
+     *
+     * recv_freed counts bytes the local consumer has taken since the last
+     * window update went out; recv_window is the capacity those updates
+     * are measured against. One update is emitted when recv_freed reaches
+     * half the window.
+     *
+     * Nothing acts on the updates yet -- the sending side of credit is a
+     * later stage. They are emitted now, and ignored on arrival, so that
+     * their FREQUENCY can be measured before anything depends on them. */
+    /* SEND-SIDE CREDIT (stage 3). How many more bytes this side may put
+     * on the wire for this stream. It starts at the receive capacity both
+     * ends agree on from the session config -- nothing is exchanged to
+     * establish it -- and is replenished by the peer's window updates.
+     *
+     * ACCOUNTED BUT NOT YET ENFORCED. cloak_stream_write still sends
+     * whatever it is given; the clamp belongs with the relay change that
+     * makes a short write safe, and landing the two separately would mean
+     * a producer silently losing the bytes it was not told about. */
+    size_t send_credit;
+
+    size_t recv_window;
+    size_t recv_freed;
+    int flow_control; /* 0 suppresses window updates -- see cloak_session_config_t */
+
+    int recv_saturated;
+    void (*on_saturation)(void *userdata, int saturated);
+    void *on_saturation_userdata;
 
     /* BOTH modes, with subtly different meanings. ORDERED: a closing
      * frame has been drained INTO ORDER (it reached next_recv_seq).
@@ -167,6 +223,29 @@ typedef struct {
  * too small to ever hold this stream's own largest possible frame
  * payload, which would otherwise let a single oversized frame wedge the
  * stream permanently). */
+/* Whether this stream can no longer accept a maximum-size frame. Always 0
+ * in unordered mode, which drops rather than backpressures on purpose --
+ * see recv_dropped_datagrams. */
+int cloak_stream_recv_saturated(const cloak_stream_t *s);
+
+/* How many window updates this stream has emitted. For tests: the update
+ * rate is the thing worth pinning before anything depends on it. */
+uint64_t cloak_stream_window_updates_sent(const cloak_stream_t *s);
+
+/* How many more bytes the peer has room for on this stream. Once the
+ * clamp lands this is the most cloak_stream_write will accept; today it
+ * is the number a producer should already be pacing against. */
+size_t cloak_stream_send_credit(const cloak_stream_t *s);
+
+/* Turns window updates off for this stream. Only the Go-interoperability
+ * tests use it; see cloak_session_config_t.flow_control. */
+void cloak_stream_set_flow_control(cloak_stream_t *s, int on);
+
+/* Fires ONLY on a change, with the new value, so the owner can keep a
+ * count rather than rescan. Set before the stream carries any traffic. */
+void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata, int saturated),
+                                    void *userdata);
+
 int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *obfuscator,
                        size_t max_on_wire_size, size_t recv_capacity, size_t max_pending_frames,
                        cloak_session_ordering_t ordering,

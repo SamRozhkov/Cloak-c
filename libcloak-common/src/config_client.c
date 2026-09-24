@@ -248,6 +248,16 @@ int cloak_client_config_from_cjson(const cJSON *root, cloak_client_config_t *cfg
     }
     cfg->keep_alive_sec = (found && keep_alive > 0) ? keep_alive : -1;
 
+    /* "FlowControl": absent or true keeps the window updates on, which is
+     * the product's behaviour; false is the Go-compatibility mode. Parsed
+     * as its own key rather than folded into a mode enum because it is
+     * one bit and naming it is what makes a config reviewable. */
+    int flow_control_on = 1;
+    if (cloak_config_get_bool(root, "FlowControl", &flow_control_on, &found, err, err_cap) != 0) {
+        return -1;
+    }
+    cfg->disable_flow_control = (found && !flow_control_on) ? 1 : 0;
+
     return 0;
 }
 

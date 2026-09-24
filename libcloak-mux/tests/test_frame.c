@@ -502,8 +502,88 @@ static void test_first_frame_pad_length_is_uniform(void) {
     ASSERT_COUNT_IN_RANGE("first-five-frame pad lengths in [0,15]", low, 12664ul, 14003ul);
 }
 
+
+/* ---- the window-update type carries its four bytes intact ------------- */
+
+/* THE TYPE IS JUST A BYTE, AND THAT IS WHAT THIS PINS. The frame layer
+ * must not treat CLOAK_FRAME_TYPE_WINDOW_UPDATE specially: it obfuscates
+ * and deobfuscates like any other frame, and the four payload bytes must
+ * survive byte for byte, because a corrupted delta is a credit error that
+ * would show up much later as a stall with no evident cause.
+ *
+ * Also pins that the type is distinguishable from the three that existed
+ * before it -- a decoder that folded unknown values into NOTHING would
+ * pass every other test in this file. */
+static void test_window_update_round_trip(void) {
+    cloak_obfuscator_t o;
+    make_plain_obfuscator(&o);
+
+    /* 0xDEADBEEF little-endian, and deliberately not a palindrome: a
+     * byte-order slip reads back 0xEFBEADDE and fails here rather than
+     * silently granting the wrong credit. */
+    const uint8_t payload[CLOAK_FRAME_WINDOW_UPDATE_LEN] = {0xEF, 0xBE, 0xAD, 0xDE};
+    cloak_frame_t frame;
+    frame.stream_id = 9;
+    frame.seq = 100;
+    frame.closing = CLOAK_FRAME_TYPE_WINDOW_UPDATE;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[128];
+    long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ_INT(n, CLOAK_FRAME_HEADER_LEN + CLOAK_FRAME_WINDOW_UPDATE_LEN +
+                         CLOAK_SALSA20_NONCE_LEN);
+
+    cloak_frame_t out;
+    ASSERT_EQ_INT(0, cloak_frame_deobfuscate(&o, &out, buf, (size_t)n));
+    ASSERT_EQ_INT(out.stream_id, frame.stream_id);
+    ASSERT_EQ_INT(out.seq, frame.seq);
+    ASSERT_EQ_INT(out.closing, CLOAK_FRAME_TYPE_WINDOW_UPDATE);
+    ASSERT_TRUE(out.closing != CLOAK_FRAME_CLOSING_NOTHING);
+    ASSERT_TRUE(out.closing != CLOAK_FRAME_CLOSING_STREAM);
+    ASSERT_TRUE(out.closing != CLOAK_FRAME_CLOSING_SESSION);
+    ASSERT_EQ_INT(out.payload_len, CLOAK_FRAME_WINDOW_UPDATE_LEN);
+    ASSERT_MEM_EQ(out.payload, payload, CLOAK_FRAME_WINDOW_UPDATE_LEN);
+
+    uint32_t delta = (uint32_t)out.payload[0] | ((uint32_t)out.payload[1] << 8) |
+                     ((uint32_t)out.payload[2] << 16) | ((uint32_t)out.payload[3] << 24);
+    ASSERT_EQ_INT((int)delta, (int)0xDEADBEEFu);
+}
+
+/* An update is a frame like any other under a real AEAD too, including
+ * the padding the first few sequence numbers carry. Cheap, and it is the
+ * combination -- new type, low seq, real cipher -- that no other case in
+ * this file covers. */
+static void test_window_update_survives_padding_and_aead(void) {
+    cloak_obfuscator_t o;
+    o.method = CLOAK_AEAD_AES_256_GCM;
+    memset(o.session_key, 0x5c, sizeof(o.session_key));
+
+    const uint8_t payload[CLOAK_FRAME_WINDOW_UPDATE_LEN] = {0x01, 0x00, 0x00, 0x00};
+    cloak_frame_t frame;
+    frame.stream_id = 0x01020304u;
+    frame.seq = 0; /* inside CLOAK_FRAME_PAD_FIRST_N_FRAMES, so padded */
+    frame.closing = CLOAK_FRAME_TYPE_WINDOW_UPDATE;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    uint8_t buf[512];
+    long n = cloak_frame_obfuscate(&o, &frame, buf, sizeof(buf), 0);
+    ASSERT_TRUE(n > 0);
+
+    cloak_frame_t out;
+    ASSERT_EQ_INT(0, cloak_frame_deobfuscate(&o, &out, buf, (size_t)n));
+    ASSERT_EQ_INT(out.closing, CLOAK_FRAME_TYPE_WINDOW_UPDATE);
+    ASSERT_EQ_INT(out.stream_id, frame.stream_id);
+    ASSERT_EQ_INT(out.payload_len, CLOAK_FRAME_WINDOW_UPDATE_LEN);
+    ASSERT_MEM_EQ(out.payload, payload, CLOAK_FRAME_WINDOW_UPDATE_LEN);
+}
+
 TEST_MAIN_BEGIN()
     test_round_trip_plain();
+    test_window_update_round_trip();
+    test_window_update_survives_padding_and_aead();
     test_padding_varies_for_first_n_frames_only();
     test_payload_offset_optimization_skips_copy();
     test_obfuscate_rejects_empty_payload();

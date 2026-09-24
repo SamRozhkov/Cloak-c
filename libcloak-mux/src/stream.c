@@ -6,9 +6,12 @@
 
 static int heap_grow(cloak_stream_t *s) {
     size_t new_cap = s->heap_cap == 0 ? 8 : s->heap_cap * 2;
-    if (new_cap > s->max_pending_frames) {
-        new_cap = s->max_pending_frames;
-    }
+    /* NO CLAMP TO max_pending_frames ANY MORE, and removing it was not
+     * optional: that value is now a BYTE budget enforced in heap_push, so
+     * a clamp here silently returned success without growing once the
+     * count reached 64, and the caller then wrote one past the end.
+     * Caught immediately as "double free or corruption (out)" -- the
+     * clamp and the guard it belonged to have to go together. */
     cloak_pending_frame_t *new_heap =
         (cloak_pending_frame_t *)realloc(s->heap, new_cap * sizeof(cloak_pending_frame_t));
     if (new_heap == NULL) {
@@ -20,7 +23,29 @@ static int heap_grow(cloak_stream_t *s) {
 }
 
 static int heap_push(cloak_stream_t *s, cloak_pending_frame_t pf) {
-    if (s->heap_len >= s->max_pending_frames) {
+    /* A BYTE BUDGET, NOT A FRAME COUNT, AND THE HEAP MUST NOT BE A
+     * BACKPRESSURE POINT AT ALL.
+     *
+     * What sits here is the peer's REORDERING window: with NumConn > 1 a
+     * session sprays frames across several connections, TCP preserves
+     * order only within each one, so the frame that lets next_recv_seq
+     * advance routinely arrives after frames that follow it. That window
+     * is bounded by what the sender can have in flight -- its own
+     * per-connection send queues -- not by anything this side controls.
+     *
+     * Refusing here therefore cannot be congestion control, and a
+     * previous attempt to treat it as such deadlocked: pausing every
+     * connection when the heap filled stopped reading the very
+     * connection carrying the missing sequence number. At NumConn=1 that
+     * never showed, because there is no reordering; at 4 a megabyte
+     * stopped after about 26 KB.
+     *
+     * So the bound is memory, and only memory: the same product the
+     * frame count always implied, expressed so that a peer sending many
+     * tiny frames cannot exhaust it and a peer sending legitimate
+     * full-size ones is not refused while well inside it. */
+    size_t budget = s->max_pending_frames * s->max_payload_per_frame;
+    if (s->heap_bytes + pf.payload_len > budget) {
         return -1;
     }
     if (s->heap_len == s->heap_cap) {
@@ -29,6 +54,7 @@ static int heap_push(cloak_stream_t *s, cloak_pending_frame_t pf) {
         }
     }
     size_t i = s->heap_len++;
+    s->heap_bytes += pf.payload_len;
     s->heap[i] = pf;
     while (i > 0) {
         size_t parent = (i - 1) / 2;
@@ -44,6 +70,9 @@ static int heap_push(cloak_stream_t *s, cloak_pending_frame_t pf) {
 }
 
 static cloak_pending_frame_t heap_pop(cloak_stream_t *s) {
+    /* Kept in step with heap_push's budget; the top frame's length is
+     * read before the heap is reshaped. */
+    s->heap_bytes -= s->heap[0].payload_len;
     cloak_pending_frame_t top = s->heap[0];
     s->heap_len--;
     if (s->heap_len > 0) {
@@ -150,12 +179,17 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
      * either must be behind the same branch this is; see cloak/stream.h's
      * per-field mode annotations. */
     if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        s->recv_window = recv_capacity;
+        s->send_credit = recv_capacity;
+        s->flow_control = 1;
         if (cloak_msgqueue_init(&s->recv_msgs, recv_capacity) != 0) {
             free(s->write_buf);
             s->write_buf = NULL;
             return -1;
         }
-    } else if (cloak_bytequeue_init(&s->recv_bytes, recv_capacity) != 0) {
+    } else if ((s->recv_window = recv_capacity, s->send_credit = recv_capacity,
+                s->flow_control = 1,
+                cloak_bytequeue_init(&s->recv_bytes, recv_capacity)) != 0) {
         free(s->write_buf);
         s->write_buf = NULL;
         return -1;
@@ -197,6 +231,134 @@ void cloak_stream_destroy(cloak_stream_t *s) {
     }
     free(s->heap);
     memset(s, 0, sizeof(*s));
+}
+
+
+/* Recomputes receive-side saturation and fires the owner's callback only
+ * when it changes.
+ *
+ * THE WATERMARK IS HALF THE HEAP, NOT THE WHOLE OF IT, and that slack is
+ * the entire point. Frames already sitting in the connection's socket
+ * buffer, and frames already parsed out of one read batch, arrive AFTER
+ * the decision to stop reading -- backpressure is never instantaneous.
+ * Pausing only once the heap is completely full would leave nowhere to
+ * put them and drop exactly the frame the pause existed to save. At the
+ * default max_pending_frames of 64 this keeps 32 frames -- about 516 KB
+ * at the usual maximum payload -- in reserve for that flight.
+ *
+ * The recv_bytes half of the test is what actually fires in a healthy
+ * bulk transfer: frames arrive in order, try_drain moves each into
+ * recv_bytes, and the heap stays near empty until recv_bytes fills. The
+ * heap half catches the out-of-order case, where try_drain cannot
+ * advance at all. */
+static void stream_update_saturation(cloak_stream_t *s) {
+    int now = 0;
+    if (s->ordering != CLOAK_SESSION_ORDERING_UNORDERED) {
+        /* recv_bytes ONLY. The heap deliberately does not appear here: it
+         * holds the peer's reordering window, and pausing on it stops the
+         * connection carrying the frame that would drain it. recv_bytes
+         * is different -- it fills only when the CONSUMER is behind, and
+         * a consumer that is behind is exactly what backpressure is
+         * for. */
+        now = cloak_bytequeue_free_space(&s->recv_bytes) < s->max_payload_per_frame;
+    }
+    if (now == s->recv_saturated) {
+        return;
+    }
+    s->recv_saturated = now;
+    if (s->on_saturation != NULL) {
+        s->on_saturation(s->on_saturation_userdata, now);
+    }
+}
+
+int cloak_stream_recv_saturated(const cloak_stream_t *s) {
+    return s == NULL ? 0 : s->recv_saturated;
+}
+
+void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata, int saturated),
+                                    void *userdata) {
+    if (s == NULL) {
+        return;
+    }
+    s->on_saturation = cb;
+    s->on_saturation_userdata = userdata;
+}
+
+
+/* Emits one window update if the consumer has freed at least half the
+ * window since the last one.
+ *
+ * HALF, NOT EVERY READ. An update per read would put a frame on the wire
+ * for every application-sized read -- on a bulk transfer, one per few
+ * kilobytes -- and the storm would cost more than the flow control it
+ * serves. Half bounds the rate at two updates per window while still
+ * refilling a peer long before it could run dry.
+ *
+ * IT DOES NOT ADVANCE next_write_seq, AND THAT IS LOAD-BEARING. The
+ * sequence space belongs to the data stream: a receiver that ignores
+ * these frames (which is every receiver until the sending half of credit
+ * lands) never advances next_recv_seq past one, so a consumed sequence
+ * number would be a permanent gap and the stream would wedge. The seq
+ * field is therefore a don't-care, carried only because the header has
+ * one.
+ *
+ * A failure to send is deliberately not fatal. The sink refuses when the
+ * session is already broken, and turning that into a torn-down stream
+ * would make a connection that is going away anyway fail twice. */
+
+/* Grants the credit a peer's window update carries.
+ *
+ * SATURATING, NOT WRAPPING. A peer that sends nonsense -- or a long-lived
+ * stream whose deltas legitimately sum past the type's range -- must not
+ * be able to wrap this back to a small number, which would stall the
+ * stream, nor to a huge one, which would defeat the point of having a
+ * window at all. */
+static void stream_grant_credit(cloak_stream_t *s, uint32_t delta) {
+    size_t room = (size_t)-1 - s->send_credit;
+    s->send_credit += (size_t)delta < room ? (size_t)delta : room;
+}
+
+size_t cloak_stream_send_credit(const cloak_stream_t *s) {
+    return s == NULL ? 0 : s->send_credit;
+}
+
+static void stream_maybe_send_window_update(cloak_stream_t *s) {
+    if (!s->flow_control || s->recv_window == 0 || s->recv_freed * 2 < s->recv_window) {
+        return;
+    }
+    uint32_t delta = s->recv_freed > 0xffffffffu ? 0xffffffffu : (uint32_t)s->recv_freed;
+    uint8_t payload[CLOAK_FRAME_WINDOW_UPDATE_LEN];
+    payload[0] = (uint8_t)(delta & 0xffu);
+    payload[1] = (uint8_t)((delta >> 8) & 0xffu);
+    payload[2] = (uint8_t)((delta >> 16) & 0xffu);
+    payload[3] = (uint8_t)((delta >> 24) & 0xffu);
+
+    cloak_frame_t frame;
+    frame.stream_id = s->id;
+    frame.seq = s->next_write_seq; /* not consumed -- see above */
+    frame.closing = CLOAK_FRAME_TYPE_WINDOW_UPDATE;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    long written = cloak_frame_obfuscate(s->obfuscator, &frame, s->write_buf, s->write_buf_cap, 0);
+    if (written < 0) {
+        return;
+    }
+    if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
+        return;
+    }
+    s->recv_freed = 0;
+    s->window_updates_sent++;
+}
+
+void cloak_stream_set_flow_control(cloak_stream_t *s, int on) {
+    if (s != NULL) {
+        s->flow_control = on ? 1 : 0;
+    }
+}
+
+uint64_t cloak_stream_window_updates_sent(const cloak_stream_t *s) {
+    return s == NULL ? 0 : s->window_updates_sent;
 }
 
 long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
@@ -269,6 +431,10 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
             return -1;
         }
         n += chunk;
+        /* Clamped subtraction: the clamp on the way in is not here yet,
+         * so a producer can legitimately outrun its credit and this must
+         * floor at zero rather than wrap to SIZE_MAX. */
+        s->send_credit -= chunk < s->send_credit ? chunk : s->send_credit;
     }
     return (long)in_len;
 }
@@ -377,6 +543,25 @@ static int feed_frame_unordered(cloak_stream_t *s, const cloak_frame_t *frame) {
 }
 
 int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
+    /* A window update is credit for the OTHER direction, not stream data.
+     * It is consumed here, before the mode split and before anything
+     * looks at seq, so it neither advances the sequence space nor trips
+     * the closing-frame path -- both of which would wedge the stream.
+     * Nothing acts on it yet; the sending half of credit is a later
+     * stage. */
+    if (frame->closing == CLOAK_FRAME_TYPE_WINDOW_UPDATE) {
+        if (frame->payload_len == CLOAK_FRAME_WINDOW_UPDATE_LEN) {
+            uint32_t delta = (uint32_t)frame->payload[0] | ((uint32_t)frame->payload[1] << 8) |
+                             ((uint32_t)frame->payload[2] << 16) |
+                             ((uint32_t)frame->payload[3] << 24);
+            stream_grant_credit(s, delta);
+        }
+        /* A malformed update is ignored rather than fatal: it grants no
+         * credit, so the worst it can do is leave the sender where it
+         * already was. Tearing the stream down for it would turn a
+         * garbled frame into a lost connection. */
+        return 0;
+    }
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         return feed_frame_unordered(s, frame);
     }
@@ -390,6 +575,30 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
     size_t recv_total_capacity = cloak_bytequeue_len(&s->recv_bytes) + cloak_bytequeue_free_space(&s->recv_bytes);
     if (frame->payload_len > recv_total_capacity) {
         return -1;
+    }
+
+    /* THE FAST PATH: the frame that was expected, with nothing queued
+     * ahead of it and room to take it.
+     *
+     * Every frame used to cost a malloc, a copy into it, a heap push, a
+     * pop, a second copy into recv_bytes and a free -- even when it
+     * arrived exactly in order, which is the overwhelmingly common case.
+     * This writes it straight through: no allocation, one copy, no heap.
+     *
+     * The conditions are deliberately conservative. A closing frame goes
+     * the long way so that try_drain keeps being the single place that
+     * interprets one. A non-empty heap goes the long way because this
+     * frame might unblock what is already queued, and try_drain is what
+     * knows how. */
+    if (frame->closing == CLOAK_FRAME_CLOSING_NOTHING && s->heap_len == 0 &&
+        frame->seq == s->next_recv_seq &&
+        cloak_bytequeue_free_space(&s->recv_bytes) >= frame->payload_len) {
+        if (frame->payload_len > 0) {
+            cloak_bytequeue_write(&s->recv_bytes, frame->payload, frame->payload_len);
+        }
+        s->next_recv_seq++;
+        stream_update_saturation(s);
+        return 0;
     }
 
     uint8_t *payload_copy = NULL;
@@ -408,11 +617,21 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
     pf.payload_len = frame->payload_len;
 
     if (heap_push(s, pf) != 0) {
+        /* Now genuinely a misbehaving peer rather than ordinary
+         * congestion: with backpressure in place, in-order traffic pauses
+         * the connection at the half-heap watermark long before this, so
+         * reaching a full heap means a peer sending far-future sequence
+         * numbers it never intends to fill in. Retiring the stream is the
+         * right answer to that, and was always the right answer -- what
+         * was wrong was reaching here on a perfectly ordinary transfer. */
         free(payload_copy);
+        stream_update_saturation(s);
         return -1;
     }
 
-    return try_drain(s);
+    int rc = try_drain(s);
+    stream_update_saturation(s);
+    return rc;
 }
 
 long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
@@ -437,6 +656,12 @@ long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
     size_t n = cloak_bytequeue_read(&s->recv_bytes, out, out_cap);
     if (n > 0) {
         try_drain(s);
+        s->recv_freed += n;
+        stream_maybe_send_window_update(s);
+        /* The resume half. try_drain has already refilled recv_bytes from
+         * the heap where it could, so this sees the state the next frame
+         * will actually meet. */
+        stream_update_saturation(s);
         return (long)n;
     }
     if (cloak_bytequeue_is_eof(&s->recv_bytes)) {
