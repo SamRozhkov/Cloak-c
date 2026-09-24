@@ -125,6 +125,21 @@ static size_t stream_relay_fd_read_budget(cloak_stream_relay_t *sr, uint64_t *ou
     if (budget > STREAM_RELAY_CHUNK) {
         budget = STREAM_RELAY_CHUNK;
     }
+    /* AND NEVER MORE THAN THE PEER HAS ROOM FOR. cloak_stream_write
+     * refuses past its credit and returns the short count; this relay
+     * hands it whatever it read from the socket and would drop the
+     * remainder, because by then the bytes are out of the socket and
+     * there is nowhere to put them back. Clamping here is what makes
+     * that impossible rather than merely unlikely. A budget of 0 pauses
+     * the read, and the window update that grants credit is what resumes
+     * it -- through notify_writable, the same path a full pool uses. */
+    size_t credit = cloak_stream_send_credit(sr->stream);
+    if (budget > credit) {
+        budget = credit;
+    }
+    if (budget == 0) {
+        return 0;
+    }
     /* AND, IN UNORDERED MODE, NEVER MORE THAN ONE FRAME'S PAYLOAD.
      *
      * STREAM_RELAY_CHUNK is 16384 and max_payload_per_frame is 16132 at

@@ -396,6 +396,16 @@ static void session_on_envelope(cloak_switchboard_t *sb, const uint8_t *frame_by
     if (found && state == CLOAK_STRMTAB_ACTIVE) {
         cloak_stream_t *stream = (cloak_stream_t *)value;
         int rc = cloak_stream_feed_frame(stream, &frame);
+        if (rc == 2) {
+            /* A window update: credit, not data. Nothing to route and
+             * nothing to notify a reader about -- but a producer that
+             * paused for want of credit is waiting on exactly this, and
+             * on_writable is the signal every relay already resumes on. */
+            if (sesh->on_writable != NULL) {
+                sesh->on_writable(sesh, sesh->on_writable_userdata);
+            }
+            return;
+        }
         if (rc == 1 || rc == -1) {
             /* rc == 1: closing frame drained into order -- passive
              * close. rc == -1: protocol violation on this one stream --

@@ -179,12 +179,15 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
      * either must be behind the same branch this is; see cloak/stream.h's
      * per-field mode annotations. */
     if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
+        s->send_credit = recv_capacity;
+        s->recv_window = recv_capacity;
         if (cloak_msgqueue_init(&s->recv_msgs, recv_capacity) != 0) {
             free(s->write_buf);
             s->write_buf = NULL;
             return -1;
         }
-    } else if (cloak_bytequeue_init(&s->recv_bytes, recv_capacity) != 0) {
+    } else if ((s->send_credit = recv_capacity, s->recv_window = recv_capacity,
+                cloak_bytequeue_init(&s->recv_bytes, recv_capacity)) != 0) {
         free(s->write_buf);
         s->write_buf = NULL;
         return -1;
@@ -266,6 +269,10 @@ static void stream_update_saturation(cloak_stream_t *s) {
     }
 }
 
+size_t cloak_stream_send_credit(const cloak_stream_t *s) {
+    return s == NULL ? 0 : s->send_credit;
+}
+
 int cloak_stream_recv_saturated(const cloak_stream_t *s) {
     return s == NULL ? 0 : s->recv_saturated;
 }
@@ -277,6 +284,58 @@ void cloak_stream_set_saturation_cb(cloak_stream_t *s, void (*cb)(void *userdata
     }
     s->on_saturation = cb;
     s->on_saturation_userdata = userdata;
+}
+
+
+/* Emits one window update if the consumer has freed at least half the
+ * window since the last one.
+ *
+ * HALF, NOT EVERY READ: an update per read would put a frame on the wire
+ * for every application-sized read, which on a bulk transfer is a frame
+ * per few kilobytes -- the update storm would cost more than the flow
+ * control saves. Half bounds it at two updates per window and still
+ * refills the peer long before it runs dry.
+ *
+ * A failure to send is deliberately not fatal here. The sink refuses when
+ * the session is already broken, and turning that into a torn-down stream
+ * would convert a connection that is going away anyway into a second,
+ * confusing failure. The peer stops sending on its own when the session
+ * ends. */
+static void stream_maybe_send_window_update(cloak_stream_t *s) {
+    if (s->recv_window == 0 || s->recv_freed * 2 < s->recv_window) {
+        return;
+    }
+    uint32_t delta = (uint32_t)s->recv_freed;
+    uint8_t payload[CLOAK_FRAME_WINDOW_UPDATE_LEN];
+    payload[0] = (uint8_t)(delta & 0xffu);
+    payload[1] = (uint8_t)((delta >> 8) & 0xffu);
+    payload[2] = (uint8_t)((delta >> 16) & 0xffu);
+    payload[3] = (uint8_t)((delta >> 24) & 0xffu);
+
+    cloak_frame_t frame;
+    frame.stream_id = s->id;
+    frame.seq = s->next_write_seq;
+    frame.closing = CLOAK_FRAME_TYPE_WINDOW_UPDATE;
+    frame.payload = payload;
+    frame.payload_len = sizeof(payload);
+
+    long written = cloak_frame_obfuscate(s->obfuscator, &frame, s->write_buf, s->write_buf_cap, 0);
+    if (written < 0) {
+        return;
+    }
+    s->next_write_seq++;
+    if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
+        return;
+    }
+    s->recv_freed = 0;
+}
+
+/* Grants credit a peer's window update carries. Saturating rather than
+ * wrapping: a peer that sends nonsense should not be able to make this
+ * side believe it has an enormous window. */
+static void stream_grant_credit(cloak_stream_t *s, uint32_t delta) {
+    size_t room = (size_t)-1 - s->send_credit;
+    s->send_credit += (size_t)delta < room ? (size_t)delta : room;
 }
 
 long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
@@ -326,6 +385,16 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED && in_len > s->max_payload_per_frame) {
         return CLOAK_STREAM_ERR_SHORT_BUFFER;
     }
+    /* BOUNDED BY CREDIT, AND A SHORT ANSWER IS NORMAL NOW. A producer
+     * that ignores the return value will lose bytes, which is why
+     * stream_relay_fd_read_budget clamps its read to this same number
+     * before it ever touches the socket. */
+    if (in_len > s->send_credit) {
+        in_len = s->send_credit;
+    }
+    if (in_len == 0) {
+        return 0;
+    }
     size_t n = 0;
     while (n < in_len) {
         size_t remaining = in_len - n;
@@ -349,6 +418,7 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
             return -1;
         }
         n += chunk;
+        s->send_credit -= chunk;
     }
     return (long)in_len;
 }
@@ -457,6 +527,26 @@ static int feed_frame_unordered(cloak_stream_t *s, const cloak_frame_t *frame) {
 }
 
 int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
+    /* A window update is not stream data and never touches the sequence
+     * space: it is out-of-band credit for the OTHER direction. Handled
+     * before the mode split because it means the same thing in both. */
+    if (frame->closing == CLOAK_FRAME_TYPE_WINDOW_UPDATE) {
+        if (frame->payload_len == CLOAK_FRAME_WINDOW_UPDATE_LEN) {
+            uint32_t delta = (uint32_t)frame->payload[0] | ((uint32_t)frame->payload[1] << 8) |
+                             ((uint32_t)frame->payload[2] << 16) |
+                             ((uint32_t)frame->payload[3] << 24);
+            stream_grant_credit(s, delta);
+        }
+        /* 2, NOT 0, AND THE DIFFERENCE IS A STALL.
+         *
+         * A producer whose credit ran out pauses its read and waits for
+         * an event. Pool pressure has one (the drained callback) and rate
+         * limiting arms its own timer; credit had neither, so a relay
+         * that stopped for want of credit would never be told it had
+         * some. The session turns this return into the writable signal
+         * every relay already knows how to resume on. */
+        return 2;
+    }
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         return feed_frame_unordered(s, frame);
     }
@@ -551,6 +641,8 @@ long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
     size_t n = cloak_bytequeue_read(&s->recv_bytes, out, out_cap);
     if (n > 0) {
         try_drain(s);
+        s->recv_freed += n;
+        stream_maybe_send_window_update(s);
         /* The resume half. try_drain has already refilled recv_bytes from
          * the heap where it could, so this sees the state the next frame
          * will actually meet. */

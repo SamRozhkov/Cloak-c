@@ -129,6 +129,27 @@ typedef struct {
      * reports when it can no longer accept a maximum-size frame, the
      * session counts how many of its streams say so, and the switchboard
      * drops READABLE from every connection until they drain. */
+    /* PER-STREAM CREDIT.
+     *
+     * send_credit is how many more bytes this side may put on the wire
+     * for this stream. It starts at the receive capacity both ends agree
+     * on from the session config -- nothing is exchanged to establish it
+     * -- and is replenished by CLOAK_FRAME_TYPE_WINDOW_UPDATE frames the
+     * peer emits as its consumer drains.
+     *
+     * recv_freed counts bytes the local consumer has taken since the last
+     * update went out. One update is emitted when it reaches half the
+     * window: half bounds the update rate at two per window while never
+     * leaving the peer idle for want of credit.
+     *
+     * This is what lets the receive buffer be finite without anything
+     * being dropped and without any connection being stopped -- the two
+     * mechanisms this replaces, each of which failed one half of "faster
+     * and more stable". */
+    size_t send_credit;
+    size_t recv_window;
+    size_t recv_freed;
+
     int recv_saturated;
     void (*on_saturation)(void *userdata, int saturated);
     void *on_saturation_userdata;
@@ -201,6 +222,11 @@ typedef struct {
  * in unordered mode, which drops rather than backpressures on purpose --
  * see recv_dropped_datagrams. */
 int cloak_stream_recv_saturated(const cloak_stream_t *s);
+
+/* How many more bytes cloak_stream_write would accept for this stream
+ * right now. A producer must pace against this: writing past it is
+ * refused, not queued. */
+size_t cloak_stream_send_credit(const cloak_stream_t *s);
 
 /* Fires ONLY on a change, with the new value, so the owner can keep a
  * count rather than rescan. Set before the stream carries any traffic. */
