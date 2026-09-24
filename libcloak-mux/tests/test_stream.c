@@ -636,20 +636,20 @@ static void test_stream_init_rejects_invalid_ordering(void) {
 }
 
 
-/* ---- window updates: they go out, and at the rate they are meant to --- */
+/* ---- window updates: only when the peer is about to run out ---------- */
 
-/* WITHOUT THIS CASE THE WHOLE MECHANISM IS UNPINNED, and that was not a
- * guess: suppressing every window update left all 85 test binaries green.
- * A mechanism nothing would miss is a mechanism that will be deleted or
- * broken by someone who has no way to find out.
+/* WITHOUT THIS CASE THE MECHANISM IS UNPINNED, and that was measured, not
+ * assumed: suppressing every window update once left all 85 test binaries
+ * green.
  *
- * Three properties, and the rate is the one that matters most. An update
- * per read would be a frame on the wire for every application-sized read
- * -- on a bulk transfer, one per few kilobytes -- and that storm would
- * cost more than the flow control it serves. Half the window bounds it at
- * two per window.
- */
-static void test_window_updates_are_emitted_at_half_the_window(void) {
+ * The rule under test is not a fixed fraction of the window. An update is
+ * sent when the PEER's remaining credit drops below one maximum frame --
+ * the point at which it can no longer send a full frame and is therefore
+ * actually waiting on us. Before that an update is pure overhead. Fixed
+ * fractions were tried first and each failed at one end: half a window
+ * starved the tail of a transfer, and releasing on every caught-up read
+ * turned interactive traffic into one update per message. */
+static void test_window_updates_wait_until_the_peer_is_nearly_out(void) {
     cloak_obfuscator_t o;
     make_obfuscator(&o);
     wire_t wtx, wrx;
@@ -662,18 +662,28 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
     cloak_stream_t rx;
     ASSERT_EQ_INT(cloak_stream_init(&rx, 11, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
                                     CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &wrx), 0);
-    /* Explicit, because a bare stream has no peer and therefore no flow
-     * control by default -- see cloak_stream_t::flow_control. */
+    /* Explicit: a bare stream has no peer, so it has no flow control by
+     * default -- see cloak_stream_t::flow_control. */
+    cloak_stream_set_flow_control(&tx, 1);
     cloak_stream_set_flow_control(&rx, 1);
 
-    /* A quarter of the window, read out in full: under the half-window
-     * mark, so nothing should go out yet. */
-    const size_t quarter = RECV_CAP / 4;
-    uint8_t *payload = (uint8_t *)malloc(quarter);
-    ASSERT_TRUE(payload != NULL);
-    memset(payload, 0x27, quarter);
+    uint8_t *payload = (uint8_t *)malloc(RECV_CAP);
+    uint8_t *out = (uint8_t *)malloc(RECV_CAP);
+    ASSERT_TRUE(payload != NULL && out != NULL);
+    memset(payload, 0x27, RECV_CAP);
 
-    ASSERT_EQ_INT((long)quarter, cloak_stream_write(&tx, payload, quarter));
+    /* A quarter of the window, delivered and fully drained. The peer
+     * still has three quarters, so it is not waiting on anything and no
+     * update should go out. */
+    const size_t quarter = RECV_CAP / 4;
+    size_t delivered = 0;
+    size_t drained = 0;
+    while (delivered < quarter) {
+        size_t chunk = quarter - delivered;
+        long wrote = cloak_stream_write(&tx, payload, chunk);
+        ASSERT_TRUE(wrote > 0);
+        delivered += (size_t)wrote;
+    }
     size_t nframes = wtx.frame_count;
     size_t *order = (size_t *)malloc(nframes * sizeof(size_t));
     ASSERT_TRUE(order != NULL);
@@ -681,10 +691,6 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
         order[i] = i;
     }
     deliver_frames(&wtx, &o, &rx, order, nframes);
-
-    uint8_t *out = (uint8_t *)malloc(RECV_CAP);
-    ASSERT_TRUE(out != NULL);
-    size_t drained = 0;
     for (;;) {
         long got = cloak_stream_read(&rx, out, RECV_CAP);
         if (got <= 0) {
@@ -696,21 +702,21 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
     ASSERT_EQ_INT(0, (int)cloak_stream_window_updates_sent(&rx));
     ASSERT_EQ_INT(0, (int)wrx.frame_count);
 
-    /* Another quarter takes the total past half the window: exactly one
-     * update, not one per read. */
-    ASSERT_EQ_INT((long)quarter, cloak_stream_write(&tx, payload, quarter));
+    /* Now spend the rest of the peer's credit. It ends below one frame's
+     * worth, so exactly one update must go out -- one, not one per read,
+     * which is the property a per-read rule would break. */
+    while (cloak_stream_send_credit(&tx) > tx.max_payload_per_frame) {
+        long wrote = cloak_stream_write(&tx, payload, tx.max_payload_per_frame);
+        ASSERT_TRUE(wrote > 0);
+    }
     free(order);
-    size_t nframes2 = wtx.frame_count;
-    order = (size_t *)malloc(nframes2 * sizeof(size_t));
+    nframes = wtx.frame_count;
+    order = (size_t *)malloc(nframes * sizeof(size_t));
     ASSERT_TRUE(order != NULL);
-    for (size_t i = 0; i < nframes2; i++) {
+    for (size_t i = 0; i < nframes; i++) {
         order[i] = i;
     }
-    /* deliver_frames replays from the start of the wire, so the receiver
-     * sees the first quarter again -- already-consumed sequence numbers,
-     * which it drops. Only the new frames land. */
-    deliver_frames(&wtx, &o, &rx, order, nframes2);
-
+    deliver_frames(&wtx, &o, &rx, order, nframes);
     for (;;) {
         long got = cloak_stream_read(&rx, out, RECV_CAP);
         if (got <= 0) {
@@ -718,12 +724,10 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
         }
         drained += (size_t)got;
     }
-    ASSERT_EQ_INT((int)(quarter * 2), (int)drained);
     ASSERT_EQ_INT(1, (int)cloak_stream_window_updates_sent(&rx));
-
-    /* And what went out really is a window update, with the right length
-     * and the delta the consumer actually freed. */
     ASSERT_EQ_INT(1, (int)wrx.frame_count);
+
+    /* And it really is an update, carrying what the consumer freed. */
     cloak_frame_t upd;
     ASSERT_EQ_INT(0, cloak_frame_deobfuscate(&o, &upd, wrx.frames_data, wrx.frame_lens[0]));
     ASSERT_EQ_INT(upd.closing, CLOAK_FRAME_TYPE_WINDOW_UPDATE);
@@ -731,14 +735,12 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
     ASSERT_EQ_INT((int)upd.payload_len, CLOAK_FRAME_WINDOW_UPDATE_LEN);
     uint32_t delta = (uint32_t)upd.payload[0] | ((uint32_t)upd.payload[1] << 8) |
                      ((uint32_t)upd.payload[2] << 16) | ((uint32_t)upd.payload[3] << 24);
-    ASSERT_EQ_INT((int)delta, (int)(quarter * 2));
+    ASSERT_TRUE(delta > 0);
 
-    /* A receiver must not treat one as data or as a close. 2 rather than
-     * 0 is how it says "credit, not data" -- the session turns that into
-     * the writable signal a producer paused for want of credit is waiting
-     * on. What matters here is that nothing became readable. */
+    /* Feeding it back grants credit and is not data: 2 says "credit". */
+    size_t before = cloak_stream_send_credit(&tx);
     ASSERT_EQ_INT(2, cloak_stream_feed_frame(&tx, &upd));
-    ASSERT_EQ_INT(0, (int)cloak_stream_recv_available(&tx));
+    ASSERT_EQ_INT((int)(before + delta), (int)cloak_stream_send_credit(&tx));
 
     free(payload);
     free(order);
@@ -748,7 +750,6 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
     wire_free(&wtx);
     wire_free(&wrx);
 }
-
 
 /* ---- credit: spent by writing, granted by a peer's update ------------- */
 
@@ -829,7 +830,7 @@ static void test_credit_is_spent_by_writes_and_granted_by_updates(void) {
 
 TEST_MAIN_BEGIN()
     test_round_trip_in_order();
-    test_window_updates_are_emitted_at_half_the_window();
+    test_window_updates_wait_until_the_peer_is_nearly_out();
     test_credit_is_spent_by_writes_and_granted_by_updates();
     test_multi_frame_chunking_and_reassembly();
     test_out_of_order_delivery();

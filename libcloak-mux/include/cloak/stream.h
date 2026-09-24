@@ -153,6 +153,11 @@ typedef struct {
 
     size_t recv_window;
     size_t recv_freed;
+    /* What the PEER believes it may still send us: the window, less every
+     * payload byte we have accepted, plus every byte we have granted
+     * back. Tracked exactly rather than inferred, because it is the only
+     * number that says when an update is actually needed. */
+    size_t peer_credit;
     /* 0 -- the default for a bare stream -- means no credit at all: no
      * window updates emitted, no clamp on writes, cloak_stream_send_credit
      * answering SIZE_MAX. Credit is a SESSION-level protocol feature,

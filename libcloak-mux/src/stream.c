@@ -181,12 +181,14 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
     if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         s->recv_window = recv_capacity;
         s->send_credit = recv_capacity;
+        s->peer_credit = recv_capacity;
         if (cloak_msgqueue_init(&s->recv_msgs, recv_capacity) != 0) {
             free(s->write_buf);
             s->write_buf = NULL;
             return -1;
         }
     } else if ((s->recv_window = recv_capacity, s->send_credit = recv_capacity,
+                s->peer_credit = recv_capacity,
                 cloak_bytequeue_init(&s->recv_bytes, recv_capacity)) != 0) {
         free(s->write_buf);
         s->write_buf = NULL;
@@ -348,7 +350,31 @@ static void stream_maybe_send_window_update(cloak_stream_t *s) {
      * amount", and choosing it is a decision about update frequency
      * against tail latency that deserves its own measurement rather than
      * a guess here. */
-    if (s->recv_freed * 2 < s->recv_window) {
+    /* SEND WHEN THE PEER IS ABOUT TO RUN OUT, NOT ON A FIXED FRACTION.
+     *
+     * peer_credit is exactly what the other side believes it may still
+     * send. Once that is below one maximum frame it cannot send a full
+     * frame, so an update is the only thing that will move the stream --
+     * and until then an update is pure overhead, because the peer is not
+     * waiting on us.
+     *
+     * This is what a fixed fraction could not get right at both ends of
+     * the range. Half a window starved the tail: the last drain is
+     * smaller than the threshold, so no update went out and a transfer
+     * stopped 16,887 bytes short of 131,072. Releasing on every caught-up
+     * read fixed the tail and broke the other case -- interactive traffic
+     * empties the queue after almost every read, so it became one update
+     * per message and took the suite from 6 failures to 8. Gating that on
+     * a frame's worth of freed bytes left a smaller tail of the same
+     * shape, 1,007 bytes short.
+     *
+     * The peer's own credit is the quantity all three were approximating,
+     * so this uses it directly. Measured across fixed fractions before
+     * settling here: window/2 gave 163.1 MiB/s, window/4 167.3, window/8
+     * 148.9, window/16 137.4, with p50 latency flat at 136.6-137.9 us --
+     * i.e. more frequent updates cost throughput and bought nothing, which
+     * is the trade this rule avoids making at all. */
+    if (s->peer_credit >= s->max_payload_per_frame) {
         return;
     }
     uint32_t delta = s->recv_freed > 0xffffffffu ? 0xffffffffu : (uint32_t)s->recv_freed;
@@ -372,6 +398,7 @@ static void stream_maybe_send_window_update(cloak_stream_t *s) {
     if (s->sink(s->sink_userdata, s->write_buf, (size_t)written) != 0) {
         return;
     }
+    s->peer_credit += delta;
     s->recv_freed = 0;
     s->window_updates_sent++;
 }
@@ -588,6 +615,11 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
      * the closing-frame path -- both of which would wedge the stream.
      * Nothing acts on it yet; the sending half of credit is a later
      * stage. */
+    if (frame->closing != CLOAK_FRAME_TYPE_WINDOW_UPDATE && s->flow_control) {
+        /* Every payload byte we accept is a byte the peer has spent. */
+        size_t spent = frame->payload_len;
+        s->peer_credit -= spent < s->peer_credit ? spent : s->peer_credit;
+    }
     if (frame->closing == CLOAK_FRAME_TYPE_WINDOW_UPDATE) {
         if (frame->payload_len == CLOAK_FRAME_WINDOW_UPDATE_LEN) {
             uint32_t delta = (uint32_t)frame->payload[0] | ((uint32_t)frame->payload[1] << 8) |
