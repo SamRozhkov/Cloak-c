@@ -534,10 +534,21 @@ static int writer_step(void *ctx) {
         if (chunk > w->len - w->sent) {
             chunk = w->len - w->sent;
         }
-        if (cloak_stream_write(w->stream, w->buf + w->sent, chunk) < 0) {
+        /* THE RETURN VALUE IS THE ANSWER, NOT THE REQUEST. This used to
+         * add `chunk` whatever cloak_stream_write said, which silently
+         * lost every byte of a short write -- and short writes are now
+         * ordinary, because a stream may not send past the credit its
+         * peer has advertised. The old form reported 524,288 bytes sent
+         * while 65,536 arrived, so the failure showed up as missing data
+         * at the far end rather than as the accounting error it was. */
+        long wrote = cloak_stream_write(w->stream, w->buf + w->sent, chunk);
+        if (wrote < 0) {
             return 1; /* broken: let the caller's assertions report it */
         }
-        w->sent += chunk;
+        if (wrote == 0) {
+            break; /* out of credit: the peer has to read before we go on */
+        }
+        w->sent += (size_t)wrote;
     }
     return w->sent >= w->len;
 }

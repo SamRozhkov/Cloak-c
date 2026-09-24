@@ -591,10 +591,19 @@ static int writer_step(void *ctx) {
         if (chunk > w->len - w->sent) {
             chunk = w->len - w->sent;
         }
-        if (cloak_stream_write(w->stream, w->buf + w->sent, chunk) < 0) {
-            return 1; /* broken: let the caller's assertions report it */
+        /* THE RETURN VALUE IS THE ANSWER, NOT THE REQUEST -- the same
+         * accounting bug test_proxy_stream carried. Adding `chunk`
+         * whatever the write said loses every byte of a short write, and
+         * short writes are ordinary now: a stream may not send past the
+         * credit its peer has advertised. */
+        long wrote = cloak_stream_write(w->stream, w->buf + w->sent, chunk);
+        if (wrote < 0) {
+            return 1;
         }
-        w->sent += chunk;
+        if (wrote == 0) {
+            break; /* out of credit: the peer has to read before we go on */
+        }
+        w->sent += (size_t)wrote;
         chunks++;
     }
     return w->sent >= w->len;

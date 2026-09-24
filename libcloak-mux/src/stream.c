@@ -330,7 +330,25 @@ size_t cloak_stream_send_credit(const cloak_stream_t *s) {
 }
 
 static void stream_maybe_send_window_update(cloak_stream_t *s) {
-    if (!s->flow_control || s->recv_window == 0 || s->recv_freed * 2 < s->recv_window) {
+    if (!s->flow_control || s->recv_window == 0 || s->recv_freed == 0) {
+        return;
+    }
+    /* HALF THE WINDOW, AND THE TAIL IS A KNOWN GAP.
+     *
+     * The last drain of a transfer is smaller than half a window, so no
+     * update goes out and a sender can sit on a few kilobytes it will
+     * never be given credit for. Measured: a two-stream transfer stopping
+     * at 114,185 bytes of 131,072.
+     *
+     * The obvious repair -- also release whenever the consumer has caught
+     * up -- was tried and measured worse: it turned interactive traffic,
+     * where the queue is empty after almost every read, into one update
+     * per message, and took the suite from 6 failures to 8. The right
+     * shape is a threshold somewhere between "half a window" and "any
+     * amount", and choosing it is a decision about update frequency
+     * against tail latency that deserves its own measurement rather than
+     * a guess here. */
+    if (s->recv_freed * 2 < s->recv_window) {
         return;
     }
     uint32_t delta = s->recv_freed > 0xffffffffu ? 0xffffffffu : (uint32_t)s->recv_freed;
