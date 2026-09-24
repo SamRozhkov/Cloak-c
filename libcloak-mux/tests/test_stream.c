@@ -662,6 +662,9 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
     cloak_stream_t rx;
     ASSERT_EQ_INT(cloak_stream_init(&rx, 11, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
                                     CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &wrx), 0);
+    /* Explicit, because a bare stream has no peer and therefore no flow
+     * control by default -- see cloak_stream_t::flow_control. */
+    cloak_stream_set_flow_control(&rx, 1);
 
     /* A quarter of the window, read out in full: under the half-window
      * mark, so nothing should go out yet. */
@@ -730,9 +733,11 @@ static void test_window_updates_are_emitted_at_half_the_window(void) {
                      ((uint32_t)upd.payload[2] << 16) | ((uint32_t)upd.payload[3] << 24);
     ASSERT_EQ_INT((int)delta, (int)(quarter * 2));
 
-    /* A receiver must ignore one rather than treat it as data or as a
-     * close: feeding it back into a stream changes nothing. */
-    ASSERT_EQ_INT(0, cloak_stream_feed_frame(&tx, &upd));
+    /* A receiver must not treat one as data or as a close. 2 rather than
+     * 0 is how it says "credit, not data" -- the session turns that into
+     * the writable signal a producer paused for want of credit is waiting
+     * on. What matters here is that nothing became readable. */
+    ASSERT_EQ_INT(2, cloak_stream_feed_frame(&tx, &upd));
     ASSERT_EQ_INT(0, (int)cloak_stream_recv_available(&tx));
 
     free(payload);
@@ -767,6 +772,7 @@ static void test_credit_is_spent_by_writes_and_granted_by_updates(void) {
     cloak_stream_t tx;
     ASSERT_EQ_INT(cloak_stream_init(&tx, 13, &o, MAX_ON_WIRE, RECV_CAP, MAX_PENDING,
                                     CLOAK_SESSION_ORDERING_ORDERED, wire_sink, &w), 0);
+    cloak_stream_set_flow_control(&tx, 1);
 
     /* Starts at the window both ends know from the session config. */
     ASSERT_EQ_INT((int)RECV_CAP, (int)cloak_stream_send_credit(&tx));
@@ -788,14 +794,14 @@ static void test_credit_is_spent_by_writes_and_granted_by_updates(void) {
     upd.closing = CLOAK_FRAME_TYPE_WINDOW_UPDATE;
     upd.payload = upd_payload;
     upd.payload_len = sizeof(upd_payload);
-    ASSERT_EQ_INT(0, cloak_stream_feed_frame(&tx, &upd));
+    ASSERT_EQ_INT(2, cloak_stream_feed_frame(&tx, &upd));
     ASSERT_EQ_INT((int)(RECV_CAP - chunk), (int)cloak_stream_send_credit(&tx));
 
     /* An update carrying nothing usable grants nothing and does not
      * disturb the stream. */
     cloak_frame_t bad = upd;
     bad.payload_len = 1;
-    ASSERT_EQ_INT(0, cloak_stream_feed_frame(&tx, &bad));
+    ASSERT_EQ_INT(2, cloak_stream_feed_frame(&tx, &bad));
     ASSERT_EQ_INT((int)(RECV_CAP - chunk), (int)cloak_stream_send_credit(&tx));
 
     /* THE SATURATING GUARD IS NOT TESTED HERE, AND SAYING SO IS THE

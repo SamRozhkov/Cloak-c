@@ -153,7 +153,14 @@ typedef struct {
 
     size_t recv_window;
     size_t recv_freed;
-    int flow_control; /* 0 suppresses window updates -- see cloak_session_config_t */
+    /* 0 -- the default for a bare stream -- means no credit at all: no
+     * window updates emitted, no clamp on writes, cloak_stream_send_credit
+     * answering SIZE_MAX. Credit is a SESSION-level protocol feature,
+     * because it needs a peer to send the updates; a stream constructed
+     * on its own has none, and clamping it would stall it after one
+     * window with nothing able to refill it. cloak_session_init turns it
+     * on unless the config disables it. */
+    int flow_control;
 
     int recv_saturated;
     void (*on_saturation)(void *userdata, int saturated);

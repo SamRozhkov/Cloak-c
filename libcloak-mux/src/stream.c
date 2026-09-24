@@ -181,14 +181,12 @@ int cloak_stream_init(cloak_stream_t *s, uint32_t id, const cloak_obfuscator_t *
     if (ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         s->recv_window = recv_capacity;
         s->send_credit = recv_capacity;
-        s->flow_control = 1;
         if (cloak_msgqueue_init(&s->recv_msgs, recv_capacity) != 0) {
             free(s->write_buf);
             s->write_buf = NULL;
             return -1;
         }
     } else if ((s->recv_window = recv_capacity, s->send_credit = recv_capacity,
-                s->flow_control = 1,
                 cloak_bytequeue_init(&s->recv_bytes, recv_capacity)) != 0) {
         free(s->write_buf);
         s->write_buf = NULL;
@@ -319,7 +317,16 @@ static void stream_grant_credit(cloak_stream_t *s, uint32_t delta) {
 }
 
 size_t cloak_stream_send_credit(const cloak_stream_t *s) {
-    return s == NULL ? 0 : s->send_credit;
+    if (s == NULL) {
+        return 0;
+    }
+    /* WITHOUT FLOW CONTROL THERE IS NO LIMIT, and answering the real
+     * counter here would be a deadlock rather than a divergence: a peer
+     * in compatibility mode never sends window updates, so a sender that
+     * honoured its credit would stop after one window and never be given
+     * another. The relay clamps its read to this number, so SIZE_MAX is
+     * how "do not clamp" is spelled. */
+    return s->flow_control ? s->send_credit : (size_t)-1;
 }
 
 static void stream_maybe_send_window_update(cloak_stream_t *s) {
@@ -408,6 +415,20 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED && in_len > s->max_payload_per_frame) {
         return CLOAK_STREAM_ERR_SHORT_BUFFER;
     }
+    /* ENFORCED FROM HERE. A short return is now normal, and a producer
+     * that ignores it loses the remainder -- the bytes are already out of
+     * its socket by then and there is nowhere to put them back. That is
+     * why stream_relay_fd_read_budget clamps its read to this same number
+     * before it ever touches the socket, and why the two changes land in
+     * one commit. */
+    if (s->flow_control) {
+        if (in_len > s->send_credit) {
+            in_len = s->send_credit;
+        }
+        if (in_len == 0) {
+            return 0;
+        }
+    }
     size_t n = 0;
     while (n < in_len) {
         size_t remaining = in_len - n;
@@ -431,9 +452,9 @@ long cloak_stream_write(cloak_stream_t *s, const uint8_t *in, size_t in_len) {
             return -1;
         }
         n += chunk;
-        /* Clamped subtraction: the clamp on the way in is not here yet,
-         * so a producer can legitimately outrun its credit and this must
-         * floor at zero rather than wrap to SIZE_MAX. */
+        /* The clamp above means chunk <= send_credit, so this cannot
+         * wrap; the floor is kept anyway because it costs nothing and the
+         * invariant it rests on lives twenty lines away. */
         s->send_credit -= chunk < s->send_credit ? chunk : s->send_credit;
     }
     return (long)in_len;
@@ -559,8 +580,15 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
         /* A malformed update is ignored rather than fatal: it grants no
          * credit, so the worst it can do is leave the sender where it
          * already was. Tearing the stream down for it would turn a
-         * garbled frame into a lost connection. */
-        return 0;
+         * garbled frame into a lost connection.
+         *
+         * 2, NOT 0, AND THE DIFFERENCE IS A STALL. A producer whose
+         * credit ran out pauses its read and then waits for an event.
+         * Pool pressure has one, rate limiting arms its own timer, and
+         * credit had neither -- so a relay that stopped for want of
+         * credit would never learn it had some. The session turns this
+         * into the writable signal every relay already resumes on. */
+        return 2;
     }
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         return feed_frame_unordered(s, frame);
@@ -637,6 +665,15 @@ int cloak_stream_feed_frame(cloak_stream_t *s, const cloak_frame_t *frame) {
 long cloak_stream_read(cloak_stream_t *s, uint8_t *out, size_t out_cap) {
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED) {
         long n = cloak_msgqueue_read(&s->recv_msgs, out, out_cap);
+        if (n > 0) {
+            /* THE UNORDERED PATH NEEDS CREDIT TOO, and forgetting it was
+             * not a subtle failure: a datagram session emitted no window
+             * updates at all, so its peer spent one window and stopped
+             * for good. Every test that moved more than 64 KiB over UDP
+             * timed out at once. */
+            s->recv_freed += (size_t)n;
+            stream_maybe_send_window_update(s);
+        }
         if (n == CLOAK_MSGQUEUE_SHORT_BUFFER) {
             /* The datagram is still queued -- cloak_msgqueue_read returns
              * before it pops anything, exactly as Go returns at
