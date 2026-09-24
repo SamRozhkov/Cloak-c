@@ -697,6 +697,28 @@ static void piper_pump_read(cloak_udp_piper_t *pp) {
          * refusal cloak/stream.h describes -- the oversized case was
          * dealt with above, on the socket, where the whole datagram is
          * still available to be refused as a unit. */
+        /* CREDIT CAN REFUSE THIS, AND THE DATAGRAM MUST NOT BE LOST.
+         *
+         * The pool check above asks whether the CONNECTIONS have room; it
+         * does not ask whether the peer has advertised any. A stream out
+         * of credit answers 0 -- refused whole, never truncated, because
+         * a datagram is atomic -- and the old code read that as success
+         * and moved on, dropping the datagram silently. The one place
+         * this port must not be silent is exactly here: it is the
+         * difference between a slow tunnel and a lossy one.
+         *
+         * So the read loop stops instead, counted as a pause like any
+         * other, and resumes when the peer's window update arrives. The
+         * datagram still in `buf` is the one casualty and it is dropped
+         * knowingly -- it has already left the socket and the local
+         * sender will retransmit or not, as UDP always leaves it. */
+        if (cloak_stream_send_credit(peer->stream) < (size_t)n) {
+            if (!pp->read_paused) {
+                pp->read_paused = 1;
+                pp->pool_pauses++;
+            }
+            break;
+        }
         if (cloak_stream_write(peer->stream, buf, (size_t)n) < 0) {
             /* cloak/stream.h: a failed write leaves the stream unusable
              * and the caller must tear it down. One peer dies; the loop
