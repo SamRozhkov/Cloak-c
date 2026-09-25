@@ -145,6 +145,21 @@ typedef struct {
      * ends agree on from the session config -- nothing is exchanged to
      * establish it -- and is replenished by the peer's window updates.
      *
+     * IT ASSUMES BOTH ENDS ARE CONFIGURED ALIKE, and that assumption is
+     * load-bearing in one direction. Nothing on the wire announces the
+     * peer's capacity before the first frame, so this side starts from
+     * its OWN. Both ends of the product take the same default, so it is
+     * exact there. A peer configured with a SMALLER receive capacity than
+     * ours would be handed more than it can hold -- the overflow this
+     * whole mechanism exists to remove, arrived at from the configuration
+     * instead. A peer with a larger one merely runs slower than it could.
+     *
+     * Found the benign way round: a test whose client used 65,536 against
+     * a server template of 2,097,152 delivered exactly 65,536 bytes of a
+     * 512 KiB transfer. Closing the dangerous direction properly needs
+     * the window announced rather than assumed, which is a wire change
+     * this port has not made yet.
+     *
      * ACCOUNTED BUT NOT YET ENFORCED. cloak_stream_write still sends
      * whatever it is given; the clamp belongs with the relay change that
      * makes a short write safe, and landing the two separately would mean

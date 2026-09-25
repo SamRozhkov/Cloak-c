@@ -1257,7 +1257,17 @@ static int client_up(client_t *cl, struct fixture *fx, uint32_t session_id,
     cfg.dial_timeout_ms = 5000;
     cfg.handshake_timeout_ms = 10000;
     cfg.session_template.max_on_wire_size = fx->wire;
-    cfg.session_template.stream_recv_capacity = 65536;
+    /* THE SAME WINDOW AS THE SERVER'S TEMPLATE, AND THE SYMMETRY IS NOT
+     * COSMETIC. Initial credit is taken from THIS side's own receive
+     * capacity, because there is nothing on the wire that announces the
+     * peer's before the first frame. That is exact only while both ends
+     * are configured alike -- which they are in the product, where both
+     * default to the same constant. A client that believed it had a
+     * larger window than the server really has would overrun it; one that
+     * believed it had a smaller window would simply be slower. The
+     * asymmetry here made it the second kind, and it showed as a 512 KiB
+     * transfer arriving as exactly 65,536 bytes. */
+    cfg.session_template.stream_recv_capacity = 2097152;
     cfg.session_template.stream_max_pending_frames = 64;
     cfg.session_template.conn_send_queue_cap = conn_send_queue_cap;
     cfg.session_template.inactivity_timeout_ms = 60000;
@@ -1317,7 +1327,17 @@ static int client_second_session(client_t *cl, struct fixture *fx, uint32_t sess
     cfg.dial_timeout_ms = 5000;
     cfg.handshake_timeout_ms = 10000;
     cfg.session_template.max_on_wire_size = fx->wire;
-    cfg.session_template.stream_recv_capacity = 65536;
+    /* THE SAME WINDOW AS THE SERVER'S TEMPLATE, AND THE SYMMETRY IS NOT
+     * COSMETIC. Initial credit is taken from THIS side's own receive
+     * capacity, because there is nothing on the wire that announces the
+     * peer's before the first frame. That is exact only while both ends
+     * are configured alike -- which they are in the product, where both
+     * default to the same constant. A client that believed it had a
+     * larger window than the server really has would overrun it; one that
+     * believed it had a smaller window would simply be slower. The
+     * asymmetry here made it the second kind, and it showed as a 512 KiB
+     * transfer arriving as exactly 65,536 bytes. */
+    cfg.session_template.stream_recv_capacity = 2097152;
     cfg.session_template.stream_max_pending_frames = 64;
     cfg.session_template.conn_send_queue_cap = 262144;
     cfg.session_template.inactivity_timeout_ms = 60000;
