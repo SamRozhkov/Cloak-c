@@ -362,6 +362,16 @@ static size_t adminapi_write_budget(const cloak_adminapi_stream_t *ast) {
     if (s->ordering == CLOAK_SESSION_ORDERING_UNORDERED && budget > s->max_payload_per_frame) {
         budget = s->max_payload_per_frame;
     }
+    /* AND NEVER MORE THAN THE PEER HAS ROOM FOR. cloak_stream_write
+     * refuses past its credit and answers short; this loop would advance
+     * over the remainder. Clamping here is the same guard
+     * stream_relay_fd_read_budget carries, for the same reason. */
+    {
+        size_t credit = cloak_stream_send_credit(ast->stream);
+        if (budget > credit) {
+            budget = credit;
+        }
+    }
     return budget;
 }
 
@@ -392,15 +402,27 @@ static void adminapi_pump_write(cloak_adminapi_stream_t *ast) {
         }
         size_t remaining = ast->resp_len - ast->resp_sent;
         size_t chunk = budget < remaining ? budget : remaining;
-        if (cloak_stream_write(ast->stream, (const uint8_t *)ast->resp + ast->resp_sent, chunk) <
-            0) {
+        long wrote =
+            cloak_stream_write(ast->stream, (const uint8_t *)ast->resp + ast->resp_sent, chunk);
+        if (wrote < 0) {
             /* The stream's write side is closed (the peer went away) or a
              * frame could not be built. Either way there is no response
              * to finish. */
             finished = 1;
             break;
         }
-        ast->resp_sent += chunk;
+        if (wrote == 0) {
+            break; /* credit-bound; the peer's window update owns this resume */
+        }
+        /* THE COUNT WRITTEN, NOT THE COUNT ASKED FOR. Advancing by chunk
+         * regardless was silent truncation the moment a short write
+         * became possible, and per-stream credit made it ordinary: a
+         * 144,801-byte user listing arrived as 65,410 bytes -- one window
+         * -- with a JSON document cut mid-object and no error anywhere.
+         * The budget above now asks for no more than the credit allows,
+         * so a short answer should not happen; this is what makes the
+         * truncation impossible rather than merely unlikely. */
+        ast->resp_sent += (size_t)wrote;
     }
     if (ast->resp_sent >= ast->resp_len) {
         finished = 1;
