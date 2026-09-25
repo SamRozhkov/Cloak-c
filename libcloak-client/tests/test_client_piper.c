@@ -625,7 +625,19 @@ static int fixture_init_opts(struct fixture *fx, size_t max_on_wire_size) {
     dcfg.registry = &fx->registry;
     dcfg.panel = fx->panel;
     dcfg.session_config_template.max_on_wire_size = fx->wire;
-    dcfg.session_config_template.stream_recv_capacity = 65536;
+    /* A WINDOW LARGER THAN WHAT THE SOCKET AND THE POOL CAN SWALLOW.
+     *
+     * Per-stream credit gives a producer a third way to stop, alongside a
+     * full pool and an empty rate bucket, and at 65,536 bytes it becomes
+     * the FIRST one: the kernel socket buffer absorbs everything the
+     * window allows, so the pool never backs up and a case that asserts
+     * congestion is asserting something that can no longer happen.
+     * Measured in test_valve_rate as min_conn_free 32,768 -- the pool
+     * completely empty -- with credit at 0.
+     *
+     * These cases are about the POOL, so the window is raised until the
+     * pool is the tightest constraint again. */
+    dcfg.session_config_template.stream_recv_capacity = 2097152;
     dcfg.session_config_template.stream_max_pending_frames = 64;
     dcfg.session_config_template.conn_send_queue_cap = 262144;
     dcfg.session_config_template.inactivity_timeout_ms = 60000;
